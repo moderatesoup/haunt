@@ -48,7 +48,7 @@ Project-level example: [`contrib/cursor/hooks.json`](contrib/cursor/hooks.json).
 | `postToolUse` | observe tool_name + input + output (tier=procedural; see **tier caveat** below) |
 | `afterShellExecution` | observe command + output (`tool_name=Shell`) |
 | `afterMCPExecution` | observe MCP call; skips `memory_*` to avoid recursion |
-| `sessionStart` | tiny session-open event + last 5 memories + MCP reminder |
+| `sessionStart` | session-open coordinate event + worldview card (`additional_context`) |
 | `sessionEnd` | close session; no summary |
 
 **Secret redaction:** Hook-stored tool input and output are run through a best-effort denylist that redacts common secret patterns (API keys, bearer tokens, AWS access keys, GitHub PATs, JWTs, etc.). This is **not** exhaustive — do not rely on it as a security boundary. If a tool returns sensitive material you must not persist, avoid passing secrets through `memory_observe`.
@@ -106,7 +106,7 @@ After `haunt bootstrap` (and `pip install -e .` so `python -m haunt.mcp_server` 
 }
 ```
 
-`haunt bootstrap` prints the absolute launcher path. The file is a `/bin/sh` wrapper around the venv `haunt-mcp` console script (stdio). `~/.haunt/bin/lore-mcp` and `~/.haunt/bin/engram-mcp` are legacy aliases for the same server. Tools: `memory_observe`, `memory_recall`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end` (closes a session; **no** distillation).
+`haunt bootstrap` prints the absolute launcher path. The file is a `/bin/sh` wrapper around the venv `haunt-mcp` console script (stdio). `~/.haunt/bin/lore-mcp` and `~/.haunt/bin/engram-mcp` are legacy aliases for the same server. Tools: `memory_observe`, `memory_recall`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end` (closes a session; **no** distillation).
 
 ## What v1 does / does not
 
