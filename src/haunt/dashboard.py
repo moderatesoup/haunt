@@ -638,13 +638,15 @@ setInterval(async()=>{
 """
 
 
-def _health(ns: str | None = None) -> dict[str, Any]:
-    from haunt.bootstrap import probe_sqlite_vec
-
+def _health_from_store(st: Store) -> dict[str, Any]:
     es = embed_state()
-    payload: dict[str, Any] = {
+    vec_info: dict[str, Any] = {"ok": st.vec_ok()}
+    ver = st.vec_version()
+    if ver:
+        vec_info["version"] = ver
+    return {
         "haunt_home": str(haunt_home()),
-        "sqlite_vec": probe_sqlite_vec(),
+        "sqlite_vec": vec_info,
         "embed": {
             "loaded": es.model_id,
             "dim": es.dim,
@@ -653,7 +655,6 @@ def _health(ns: str | None = None) -> dict[str, Any]:
             "fallback": es.fallback,
         },
     }
-    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -676,10 +677,11 @@ async def api_namespace(request: Request) -> JSONResponse:
         stats = st.stats()
         events = st.events(limit=40)
         entities = st.top_entities(20)
+        health = _health_from_store(st)
     return JSONResponse(
         {
             "haunt_home": str(haunt_home()),
-            "health": _health(name),
+            "health": health,
             "namespaces": list_namespaces(),
             "stats": stats,
             "events": events,
@@ -807,8 +809,8 @@ async def api_worldview(request: Request) -> JSONResponse:
 
 async def api_health(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
-    health = _health(name)
     with Store(name) as st:
+        health = _health_from_store(st)
         stats = st.stats()
     health["namespace"] = name
     health["db_path"] = stats.get("db_path", "")

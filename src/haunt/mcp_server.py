@@ -110,7 +110,6 @@ def memory_timeline(
 
 @server.tool(description="Health and counts for a namespace.")
 def memory_health(namespace: Optional[str] = None) -> str:
-    from haunt.bootstrap import probe_sqlite_vec
     from haunt.embed import state as embed_state
     from haunt.paths import haunt_home
 
@@ -118,12 +117,16 @@ def memory_health(namespace: Optional[str] = None) -> str:
     es = embed_state()
     with Store(ns) as st:
         stats = st.stats()
+        vec_info: dict = {"ok": st.vec_ok()}
+        ver = st.vec_version()
+        if ver:
+            vec_info["version"] = ver
     return _json(
         {
             "namespace": ns,
             "db_path": stats.get("db_path", ""),
             "haunt_home": str(haunt_home()),
-            "sqlite_vec": probe_sqlite_vec(),
+            "sqlite_vec": vec_info,
             "embed": {
                 "loaded": es.model_id,
                 "dim": es.dim,

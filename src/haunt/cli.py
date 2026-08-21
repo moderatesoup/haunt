@@ -170,17 +170,12 @@ def health_cmd(
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
 ) -> None:
     """Store, vec, and embed status."""
-    from haunt.bootstrap import probe_sqlite_vec
     from haunt.paths import registry_path
 
     es = embed_state()
-    vec = probe_sqlite_vec()
     typer.echo(f"haunt         v{__version__}")
     typer.echo(f"HAUNT_HOME    {haunt_home()}")
     typer.echo(f"registry      {registry_path()}  exists={registry_path().exists()}")
-    typer.echo(
-        f"sqlite-vec    {'ok ' + str(vec.get('version')) if vec.get('ok') else 'FAIL'}"
-    )
     typer.echo(
         f"embed         loaded={es.model_id} dim={es.dim} requested={es.requested} "
         f"available={es.available} fallback={es.fallback} backend={getattr(es, 'backend', '?')}"
@@ -189,6 +184,11 @@ def health_cmd(
         typer.echo(f"embed error   {es.error}")
     ns = _ns(namespace)
     with Store(ns) as st:
+        vec_ok = st.vec_ok()
+        vec_ver = st.vec_version()
+        typer.echo(
+            f"sqlite-vec    {'ok ' + str(vec_ver) if vec_ok else 'off (FTS-only)'}"
+        )
         s = st.stats()
         typer.echo(f"namespace     {s['namespace']}")
         typer.echo(f"db            {s['db_path']}  bytes={s['db_size_bytes']}  wal={s['wal']}")
