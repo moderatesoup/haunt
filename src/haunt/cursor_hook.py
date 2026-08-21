@@ -252,7 +252,7 @@ def _handle_post_tool(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         role="tool",
         tier="procedural",
         tool_name=name,
-        tool_input=_as_text(payload.get("tool_input")),
+        tool_input=_redact_secrets(_as_text(payload.get("tool_input"))),
         tool_output=_redact_secrets(_as_text(payload.get("tool_output"))),
     )
     return {}
@@ -266,7 +266,7 @@ def _handle_after_shell(store: Store, payload: dict[str, Any]) -> dict[str, Any]
         role="tool",
         tier="procedural",
         tool_name="Shell",
-        tool_input=_as_text(payload.get("command")),
+        tool_input=_redact_secrets(_as_text(payload.get("command"))),
         tool_output=_redact_secrets(_as_text(payload.get("output"))),
     )
     return {}
@@ -283,7 +283,7 @@ def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         role="tool",
         tier="procedural",
         tool_name=name or "mcp",
-        tool_input=_as_text(payload.get("tool_input")),
+        tool_input=_redact_secrets(_as_text(payload.get("tool_input"))),
         tool_output=_redact_secrets(_as_text(payload.get("result_json"))),
     )
     return {}

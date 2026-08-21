@@ -51,7 +51,7 @@ Project-level example: [`contrib/cursor/hooks.json`](contrib/cursor/hooks.json).
 | `sessionStart` | tiny session-open event + last 5 memories + MCP reminder |
 | `sessionEnd` | close session; no summary |
 
-**Secret redaction:** Hook-stored tool output is run through a best-effort denylist that redacts common secret patterns (API keys, bearer tokens, AWS access keys, GitHub PATs, JWTs, etc.). This is **not** exhaustive — do not rely on it as a security boundary. If a tool returns sensitive material you must not persist, avoid passing secrets through `memory_observe`.
+**Secret redaction:** Hook-stored tool input and output are run through a best-effort denylist that redacts common secret patterns (API keys, bearer tokens, AWS access keys, GitHub PATs, JWTs, etc.). This is **not** exhaustive — do not rely on it as a security boundary. If a tool returns sensitive material you must not persist, avoid passing secrets through `memory_observe`.
 
 Namespace is inferred from `CURSOR_PROJECT_DIR` / git / cwd. Session id is `conversation_id` or `session_id`.
 
