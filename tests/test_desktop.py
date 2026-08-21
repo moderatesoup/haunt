@@ -65,3 +65,35 @@ def test_install_icon_unsupported_platform(tmp_path, monkeypatch):
     result = install_desktop_icon(home=tmp_path)
     assert result["written"] is False
     assert "unsupported" in result.get("reason", "")
+
+
+def test_shortcut_invokes_haunt_dash_linux(tmp_path, monkeypatch):
+    """Linux shortcut Exec line must call 'haunt dash' so browser-open rides the CLI."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    from haunt.desktop import install_desktop_icon
+
+    result = install_desktop_icon(home=tmp_path)
+    assert result["written"] is True
+    content = Path(result["path"]).read_text()
+    exec_lines = [l for l in content.splitlines() if l.startswith("Exec=")]
+    assert len(exec_lines) == 1
+    assert exec_lines[0].endswith("dash"), (
+        f"Exec must end with 'dash' (got: {exec_lines[0]!r}); "
+        "browser-open is handled by 'haunt dash' itself"
+    )
+
+
+def test_shortcut_invokes_haunt_dash_macos(tmp_path, monkeypatch):
+    """macOS .command must call 'haunt dash' so browser-open rides the CLI."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    from haunt.desktop import install_desktop_icon
+
+    result = install_desktop_icon(home=tmp_path)
+    assert result["written"] is True
+    content = Path(result["path"]).read_text()
+    assert "dash" in content
+    assert "--no-open" not in content, (
+        "Desktop shortcut must NOT pass --no-open; browser should open"
+    )

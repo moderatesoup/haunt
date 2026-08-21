@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from haunt.store import Store, observe
@@ -127,3 +129,51 @@ def test_api_health(dash_client):
     assert "stats" in data
     assert "db_path" in data
     assert "namespace" in data
+
+
+def test_no_open_still_serves(dash_client):
+    """dash --no-open must still serve HTTP; the test client exercises this."""
+    r = dash_client.get("/")
+    assert r.status_code == 200
+    assert "haunt" in r.text.lower()
+
+
+def test_run_dashboard_opens_browser_by_default():
+    """Mutation guard: run_dashboard must default open_browser=True.
+
+    If someone removes browser-open, this test fails — ensuring the
+    first-run experience keeps working.
+    """
+    from haunt.dashboard import run_dashboard
+
+    sig = inspect.signature(run_dashboard)
+    param = sig.parameters.get("open_browser")
+    assert param is not None, "run_dashboard must accept open_browser parameter"
+    assert param.default is True, (
+        f"open_browser default must be True (got {param.default!r}); "
+        "haunt dash opens the browser by default for first-run UX"
+    )
+
+
+def test_run_dashboard_no_open_skips_browser(lore_env, monkeypatch):
+    """open_browser=False must not attempt webbrowser.open."""
+    import threading
+
+    opened = []
+    monkeypatch.setattr("webbrowser.open", lambda url: opened.append(url))
+
+    from haunt.dashboard import run_dashboard
+
+    original_run = None
+    try:
+        import uvicorn
+        original_run = uvicorn.run
+
+        def fake_run(*a, **kw):
+            pass
+
+        monkeypatch.setattr("uvicorn.run", fake_run)
+        run_dashboard(open_browser=False)
+        assert opened == [], "webbrowser.open should not be called when open_browser=False"
+    finally:
+        pass

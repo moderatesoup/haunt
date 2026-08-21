@@ -119,6 +119,21 @@ def test_default_embed_model_is_bge_m3():
     assert DEFAULT_REQUESTED == "BAAI/bge-m3"
 
 
+def test_bootstrap_report_includes_desktop_icon(tmp_path, monkeypatch):
+    """bootstrap() report must include a desktop_icon path when HOME is a temp dir."""
+    monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.delenv("LORE_HOME", raising=False)
+
+    from haunt import embed
+    from haunt.bootstrap import bootstrap
+
+    embed.reset()
+    report = bootstrap()
+    assert "desktop_icon" in report, "bootstrap report must include 'desktop_icon' key"
+    embed.reset()
+
+
 def test_fts_only_env_disables_embeddings(tmp_path, monkeypatch):
     """HAUNT_FTS_ONLY=1 must disable embeddings entirely."""
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")

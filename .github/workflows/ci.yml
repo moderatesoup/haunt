@@ -42,3 +42,13 @@ jobs:
           haunt observe "CI smoke test phrase ZEPHYR-42"
           haunt recall "ZEPHYR-42" | grep -q "ZEPHYR-42"
           haunt health
+
+      - name: "Smoke: haunt dash --install-icon writes shortcut"
+        env:
+          HAUNT_FTS_ONLY: "1"
+        run: |
+          export HAUNT_HOME="$(mktemp -d)"
+          export HOME="$(mktemp -d)"
+          haunt bootstrap
+          haunt dash --install-icon
+          test -f "$HOME/.local/share/applications/haunt-memories.desktop"

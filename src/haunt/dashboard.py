@@ -695,8 +695,30 @@ routes = [
 app = Starlette(debug=False, routes=routes)
 
 
-def run_dashboard(host: str = "127.0.0.1", port: int = 7340) -> None:
+def run_dashboard(
+    host: str = "127.0.0.1",
+    port: int = 7340,
+    open_browser: bool = True,
+) -> None:
+    import threading
+    import time
+    import socket
     import uvicorn
+    import webbrowser
+
+    url = f"http://{host}:{port}"
+
+    if open_browser:
+        def _open_when_ready() -> None:
+            for _ in range(40):
+                try:
+                    with socket.create_connection((host, port), timeout=0.5):
+                        webbrowser.open(url)
+                        return
+                except OSError:
+                    time.sleep(0.25)
+
+        threading.Thread(target=_open_when_ready, daemon=True).start()
 
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
