@@ -685,6 +685,186 @@ class Store:
         }
 
 
+    # ------------------------------------------------------------------
+    # worldview: compact per-namespace briefing
+    # ------------------------------------------------------------------
+
+    def worldview(self, *, facts_cap: int = 12, names_cap: int = 12) -> dict[str, Any]:
+        """Compile a structured namespace briefing from existing rows.
+
+        No LLM. Pure read queries over stored semantic/procedural/entity data.
+        """
+        facts = [
+            dict(r)
+            for r in self.conn.execute(
+                """
+                SELECT m.id, m.content, m.valid_from, m.created_at
+                FROM memories m
+                WHERE m.tier='semantic' AND m.valid_to IS NULL
+                ORDER BY m.created_at DESC
+                LIMIT ?
+                """,
+                (int(facts_cap),),
+            ).fetchall()
+        ]
+
+        procedures = [
+            dict(r)
+            for r in self.conn.execute(
+                """
+                SELECT m.id, m.content, e.meta
+                FROM memories m
+                JOIN events e ON e.id = m.event_id
+                WHERE m.tier='procedural' AND m.valid_to IS NULL AND e.meta LIKE '%"kind": "procedure"%'
+                ORDER BY m.created_at DESC
+                """,
+            ).fetchall()
+        ]
+        proc_index: list[dict[str, Any]] = []
+        for p in procedures:
+            emeta = loads(p.get("meta"))
+            proc_index.append({
+                "id": p["id"],
+                "name": emeta.get("name", ""),
+                "trigger": emeta.get("trigger", ""),
+            })
+
+        names = self.top_entities(limit=names_cap)
+        name_list = [{"name": n["name"], "type": n["type"], "mentions": n["rels"]} for n in names]
+
+        stats = self.stats()
+        counts = {
+            "events": stats["events"],
+            "memories": stats["memories"],
+            "sessions": stats["sessions"],
+        }
+
+        return {
+            "namespace": self.name,
+            "facts": facts,
+            "names": name_list,
+            "procedures": proc_index,
+            "counts": counts,
+        }
+
+    # ------------------------------------------------------------------
+    # procedure: named how-tos
+    # ------------------------------------------------------------------
+
+    def procedure_write(
+        self,
+        name: str,
+        body: str,
+        *,
+        trigger: str = "",
+        origin: str = "cli",
+        session_id: str | None = None,
+    ) -> ObserveResult:
+        """Store a named procedure. Verbatim body, stored as tier=procedural."""
+        meta = {"kind": "procedure", "name": name, "trigger": trigger}
+        return self.observe(
+            body,
+            role="system",
+            tier="procedural",
+            session_id=session_id,
+            origin=origin,
+            meta=meta,
+        )
+
+    def procedure_get(self, name: str) -> dict[str, Any] | None:
+        """Retrieve a procedure by name. Returns newest matching row."""
+        row = self.conn.execute(
+            """
+            SELECT m.id, m.content, m.valid_from, m.valid_to, m.created_at, e.meta
+            FROM memories m
+            JOIN events e ON e.id = m.event_id
+            WHERE m.tier='procedural'
+              AND m.valid_to IS NULL
+              AND e.meta LIKE ?
+            ORDER BY m.created_at DESC
+            LIMIT 1
+            """,
+            (f'%"name": "{name}"%',),
+        ).fetchone()
+        if not row:
+            return None
+        emeta = loads(row["meta"])
+        return {
+            "id": row["id"],
+            "name": emeta.get("name", name),
+            "body": row["content"],
+            "trigger": emeta.get("trigger", ""),
+            "valid_from": row["valid_from"],
+            "created_at": row["created_at"],
+        }
+
+    def procedure_list(self) -> list[dict[str, Any]]:
+        """List all active procedures (valid_to IS NULL)."""
+        rows = self.conn.execute(
+            """
+            SELECT m.id, m.content, m.created_at, e.meta
+            FROM memories m
+            JOIN events e ON e.id = m.event_id
+            WHERE m.tier='procedural'
+              AND m.valid_to IS NULL
+              AND e.meta LIKE '%"kind": "procedure"%'
+            ORDER BY m.created_at DESC
+            """,
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            emeta = loads(r["meta"])
+            out.append({
+                "id": r["id"],
+                "name": emeta.get("name", ""),
+                "body": r["content"],
+                "trigger": emeta.get("trigger", ""),
+                "created_at": r["created_at"],
+            })
+        return out
+
+    # ------------------------------------------------------------------
+    # contradict: supersede a memory
+    # ------------------------------------------------------------------
+
+    def contradict(
+        self,
+        memory_id: str,
+        *,
+        replacement: str | None = None,
+        namespace: str | None = None,
+        origin: str = "cli",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Mark memory_id superseded (set valid_to=now). Optionally store replacement as semantic."""
+        ts = now_iso()
+        row = self.conn.execute(
+            "SELECT id, valid_to FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": f"memory {memory_id} not found"}
+        self.conn.execute(
+            "UPDATE memories SET valid_to=? WHERE id=?", (ts, memory_id)
+        )
+        self.conn.commit()
+        result: dict[str, Any] = {
+            "ok": True,
+            "superseded": memory_id,
+            "valid_to": ts,
+        }
+        if replacement and replacement.strip():
+            r = self.observe(
+                replacement,
+                role="system",
+                tier="semantic",
+                session_id=session_id,
+                origin=origin,
+            )
+            result["replacement_memory_id"] = r.memory_id
+            result["replacement_event_id"] = r.event_id
+        return result
+
+
 def get_store(name: str | None = None, repo_path: str | None = None) -> Store:
     ns = resolve_namespace(name)
     return Store(ns, repo_path=repo_path, create=True)

@@ -182,6 +182,136 @@ def test_graph_no_duplicate_triples_same_event(lore_env):
         assert any("handle_stripe_event" in n for n in stored)
 
 
+# --------------------------------------------------------------------------
+# worldview
+# --------------------------------------------------------------------------
+
+
+def test_worldview_lists_semantic_facts_and_procedures(lore_env):
+    """Write a semantic fact + a named procedure; worldview lists both."""
+    with Store("default") as st:
+        st.observe(
+            "The API base URL is https://api.example.com/v2",
+            role="system",
+            tier="semantic",
+            origin="test",
+        )
+        st.procedure_write(
+            "deploy",
+            "1. git pull\n2. docker compose up -d\n3. curl health",
+            trigger="when deploying to production",
+            origin="test",
+        )
+        wv = st.worldview()
+
+    assert wv["namespace"] == "default"
+    assert wv["counts"]["memories"] >= 2
+    assert len(wv["facts"]) >= 1
+    assert any("api.example.com" in f["content"] for f in wv["facts"])
+    assert len(wv["procedures"]) >= 1
+    assert any(p["name"] == "deploy" for p in wv["procedures"])
+    assert any("deploying to production" in p.get("trigger", "") for p in wv["procedures"])
+
+
+def test_worldview_excludes_episodic_from_facts(lore_env):
+    """Chat-only episodic turns do NOT show up as facts or procedures."""
+    with Store("default") as st:
+        st.observe("user asked about the weather", role="user", tier="episodic")
+        st.observe(
+            "The database host is db.internal:5432",
+            role="system",
+            tier="semantic",
+        )
+        wv = st.worldview()
+
+    for f in wv["facts"]:
+        assert "weather" not in f["content"]
+    assert any("db.internal" in f["content"] for f in wv["facts"])
+
+
+# --------------------------------------------------------------------------
+# procedure
+# --------------------------------------------------------------------------
+
+
+def test_procedure_write_and_get_verbatim(lore_env):
+    """procedure get returns verbatim body."""
+    body = "1. Stop the server\n2. Run migrations\n3. Restart"
+    with Store("default") as st:
+        st.procedure_write("maintenance", body, trigger="when doing maintenance")
+        proc = st.procedure_get("maintenance")
+
+    assert proc is not None
+    assert proc["name"] == "maintenance"
+    assert proc["body"] == body
+    assert proc["trigger"] == "when doing maintenance"
+
+
+def test_procedure_list(lore_env):
+    with Store("default") as st:
+        st.procedure_write("deploy", "git pull && make deploy", origin="test")
+        st.procedure_write("rollback", "git revert HEAD && make deploy", trigger="when deploy fails", origin="test")
+        procs = st.procedure_list()
+
+    names = [p["name"] for p in procs]
+    assert "deploy" in names
+    assert "rollback" in names
+
+
+def test_episodic_not_in_procedure_list(lore_env):
+    """Chat-only episodic turns do NOT show up as procedures."""
+    with Store("default") as st:
+        st.observe("just chatting about code", role="user", tier="episodic")
+        st.observe(
+            "",
+            role="tool",
+            tier="procedural",
+            tool_name="Read",
+            tool_input='{"path": "foo.py"}',
+            tool_output="print('hello')",
+            origin="test",
+        )
+        st.procedure_write("real-proc", "do the thing", origin="test")
+        procs = st.procedure_list()
+
+    names = [p["name"] for p in procs]
+    assert "real-proc" in names
+    assert len(procs) == 1
+
+
+# --------------------------------------------------------------------------
+# contradict
+# --------------------------------------------------------------------------
+
+
+def test_contradict_supersedes_memory(lore_env):
+    with Store("default") as st:
+        r = st.observe("the port is 8080", role="system", tier="semantic")
+        result = st.contradict(r.memory_id, replacement="the port is 9090")
+
+    assert result["ok"] is True
+    assert result["superseded"] == r.memory_id
+    assert "replacement_memory_id" in result
+
+    with Store("default") as st:
+        old = st.conn.execute(
+            "SELECT valid_to FROM memories WHERE id=?", (r.memory_id,)
+        ).fetchone()
+        assert old["valid_to"] is not None
+
+        wv = st.worldview()
+        contents = [f["content"] for f in wv["facts"]]
+        assert any("9090" in c for c in contents)
+        assert not any("8080" in c for c in contents)
+
+
+def test_contradict_not_found(lore_env):
+    with Store("default") as st:
+        result = st.contradict("nonexistent-id-12345")
+    assert result["ok"] is False
+    assert "not found" in result["error"]
+
+
 def test_reembed_rebuilds_on_dim_mismatch(lore_env):
     observe("stripe webhook key lives in config/secrets.toml", namespace="default")
     with Store("default") as st:
