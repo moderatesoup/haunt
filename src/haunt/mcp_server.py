@@ -185,6 +185,9 @@ def memory_procedure(
     namespace: Optional[str] = None,
     origin: str = "mcp",
 ) -> str:
+    valid_actions = ("write", "get", "list")
+    if action not in valid_actions:
+        return _json({"ok": False, "error": f"unknown action '{action}', must be one of: {', '.join(valid_actions)}"})
     ns = resolve_namespace(namespace)
     with Store(ns) as st:
         if action == "write":
