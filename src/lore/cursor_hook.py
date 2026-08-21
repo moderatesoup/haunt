@@ -134,7 +134,7 @@ def _is_memory_tool(name: str) -> bool:
 
 
 def format_recall_block(hits: list[Hit], namespace: str) -> str:
-    lines = [f"[engram ns={namespace}]"]
+    lines = [f"[haunt ns={namespace}]"]
     if not hits:
         lines.append("(no memories)")
         return "\n".join(lines)
@@ -146,7 +146,7 @@ def format_recall_block(hits: list[Hit], namespace: str) -> str:
 
 
 def format_timeline_block(rows: list[dict[str, Any]], namespace: str) -> str:
-    lines = [f"[engram recent ns={namespace}]"]
+    lines = [f"[haunt recent ns={namespace}]"]
     if not rows:
         lines.append("(no memories)")
         return "\n".join(lines)
@@ -251,7 +251,7 @@ def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
 
 def format_worldview_card(wv: dict[str, Any]) -> str:
     """Render a worldview dict as a compact text card for additional_context."""
-    lines = [f"[engram worldview ns={wv['namespace']}]"]
+    lines = [f"[haunt worldview ns={wv['namespace']}]"]
     counts = wv.get("counts", {})
     lines.append(
         f"events={counts.get('events', 0)} memories={counts.get('memories', 0)} "
@@ -280,17 +280,19 @@ def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dic
     _observe(
         store,
         payload,
-        content="engram session start",
+        content="haunt session start",
         role="system",
         tier="coordinate",
     )
     wv = store.worldview()
     card = format_worldview_card(wv)
     intro = (
-        "You have persistent local memory via engram (MCP tools "
-        "memory_recall / memory_observe / memory_worldview / memory_procedure). "
-        "Before acting on a user request, call memory_recall with their wording. "
-        "Store new facts with memory_observe (tier=semantic). "
+        "You have persistent local memory via haunt (MCP server lore). "
+        "Hooks store turns automatically — do not double-observe what hooks already log. "
+        "Hooks do NOT inject recall into your context on beforeSubmitPrompt "
+        "(additional_context there is unproven). You MUST call memory_recall "
+        "with the user's wording yourself unless a [haunt ns=…] block is "
+        "already visible in this context. "
         f"Namespace: {ns}."
     )
     return {"additional_context": f"{intro}\n\n{card}"}

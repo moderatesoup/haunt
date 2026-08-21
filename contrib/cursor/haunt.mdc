@@ -1,42 +1,78 @@
 ---
-description: haunt local memory — verbatim store/recall/worldview/procedures
+description: haunt local memory — hooks store, agents must recall
 alwaysApply: true
 ---
 
 # haunt
 
-Local-first verbatim memory. Hooks store prompts, replies, and tool calls
-automatically (no summarization, no LLM). MCP server name is `lore`;
-tools are prefixed `memory_`.
+Local-first verbatim memory. MCP server name is `lore`; tools are
+prefixed `memory_`.
 
-## Every turn
+## What hooks do (automatic)
 
-1. At the start of a turn, call `memory_recall` with the user's exact
-   wording before acting. If the session just started and worldview
-   context is already present, you may skip the redundant recall.
-2. After acting, let hooks store the turn automatically. If hooks are
-   missing, call `memory_observe` with the verbatim text (tier=episodic
-   for chat, tier=semantic for durable facts).
-3. Never summarize or distill into memory — pass text as-is.
+Cursor hooks automatically LOG turns: prompts, replies, tool calls,
+shell output, MCP results. This happens without agent action.
+Do not double-observe what hooks already store.
+
+## What hooks do NOT do
+
+Hooks do NOT reliably inject recall context into your prompt.
+`beforeSubmitPrompt` returns `additional_context` but Cursor's official
+output schema for that hook is only `{continue, user_message}` —
+injection is unproven and may not arrive.
+
+## Agent responsibility: recall
+
+If no `[haunt ns=…]` block is visible in your current context, you MUST
+call `memory_recall` with the user's exact wording before acting.
+Do not assume prior context was injected.
+
+## Observe rules
+
+- Hooks handle episodic logging. Only call `memory_observe` manually
+  when hooks are absent (e.g. Grok Bot, Claude Code — no hook support).
+- tier=semantic for durable facts. tier=episodic for chat.
+- Always pass `origin` (e.g. "cursor", "cli") and `session` id when
+  available.
+- Never summarize. Never distill. Store verbatim or don't store.
+
+## Skip list (never observe)
+
+- Secrets, tokens, API keys, passwords
+- Acks: "ok", "got it", "sure", empty turns
+- `memory_*` tool inputs/outputs (hooks already skip these)
+- Entire READMEs or large file dumps — store a pointer, not the blob
 
 ## Worldview
 
-Call `memory_worldview` when you need the full namespace briefing (facts,
-entities, procedure index, counts). The sessionStart hook returns a
-compact worldview card automatically.
+Call `memory_worldview` when you need the full namespace briefing.
+The sessionStart hook tries to inject a compact worldview card, but
+verify it arrived (look for `[haunt worldview ns=…]`).
 
 ## Procedures
 
-Use `memory_procedure` (action=write) only when promoting a specific
-how-to the user wants remembered — not on every turn. Include a clear
-`name`, verbatim `body` (steps), and optional `trigger` (one-liner of
-when to invoke it).
+Use `memory_procedure` action=write only when deliberately promoting a
+how-to the user wants remembered. Include `name`, verbatim `body`, and
+optional `trigger`. Do not auto-extract procedures from every turn.
 
-## Rules
+## Contradict
 
-- Namespace is inferred from the project (`CURSOR_PROJECT_DIR` / git /
-  cwd). Do not invent a different namespace unless the user asks.
-- Hooks skip MCP tools whose names start with `memory_` — do not
-  observe memory tool calls to avoid recursion.
-- Home dir is `~/.lore` (`LORE_HOME`, or `ENGRAM_HOME` as alias).
-- No API keys required. All storage and retrieval is local SQLite.
+Use `memory_contradict` with the `memory_id` of a now-wrong fact.
+Optionally pass `replacement` to store the correction.
+
+## Recall scores
+
+RRF scores are rank-normalized, not relevance scores. A hit with
+score 0.03 is not "3% relevant" — it just ranked lower. Ignore hits
+that are clearly off-corpus rather than trusting the number.
+
+## Namespace
+
+Inferred from `CURSOR_PROJECT_DIR` / git / cwd. Do not invent
+namespaces unless the user asks.
+
+## No hooks environment (Grok Bot, Claude Code, etc.)
+
+When hooks are unavailable, the agent must both observe AND recall
+manually. Observe each user turn (tier=episodic) and each durable
+fact (tier=semantic). Recall before acting.

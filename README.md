@@ -41,7 +41,7 @@ Project-level example: [`contrib/cursor/hooks.json`](contrib/cursor/hooks.json).
 
 | hook | what |
 |---|---|
-| `beforeSubmitPrompt` | observe user prompt (episodic), recall k=8, return `additional_context` |
+| `beforeSubmitPrompt` | observe user prompt (episodic), recall k=8, return `additional_context` (unproven — Cursor's official output is `{continue, user_message}` only; agent must still `memory_recall` if no `[haunt ns=…]` block is in context) |
 | `afterAgentResponse` | observe assistant text |
 | `afterAgentThought` | skipped by default (`ENGRAM_STORE_THOUGHTS=1` to store as system/coordinate) |
 | `postToolUse` | observe tool_name + input + output (procedural) |
@@ -49,6 +49,8 @@ Project-level example: [`contrib/cursor/hooks.json`](contrib/cursor/hooks.json).
 | `afterMCPExecution` | observe MCP call; skips `memory_*` to avoid recursion |
 | `sessionStart` | session-open event + worldview card (facts, entities, procedures, counts) |
 | `sessionEnd` | close session; no summary |
+
+**Important:** Hooks store turns automatically (logging). Recall is NOT automatic — the agent must call `memory_recall` unless context was already injected. Clients without hook support (Grok Bot, Claude Code) must both observe and recall manually.
 
 Namespace is inferred from `CURSOR_PROJECT_DIR` / git / cwd (same as the rest of engram). Session id is `conversation_id` or `session_id`.
 

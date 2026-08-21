@@ -187,7 +187,7 @@ def test_session_start_returns_worldview_card(fts_hook_env, capsys, monkeypatch)
     }
     out = _run_hook(payload, capsys, monkeypatch)
     ctx = out.get("additional_context", "")
-    assert "worldview" in ctx
-    assert "memory_worldview" in ctx
+    assert "[haunt worldview" in ctx
+    assert "memory_recall" in ctx
     assert "API key" in ctx or "facts" in ctx
     assert "deploy" in ctx
