@@ -198,3 +198,46 @@ def test_api_namespace_nonexistent_returns_404(dash_client, lore_env):
         f"GET auto-created namespace(s): {created}. "
         "Reading a nonexistent namespace must not have write side-effects."
     )
+
+
+GHOST_NS = "GHOST_NEVER_EXISTS_77"
+
+@pytest.mark.parametrize("path_suffix", [
+    "",
+    "/recall?q=test",
+    "/browse?limit=1",
+    "/memory/nonexistent-id",
+    "/event/nonexistent-id/memories",
+    "/procedures",
+    "/worldview",
+    "/health",
+])
+def test_all_namespace_routes_return_404_for_missing_ns(dash_client, lore_env, path_suffix):
+    """Every GET route under /api/namespace/{name} must return 404 — not
+    auto-create — when the namespace does not exist."""
+    from haunt.store import list_namespaces, namespace_exists
+
+    assert not namespace_exists(GHOST_NS)
+
+    r = dash_client.get(f"/api/namespace/{GHOST_NS}{path_suffix}")
+    assert r.status_code == 404, (
+        f"GET /api/namespace/{GHOST_NS}{path_suffix} returned {r.status_code}, "
+        "expected 404 for nonexistent namespace."
+    )
+
+    assert not namespace_exists(GHOST_NS), (
+        f"GET /api/namespace/{GHOST_NS}{path_suffix} auto-created the namespace. "
+        "Read-only routes must not have write side-effects."
+    )
+
+
+def test_delete_on_missing_namespace_returns_404(dash_client, lore_env):
+    """DELETE /api/namespace/{name}/memory/{id} must 404 on missing namespace."""
+    from haunt.store import namespace_exists
+
+    assert not namespace_exists(GHOST_NS)
+
+    r = dash_client.request("DELETE", f"/api/namespace/{GHOST_NS}/memory/nonexistent-id")
+    assert r.status_code == 404
+
+    assert not namespace_exists(GHOST_NS)
