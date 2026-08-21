@@ -16,8 +16,10 @@ server = MCPServer(
     name="lore",
     version="0.1.0",
     instructions=(
-        "engram (lore) is local-first verbatim agent memory. "
-        "Call memory_observe on every user/assistant/tool turn. "
+        "haunt (lore) is local-first verbatim agent memory. "
+        "If Cursor hooks are active, they log turns automatically — do NOT "
+        "also call memory_observe (that would double-store). Only call "
+        "memory_observe when hooks are absent (Grok Bot, Claude Code, etc.). "
         "Call memory_recall to fetch prior context. Never summarize on write."
     ),
 )
