@@ -568,6 +568,15 @@ def _health(ns: str | None = None) -> dict[str, Any]:
 # Routes
 # ---------------------------------------------------------------------------
 
+def _resolve_or_404(request: Request) -> str | JSONResponse:
+    """Resolve namespace name from the request; return a 404 JSONResponse if it
+    does not exist so that read-only GETs never auto-create databases."""
+    name = resolve_namespace(request.path_params["name"])
+    if not namespace_exists(name):
+        return JSONResponse({"error": f"namespace '{name}' not found"}, status_code=404)
+    return name
+
+
 async def index(_request: Request) -> HTMLResponse:
     return HTMLResponse(HTML)
 
@@ -577,9 +586,10 @@ async def api_namespaces(_request: Request) -> JSONResponse:
 
 
 async def api_namespace(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
-    if not namespace_exists(name):
-        return JSONResponse({"error": f"namespace '{name}' not found"}, status_code=404)
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
     try:
         with Store(name, create=False) as st:
             stats = st.stats()
@@ -600,19 +610,25 @@ async def api_namespace(request: Request) -> JSONResponse:
 
 
 async def api_recall(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
     q = request.query_params.get("q") or ""
     k = int(request.query_params.get("k") or 8)
     tier = request.query_params.get("tier") or None
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         hits = recall(q, namespace=name, k=k, tier=tier, store=st)
     return JSONResponse({"query": q, "hits": [h.as_dict() for h in hits]})
 
 
 async def api_browse(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
     params = request.query_params
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         result = st.browse_memories(
             session_id=params.get("session") or None,
             origin=params.get("origin") or None,
@@ -626,9 +642,12 @@ async def api_browse(request: Request) -> JSONResponse:
 
 
 async def api_memory_detail(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
     memory_id = request.path_params["memory_id"]
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         detail = st.get_memory(memory_id)
     if not detail:
         return JSONResponse({"error": f"memory {memory_id} not found"}, status_code=404)
@@ -636,18 +655,24 @@ async def api_memory_detail(request: Request) -> JSONResponse:
 
 
 async def api_memory_delete(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
     memory_id = request.path_params["memory_id"]
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         result = st.purge(memory_id)
     status = 200 if result.get("ok") else 404
     return JSONResponse(result, status_code=status)
 
 
 async def api_event_memories(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
     event_id = request.path_params["event_id"]
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         rows = st.conn.execute(
             "SELECT id FROM memories WHERE event_id=? ORDER BY created_at DESC",
             (event_id,),
@@ -657,23 +682,32 @@ async def api_event_memories(request: Request) -> JSONResponse:
 
 
 async def api_procedures(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
-    with Store(name) as st:
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
+    with Store(name, create=False) as st:
         procs = st.procedure_list()
     return JSONResponse({"procedures": procs})
 
 
 async def api_worldview(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
-    with Store(name) as st:
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
+    with Store(name, create=False) as st:
         wv = st.worldview()
     return JSONResponse(wv)
 
 
 async def api_health(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
+    result = _resolve_or_404(request)
+    if isinstance(result, JSONResponse):
+        return result
+    name = result
     health = _health(name)
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         stats = st.stats()
     health["namespace"] = name
     health["db_path"] = stats.get("db_path", "")
