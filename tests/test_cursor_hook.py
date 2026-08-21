@@ -204,6 +204,24 @@ def test_secret_redaction_in_tool_output(fts_hook_env, capsys, monkeypatch):
         assert "[REDACTED]" in output
 
 
+def test_session_start_returns_worldview_card(fts_hook_env, capsys, monkeypatch):
+    project = fts_hook_env["project"]
+    with Store("hooktest") as st:
+        st.observe("The API key is stored in .env", role="system", tier="semantic")
+        st.procedure_write("deploy", "git pull && make", trigger="when shipping")
+    payload = {
+        "hook_event_name": "sessionStart",
+        "session_id": "sess-wv",
+        "workspace_roots": [str(project)],
+    }
+    out = _run_hook(payload, capsys, monkeypatch)
+    ctx = out.get("additional_context", "")
+    assert "[haunt worldview" in ctx
+    assert "memory_recall" in ctx
+    assert "API key" in ctx or "facts" in ctx
+    assert "deploy" in ctx
+
+
 def test_secret_redaction_in_tool_input(fts_hook_env, capsys, monkeypatch):
     """Secrets in tool_input (e.g. shell commands with auth headers) must be redacted."""
     project = fts_hook_env["project"]
