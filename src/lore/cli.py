@@ -321,13 +321,15 @@ def procedure_list_cmd(
 
 @app.command("cursor-install")
 def cursor_install_cmd() -> None:
-    """Merge Cursor hooks at ~/.cursor/hooks.json (engram auto-memory)."""
+    """Merge Cursor hooks at ~/.cursor/hooks.json + install haunt.mdc rule."""
     from lore.cursor_hook import install_cursor_hooks
 
     report = install_cursor_hooks()
     typer.echo(f"hooks     {report['hooks_json']}")
     typer.echo(f"launcher  {report['launcher']}")
     typer.echo(f"events    {', '.join(report['events'])}")
+    if report.get("rule"):
+        typer.echo(f"rule      {report['rule']}")
     typer.echo("merged existing hooks; other commands were kept")
     typer.echo(f"home      {report['lore_home']}  (LORE_HOME / ENGRAM_HOME)")
 

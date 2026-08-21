@@ -35,8 +35,9 @@ engram cursor-install
 1. Publishes `~/.lore/bin/engram-hook` (a `/bin/sh` wrapper to the venv `engram-hook` script; also writes `lore-hook`).
 2. Merges user hooks at `~/.cursor/hooks.json` (version 1). Existing hook commands are kept. Adds:
    `beforeSubmitPrompt`, `afterAgentResponse`, `postToolUse`, `afterShellExecution`, `afterMCPExecution`, `sessionStart`, `sessionEnd`.
+3. Installs `haunt.mdc` (alwaysApply agent rule) into `~/.cursor/rules/`. Removes stale `engram.mdc` if present.
 
-Project-level example: [`contrib/cursor/hooks.json`](contrib/cursor/hooks.json). Agent rule: [`contrib/cursor/engram.mdc`](contrib/cursor/engram.mdc) — copy into `.cursor/rules/` if you want the agent to `memory_recall` when hook context is missing.
+Project-level example: [`contrib/cursor/hooks.json`](contrib/cursor/hooks.json). Agent rule: [`contrib/cursor/haunt.mdc`](contrib/cursor/haunt.mdc) — installed automatically by `engram cursor-install` into `~/.cursor/rules/haunt.mdc`. Agent skill: [`contrib/skills/haunt/SKILL.md`](contrib/skills/haunt/SKILL.md) — full usage reference for Claude/Cursor-style skill discovery.
 
 | hook | what |
 |---|---|
@@ -81,7 +82,7 @@ Namespace DBs store `embed_model` / `embed_dim` in `meta`. A dim or model change
 | `engram graph [--entity] [--rebuild]` | entities + relations; `--rebuild` wipes graph and re-extracts from events |
 | `engram dash [--port 7340]` | local dashboard (127.0.0.1) |
 | `engram bootstrap [--reembed]` | first-run setup; `--reembed` rebuilds all namespace vectors |
-| `engram cursor-install` | merge Cursor user hooks → `~/.lore/bin/engram-hook` |
+| `engram cursor-install` | merge Cursor hooks + install `haunt.mdc` rule → `~/.cursor/rules/` |
 
 Every command also works as `lore …`. Observe flags: `--namespace --tier --session --role --tool-name --tool-input --tool-output --event-time`.
 

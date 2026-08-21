@@ -377,8 +377,32 @@ def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
     return existing
 
 
+def _install_rule_file() -> Path | None:
+    """Copy haunt.mdc into .cursor/rules/ (user-level or project-level)."""
+    import importlib.resources
+
+    try:
+        src = Path(__file__).resolve().parent.parent.parent / "contrib" / "cursor" / "haunt.mdc"
+        if not src.exists():
+            ref = importlib.resources.files("lore").joinpath("../../../contrib/cursor/haunt.mdc")
+            src = Path(str(ref))
+        if not src.exists():
+            return None
+    except Exception:
+        return None
+
+    rules_dir = cursor_dir() / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    dest = rules_dir / "haunt.mdc"
+    dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    old = rules_dir / "engram.mdc"
+    if old.exists():
+        old.unlink()
+    return dest
+
+
 def install_cursor_hooks() -> dict[str, Any]:
-    """Write ~/.lore/bin/engram-hook and merge ~/.cursor/hooks.json."""
+    """Write ~/.lore/bin/engram-hook, merge ~/.cursor/hooks.json, install rule."""
     from lore.bootstrap import write_hook_launcher, write_launcher
     from lore.paths import ensure_layout
 
@@ -388,11 +412,13 @@ def install_cursor_hooks() -> dict[str, Any]:
     hooks_path = cursor_hooks_json()
     command = str(launcher)
     merge_hooks_json(hooks_path, command)
+    rule_path = _install_rule_file()
     return {
         "lore_home": str(home),
         "launcher": command,
         "hooks_json": str(hooks_path),
         "events": list(HOOK_EVENTS),
+        "rule": str(rule_path) if rule_path else None,
     }
 
 

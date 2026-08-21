@@ -1,0 +1,42 @@
+---
+description: haunt local memory — verbatim store/recall/worldview/procedures
+alwaysApply: true
+---
+
+# haunt
+
+Local-first verbatim memory. Hooks store prompts, replies, and tool calls
+automatically (no summarization, no LLM). MCP server name is `lore`;
+tools are prefixed `memory_`.
+
+## Every turn
+
+1. At the start of a turn, call `memory_recall` with the user's exact
+   wording before acting. If the session just started and worldview
+   context is already present, you may skip the redundant recall.
+2. After acting, let hooks store the turn automatically. If hooks are
+   missing, call `memory_observe` with the verbatim text (tier=episodic
+   for chat, tier=semantic for durable facts).
+3. Never summarize or distill into memory — pass text as-is.
+
+## Worldview
+
+Call `memory_worldview` when you need the full namespace briefing (facts,
+entities, procedure index, counts). The sessionStart hook returns a
+compact worldview card automatically.
+
+## Procedures
+
+Use `memory_procedure` (action=write) only when promoting a specific
+how-to the user wants remembered — not on every turn. Include a clear
+`name`, verbatim `body` (steps), and optional `trigger` (one-liner of
+when to invoke it).
+
+## Rules
+
+- Namespace is inferred from the project (`CURSOR_PROJECT_DIR` / git /
+  cwd). Do not invent a different namespace unless the user asks.
+- Hooks skip MCP tools whose names start with `memory_` — do not
+  observe memory tool calls to avoid recursion.
+- Home dir is `~/.lore` (`LORE_HOME`, or `ENGRAM_HOME` as alias).
+- No API keys required. All storage and retrieval is local SQLite.
