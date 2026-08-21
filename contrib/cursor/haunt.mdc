@@ -55,10 +55,15 @@ Use `memory_procedure` action=write only when deliberately promoting a
 how-to the user wants remembered. Include `name`, verbatim `body`, and
 optional `trigger`. Do not auto-extract procedures from every turn.
 
-## Contradict
+## Contradict / purge
 
-Use `memory_contradict` with the `memory_id` of a now-wrong fact.
-Optionally pass `replacement` to store the correction.
+Use `memory_contradict` with the `memory_id` of a now-wrong fact to
+supersede it (sets valid_to). Optionally pass `replacement` to store
+the correction.
+
+Use `memory_purge` to permanently hard-delete a memory and its entire
+provenance chain (FTS, embedding, graph, orphaned event). Data is gone
+after purge — not just marked superseded.
 
 ## Recall scores
 

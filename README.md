@@ -21,10 +21,47 @@ haunt dash               # open the memory console → http://127.0.0.1:7340
 To wire up Cursor hooks:
 
 ```bash
-haunt cursor-install     # merges hooks at ~/.cursor/hooks.json
+haunt cursor-install     # merges hooks at ~/.cursor/hooks.json + writes ~/.cursor/rules/haunt.mdc
 ```
 
-Then point your MCP client at `~/.haunt/bin/haunt-mcp`.
+Then add haunt as an MCP server (it runs alongside any other servers you have — it does not replace them):
+
+```json
+{
+  "mcpServers": {
+    "haunt": {
+      "command": "~/.haunt/bin/haunt-mcp"
+    }
+  }
+}
+```
+
+> **Note:** `haunt-mcp` is a stdio server — do not run it with `--help` or directly in a terminal; it reads JSON on stdin and will hang. Use it only as an MCP server command.
+
+### macOS: use Homebrew Python, not pyenv
+
+pyenv-compiled CPython typically lacks `--enable-loadable-sqlite-extensions`, which means `sqlite-vec` cannot load (`enable_load_extension` is missing or disabled). `haunt bootstrap` will correctly fail loud if this happens.
+
+The working pattern on macOS:
+
+```bash
+# Install Homebrew Python (has loadable-extension support out of the box)
+brew install python@3.14      # or python@3.12, python@3.13
+
+# Create a venv from Homebrew Python — NOT from pyenv Python
+/opt/homebrew/bin/python3 -m venv ~/.haunt/venv
+source ~/.haunt/venv/bin/activate
+pip install -e .              # or: pip install haunt
+haunt bootstrap               # should succeed — sqlite-vec loads
+
+# ~/.haunt/bin/haunt-mcp execs the venv Python, so MCP works everywhere
+```
+
+If you **must** use pyenv, rebuild with:
+
+```bash
+PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
+```
 
 ### What is and isn't automatic
 
@@ -56,7 +93,7 @@ Writes a real shortcut: Linux `.desktop` file (`Haunt Memories` → `haunt dash`
 
 ## Embeddings
 
-Default is **`BAAI/bge-m3`** dense (1024-d, ~2.28 GB). haunt loads it locally via onnxruntime (no API key). First `haunt bootstrap` downloads the model from Hugging Face.
+Default is **`BAAI/bge-m3`** dense (1024-d, ~2.28 GB ONNX). haunt loads it locally via onnxruntime (no API key). First `haunt bootstrap` downloads the model from Hugging Face.
 
 Namespaces lock to the embed model/dimension they were written with. Switching models later requires a full re-embed (`haunt bootstrap --reembed`). A namespace switch = full re-embed of that namespace.
 
@@ -77,6 +114,10 @@ CI runs FTS-only to avoid the 2 GB download.
 ## Cursor hooks
 
 Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summaries. Fail-open (`{}` + exit 0) so a hook never blocks the agent.
+
+`haunt cursor-install` does two things:
+1. Merges haunt hook entries into `~/.cursor/hooks.json` (preserving your existing hooks).
+2. Writes `~/.cursor/rules/haunt.mdc` — a Cursor rule file that tells agents how to use haunt (recall responsibility, observe rules, skip list).
 
 **Secret redaction:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.). This is **not** a security boundary — see [SECURITY.md](SECURITY.md).
 
@@ -109,11 +150,13 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 | `haunt procedure list` | list all active procedures |
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
 | `haunt dash [--port 7340] [--install-icon]` | local memory console (127.0.0.1) or install desktop shortcut |
-| `haunt cursor-install` | merge Cursor user hooks |
+| `haunt cursor-install` | merge Cursor user hooks + install haunt.mdc rule |
 
 ## MCP
 
-After bootstrap, configure your MCP client:
+haunt is its own MCP server — it runs alongside any other servers you already have (IronRecall, etc.) without interfering.
+
+After bootstrap, add haunt to your MCP config:
 
 ```json
 {
@@ -124,6 +167,8 @@ After bootstrap, configure your MCP client:
   }
 }
 ```
+
+`haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
 
 Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`.
 
