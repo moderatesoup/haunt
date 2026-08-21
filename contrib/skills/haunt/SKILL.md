@@ -23,6 +23,7 @@ already visible in context.
 | `memory_worldview` | Compact namespace briefing: facts, entities, procedures, counts |
 | `memory_procedure` | Named how-to procedures — action: `write` / `get` / `list` |
 | `memory_contradict` | Mark a memory superseded, optionally store replacement |
+| `memory_purge` | Permanently hard-delete a memory and its provenance chain |
 | `memory_timeline` | List events in time order |
 | `memory_health` | Namespace health and counts |
 | `memory_namespaces` | List all namespaces |
@@ -80,6 +81,12 @@ automatically. Do not also call `memory_observe` on the same content.
 - `memory_contradict` with the `memory_id` of the old row.
 - Optionally pass `replacement` to store the corrected fact as semantic.
 
+### Purge (hard delete)
+- `memory_purge` with `memory_id` to permanently delete a memory.
+- Removes the memory, FTS index, vector embedding, graph relations,
+  orphaned entities, and the event if nothing else references it.
+- Data is gone — not just superseded. Use contradict to supersede.
+
 ## No-hooks environments (Grok Bot, Claude Code, etc.)
 
 These clients have no hook support. The agent must:
@@ -95,6 +102,8 @@ haunt procedure write NAME --body "..."  # store a procedure
 haunt procedure get NAME                 # retrieve by name
 haunt recall "search query"              # hybrid search
 haunt observe "fact text" --tier semantic # store a fact
+haunt delete MEMORY_ID -y                # hard-delete a memory
+haunt dash                               # open local memory console
 ```
 
 `lore` and `engram` are aliases for `haunt` (all commands work with any name).

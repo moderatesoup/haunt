@@ -215,6 +215,26 @@ def memory_procedure(
 
 @server.tool(
     description=(
+        "Permanently delete a memory and its entire provenance chain: "
+        "FTS index, vector embedding, graph relations/entities tied to the event, "
+        "and the event itself if no other memories reference it. "
+        "This is a hard purge — the data is gone, not just superseded. "
+        "Use memory_contradict to supersede (set valid_to) without deleting."
+    )
+)
+def memory_purge(
+    memory_id: str,
+    namespace: Optional[str] = None,
+) -> str:
+    ns = resolve_namespace(namespace)
+    with Store(ns) as st:
+        result = st.purge(memory_id)
+    result["namespace"] = ns
+    return _json(result)
+
+
+@server.tool(
+    description=(
         "Mark a memory superseded: sets valid_to=now on the old row. "
         "Optionally store a replacement as a new semantic memory."
     )

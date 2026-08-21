@@ -686,6 +686,197 @@ class Store:
 
 
     # ------------------------------------------------------------------
+    # purge: hard-delete a memory and its entire provenance chain
+    # ------------------------------------------------------------------
+
+    def purge(self, memory_id: str) -> dict[str, Any]:
+        """Hard-delete a memory and clean up all associated data.
+
+        Removes: memory row, FTS row, vec row, graph rows tied to the
+        memory's event, and the event itself if no other memories reference it.
+        Returns a report of what was deleted.
+        """
+        row = self.conn.execute(
+            "SELECT id, event_id FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": f"memory {memory_id} not found"}
+
+        event_id = row["event_id"]
+        deleted: dict[str, Any] = {
+            "ok": True,
+            "memory_id": memory_id,
+            "event_id": event_id,
+            "fts_deleted": False,
+            "vec_deleted": False,
+            "relations_deleted": 0,
+            "entities_deleted": 0,
+            "event_deleted": False,
+        }
+
+        self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+
+        try:
+            self.conn.execute(
+                "DELETE FROM memories_fts WHERE id=?", (memory_id,)
+            )
+            deleted["fts_deleted"] = True
+        except sqlite3.Error:
+            pass
+
+        if _vec_loaded(self.conn):
+            try:
+                has_vec = self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memories'"
+                ).fetchone()
+                if has_vec:
+                    self.conn.execute(
+                        "DELETE FROM vec_memories WHERE id=?", (memory_id,)
+                    )
+                    deleted["vec_deleted"] = True
+            except sqlite3.Error:
+                pass
+
+        rel_count = self.conn.execute(
+            "SELECT COUNT(*) FROM relations WHERE event_id=?", (event_id,)
+        ).fetchone()[0]
+        self.conn.execute("DELETE FROM relations WHERE event_id=?", (event_id,))
+        deleted["relations_deleted"] = rel_count
+
+        orphan_entities = self.conn.execute(
+            """
+            SELECT e.id FROM entities e
+            WHERE NOT EXISTS (
+                SELECT 1 FROM relations r
+                WHERE r.src_entity = e.id OR r.dst_entity = e.id
+            )
+            """
+        ).fetchall()
+        deleted["entities_deleted"] = len(orphan_entities)
+        for oe in orphan_entities:
+            self.conn.execute("DELETE FROM entities WHERE id=?", (oe["id"],))
+
+        other_memories = self.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
+        ).fetchone()[0]
+        if other_memories == 0:
+            self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+            deleted["event_deleted"] = True
+
+        self.conn.commit()
+        touch_namespace(self.name)
+        return deleted
+
+    def get_memory(self, memory_id: str) -> dict[str, Any] | None:
+        """Retrieve full provenance detail for a single memory."""
+        row = self.conn.execute(
+            """
+            SELECT m.id AS memory_id, m.event_id, m.tier, m.content,
+                   m.valid_from, m.valid_to, m.created_at,
+                   e.session_id, e.ts, e.event_time, e.role, e.content AS event_content,
+                   e.tool_name, e.tool_input, e.tool_output, e.origin, e.meta
+            FROM memories m
+            JOIN events e ON e.id = m.event_id
+            WHERE m.id = ?
+            """,
+            (memory_id,),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["db_path"] = str(Path(self.db_path).resolve())
+        d["haunt_home"] = str(haunt_home())
+        d["namespace"] = self.name
+        d["has_embedding"] = self.conn.execute(
+            "SELECT embedding IS NOT NULL AS has FROM memories WHERE id=?",
+            (memory_id,),
+        ).fetchone()["has"]
+
+        mentions = self.conn.execute(
+            """
+            SELECT DISTINCT e.id, e.name, e.type
+            FROM entities e
+            JOIN relations r ON (r.src_entity = e.id OR r.dst_entity = e.id)
+            WHERE r.event_id = ?
+            """,
+            (d["event_id"],),
+        ).fetchall()
+        d["entity_mentions"] = [dict(m) for m in mentions]
+
+        related = self.conn.execute(
+            """
+            SELECT m.id AS memory_id, m.tier, m.content, m.valid_from, m.valid_to
+            FROM memories m
+            WHERE m.event_id IN (
+                SELECT id FROM events WHERE session_id = ?
+            ) AND m.id != ?
+            ORDER BY m.created_at DESC
+            LIMIT 20
+            """,
+            (d["session_id"], memory_id),
+        ).fetchall()
+        d["related_memories"] = [dict(r) for r in related]
+
+        return d
+
+    def browse_memories(
+        self,
+        *,
+        session_id: str | None = None,
+        origin: str | None = None,
+        tier: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Browse memories with filters. Returns paginated results."""
+        sql = """
+            SELECT m.id AS memory_id, m.event_id, m.tier, m.content,
+                   m.valid_from, m.valid_to, m.created_at,
+                   e.session_id, e.event_time, e.role, e.origin, e.tool_name
+            FROM memories m
+            JOIN events e ON e.id = m.event_id
+            WHERE 1=1
+        """
+        count_sql = """
+            SELECT COUNT(*) FROM memories m
+            JOIN events e ON e.id = m.event_id
+            WHERE 1=1
+        """
+        params: list[Any] = []
+        if session_id:
+            sql += " AND e.session_id = ?"
+            count_sql += " AND e.session_id = ?"
+            params.append(session_id)
+        if origin:
+            sql += " AND e.origin = ?"
+            count_sql += " AND e.origin = ?"
+            params.append(origin)
+        if tier:
+            sql += " AND m.tier = ?"
+            count_sql += " AND m.tier = ?"
+            params.append(tier)
+        if since:
+            sql += " AND e.event_time >= ?"
+            count_sql += " AND e.event_time >= ?"
+            params.append(iso_or_now(since))
+        if until:
+            sql += " AND e.event_time <= ?"
+            count_sql += " AND e.event_time <= ?"
+            params.append(iso_or_now(until))
+
+        total = self.conn.execute(count_sql, params).fetchone()[0]
+        sql += " ORDER BY m.created_at DESC LIMIT ? OFFSET ?"
+        rows = self.conn.execute(sql, params + [limit, offset]).fetchall()
+        return {
+            "memories": [dict(r) for r in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    # ------------------------------------------------------------------
     # worldview: compact per-namespace briefing
     # ------------------------------------------------------------------
 

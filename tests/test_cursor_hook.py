@@ -162,6 +162,25 @@ def test_cursor_install_merges_without_clobber(fts_hook_env, tmp_path, monkeypat
         assert any("haunt-hook" in c["command"] for c in data["hooks"][event])
 
 
+def test_cursor_install_writes_rule_file(fts_hook_env, tmp_path, monkeypatch):
+    """cursor-install must write haunt.mdc to ~/.cursor/rules/ even without contrib/ on disk."""
+    cursor_home = tmp_path / "cursor"
+    cursor_home.mkdir()
+    monkeypatch.setenv("CURSOR_HOME", str(cursor_home))
+    from haunt.cursor_hook import install_cursor_hooks
+
+    report = install_cursor_hooks()
+    assert report["rule"] is not None, "rule file should be written"
+    rule_path = Path(report["rule"])
+    assert rule_path.exists(), f"rule file should exist at {rule_path}"
+    content = rule_path.read_text(encoding="utf-8")
+    assert "haunt" in content
+    assert "memory_recall" in content
+    assert "memory_purge" in content
+    assert rule_path.name == "haunt.mdc"
+    assert rule_path.parent.name == "rules"
+
+
 def test_skips_memory_mcp_tools(fts_hook_env, capsys, monkeypatch):
     project = fts_hook_env["project"]
     payload = {
