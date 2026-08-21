@@ -249,9 +249,34 @@ def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def format_worldview_card(wv: dict[str, Any]) -> str:
+    """Render a worldview dict as a compact text card for additional_context."""
+    lines = [f"[engram worldview ns={wv['namespace']}]"]
+    counts = wv.get("counts", {})
+    lines.append(
+        f"events={counts.get('events', 0)} memories={counts.get('memories', 0)} "
+        f"sessions={counts.get('sessions', 0)}"
+    )
+    facts = wv.get("facts", [])
+    if facts:
+        lines.append(f"facts ({len(facts)}):")
+        for f in facts[:12]:
+            lines.append(f"  {snippet(f.get('content', ''), 140)}")
+    names = wv.get("names", [])
+    if names:
+        lines.append(f"entities ({len(names)}):")
+        for n in names[:12]:
+            lines.append(f"  {n['name']} ({n['type']})")
+    procs = wv.get("procedures", [])
+    if procs:
+        lines.append(f"procedures ({len(procs)}):")
+        for p in procs:
+            trigger = f" — when: {p['trigger']}" if p.get("trigger") else ""
+            lines.append(f"  {p['name']}{trigger}")
+    return "\n".join(lines)
+
+
 def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dict[str, Any]:
-    rows = store.events(limit=5)
-    recent = format_timeline_block(rows, ns)
     _observe(
         store,
         payload,
@@ -259,13 +284,16 @@ def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dic
         role="system",
         tier="coordinate",
     )
+    wv = store.worldview()
+    card = format_worldview_card(wv)
     intro = (
         "You have persistent local memory via engram (MCP tools "
-        "memory_recall / memory_observe). Before acting on a user request, "
-        "call memory_recall with their wording. Store new facts/tools with "
-        f"memory_observe. Namespace: {ns}."
+        "memory_recall / memory_observe / memory_worldview / memory_procedure). "
+        "Before acting on a user request, call memory_recall with their wording. "
+        "Store new facts with memory_observe (tier=semantic). "
+        f"Namespace: {ns}."
     )
-    return {"additional_context": f"{intro}\n\n{recent}"}
+    return {"additional_context": f"{intro}\n\n{card}"}
 
 
 def _handle_session_end(store: Store, payload: dict[str, Any]) -> dict[str, Any]:

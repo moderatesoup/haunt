@@ -227,6 +227,98 @@ def graph_cmd(
             typer.echo(f"  {src}  --{r['rel']}-->  {dst}  w={r['weight']}")
 
 
+@app.command("worldview")
+def worldview_cmd(
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+    facts_cap: int = typer.Option(12, "--facts-cap"),
+    names_cap: int = typer.Option(12, "--names-cap"),
+    json_out: bool = typer.Option(False, "--json", help="Output raw JSON"),
+) -> None:
+    """Compact namespace briefing: facts, entities, procedures, counts."""
+    import json as _json
+
+    ns = _ns(namespace)
+    with Store(ns) as st:
+        wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
+    if json_out:
+        typer.echo(_json.dumps(wv, ensure_ascii=False, default=str, indent=2))
+        return
+    typer.echo(f"namespace  {wv['namespace']}")
+    typer.echo(f"counts     events={wv['counts']['events']}  memories={wv['counts']['memories']}  sessions={wv['counts']['sessions']}")
+    typer.echo("")
+    typer.echo(f"facts ({len(wv['facts'])})")
+    for f in wv["facts"]:
+        typer.echo(f"  {f['id'][:8]}  {snippet(f['content'], 120)}")
+    typer.echo("")
+    typer.echo(f"names ({len(wv['names'])})")
+    for n in wv["names"]:
+        typer.echo(f"  {n['name']:<28} {n['type']:<12} mentions={n['mentions']}")
+    typer.echo("")
+    typer.echo(f"procedures ({len(wv['procedures'])})")
+    for p in wv["procedures"]:
+        trigger = f"  when: {p['trigger']}" if p.get("trigger") else ""
+        typer.echo(f"  {p['name']:<28} {p['id'][:8]}{trigger}")
+
+
+procedure_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Named how-to procedures (verbatim steps).",
+)
+app.add_typer(procedure_app, name="procedure")
+
+
+@procedure_app.command("write")
+def procedure_write_cmd(
+    name: str = typer.Argument(..., help="Procedure name"),
+    body: str = typer.Option(..., "--body", "-b", help="Verbatim step-by-step body"),
+    when: Optional[str] = typer.Option(None, "--when", "-w", help="Trigger description"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+) -> None:
+    """Store a named procedure."""
+    ns = _ns(namespace)
+    with Store(ns) as st:
+        r = st.procedure_write(name, body, trigger=when or "", origin="cli")
+    typer.echo(f"ok  procedure={name}  memory={r.memory_id}  ns={r.namespace}")
+
+
+@procedure_app.command("get")
+def procedure_get_cmd(
+    name: str = typer.Argument(..., help="Procedure name"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+) -> None:
+    """Retrieve a named procedure."""
+    ns = _ns(namespace)
+    with Store(ns) as st:
+        proc = st.procedure_get(name)
+    if not proc:
+        typer.echo(f"not found: {name}")
+        raise typer.Exit(1)
+    typer.echo(f"name     {proc['name']}")
+    if proc.get("trigger"):
+        typer.echo(f"trigger  {proc['trigger']}")
+    typer.echo(f"id       {proc['id']}")
+    typer.echo(f"created  {proc['created_at']}")
+    typer.echo(f"---")
+    typer.echo(proc["body"])
+
+
+@procedure_app.command("list")
+def procedure_list_cmd(
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+) -> None:
+    """List all active procedures."""
+    ns = _ns(namespace)
+    with Store(ns) as st:
+        procs = st.procedure_list()
+    if not procs:
+        typer.echo("no procedures")
+        return
+    typer.echo(f"{'name':<28} {'trigger':<32} id")
+    for p in procs:
+        typer.echo(f"{p['name']:<28} {p.get('trigger', ''):<32} {p['id'][:12]}")
+
+
 @app.command("cursor-install")
 def cursor_install_cmd() -> None:
     """Merge Cursor hooks at ~/.cursor/hooks.json (engram auto-memory)."""

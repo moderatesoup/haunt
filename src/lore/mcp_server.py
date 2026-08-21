@@ -148,6 +148,86 @@ def memory_session_end(
     return _json({"ok": True, "namespace": ns, "session_id": sid, "distilled": False})
 
 
+@server.tool(
+    description=(
+        "Compact per-namespace briefing for session start. Returns current facts "
+        "(semantic memories), top entity names, procedure index, and counts."
+    )
+)
+def memory_worldview(
+    namespace: Optional[str] = None,
+    facts_cap: int = 12,
+    names_cap: int = 12,
+) -> str:
+    ns = resolve_namespace(namespace)
+    with Store(ns) as st:
+        wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
+    return _json(wv)
+
+
+@server.tool(
+    description=(
+        "Named how-to procedures (verbatim steps). "
+        "action=write: store a named procedure. "
+        "action=get: retrieve by name. "
+        "action=list: list all active procedures."
+    )
+)
+def memory_procedure(
+    action: str = "list",
+    name: Optional[str] = None,
+    body: Optional[str] = None,
+    trigger: Optional[str] = None,
+    namespace: Optional[str] = None,
+    origin: str = "mcp",
+) -> str:
+    ns = resolve_namespace(namespace)
+    with Store(ns) as st:
+        if action == "write":
+            if not name:
+                return _json({"ok": False, "error": "name is required for write"})
+            if not body:
+                return _json({"ok": False, "error": "body is required for write"})
+            r = st.procedure_write(name, body, trigger=trigger or "", origin=origin)
+            return _json({
+                "ok": True,
+                "action": "write",
+                "memory_id": r.memory_id,
+                "event_id": r.event_id,
+                "namespace": ns,
+                "name": name,
+            })
+        elif action == "get":
+            if not name:
+                return _json({"ok": False, "error": "name is required for get"})
+            proc = st.procedure_get(name)
+            if not proc:
+                return _json({"ok": False, "error": f"procedure '{name}' not found"})
+            return _json({"ok": True, "action": "get", "namespace": ns, "procedure": proc})
+        else:
+            procs = st.procedure_list()
+            return _json({"ok": True, "action": "list", "namespace": ns, "procedures": procs})
+
+
+@server.tool(
+    description=(
+        "Mark a memory superseded: sets valid_to=now on the old row. "
+        "Optionally store a replacement as a new semantic memory."
+    )
+)
+def memory_contradict(
+    memory_id: str,
+    replacement: Optional[str] = None,
+    namespace: Optional[str] = None,
+    origin: str = "mcp",
+) -> str:
+    ns = resolve_namespace(namespace)
+    with Store(ns) as st:
+        result = st.contradict(memory_id, replacement=replacement, origin=origin)
+    result["namespace"] = ns
+    return _json(result)
+
+
 def main() -> None:
     # stdio MCP: do not print to stdout except protocol messages
     asyncio.run(server.run_stdio_async())

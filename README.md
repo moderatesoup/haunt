@@ -46,7 +46,7 @@ Project-level example: [`contrib/cursor/hooks.json`](contrib/cursor/hooks.json).
 | `postToolUse` | observe tool_name + input + output (procedural) |
 | `afterShellExecution` | observe command + output (`tool_name=Shell`) |
 | `afterMCPExecution` | observe MCP call; skips `memory_*` to avoid recursion |
-| `sessionStart` | tiny session-open event + last 5 memories + MCP reminder |
+| `sessionStart` | session-open event + worldview card (facts, entities, procedures, counts) |
 | `sessionEnd` | close session; no summary |
 
 Namespace is inferred from `CURSOR_PROJECT_DIR` / git / cwd (same as the rest of engram). Session id is `conversation_id` or `session_id`.
@@ -71,6 +71,10 @@ Namespace DBs store `embed_model` / `embed_dim` in `meta`. A dim or model change
 | `engram init [name] [--repo PATH]` | create a namespace |
 | `engram observe TEXT ...` | store a turn / tool call verbatim |
 | `engram recall QUERY [--as-of --since --until --tier --k]` | hybrid recall |
+| `engram worldview [--namespace --json]` | compact namespace briefing (facts, entities, procedures, counts) |
+| `engram procedure write NAME --body ... [--when ...]` | store a named procedure (verbatim steps) |
+| `engram procedure get NAME` | retrieve a named procedure |
+| `engram procedure list` | list all active procedures |
 | `engram timeline` | events by `event_time` |
 | `engram namespaces` | list + counts |
 | `engram health` | vec / embed / counts |
@@ -100,7 +104,19 @@ After `engram bootstrap` (and `pip install -e .` so `python -m lore.mcp_server` 
 }
 ```
 
-`engram bootstrap` prints the absolute launcher path. The file is a `/bin/sh` wrapper around the venv `lore-mcp` console script (stdio). `~/.lore/bin/engram-mcp` is the same server. Tools: `memory_observe`, `memory_recall`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end` (closes a session; **no** distillation).
+`engram bootstrap` prints the absolute launcher path. The file is a `/bin/sh` wrapper around the venv `lore-mcp` console script (stdio). `~/.lore/bin/engram-mcp` is the same server.
+
+| MCP tool | what |
+|---|---|
+| `memory_observe` | store a verbatim turn or tool call |
+| `memory_recall` | hybrid recall (vec + FTS5 + RRF) |
+| `memory_worldview` | compact namespace briefing for session start (facts, entities, procedures, counts) |
+| `memory_procedure` | named how-to procedures — action: `write` / `get` / `list` |
+| `memory_contradict` | mark a memory superseded (`valid_to=now`), optionally store replacement |
+| `memory_timeline` | list events in time order |
+| `memory_health` | namespace health, counts, embed status |
+| `memory_namespaces` | list all namespaces |
+| `memory_session_end` | close a session (no distillation) |
 
 ## What v1 does / does not
 
