@@ -393,6 +393,7 @@ def dash_cmd(
     port: int = typer.Option(7340, "--port"),
     host: str = typer.Option("127.0.0.1", "--host"),
     install_icon: bool = typer.Option(False, "--install-icon", help="Write a desktop shortcut and exit"),
+    no_open: bool = typer.Option(False, "--no-open", help="Do not open the browser automatically"),
 ) -> None:
     """Start the local memory console (127.0.0.1), or install a desktop shortcut."""
     if install_icon:
@@ -408,7 +409,7 @@ def dash_cmd(
     from haunt.dashboard import run_dashboard
 
     typer.echo(f"haunt dash  http://{host}:{port}  home={haunt_home()}")
-    run_dashboard(host=host, port=port)
+    run_dashboard(host=host, port=port, open_browser=not no_open)
 
 
 @app.callback(invoke_without_command=True)

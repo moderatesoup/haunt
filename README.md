@@ -7,15 +7,19 @@ Local-first **verbatim** memory for AI agents. One SQLite file per namespace. No
 ## 60-second start
 
 ```bash
-# Option A: one-command bootstrap
+# Option A: pip install (no clone needed)
+pip install haunt
+haunt bootstrap          # creates ~/.haunt, probes sqlite-vec, downloads embed model, installs desktop shortcut
+haunt dash               # opens the memory console in your browser → http://127.0.0.1:7340
+
+# Option B: one-command bootstrap (git clone)
 scripts/bootstrap.sh
 
-# Option B: manual
+# Option C: manual (git clone)
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
-haunt bootstrap          # creates ~/.haunt, probes sqlite-vec, downloads BAAI/bge-m3 (~2.28 GB)
-haunt dash --install-icon  # writes a desktop shortcut (Linux .desktop / macOS .command)
-haunt dash               # open the memory console → http://127.0.0.1:7340
+haunt bootstrap          # creates ~/.haunt, probes sqlite-vec, downloads BAAI/bge-m3 (~2.28 GB), installs desktop shortcut
+haunt dash               # opens the memory console in your browser → http://127.0.0.1:7340
 ```
 
 To wire up Cursor hooks:
@@ -68,11 +72,11 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 - **Hooks store automatically.** Once `haunt cursor-install` runs, every prompt, response, and tool call is stored verbatim via Cursor hooks.
 - **Recall is NOT automatic.** Cursor does not reliably inject `additional_context` from `beforeSubmitPrompt` into the model context. Agents must call `memory_recall` explicitly via MCP.
 - **sessionStart** injects a worldview card via `additional_context` — this may appear as context but is not a guaranteed recall path.
-- **No-hook IDEs** (Claude Code, Codex, etc.): call `memory_observe` and `memory_recall` manually via MCP. There is no Cursor-style hook integration for other environments.
+- **No-hook IDEs** (Grok Bot, Claude Code, Codex, etc.): call `memory_observe` and `memory_recall` manually via MCP. There is no Cursor-style hook integration for these environments — they have no auto-store hooks.
 
 ## Memory console (dashboard)
 
-`haunt dash` serves a local-only memory management UI at `http://127.0.0.1:7340`. No React, no npm — single-file inline HTML.
+`haunt dash` serves a local-only memory management UI at `http://127.0.0.1:7340` and opens it in your default browser once the server is ready. Pass `--no-open` to suppress the browser (useful for CI or scripting). No React, no npm — single-file inline HTML.
 
 Features:
 
@@ -85,11 +89,13 @@ Features:
 
 ### Desktop shortcut
 
+`haunt bootstrap` automatically installs a desktop shortcut. You can also install or reinstall it manually:
+
 ```bash
 haunt dash --install-icon
 ```
 
-Writes a real shortcut: Linux `.desktop` file (`Haunt Memories` → `haunt dash`), macOS `.command` script, or Windows `.bat`. `scripts/bootstrap.sh` calls this automatically.
+Writes a real shortcut: Linux `.desktop` file (`Haunt Memories` → `haunt dash`), macOS `.command` script, or Windows `.bat`. The shortcut launches `haunt dash`, which starts the server and opens the browser.
 
 ## Embeddings
 
@@ -136,7 +142,7 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 
 | command | what |
 |---|---|
-| `haunt bootstrap [--reembed]` | first-run setup; exits 1 if sqlite-vec fails |
+| `haunt bootstrap [--reembed]` | first-run setup; installs desktop shortcut; exits 1 if sqlite-vec fails |
 | `haunt init [name] [--repo PATH]` | create a namespace |
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
 | `haunt recall QUERY [--as-of --since --until --tier --k]` | hybrid recall (vec + FTS5 + RRF) |
@@ -149,7 +155,7 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 | `haunt procedure get NAME` | retrieve a named procedure |
 | `haunt procedure list` | list all active procedures |
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
-| `haunt dash [--port 7340] [--install-icon]` | local memory console (127.0.0.1) or install desktop shortcut |
+| `haunt dash [--port 7340] [--install-icon] [--no-open]` | local memory console (127.0.0.1); opens browser automatically (use `--no-open` for CI/scripts) |
 | `haunt cursor-install` | merge Cursor user hooks + install haunt.mdc rule |
 
 ## MCP

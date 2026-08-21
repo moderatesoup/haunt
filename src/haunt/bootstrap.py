@@ -113,6 +113,9 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                     changed["namespace"] = row["name"]
                     changed["auto"] = True
                     reembed_report.append(changed)
+    from haunt.desktop import install_desktop_icon
+    icon_result = install_desktop_icon()
+
     hook_launcher = bin_dir() / "haunt-hook"
     report = {
         "haunt_home": str(home),
@@ -120,6 +123,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
         "launcher": str(launcher.resolve()),
         "hook_launcher": str(hook_launcher.resolve()),
         "models_dir": str(models_dir()),
+        "desktop_icon": icon_result.get("path") if icon_result.get("written") else None,
         "sqlite_vec": vec,
         "embed": {
             "requested": embed_state.requested,
@@ -143,10 +147,12 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
 
 def format_report(report: dict) -> str:
     home = report.get('haunt_home') or report.get('lore_home', '')
+    icon = report.get('desktop_icon')
     lines = [
         f"haunt home    {home}",
         f"launcher      {report['launcher']}",
         f"hook          {report.get('hook_launcher', '')}",
+        f"desktop icon  {icon or 'skipped (unsupported platform)'}",
         f"python        {report['python']}",
         f"sqlite-vec    {'ok ' + str(report['sqlite_vec'].get('version', '')) if report['sqlite_vec'].get('ok') else 'FAIL ' + str(report['sqlite_vec'].get('error'))}",
         f"embed         loaded={report['embed']['loaded']} dim={report['embed']['dim']} requested={report['embed']['requested']}"

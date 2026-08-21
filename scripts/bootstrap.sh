@@ -17,12 +17,44 @@ VENV_DIR="${REPO_ROOT}/.venv"
 echo "==> haunt bootstrap"
 echo "    repo: ${REPO_ROOT}"
 
+# ── pick python ─────────────────────────────────────────────────────────
+_pick_python() {
+    # On macOS, prefer Homebrew python if the default python3 cannot load
+    # sqlite extensions (common with pyenv).
+    local candidate="python3"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        if ! "$candidate" -c "import sqlite3; sqlite3.connect(':memory:').enable_load_extension(True)" 2>/dev/null; then
+            for brew_py in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+                if [ -x "$brew_py" ] && "$brew_py" -c "import sqlite3; sqlite3.connect(':memory:').enable_load_extension(True)" 2>/dev/null; then
+                    echo "    default python3 lacks sqlite extension support; using ${brew_py}" >&2
+                    candidate="$brew_py"
+                    break
+                fi
+            done
+        fi
+    fi
+    echo "$candidate"
+}
+
+PYTHON_CMD="$(_pick_python)"
+
 # ── venv ────────────────────────────────────────────────────────────────
 if [ ! -d "${VENV_DIR}" ]; then
-    echo "==> Creating virtualenv at ${VENV_DIR}"
-    python3 -m venv "${VENV_DIR}"
+    echo "==> Creating virtualenv at ${VENV_DIR} (${PYTHON_CMD})"
+    "${PYTHON_CMD}" -m venv "${VENV_DIR}"
 else
-    echo "==> Virtualenv already exists at ${VENV_DIR}"
+    # If the existing venv python cannot load sqlite extensions and we have
+    # a better python, recreate the venv.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        if ! "${VENV_DIR}/bin/python3" -c "import sqlite3; sqlite3.connect(':memory:').enable_load_extension(True)" 2>/dev/null; then
+            if [ "$PYTHON_CMD" != "python3" ]; then
+                echo "==> Recreating virtualenv with ${PYTHON_CMD} (sqlite extension support)"
+                rm -rf "${VENV_DIR}"
+                "${PYTHON_CMD}" -m venv "${VENV_DIR}"
+            fi
+        fi
+    fi
+    echo "==> Virtualenv at ${VENV_DIR}"
 fi
 
 # shellcheck disable=SC1091
