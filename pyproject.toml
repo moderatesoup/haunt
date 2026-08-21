@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "haunt — local-first verbatim memory for AI agents"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{name = "haunt"}]
+authors = [{name = "Aron Riley"}]
+license = {text = "Apache-2.0"}
 dependencies = [
     "sqlite-vec>=0.1.6",
     "fastembed>=0.4.0",

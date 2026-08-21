@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Pytest
+        env:
+          HAUNT_FTS_ONLY: "1"
+        run: pytest tests/
+
+      - name: "Smoke: haunt --version"
+        run: |
+          haunt --version
+          haunt --version | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'
+
+      - name: "Smoke: haunt --help"
+        run: haunt --help
+
+      - name: "Smoke: haunt observe + recall (FTS-only, temp home)"
+        env:
+          HAUNT_FTS_ONLY: "1"
+        run: |
+          export HAUNT_HOME="$(mktemp -d)"
+          haunt bootstrap
+          haunt observe "CI smoke test phrase ZEPHYR-42"
+          haunt recall "ZEPHYR-42" | grep -q "ZEPHYR-42"
+          haunt health
