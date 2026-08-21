@@ -177,3 +177,112 @@ def test_run_dashboard_no_open_skips_browser(lore_env, monkeypatch):
         assert opened == [], "webbrowser.open should not be called when open_browser=False"
     finally:
         pass
+
+
+# --------------------------------------------------------------------------
+# Regression: switchView must NOT destroy DOM with innerHTML
+# --------------------------------------------------------------------------
+
+
+class TestSwitchViewNoInnerHTMLDestruction:
+    """Guard against the dead-click bug where switchView replaced view
+    innerHTML with a hint string, destroying inputs/tables/ids and making
+    every subsequent click throw."""
+
+    def test_switchview_does_not_replace_view_innerhtml(self, dash_client):
+        """switchView must not replace a view container's innerHTML with a
+        hint string — that destroys inputs, tables, and element ids."""
+        from haunt.dashboard import HTML
+
+        assert "$('view-'+v).innerHTML=" not in HTML
+
+    def test_html_uses_allns_hint_overlay(self, dash_client):
+        """The fix should use an overlay approach (allns-hint) instead of
+        replacing innerHTML."""
+        from haunt.dashboard import HTML
+
+        assert "allns-hint" in HTML
+        assert "showAllNsHint" in HTML
+        assert "hideAllNsHint" in HTML
+
+
+# --------------------------------------------------------------------------
+# Unit tests for pick_default_namespace
+# --------------------------------------------------------------------------
+
+
+class TestPickDefaultNamespace:
+    def test_empty_list_returns_default(self):
+        from haunt.dashboard import pick_default_namespace
+
+        assert pick_default_namespace([]) == "default"
+
+    def test_prefers_most_events(self):
+        from haunt.dashboard import pick_default_namespace
+
+        ns = [
+            {"name": "aronriley", "events": 0},
+            {"name": "haunt", "events": 42},
+            {"name": "work", "events": 10},
+        ]
+        assert pick_default_namespace(ns) == "haunt"
+
+    def test_prefers_higher_event_count(self):
+        from haunt.dashboard import pick_default_namespace
+
+        ns = [
+            {"name": "alpha", "events": 5},
+            {"name": "beta", "events": 100},
+            {"name": "gamma", "events": 50},
+        ]
+        assert pick_default_namespace(ns) == "beta"
+
+    def test_skips_zero_event_ns(self):
+        from haunt.dashboard import pick_default_namespace
+
+        ns = [
+            {"name": "aronriley", "events": 0},
+            {"name": "empty-too", "events": 0},
+            {"name": "real-data", "events": 3},
+        ]
+        assert pick_default_namespace(ns) == "real-data"
+
+    def test_all_zero_prefers_haunt(self):
+        from haunt.dashboard import pick_default_namespace
+
+        ns = [
+            {"name": "aronriley", "events": 0},
+            {"name": "haunt", "events": 0},
+            {"name": "work", "events": 0},
+        ]
+        assert pick_default_namespace(ns) == "haunt"
+
+    def test_all_zero_no_haunt_returns_first(self):
+        from haunt.dashboard import pick_default_namespace
+
+        ns = [
+            {"name": "alpha", "events": 0},
+            {"name": "beta", "events": 0},
+        ]
+        assert pick_default_namespace(ns) == "alpha"
+
+    def test_none_events_treated_as_zero(self):
+        from haunt.dashboard import pick_default_namespace
+
+        ns = [
+            {"name": "empty", "events": None},
+            {"name": "real", "events": 5},
+        ]
+        assert pick_default_namespace(ns) == "real"
+
+
+class TestApiNamespacesDefault:
+    def test_api_namespaces_includes_default(self, dash_client):
+        """The /api/namespaces response must include a 'default' field
+        recommending which namespace to load on boot."""
+        r = dash_client.get("/api/namespaces")
+        assert r.status_code == 200
+        data = r.json()
+        assert "default" in data
+        assert isinstance(data["default"], str)
+        assert len(data["default"]) > 0

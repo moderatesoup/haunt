@@ -15,6 +15,24 @@ from haunt.paths import haunt_home, resolve_namespace
 from haunt.recall import recall, Hit, RRF_K
 from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
 
+def pick_default_namespace(namespaces: list[dict[str, Any]]) -> str:
+    """Choose the best namespace to display on boot.
+
+    Priority: namespace with the most events, then one named ``haunt``,
+    then any namespace with data, then the first namespace, then ``"default"``.
+    Never prefer a 0-event namespace when one with data exists.
+    """
+    if not namespaces:
+        return "default"
+    with_events = [ns for ns in namespaces if (ns.get("events") or 0) > 0]
+    if with_events:
+        return max(with_events, key=lambda ns: ns.get("events", 0))["name"]
+    haunt = next((ns for ns in namespaces if ns["name"] == "haunt"), None)
+    if haunt:
+        return haunt["name"]
+    return namespaces[0]["name"]
+
+
 # ---------------------------------------------------------------------------
 # HTML: single-file memory management console
 # ---------------------------------------------------------------------------
@@ -313,15 +331,38 @@ function fmtTime(s){return(s||"—").replace("T"," ").replace(/\+00:00$/,"Z").sl
 function snip(s,n){s=(s||"").replace(/\s+/g," ");return s.length<=n?s:s.slice(0,n-1)+"…";}
 async function j(url,opts){const r=await fetch(url,opts);if(!r.ok)throw new Error(await r.text());return r.json();}
 
+function showAllNsHint(container){
+  Array.from(container.children).forEach(el=>{
+    if(!el.classList.contains('allns-hint')) el.dataset.hiddenByAllns='1', el.style.display='none';
+  });
+  let hint=container.querySelector('.allns-hint');
+  if(!hint){
+    hint=document.createElement('div');
+    hint.className='empty allns-hint';
+    hint.textContent='pick a namespace to use this view';
+    container.appendChild(hint);
+  }
+  hint.style.display='';
+}
+
+function hideAllNsHint(container){
+  const hint=container.querySelector('.allns-hint');
+  if(hint) hint.style.display='none';
+  Array.from(container.children).forEach(el=>{
+    if(el.dataset.hiddenByAllns){delete el.dataset.hiddenByAllns; el.style.display='';}
+  });
+}
+
 function switchView(v){
   document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('on'));
   document.querySelectorAll('.nav-btn').forEach(el=>el.classList.remove('on'));
   $('view-'+v).classList.add('on');
   document.querySelector(`.nav-btn[data-view="${v}"]`).classList.add('on');
   if(ALL_NS && v!=='search' && v!=='overview'){
-    $('view-'+v).innerHTML='<div class="empty">pick a namespace to use this view</div>';
+    showAllNsHint($('view-'+v));
     return;
   }
+  hideAllNsHint($('view-'+v));
   if(v==='timeline')loadTimeline();
   if(v==='browse')doBrowse(0);
   if(v==='procedures')loadProcedures();
@@ -695,6 +736,7 @@ let _health_cache={};
 async function loadNs(name){
   ALL_NS=false;
   NS=name;
+  document.querySelectorAll('.tab-content').forEach(v=>hideAllNsHint(v));
   const data=await j("/api/namespace/"+encodeURIComponent(name));
   $("title").textContent=name;
   $("home").textContent=data.haunt_home||"";
@@ -710,7 +752,7 @@ async function loadNs(name){
 (async()=>{
   const boot=await j("/api/namespaces");
   $("home").textContent=boot.haunt_home||"";
-  const first=(boot.namespaces[0]||{}).name||"default";
+  const first=boot.default||(boot.namespaces[0]||{}).name||"default";
   await loadNs(first);
 })();
 
@@ -761,7 +803,12 @@ async def index(_request: Request) -> HTMLResponse:
 
 
 async def api_namespaces(_request: Request) -> JSONResponse:
-    return JSONResponse({"haunt_home": str(haunt_home()), "namespaces": list_namespaces()})
+    ns_list = list_namespaces()
+    return JSONResponse({
+        "haunt_home": str(haunt_home()),
+        "namespaces": ns_list,
+        "default": pick_default_namespace(ns_list),
+    })
 
 
 async def api_namespace(request: Request) -> JSONResponse:
