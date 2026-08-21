@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from lore.embed import available as embed_available
-from lore.graph import extract_entities
-from lore.recall import recall
-from lore.store import Store, list_namespaces, observe
+from haunt.embed import available as embed_available
+from haunt.graph import extract_entities
+from haunt.recall import recall
+from haunt.store import Store, list_namespaces, observe
 
 
 def test_observe_recall_verbatim_rank1(lore_env):
@@ -61,7 +61,7 @@ def test_temporal_as_of(lore_env):
 
 
 def test_tool_call_verbatim(lore_env):
-    inp = '{"path": "src/lore/store.py", "offset": 1}'
+    inp = '{"path": "src/haunt/store.py", "offset": 1}'
     out = "def init_schema(conn):\n    conn.execute('create table events')"
     r = observe(
         "",
@@ -84,7 +84,7 @@ def test_tool_call_verbatim(lore_env):
 
 
 def test_graph_extract_entities(lore_env):
-    sentence = "Alice updated src/lore/store.py in function init_schema() after reviewing Store."
+    sentence = "Alice updated src/haunt/store.py in function init_schema() after reviewing Store."
     ents = extract_entities(sentence)
     types = {e.type for e in ents}
     names = {e.name for e in ents}
@@ -101,14 +101,14 @@ def test_graph_extract_entities(lore_env):
 
 def test_cli_smoke(lore_env):
     env = os.environ.copy()
-    env["LORE_HOME"] = str(lore_env)
-    env["LORE_EMBED_MODEL"] = "BAAI/bge-small-en-v1.5"
+    env["HAUNT_HOME"] = str(lore_env)
+    env["HAUNT_EMBED_MODEL"] = "BAAI/bge-small-en-v1.5"
     if Path("/workspace/lore/.model-cache").exists():
-        env["LORE_MODEL_CACHE"] = "/workspace/lore/.model-cache"
+        env["HAUNT_MODEL_CACHE"] = "/workspace/lore/.model-cache"
     py = sys.executable
     def run(*args: str) -> str:
         p = subprocess.run(
-            [py, "-m", "lore", *args],
+            [py, "-m", "haunt", *args],
             env=env,
             capture_output=True,
             text=True,

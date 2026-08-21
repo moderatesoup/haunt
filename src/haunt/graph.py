@@ -6,9 +6,8 @@ import re
 import sqlite3
 from dataclasses import dataclass
 
-from lore.util import new_id
+from haunt.util import new_id
 
-# src/foo/bar.py, ./x.ts, /abs/path.json, Windows-ish, bare file.ext
 FILE_RE = re.compile(
     r"(?<![\w/])("
     r"(?:[A-Za-z]:)?(?:\.{1,2}/|/)?"
@@ -33,19 +32,15 @@ PROPER_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b")
 
 ENV_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})\b")
 
-# dotted / bracketed identifiers: stripe.webhook_secret, foo.bar.baz
 DOTTED_RE = re.compile(r"\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+\b")
 
-# snake_case identifiers / function names without a following (
 SNAKE_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b")
 
-# scheme://host... or host:port/path (keeps postgres://prod-db:5432/app)
 URL_RE = re.compile(
     r"(?:[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"`<>\[\]{}]+)"
     r"|(?:\b[A-Za-z][A-Za-z0-9_.-]*:\d{2,5}(?:/[A-Za-z0-9._~/-]*)?)"
 )
 
-# owner/repo — letter-started on both sides so "5432/app" does not match
 REPO_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_.-]+/[A-Za-z][A-Za-z0-9_.-]+)\b")
 
 PATH_PREFIXES = {
@@ -55,8 +50,6 @@ PATH_PREFIXES = {
     "node_modules", "target", "out",
 }
 
-# Common English + discourse markers. Sentence-initial "Noted." / "Also"
-# / "Confirmed." / "Next" must not become entities.
 START_STOP = {
     "the", "this", "that", "these", "those", "a", "an", "i", "we", "you",
     "he", "she", "it", "they", "when", "after", "before", "if", "for",
@@ -152,7 +145,6 @@ def extract_entities(text: str) -> list[Extracted]:
         n = norm_name(name)
         if not n or n in START_STOP:
             return
-        # drop leftover port/db fragments ("5432/app") unless they are a URL
         if re.fullmatch(r"\d{2,5}/[\w.-]+", name) and typ != "url":
             return
         found[(n, typ)] = Extracted(name=name, type=typ, norm=n)
@@ -240,7 +232,6 @@ def extract_and_store(
         for m in FILE_RE.finditer(text):
             ents.append(Extracted(name=m.group(1), type="file", norm=norm_name(m.group(1))))
 
-    # unique (norm, type) — first spelling wins
     uniq: dict[tuple[str, str], Extracted] = {}
     for e in ents:
         uniq.setdefault((e.norm, e.type), e)
@@ -328,7 +319,6 @@ def _upsert_rel(
         (src, rel, dst),
     ).fetchone()
     if row:
-        # same event: do not emit / bump a duplicate triple
         if row["event_id"] == event_id:
             return
         conn.execute(

@@ -9,17 +9,17 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
-from lore.embed import state as embed_state
-from lore.paths import lore_home, resolve_namespace
-from lore.recall import recall
-from lore.store import Store, list_namespaces, namespace_exists
+from haunt.embed import state as embed_state
+from haunt.paths import haunt_home, resolve_namespace
+from haunt.recall import recall
+from haunt.store import Store, list_namespaces, namespace_exists
 
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>lore</title>
+<title>haunt</title>
 <style>
 :root {
   --bg:#090a0d; --panel:#10131a; --panel2:#161a22; --line:#242833;
@@ -103,7 +103,7 @@ td.snip { color:#c5cbd6; max-width:520px; word-break:break-word; }
 <div id="app">
   <aside>
     <div>
-      <div class="brand">lo<span>re</span></div>
+      <div class="brand">hau<span>nt</span></div>
       <div class="sub" id="home"></div>
     </div>
     <div class="sub">namespaces</div>
@@ -213,7 +213,7 @@ async function loadNs(name){
   NS = name;
   const data = await j("/api/namespace/"+encodeURIComponent(name));
   $("title").textContent = name;
-  $("home").textContent = data.lore_home || "";
+  $("home").textContent = data.haunt_home || "";
   setPills(data.health||{});
   renderNs(data.namespaces||[], name);
   statCards(data.stats||{});
@@ -232,7 +232,7 @@ $("go").onclick = doRecall;
 $("q").addEventListener("keydown", e => { if(e.key==="Enter") doRecall(); });
 (async () => {
   const boot = await j("/api/namespaces");
-  $("home").textContent = boot.lore_home || "";
+  $("home").textContent = boot.haunt_home || "";
   const first = (boot.namespaces[0]||{}).name || "default";
   await loadNs(first);
 })();
@@ -243,11 +243,11 @@ $("q").addEventListener("keydown", e => { if(e.key==="Enter") doRecall(); });
 
 
 def _health(ns: str | None = None) -> dict[str, Any]:
-    from lore.bootstrap import probe_sqlite_vec
+    from haunt.bootstrap import probe_sqlite_vec
 
     es = embed_state()
     payload: dict[str, Any] = {
-        "lore_home": str(lore_home()),
+        "haunt_home": str(haunt_home()),
         "sqlite_vec": probe_sqlite_vec(),
         "embed": {
             "loaded": es.model_id,
@@ -265,7 +265,7 @@ async def index(_request: Request) -> HTMLResponse:
 
 
 async def api_namespaces(_request: Request) -> JSONResponse:
-    return JSONResponse({"lore_home": str(lore_home()), "namespaces": list_namespaces()})
+    return JSONResponse({"haunt_home": str(haunt_home()), "namespaces": list_namespaces()})
 
 
 async def api_namespace(request: Request) -> JSONResponse:
@@ -279,7 +279,7 @@ async def api_namespace(request: Request) -> JSONResponse:
         entities = st.top_entities(20)
     return JSONResponse(
         {
-            "lore_home": str(lore_home()),
+            "haunt_home": str(haunt_home()),
             "health": _health(name),
             "namespaces": list_namespaces(),
             "stats": stats,

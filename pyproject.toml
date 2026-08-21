@@ -1,10 +1,10 @@
 [project]
-name = "lore"
+name = "haunt"
 version = "0.1.0"
-description = "engram — local-first verbatim memory for AI agents (package: lore)"
+description = "haunt — local-first verbatim memory for AI agents"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{name = "lore"}]
+authors = [{name = "haunt"}]
 dependencies = [
     "sqlite-vec>=0.1.6",
     "fastembed>=0.4.0",
@@ -21,12 +21,15 @@ dependencies = [
 dev = ["pytest>=8.0", "httpx"]
 
 [project.scripts]
-lore = "lore.cli:main"
-lore-mcp = "lore.mcp_server:main"
-lore-hook = "lore.cursor_hook:main"
-engram = "lore.cli:main"
-engram-mcp = "lore.mcp_server:main"
-engram-hook = "lore.cursor_hook:main"
+haunt = "haunt.cli:main"
+haunt-mcp = "haunt.mcp_server:main"
+haunt-hook = "haunt.cursor_hook:main"
+lore = "haunt.cli:main"
+lore-mcp = "haunt.mcp_server:main"
+lore-hook = "haunt.cursor_hook:main"
+engram = "haunt.cli:main"
+engram-mcp = "haunt.mcp_server:main"
+engram-hook = "haunt.cursor_hook:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

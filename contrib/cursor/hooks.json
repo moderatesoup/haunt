@@ -1,12 +1,12 @@
 {
   "version": 1,
   "hooks": {
-    "beforeSubmitPrompt": [{ "command": "~/.lore/bin/engram-hook" }],
-    "afterAgentResponse": [{ "command": "~/.lore/bin/engram-hook" }],
-    "postToolUse": [{ "command": "~/.lore/bin/engram-hook" }],
-    "afterShellExecution": [{ "command": "~/.lore/bin/engram-hook" }],
-    "afterMCPExecution": [{ "command": "~/.lore/bin/engram-hook" }],
-    "sessionStart": [{ "command": "~/.lore/bin/engram-hook" }],
-    "sessionEnd": [{ "command": "~/.lore/bin/engram-hook" }]
+    "beforeSubmitPrompt": [{ "command": "~/.haunt/bin/haunt-hook" }],
+    "afterAgentResponse": [{ "command": "~/.haunt/bin/haunt-hook" }],
+    "postToolUse": [{ "command": "~/.haunt/bin/haunt-hook" }],
+    "afterShellExecution": [{ "command": "~/.haunt/bin/haunt-hook" }],
+    "afterMCPExecution": [{ "command": "~/.haunt/bin/haunt-hook" }],
+    "sessionStart": [{ "command": "~/.haunt/bin/haunt-hook" }],
+    "sessionEnd": [{ "command": "~/.haunt/bin/haunt-hook" }]
   }
 }

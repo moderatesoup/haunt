@@ -14,10 +14,10 @@ from typing import Any
 
 import sqlite_vec
 
-from lore.embed import available as embed_available
-from lore.embed import embed_one
-from lore.store import Store
-from lore.util import iso_or_now, snippet
+from haunt.embed import available as embed_available
+from haunt.embed import embed_one
+from haunt.store import Store
+from haunt.util import iso_or_now, snippet
 
 RRF_K = 60
 CANDIDATES = 40
@@ -159,7 +159,6 @@ def _vec_hits(
                 return [(r["mid"], i + 1, float(r["dist"])) for i, r in enumerate(rows)]
             except sqlite3.Error:
                 pass
-    # brute-force cosine/L2 on stored blobs
     sql = f"""
         SELECT m.id AS mid, m.embedding
         FROM memories m

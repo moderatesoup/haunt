@@ -12,10 +12,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from lore.paths import infer_namespace, safe_name
-from lore.recall import Hit, recall
-from lore.store import Store
-from lore.util import snippet
+from haunt.paths import infer_namespace, safe_name
+from haunt.recall import Hit, recall
+from haunt.store import Store
+from haunt.util import snippet
 
 ORIGIN = "cursor-hook"
 HOOK_EVENTS = (
@@ -27,7 +27,7 @@ HOOK_EVENTS = (
     "sessionStart",
     "sessionEnd",
 )
-STORE_THOUGHTS_ENV = ("ENGRAM_STORE_THOUGHTS", "LORE_STORE_THOUGHTS")
+STORE_THOUGHTS_ENV = ("HAUNT_STORE_THOUGHTS", "ENGRAM_STORE_THOUGHTS", "LORE_STORE_THOUGHTS")
 
 
 def _as_text(value: Any) -> str:
@@ -112,7 +112,11 @@ def hook_cwd(payload: dict[str, Any]) -> Path | None:
 
 
 def hook_namespace(payload: dict[str, Any]) -> str:
-    env = os.environ.get("LORE_NAMESPACE") or os.environ.get("ENGRAM_NAMESPACE")
+    env = (
+        os.environ.get("HAUNT_NAMESPACE")
+        or os.environ.get("LORE_NAMESPACE")
+        or os.environ.get("ENGRAM_NAMESPACE")
+    )
     if env:
         return safe_name(env)
     return infer_namespace(hook_cwd(payload))
@@ -134,7 +138,7 @@ def _is_memory_tool(name: str) -> bool:
 
 
 def format_recall_block(hits: list[Hit], namespace: str) -> str:
-    lines = [f"[engram ns={namespace}]"]
+    lines = [f"[haunt ns={namespace}]"]
     if not hits:
         lines.append("(no memories)")
         return "\n".join(lines)
@@ -146,7 +150,7 @@ def format_recall_block(hits: list[Hit], namespace: str) -> str:
 
 
 def format_timeline_block(rows: list[dict[str, Any]], namespace: str) -> str:
-    lines = [f"[engram recent ns={namespace}]"]
+    lines = [f"[haunt recent ns={namespace}]"]
     if not rows:
         lines.append("(no memories)")
         return "\n".join(lines)
@@ -255,12 +259,12 @@ def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dic
     _observe(
         store,
         payload,
-        content="engram session start",
+        content="haunt session start",
         role="system",
         tier="coordinate",
     )
     intro = (
-        "You have persistent local memory via engram (MCP tools "
+        "You have persistent local memory via haunt (MCP tools "
         "memory_recall / memory_observe). Before acting on a user request, "
         "call memory_recall with their wording. Store new facts/tools with "
         f"memory_observe. Namespace: {ns}."
@@ -312,13 +316,13 @@ def run(raw: str) -> dict[str, Any]:
         return {}
 
 
-def _is_engram_command(command: str) -> bool:
+def _is_haunt_command(command: str) -> bool:
     name = command.replace("\\", "/").rstrip("/").split("/")[-1]
-    return name in {"engram-hook", "lore-hook"}
+    return name in {"haunt-hook", "engram-hook", "lore-hook"}
 
 
 def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
-    """Merge engram hook entries into a Cursor hooks.json. Do not clobber others."""
+    """Merge haunt hook entries into a Cursor hooks.json. Do not clobber others."""
     existing: dict[str, Any] = {"version": 1, "hooks": {}}
     if path.exists():
         try:
@@ -339,7 +343,7 @@ def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
             hooks[event] = entries
         updated = False
         for item in entries:
-            if isinstance(item, dict) and _is_engram_command(str(item.get("command", ""))):
+            if isinstance(item, dict) and _is_haunt_command(str(item.get("command", ""))):
                 item["command"] = command
                 updated = True
         if not updated:
@@ -350,9 +354,9 @@ def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
 
 
 def install_cursor_hooks() -> dict[str, Any]:
-    """Write ~/.lore/bin/engram-hook and merge ~/.cursor/hooks.json."""
-    from lore.bootstrap import write_hook_launcher, write_launcher
-    from lore.paths import ensure_layout
+    """Write ~/.haunt/bin/haunt-hook and merge ~/.cursor/hooks.json."""
+    from haunt.bootstrap import write_hook_launcher, write_launcher
+    from haunt.paths import ensure_layout
 
     home = ensure_layout()
     write_launcher()
@@ -361,6 +365,7 @@ def install_cursor_hooks() -> dict[str, Any]:
     command = str(launcher)
     merge_hooks_json(hooks_path, command)
     return {
+        "haunt_home": str(home),
         "lore_home": str(home),
         "launcher": command,
         "hooks_json": str(hooks_path),
