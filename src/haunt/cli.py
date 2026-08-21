@@ -34,7 +34,13 @@ def bootstrap_cmd(
     ),
 ) -> None:
     """Create ~/.haunt, probe sqlite-vec, download the embed model, init default."""
-    report = bootstrap(reembed=reembed)
+    from haunt.bootstrap import BootstrapError
+
+    try:
+        report = bootstrap(reembed=reembed)
+    except BootstrapError as exc:
+        typer.echo(exc.message, err=True)
+        raise typer.Exit(1)
     typer.echo(format_report(report))
 
 

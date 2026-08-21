@@ -118,6 +118,8 @@ def memory_health(namespace: Optional[str] = None) -> str:
         stats = st.stats()
     return _json(
         {
+            "namespace": ns,
+            "db_path": stats.get("db_path", ""),
             "haunt_home": str(haunt_home()),
             "sqlite_vec": probe_sqlite_vec(),
             "embed": {

@@ -69,11 +69,30 @@ def probe_sqlite_vec() -> dict[str, str | bool]:
         conn.close()
 
 
+class BootstrapError(SystemExit):
+    """Raised when bootstrap hits a fatal problem (e.g. sqlite-vec missing)."""
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(1)
+
+
 def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict:
     home = ensure_layout()
     init_registry()
     launcher = write_launcher()
     vec = probe_sqlite_vec()
+    if not vec.get("ok"):
+        hint = (
+            "sqlite-vec failed to load: " + str(vec.get("error", "unknown")) + "\n"
+            "\n"
+            "haunt requires sqlite-vec for vector storage. Common fixes:\n"
+            "  - Use the system Python or Homebrew Python (not pyenv) which\n"
+            "    ships with loadable-extension support.\n"
+            "  - Ensure 'pip install sqlite-vec' succeeded.\n"
+            "  - On macOS with pyenv: rebuild with\n"
+            "    PYTHON_CONFIGURE_OPTS=\"--enable-loadable-sqlite-extensions\" pyenv install\n"
+        )
+        raise BootstrapError(hint)
     embed_state = warmup()
     db = register_namespace(default_namespace, repo_path=None)
     # touch schema
@@ -144,6 +163,31 @@ def format_report(report: dict) -> str:
         lines.append(
             f"reembed       ns={row.get('namespace')} updated={row.get('updated')}/"
             f"{row.get('total')} dim={row.get('dim')} model={row.get('model')}"
+        )
+    embed = report.get("embed", {})
+    if embed.get("available") and not embed.get("fallback"):
+        model_id = embed.get("loaded", "")
+        if "bge-m3" in model_id.lower():
+            lines.append("")
+            lines.append(
+                "note        The quality embed model BAAI/bge-m3 (~2.28 GB) is active."
+            )
+            lines.append(
+                "            First observe/recall may take a moment if the model"
+            )
+            lines.append(
+                "            was just downloaded. For a smaller model (~67 MB), set:"
+            )
+            lines.append(
+                "            HAUNT_EMBED_MODEL=BAAI/bge-small-en-v1.5"
+            )
+    elif embed.get("available") and embed.get("fallback"):
+        lines.append("")
+        lines.append(
+            "note        Running with fallback model. For best quality, ensure"
+        )
+        lines.append(
+            "            BAAI/bge-m3 can download (~2.28 GB)."
         )
     if os.environ.get("HAUNT_JSON") or os.environ.get("LORE_JSON"):
         return dumps(report)
