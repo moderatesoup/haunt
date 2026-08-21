@@ -324,6 +324,55 @@ def procedure_list_cmd(
         typer.echo(f"{p['name']:<28} {p.get('trigger', ''):<32} {p['id'][:12]}")
 
 
+@app.command("delete")
+def delete_cmd(
+    memory_id: str = typer.Argument(..., help="Memory ID to permanently delete"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    event_id: Optional[str] = typer.Option(None, "--event-id", help="Delete all memories for this event"),
+) -> None:
+    """Hard-delete a memory and its provenance chain (FTS, vec, graph, orphan events)."""
+    ns = _ns(namespace)
+    if event_id:
+        with Store(ns) as st:
+            rows = st.conn.execute(
+                "SELECT id FROM memories WHERE event_id=?", (event_id,)
+            ).fetchall()
+            if not rows:
+                typer.echo(f"no memories for event {event_id}")
+                raise typer.Exit(1)
+            if not yes:
+                typer.confirm(
+                    f"Permanently delete {len(rows)} memories for event {event_id}?",
+                    abort=True,
+                )
+            for r in rows:
+                result = st.purge(r["id"])
+                typer.echo(
+                    f"purged memory={r['id'][:12]}…  fts={result.get('fts_deleted')}  "
+                    f"vec={result.get('vec_deleted')}  rels={result.get('relations_deleted')}  "
+                    f"event={result.get('event_deleted')}"
+                )
+        return
+    if not yes:
+        typer.confirm(
+            f"Permanently delete memory {memory_id}? This removes the memory, "
+            "FTS index, vector embedding, graph data, and orphaned events.",
+            abort=True,
+        )
+    with Store(ns) as st:
+        result = st.purge(memory_id)
+    if not result.get("ok"):
+        typer.echo(f"error: {result.get('error', 'unknown')}", err=True)
+        raise typer.Exit(1)
+    typer.echo(
+        f"ok  purged memory={result['memory_id'][:12]}…  event={result['event_id'][:12]}…  "
+        f"fts={result['fts_deleted']}  vec={result['vec_deleted']}  "
+        f"rels={result['relations_deleted']}  ents={result['entities_deleted']}  "
+        f"event_deleted={result['event_deleted']}"
+    )
+
+
 @app.command("cursor-install")
 def cursor_install_cmd() -> None:
     """Merge Cursor hooks at ~/.cursor/hooks.json + install haunt.mdc rule."""
@@ -343,8 +392,19 @@ def cursor_install_cmd() -> None:
 def dash_cmd(
     port: int = typer.Option(7340, "--port"),
     host: str = typer.Option("127.0.0.1", "--host"),
+    install_icon: bool = typer.Option(False, "--install-icon", help="Write a desktop shortcut and exit"),
 ) -> None:
-    """Start the local metrics dashboard (127.0.0.1)."""
+    """Start the local memory console (127.0.0.1), or install a desktop shortcut."""
+    if install_icon:
+        from haunt.desktop import install_desktop_icon
+
+        result = install_desktop_icon()
+        if result.get("written"):
+            typer.echo(f"desktop icon  {result['path']}")
+        else:
+            typer.echo(f"desktop icon  skipped ({result.get('reason', 'unsupported platform')})")
+        return
+
     from haunt.dashboard import run_dashboard
 
     typer.echo(f"haunt dash  http://{host}:{port}  home={haunt_home()}")

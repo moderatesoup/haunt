@@ -28,7 +28,23 @@ pip install -e "${REPO_ROOT}" --quiet
 
 # ── first-run setup ─────────────────────────────────────────────────────
 echo "==> Running haunt bootstrap"
-haunt bootstrap
+if ! haunt bootstrap; then
+    echo ""
+    echo "FATAL: haunt bootstrap failed."
+    echo "  sqlite-vec must load successfully. See output above."
+    exit 1
+fi
+
+# ── HAUNT_HOME and db_path ──────────────────────────────────────────────
+HAUNT_HOME="${HAUNT_HOME:-${HOME}/.haunt}"
+echo ""
+echo "    HAUNT_HOME  ${HAUNT_HOME}"
+echo "    db_path     ${HAUNT_HOME}/namespaces/default.db"
+echo "    registry    ${HAUNT_HOME}/registry.db"
+
+# ── desktop icon ────────────────────────────────────────────────────────
+echo "==> Installing desktop shortcut"
+haunt dash --install-icon || true
 
 echo ""
 echo "── next steps ──────────────────────────────────────────────────────"
@@ -36,10 +52,14 @@ echo ""
 echo "  1. Activate the venv:"
 echo "       source ${VENV_DIR}/bin/activate"
 echo ""
-echo "  2. Install Cursor hooks (optional):"
+echo "  2. Open the memory console:"
+echo "       haunt dash"
+echo "       → http://127.0.0.1:7340"
+echo ""
+echo "  3. Install Cursor hooks (optional):"
 echo "       haunt cursor-install"
 echo ""
-echo "  3. Point your MCP client at the launcher:"
+echo "  4. Point your MCP client at the launcher:"
 echo "       ~/.haunt/bin/haunt-mcp"
 echo ""
 echo "  Done. Run 'haunt --help' to see all commands."
