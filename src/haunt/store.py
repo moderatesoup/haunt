@@ -429,7 +429,6 @@ class Store:
         vec = embed_one(text) if text.strip() else None
         if vec is not None:
             blob = sqlite_vec.serialize_float32(vec)
-            embedded = True
             ensure_vec_table(self.conn, len(vec))
             es = embed_state()
             self.conn.execute(
@@ -458,6 +457,7 @@ class Store:
                     "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
                     (memory_id, blob),
                 )
+                embedded = True
             except sqlite3.Error:
                 pass
         self.conn.commit()
