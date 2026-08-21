@@ -133,3 +133,31 @@ def test_fts_only_env_disables_embeddings(tmp_path, monkeypatch):
     assert st.model_id == "off"
 
     embed.reset()
+
+
+def test_memory_procedure_rejects_invalid_action(tmp_path, monkeypatch):
+    """MCP memory_procedure must return ok=False for unknown action strings."""
+    import json
+
+    monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    monkeypatch.delenv("LORE_HOME", raising=False)
+    monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+
+    from haunt import embed
+    from haunt.mcp_server import memory_procedure
+    from haunt.paths import ensure_layout
+    from haunt.store import init_registry
+
+    embed.reset()
+    ensure_layout()
+    init_registry()
+
+    for bad_action in ("delete", "update", "remove", "supersede", ""):
+        raw = memory_procedure(action=bad_action, name="x", namespace="proc-test")
+        data = json.loads(raw)
+        assert data["ok"] is False, f"action={bad_action!r} should fail, got ok=True"
+        assert "unknown action" in data["error"].lower() or "must be" in data["error"].lower()
+
+    embed.reset()
