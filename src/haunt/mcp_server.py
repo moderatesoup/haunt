@@ -67,7 +67,7 @@ def memory_observe(
     )
 
 
-@server.tool(description="Hybrid recall over verbatim memories (vec + FTS5 + RRF).")
+@server.tool(description="Hybrid recall over verbatim memories (vec + FTS5 + RRF). Scores are rank-normalized (not relevance probabilities).")
 def memory_recall(
     query: str,
     namespace: Optional[str] = None,
