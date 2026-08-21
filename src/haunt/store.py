@@ -10,21 +10,21 @@ from typing import Any, Iterator
 
 import sqlite_vec
 
-from lore.embed import available as embed_available
-from lore.embed import dimension as embed_dim
-from lore.embed import embed_one
-from lore.embed import embed_texts
-from lore.embed import state as embed_state
-from lore.paths import (
+from haunt.embed import available as embed_available
+from haunt.embed import dimension as embed_dim
+from haunt.embed import embed_one
+from haunt.embed import embed_texts
+from haunt.embed import state as embed_state
+from haunt.paths import (
     ensure_layout,
     infer_namespace,
-    lore_home,
+    haunt_home,
     namespace_db_path,
     registry_path,
     resolve_namespace,
     safe_name,
 )
-from lore.util import dumps, iso_or_now, loads, new_id, now_iso
+from haunt.util import dumps, iso_or_now, loads, new_id, now_iso
 
 ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
@@ -45,7 +45,6 @@ def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
     except Exception:
-        # vec optional — brute-force cosine still works from memories.embedding
         pass
     return conn
 
@@ -455,7 +454,7 @@ class Store:
             except sqlite3.Error:
                 pass
         self.conn.commit()
-        from lore.graph import extract_and_store
+        from haunt.graph import extract_and_store
 
         entity_names = extract_and_store(self.conn, event_id, text, et, tool_name)
         touch_namespace(self.name)
@@ -491,11 +490,7 @@ class Store:
         return False
 
     def reembed(self) -> dict[str, Any]:
-        """Rebuild every memory embedding with the currently loaded model.
-
-        Drops and recreates vec_memories so a 384-d namespace can move to
-        BGE-M3 (1024-d) without silently mixing dimensions.
-        """
+        """Rebuild every memory embedding with the currently loaded model."""
         es = embed_state()
         rows = self.conn.execute("SELECT id, content FROM memories").fetchall()
         self.conn.execute("DROP TABLE IF EXISTS vec_memories")
@@ -647,12 +642,8 @@ class Store:
         }
 
     def rebuild_graph(self) -> dict[str, Any]:
-        """Wipe entities/relations and re-extract from stored events.
-
-        Events and memories are left untouched. Uses extract_and_store
-        (same path as observe) so a tighter extractor rewrites the graph.
-        """
-        from lore.graph import extract_and_store
+        """Wipe entities/relations and re-extract from stored events."""
+        from haunt.graph import extract_and_store
 
         def count(table: str) -> int:
             return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])

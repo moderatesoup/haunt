@@ -2,15 +2,15 @@
 
 Never calls a remote LLM or embedding API. Never fakes vectors.
 
-Load order when LORE_EMBED_MODEL is BAAI/bge-m3 (the default):
-  1. Local ONNX under ~/.lore/models (or $LORE_MODEL_CACHE)
+Load order when HAUNT_EMBED_MODEL / LORE_EMBED_MODEL is BAAI/bge-m3 (the default):
+  1. Local ONNX under ~/.haunt/models (or $HAUNT_MODEL_CACHE / $LORE_MODEL_CACHE)
   2. Download BAAI/bge-m3 ONNX + tokenizer from Hugging Face
   3. Newer fastembed if it lists BAAI/bge-m3
   4. BAAI/bge-small-en-v1.5 via fastembed (384-d) — automatic fallback
 
-Set LORE_EMBED_MODEL=off or LORE_FTS_ONLY=1 for FTS-only.
+Set HAUNT_EMBED_MODEL=off or HAUNT_FTS_ONLY=1 for FTS-only.
 Existing namespace DBs created at another dim must be rebuilt
-(`lore bootstrap --reembed`, or the store auto-rebuilds on mismatch).
+(`haunt bootstrap --reembed`, or the store auto-rebuilds on mismatch).
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from lore.paths import models_dir
-from lore.util import diag
+from haunt.paths import models_dir
+from haunt.util import diag
 
 DEFAULT_REQUESTED = "BAAI/bge-m3"
 FALLBACK_MODEL = "BAAI/bge-small-en-v1.5"
@@ -36,7 +36,6 @@ BGE_M3_PATTERNS = [
     "onnx/tokenizer_config.json",
     "onnx/config.json",
 ]
-# Community INT8 export — still 1024-d BGE-M3, used only if official ONNX fails.
 BGE_M3_QUANT_REPO = "onnx-community/bge-m3-ONNX"
 BGE_M3_QUANT_PATTERNS = [
     "onnx/model_quantized.onnx",
@@ -61,19 +60,32 @@ class EmbedState:
 
 
 def _env_model() -> str:
-    raw = (os.environ.get("LORE_EMBED_MODEL") or DEFAULT_REQUESTED).strip()
+    raw = (
+        os.environ.get("HAUNT_EMBED_MODEL")
+        or os.environ.get("LORE_EMBED_MODEL")
+        or DEFAULT_REQUESTED
+    ).strip()
     return raw
 
 
 def fts_only() -> bool:
-    if os.environ.get("LORE_FTS_ONLY", "").strip() in {"1", "true", "yes"}:
+    fts_env = (
+        os.environ.get("HAUNT_FTS_ONLY")
+        or os.environ.get("LORE_FTS_ONLY")
+        or ""
+    ).strip()
+    if fts_env in {"1", "true", "yes"}:
         return True
     model = _env_model().lower()
     return model in {"off", "none", "fts", "fts5", "disabled"}
 
 
 def _max_len() -> int:
-    raw = (os.environ.get("LORE_EMBED_MAX_LEN") or "512").strip()
+    raw = (
+        os.environ.get("HAUNT_EMBED_MAX_LEN")
+        or os.environ.get("LORE_EMBED_MAX_LEN")
+        or "512"
+    ).strip()
     try:
         n = int(raw)
     except ValueError:
@@ -122,12 +134,10 @@ def _find_onnx(root: Path) -> Path | None:
     ]
     for c in candidates:
         if c.is_file():
-            # official graph expects sibling model.onnx_data
             if c.name == "model.onnx":
                 data = c.with_name("model.onnx_data")
                 if data.is_file() or c.stat().st_size > 10_000_000:
                     return c
-                # tiny graph without weights is useless
                 if not data.is_file():
                     continue
             return c
@@ -210,7 +220,7 @@ class OnnxEmbedder:
         self.input_names = [i.name for i in self.sess.get_inputs()]
         self.output_names = [o.name for o in self.sess.get_outputs()]
         self._np = np
-        probe = list(self.embed(["lore-dim-probe"]))
+        probe = list(self.embed(["haunt-dim-probe"]))
         self.dim = int(len(probe[0]))
         if self.dim <= 0:
             raise RuntimeError("ONNX embedder produced an empty vector")
@@ -231,7 +241,6 @@ class OnnxEmbedder:
         if "token_type_ids" in self.input_names:
             feeds["token_type_ids"] = np.zeros_like(input_ids)
         if not feeds:
-            # last-ditch: bind in declared order
             names = self.input_names
             if names:
                 feeds[names[0]] = input_ids
@@ -244,7 +253,6 @@ class OnnxEmbedder:
             hidden = by_name["sentence_embedding"]
         else:
             hidden = outs[-1] if len(outs) > 1 else outs[0]
-            # prefer a 2-d pooled output if present
             for o in outs:
                 if getattr(o, "ndim", 0) == 2:
                     hidden = o
@@ -252,7 +260,6 @@ class OnnxEmbedder:
         if hidden is None:
             raise RuntimeError("ONNX session returned no embedding output")
         if hidden.ndim == 3:
-            # CLS pool
             hidden = hidden[:, 0, :]
         out: list[list[float]] = []
         for row in hidden:
@@ -299,7 +306,6 @@ def _load() -> EmbedState:
     requested = _env_model()
     last_err: str | None = None
 
-    # 1–2. Real BGE-M3 ONNX when requested (default) or explicitly named.
     if _wants_bge_m3(requested):
         try:
             model, nbytes = _load_onnx_bge_m3()
@@ -317,12 +323,11 @@ def _load() -> EmbedState:
             last_err = str(exc)
             diag("embed_m3_onnx_failed", error=last_err, requested=requested)
 
-        # 3. Newer fastembed that actually lists BGE-M3.
         supported = _supported_fastembed()
         if BGE_M3_ID in supported:
             try:
                 model = _load_fastembed(BGE_M3_ID)
-                probe = list(model.embed(["lore-dim-probe"]))
+                probe = list(model.embed(["haunt-dim-probe"]))
                 dim = int(len(probe[0]))
                 _load._model = model  # type: ignore[attr-defined]
                 return EmbedState(
@@ -337,7 +342,6 @@ def _load() -> EmbedState:
                 last_err = str(exc)
                 diag("embed_m3_fastembed_failed", error=last_err)
 
-    # Explicit non-M3 model, or M3 failed — try fastembed (requested, then small).
     try:
         supported = _supported_fastembed()
         model_id = requested
@@ -352,7 +356,7 @@ def _load() -> EmbedState:
             else:
                 raise RuntimeError("fastembed has no supported text embedding models")
         model = _load_fastembed(model_id)
-        probe = list(model.embed(["lore-dim-probe"]))
+        probe = list(model.embed(["haunt-dim-probe"]))
         dim = int(len(probe[0]))
         _load._model = model  # type: ignore[attr-defined]
         if is_fallback:
@@ -394,7 +398,7 @@ def state() -> EmbedState:
 
 
 def reset() -> None:
-    """Drop cached model (tests / LORE_HOME changes)."""
+    """Drop cached model (tests / home changes)."""
     global _state
     with _lock:
         _state = None

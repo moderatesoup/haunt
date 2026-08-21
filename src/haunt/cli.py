@@ -1,4 +1,4 @@
-"""lore CLI — human-readable stdout, JSON diagnostics on stderr."""
+"""haunt CLI — human-readable stdout, JSON diagnostics on stderr."""
 
 from __future__ import annotations
 
@@ -7,18 +7,17 @@ from typing import Optional
 
 import typer
 
-from lore import __version__
-from lore.bootstrap import bootstrap, format_report
-from lore.embed import state as embed_state
-from lore.paths import lore_home, resolve_namespace
-from lore.recall import recall
-from lore.store import Store, list_namespaces, register_namespace
-from lore.util import snippet
+from haunt import __version__
+from haunt.bootstrap import bootstrap, format_report
+from haunt.embed import state as embed_state
+from haunt.paths import haunt_home, resolve_namespace
+from haunt.recall import recall
+from haunt.store import Store, list_namespaces, register_namespace
+from haunt.util import snippet
 
 app = typer.Typer(
     add_completion=False,
-    no_args_is_help=True,
-    help="engram (lore) — local-first verbatim memory for AI agents",
+    help="haunt — local-first verbatim memory for AI agents",
 )
 
 
@@ -34,7 +33,7 @@ def bootstrap_cmd(
         help="Rebuild embeddings in every namespace for the loaded model (required after a dim change).",
     ),
 ) -> None:
-    """Create ~/.lore, probe sqlite-vec, download the embed model, init default."""
+    """Create ~/.haunt, probe sqlite-vec, download the embed model, init default."""
     report = bootstrap(reembed=reembed)
     typer.echo(format_report(report))
 
@@ -151,7 +150,7 @@ def namespaces_cmd() -> None:
     """List namespaces with counts."""
     rows = list_namespaces()
     if not rows:
-        typer.echo("no namespaces (run: lore bootstrap)")
+        typer.echo("no namespaces (run: haunt bootstrap)")
         return
     typer.echo(f"{'name':<24} {'events':>7} {'mem':>7} {'sess':>6} {'ents':>6}  db")
     for r in rows:
@@ -165,13 +164,13 @@ def health_cmd(
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
 ) -> None:
     """Store, vec, and embed status."""
-    from lore.bootstrap import probe_sqlite_vec
-    from lore.paths import registry_path
+    from haunt.bootstrap import probe_sqlite_vec
+    from haunt.paths import registry_path
 
     es = embed_state()
     vec = probe_sqlite_vec()
-    typer.echo(f"lore          v{__version__}")
-    typer.echo(f"LORE_HOME     {lore_home()}")
+    typer.echo(f"haunt         v{__version__}")
+    typer.echo(f"HAUNT_HOME    {haunt_home()}")
     typer.echo(f"registry      {registry_path()}  exists={registry_path().exists()}")
     typer.echo(
         f"sqlite-vec    {'ok ' + str(vec.get('version')) if vec.get('ok') else 'FAIL'}"
@@ -229,15 +228,15 @@ def graph_cmd(
 
 @app.command("cursor-install")
 def cursor_install_cmd() -> None:
-    """Merge Cursor hooks at ~/.cursor/hooks.json (engram auto-memory)."""
-    from lore.cursor_hook import install_cursor_hooks
+    """Merge Cursor hooks at ~/.cursor/hooks.json (haunt auto-memory)."""
+    from haunt.cursor_hook import install_cursor_hooks
 
     report = install_cursor_hooks()
     typer.echo(f"hooks     {report['hooks_json']}")
     typer.echo(f"launcher  {report['launcher']}")
     typer.echo(f"events    {', '.join(report['events'])}")
     typer.echo("merged existing hooks; other commands were kept")
-    typer.echo(f"home      {report['lore_home']}  (LORE_HOME / ENGRAM_HOME)")
+    typer.echo(f"home      {report['haunt_home']}  (HAUNT_HOME / LORE_HOME / ENGRAM_HOME)")
 
 
 @app.command("dash")
@@ -246,18 +245,24 @@ def dash_cmd(
     host: str = typer.Option("127.0.0.1", "--host"),
 ) -> None:
     """Start the local metrics dashboard (127.0.0.1)."""
-    from lore.dashboard import run_dashboard
+    from haunt.dashboard import run_dashboard
 
-    typer.echo(f"lore dash  http://{host}:{port}  home={lore_home()}")
+    typer.echo(f"haunt dash  http://{host}:{port}  home={haunt_home()}")
     run_dashboard(host=host, port=port)
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def _root(
-    version: bool = typer.Option(False, "--version", help="Print version and exit"),
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False, "--version", help="Print version and exit", is_eager=True
+    ),
 ) -> None:
     if version:
         typer.echo(__version__)
+        raise typer.Exit()
+    if ctx.invoked_subcommand is None and not version:
+        typer.echo(ctx.get_help())
         raise typer.Exit()
 
 

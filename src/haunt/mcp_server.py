@@ -1,4 +1,4 @@
-"""MCP stdio server. Tools are verbatim store/recall — lore never calls an LLM."""
+"""MCP stdio server. Tools are verbatim store/recall — haunt never calls an LLM."""
 
 from __future__ import annotations
 
@@ -8,15 +8,15 @@ from typing import Any, Optional
 
 from mcp.server import MCPServer
 
-from lore.paths import resolve_namespace
-from lore.recall import recall
-from lore.store import Store, list_namespaces
+from haunt.paths import resolve_namespace
+from haunt.recall import recall
+from haunt.store import Store, list_namespaces
 
 server = MCPServer(
-    name="lore",
+    name="haunt",
     version="0.1.0",
     instructions=(
-        "engram (lore) is local-first verbatim agent memory. "
+        "haunt is local-first verbatim agent memory. "
         "Call memory_observe on every user/assistant/tool turn. "
         "Call memory_recall to fetch prior context. Never summarize on write."
     ),
@@ -67,7 +67,7 @@ def memory_observe(
     )
 
 
-@server.tool(description="Hybrid recall over verbatim memories (vec + FTS5 + RRF).")
+@server.tool(description="Hybrid recall over verbatim memories (vec + FTS5 + RRF). Scores are rank-normalized (not relevance probabilities).")
 def memory_recall(
     query: str,
     namespace: Optional[str] = None,
@@ -108,9 +108,9 @@ def memory_timeline(
 
 @server.tool(description="Health and counts for a namespace.")
 def memory_health(namespace: Optional[str] = None) -> str:
-    from lore.bootstrap import probe_sqlite_vec
-    from lore.embed import state as embed_state
-    from lore.paths import lore_home
+    from haunt.bootstrap import probe_sqlite_vec
+    from haunt.embed import state as embed_state
+    from haunt.paths import haunt_home
 
     ns = resolve_namespace(namespace)
     es = embed_state()
@@ -118,7 +118,7 @@ def memory_health(namespace: Optional[str] = None) -> str:
         stats = st.stats()
     return _json(
         {
-            "lore_home": str(lore_home()),
+            "haunt_home": str(haunt_home()),
             "sqlite_vec": probe_sqlite_vec(),
             "embed": {
                 "loaded": es.model_id,
@@ -149,7 +149,6 @@ def memory_session_end(
 
 
 def main() -> None:
-    # stdio MCP: do not print to stdout except protocol messages
     asyncio.run(server.run_stdio_async())
 
 

@@ -1,0 +1,34 @@
+---
+description: haunt local memory — verbatim store/recall
+alwaysApply: true
+---
+
+# haunt
+
+Hooks **store** prompts, replies, and tool calls automatically (verbatim,
+no summarization, no LLM). Recall is **not** automatic — Cursor does not
+inject `additional_context` from `beforeSubmitPrompt` into the model
+(output schema is `{continue, user_message}` only). The `sessionStart`
+hook injects a small worldview/recent-memory block once per session.
+
+- **Recall is your job.** Call `memory_recall` with the user's wording
+  before acting. Do not assume prior context was injected by a hook.
+- **Do not double-observe.** When hooks are active, prompts, responses,
+  and tool calls are already stored. Only call `memory_observe` for
+  genuinely new facts the agent discovers (not for content the hooks
+  already logged).
+- **Scores are rank-based.** `memory_recall` returns RRF
+  (Reciprocal Rank Fusion) scores — rank-normalized, not relevance
+  probabilities. A higher score means a better rank position, not
+  "more relevant." Ignore near-zero scores on off-corpus hits.
+- **Secrets.** Hooks store tool output verbatim. Avoid passing secrets,
+  API keys, or tokens through `memory_observe`. The hook applies a
+  small denylist to redact obvious secret patterns, but it is not
+  exhaustive.
+- **No-hooks environments.** Grok Bot, Claude Code, and Codex do not
+  have Cursor hooks. In those environments you must both observe and
+  recall manually via MCP.
+- Namespace is inferred from the project (`CURSOR_PROJECT_DIR` / git / cwd).
+  Do not invent a different namespace unless the user asks.
+- Hooks skip MCP tools whose names start with `memory_` to avoid recursion.
+- Home dir is `~/.haunt` (`HAUNT_HOME`; `LORE_HOME` / `ENGRAM_HOME` as legacy aliases).

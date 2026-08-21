@@ -1,4 +1,4 @@
-"""Filesystem layout: ~/.lore (or $LORE_HOME). Absolute paths only."""
+"""Filesystem layout: ~/.haunt (or $HAUNT_HOME). Absolute paths only."""
 
 from __future__ import annotations
 
@@ -10,30 +10,42 @@ from pathlib import Path
 SAFE_NS = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
-def lore_home() -> Path:
-    raw = os.environ.get("LORE_HOME") or os.environ.get("ENGRAM_HOME")
+def haunt_home() -> Path:
+    raw = (
+        os.environ.get("HAUNT_HOME")
+        or os.environ.get("LORE_HOME")
+        or os.environ.get("ENGRAM_HOME")
+    )
     if raw:
         return Path(raw).expanduser().resolve()
-    return (Path.home() / ".lore").resolve()
+    default = Path.home() / ".haunt"
+    legacy = Path.home() / ".lore"
+    if not default.exists() and legacy.exists():
+        return legacy.resolve()
+    return default.resolve()
+
+
+# Keep lore_home as an alias for backwards compatibility in internal code
+lore_home = haunt_home
 
 
 def models_dir() -> Path:
-    raw = os.environ.get("LORE_MODEL_CACHE")
+    raw = os.environ.get("HAUNT_MODEL_CACHE") or os.environ.get("LORE_MODEL_CACHE")
     if raw:
         return Path(raw).expanduser().resolve()
-    return lore_home() / "models"
+    return haunt_home() / "models"
 
 
 def registry_path() -> Path:
-    return lore_home() / "registry.db"
+    return haunt_home() / "registry.db"
 
 
 def namespaces_dir() -> Path:
-    return lore_home() / "namespaces"
+    return haunt_home() / "namespaces"
 
 
 def bin_dir() -> Path:
-    return lore_home() / "bin"
+    return haunt_home() / "bin"
 
 
 def namespace_db_path(name: str) -> Path:
@@ -49,7 +61,11 @@ def safe_name(name: str) -> str:
 
 def infer_namespace(cwd: Path | None = None) -> str:
     """Infer a namespace from git remote, repo folder, or cwd name."""
-    env = os.environ.get("LORE_NAMESPACE") or os.environ.get("ENGRAM_NAMESPACE")
+    env = (
+        os.environ.get("HAUNT_NAMESPACE")
+        or os.environ.get("LORE_NAMESPACE")
+        or os.environ.get("ENGRAM_NAMESPACE")
+    )
     if env:
         return safe_name(env)
     if cwd is None:
@@ -93,7 +109,7 @@ def resolve_namespace(name: str | None = None, cwd: Path | None = None) -> str:
 
 
 def ensure_layout() -> Path:
-    home = lore_home()
+    home = haunt_home()
     for p in (home, namespaces_dir(), bin_dir(), models_dir()):
         p.mkdir(parents=True, exist_ok=True)
     return home

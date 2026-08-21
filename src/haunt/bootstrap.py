@@ -7,10 +7,10 @@ import stat
 import sys
 from pathlib import Path
 
-from lore.embed import warmup
-from lore.paths import bin_dir, ensure_layout, lore_home, models_dir
-from lore.store import Store, init_registry, register_namespace, list_namespace_rows, reembed_all_namespaces
-from lore.util import diag, dumps
+from haunt.embed import warmup
+from haunt.paths import bin_dir, ensure_layout, haunt_home, models_dir
+from haunt.store import Store, init_registry, register_namespace, list_namespace_rows, reembed_all_namespaces
+from haunt.util import diag, dumps
 
 
 def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
@@ -18,17 +18,17 @@ def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     python = str(Path(sys.executable).absolute())
     sibling = Path(python).parent / sibling_name
-    home = lore_home()
+    home = haunt_home()
     if sibling.is_file():
         body = (
             "#!/bin/sh\n"
-            f'export LORE_HOME="${{LORE_HOME:-{home}}}"\n'
+            f'export HAUNT_HOME="${{HAUNT_HOME:-{home}}}"\n'
             f'exec "{sibling}" "$@"\n'
         )
     else:
         body = (
             "#!/bin/sh\n"
-            f'export LORE_HOME="${{LORE_HOME:-{home}}}"\n'
+            f'export HAUNT_HOME="${{HAUNT_HOME:-{home}}}"\n'
             f'exec "{python}" -m {module} "$@"\n'
         )
     dest.write_text(body, encoding="utf-8")
@@ -37,15 +37,17 @@ def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
 
 
 def write_hook_launcher() -> Path:
-    """Space-free launcher at ~/.lore/bin/engram-hook (plus lore-hook alias)."""
-    _write_sh_wrapper(bin_dir() / "lore-hook", "lore-hook", "lore.cursor_hook")
-    return _write_sh_wrapper(bin_dir() / "engram-hook", "engram-hook", "lore.cursor_hook")
+    """Space-free launcher at ~/.haunt/bin/haunt-hook (plus legacy aliases)."""
+    _write_sh_wrapper(bin_dir() / "lore-hook", "lore-hook", "haunt.cursor_hook")
+    _write_sh_wrapper(bin_dir() / "engram-hook", "engram-hook", "haunt.cursor_hook")
+    return _write_sh_wrapper(bin_dir() / "haunt-hook", "haunt-hook", "haunt.cursor_hook")
 
 
 def write_launcher() -> Path:
-    """Space-free absolute launchers at ~/.lore/bin/{lore,engram}-{mcp,hook}."""
-    dest = _write_sh_wrapper(bin_dir() / "lore-mcp", "lore-mcp", "lore.mcp_server")
-    _write_sh_wrapper(bin_dir() / "engram-mcp", "engram-mcp", "lore.mcp_server")
+    """Space-free absolute launchers at ~/.haunt/bin/{haunt,lore,engram}-{mcp,hook}."""
+    dest = _write_sh_wrapper(bin_dir() / "haunt-mcp", "haunt-mcp", "haunt.mcp_server")
+    _write_sh_wrapper(bin_dir() / "lore-mcp", "lore-mcp", "haunt.mcp_server")
+    _write_sh_wrapper(bin_dir() / "engram-mcp", "engram-mcp", "haunt.mcp_server")
     write_hook_launcher()
     return dest
 
@@ -84,8 +86,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
     if reembed:
         reembed_report = reembed_all_namespaces()
     else:
-        # rebuild any namespace whose stored dim/model does not match
-        from lore.store import Store as _S
+        from haunt.store import Store as _S
         for row in list_namespace_rows():
             with _S(row["name"], create=False) as st:
                 changed = st.ensure_current_embeddings()
@@ -93,8 +94,9 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                     changed["namespace"] = row["name"]
                     changed["auto"] = True
                     reembed_report.append(changed)
-    hook_launcher = bin_dir() / "engram-hook"
+    hook_launcher = bin_dir() / "haunt-hook"
     report = {
+        "haunt_home": str(home),
         "lore_home": str(home),
         "launcher": str(launcher.resolve()),
         "hook_launcher": str(hook_launcher.resolve()),
@@ -116,13 +118,14 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
         "backend": getattr(embed_state, "backend", None),
         "download_bytes": getattr(embed_state, "download_bytes", None),
     }
-    diag("bootstrap", **{k: report[k] for k in ("lore_home", "launcher")})
+    diag("bootstrap", **{k: report[k] for k in ("haunt_home", "launcher")})
     return report
 
 
 def format_report(report: dict) -> str:
+    home = report.get('haunt_home') or report.get('lore_home', '')
     lines = [
-        f"lore home     {report['lore_home']}",
+        f"haunt home    {home}",
         f"launcher      {report['launcher']}",
         f"hook          {report.get('hook_launcher', '')}",
         f"python        {report['python']}",
@@ -142,6 +145,6 @@ def format_report(report: dict) -> str:
             f"reembed       ns={row.get('namespace')} updated={row.get('updated')}/"
             f"{row.get('total')} dim={row.get('dim')} model={row.get('model')}"
         )
-    if os.environ.get("LORE_JSON"):
+    if os.environ.get("HAUNT_JSON") or os.environ.get("LORE_JSON"):
         return dumps(report)
     return "\n".join(lines)

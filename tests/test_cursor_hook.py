@@ -7,25 +7,27 @@ from pathlib import Path
 
 import pytest
 
-from lore.store import Store
+from haunt.store import Store
 
 
 @pytest.fixture
 def fts_hook_env(tmp_path, monkeypatch):
-    """Isolated LORE_HOME, FTS-only — never download BGE-M3."""
-    home = tmp_path / "lorehome"
+    """Isolated HAUNT_HOME, FTS-only — never download BGE-M3."""
+    home = tmp_path / "haunthome"
     project = tmp_path / "myproj"
     project.mkdir()
-    monkeypatch.setenv("LORE_HOME", str(home))
-    monkeypatch.setenv("LORE_FTS_ONLY", "1")
-    monkeypatch.setenv("LORE_EMBED_MODEL", "off")
-    monkeypatch.setenv("LORE_NAMESPACE", "hooktest")
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    monkeypatch.setenv("HAUNT_NAMESPACE", "hooktest")
+    monkeypatch.delenv("LORE_HOME", raising=False)
+    monkeypatch.delenv("LORE_NAMESPACE", raising=False)
     monkeypatch.delenv("ENGRAM_NAMESPACE", raising=False)
     monkeypatch.delenv("ENGRAM_HOME", raising=False)
     monkeypatch.delenv("CURSOR_PROJECT_DIR", raising=False)
-    from lore import embed
-    from lore.paths import ensure_layout
-    from lore.store import init_registry
+    from haunt import embed
+    from haunt.paths import ensure_layout
+    from haunt.store import init_registry
 
     embed.reset()
     ensure_layout()
@@ -35,7 +37,7 @@ def fts_hook_env(tmp_path, monkeypatch):
 
 
 def _run_hook(payload: dict, capsys, monkeypatch) -> dict:
-    from lore.cursor_hook import main
+    from haunt.cursor_hook import main
 
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     with pytest.raises(SystemExit) as exc:
@@ -70,7 +72,7 @@ def test_before_submit_prompt_stores_verbatim_and_recalls(fts_hook_env, capsys, 
 
 def test_post_tool_use_stores_verbatim(fts_hook_env, capsys, monkeypatch):
     project = fts_hook_env["project"]
-    tool_input = {"path": "src/lore/store.py", "offset": 1}
+    tool_input = {"path": "src/haunt/store.py", "offset": 1}
     tool_output = "def init_schema(conn):\n    conn.execute('create table events')"
     payload = {
         "hook_event_name": "postToolUse",
@@ -83,7 +85,7 @@ def test_post_tool_use_stores_verbatim(fts_hook_env, capsys, monkeypatch):
     }
     out = _run_hook(payload, capsys, monkeypatch)
     assert out == {} or isinstance(out, dict)
-    json.dumps(out)  # stdout JSON is valid
+    json.dumps(out)
     with Store("hooktest") as st:
         rows = st.events(session_id="conv-hook-2")
         assert rows, "expected a stored tool event"
@@ -91,7 +93,7 @@ def test_post_tool_use_stores_verbatim(fts_hook_env, capsys, monkeypatch):
         assert row["role"] == "tool"
         assert row["tier"] == "procedural"
         assert row["tool_name"] == "Read"
-        assert "src/lore/store.py" in (row["tool_input"] or "")
+        assert "src/haunt/store.py" in (row["tool_input"] or "")
         assert "init_schema" in (row["tool_output"] or "")
         mem = st.conn.execute("SELECT content FROM memories").fetchone()
         assert mem and "init_schema" in mem["content"]
@@ -113,7 +115,7 @@ def test_infer_event_without_hook_event_name(fts_hook_env, capsys, monkeypatch):
 
 
 def test_fail_open_invalid_json(fts_hook_env, capsys, monkeypatch):
-    from lore.cursor_hook import main
+    from haunt.cursor_hook import main
 
     monkeypatch.setattr(sys, "stdin", io.StringIO("not-json{"))
     with pytest.raises(SystemExit) as exc:
@@ -139,7 +141,7 @@ def test_cursor_install_merges_without_clobber(fts_hook_env, tmp_path, monkeypat
         encoding="utf-8",
     )
     monkeypatch.setenv("CURSOR_HOME", str(cursor_home))
-    from lore.cursor_hook import install_cursor_hooks
+    from haunt.cursor_hook import install_cursor_hooks
 
     report = install_cursor_hooks()
     data = json.loads(Path(report["hooks_json"]).read_text(encoding="utf-8"))
@@ -147,7 +149,7 @@ def test_cursor_install_merges_without_clobber(fts_hook_env, tmp_path, monkeypat
     assert data["hooks"]["afterFileEdit"] == [{"command": "./hooks/format.sh"}]
     prompts = data["hooks"]["beforeSubmitPrompt"]
     assert any("audit.sh" in c["command"] for c in prompts)
-    assert any("engram-hook" in c["command"] for c in prompts)
+    assert any("haunt-hook" in c["command"] for c in prompts)
     assert Path(report["launcher"]).is_file()
     for event in (
         "afterAgentResponse",
@@ -157,7 +159,7 @@ def test_cursor_install_merges_without_clobber(fts_hook_env, tmp_path, monkeypat
         "sessionStart",
         "sessionEnd",
     ):
-        assert any("engram-hook" in c["command"] for c in data["hooks"][event])
+        assert any("haunt-hook" in c["command"] for c in data["hooks"][event])
 
 
 def test_skips_memory_mcp_tools(fts_hook_env, capsys, monkeypatch):
@@ -173,3 +175,56 @@ def test_skips_memory_mcp_tools(fts_hook_env, capsys, monkeypatch):
     _run_hook(payload, capsys, monkeypatch)
     with Store("hooktest") as st:
         assert st.events() == []
+
+
+def test_secret_redaction_in_tool_output(fts_hook_env, capsys, monkeypatch):
+    project = fts_hook_env["project"]
+    payload = {
+        "hook_event_name": "postToolUse",
+        "tool_name": "Read",
+        "tool_input": '{"path": "config/.env"}',
+        "tool_output": (
+            "API_KEY=sk-live-abc123XYZ456def789ghi012jkl\n"
+            "DB_HOST=localhost\n"
+            "GITHUB_TOKEN=ghp_aAbBcCdDfFeEgGhHiIjJkKlLmMnNoOpPqQrRsS01\n"
+            "AWS_KEY=AKIAIOSFODNN7EXAMPLE\n"
+        ),
+        "conversation_id": "conv-secret",
+        "workspace_roots": [str(project)],
+    }
+    _run_hook(payload, capsys, monkeypatch)
+    with Store("hooktest") as st:
+        rows = st.events(session_id="conv-secret")
+        assert rows, "expected a stored tool event"
+        output = rows[0]["tool_output"] or ""
+        assert "sk-live-abc123" not in output
+        assert "ghp_aAbBcCdDfF" not in output
+        assert "AKIAIOSFODNN7EXAMPLE" not in output
+        assert "DB_HOST" in output or "localhost" in output
+        assert "[REDACTED]" in output
+
+
+def test_secret_redaction_in_tool_input(fts_hook_env, capsys, monkeypatch):
+    """Secrets in tool_input (e.g. shell commands with auth headers) must be redacted."""
+    project = fts_hook_env["project"]
+    secret_cmd = (
+        'curl -H "Authorization: Bearer sk-live-abc123XYZ456def789ghi012jkl" '
+        "https://api.stripe.com/v1/charges"
+    )
+    payload = {
+        "hook_event_name": "afterShellExecution",
+        "command": secret_cmd,
+        "output": '{"id": "ch_123", "amount": 5000}',
+        "conversation_id": "conv-input-secret",
+        "workspace_roots": [str(project)],
+    }
+    _run_hook(payload, capsys, monkeypatch)
+    with Store("hooktest") as st:
+        rows = st.events(session_id="conv-input-secret")
+        assert rows, "expected a stored shell event"
+        stored_input = rows[0]["tool_input"] or ""
+        assert "sk-live-abc123" not in stored_input
+        assert "[REDACTED]" in stored_input
+        assert "api.stripe.com" in stored_input
+        mem = st.conn.execute("SELECT content FROM memories").fetchone()
+        assert mem and "sk-live-abc123" not in mem["content"]
