@@ -12,8 +12,8 @@ from starlette.routing import Route
 
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
-from haunt.recall import recall
-from haunt.store import Store, list_namespaces, namespace_exists
+from haunt.recall import recall, Hit, RRF_K
+from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
 
 # ---------------------------------------------------------------------------
 # HTML: single-file memory management console
@@ -123,6 +123,10 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
 .tab-content{display:none;} .tab-content.on{display:block;}
 
 .page-nav{display:flex;gap:8px;padding:8px 12px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--mut);}
+.ns-badge{font-family:var(--mono);font-size:10px;padding:1px 5px;border-radius:3px;background:#1a2030;border:1px solid var(--line);color:var(--acc2);}
+.persistent-health{border-bottom:1px solid var(--line);background:var(--panel);padding:0;}
+.persistent-health .health-strip{padding:6px 12px;}
+.ns.all-ns{color:var(--acc2);font-style:italic;}
 
 @media(max-width:1100px){
   #app{grid-template-columns:1fr;}
@@ -148,6 +152,9 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
     <button class="nav-btn" data-view="health" onclick="switchView('health')">health</button>
   </aside>
   <main>
+    <div class="persistent-health" id="persistentHealth">
+      <div class="health-strip" id="healthStripGlobal"></div>
+    </div>
     <header class="top">
       <h1 id="title">—</h1>
       <div class="pills" id="pills"></div>
@@ -260,7 +267,7 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
 
 <script>
 const $=id=>document.getElementById(id);
-let NS=null, DETAIL_MID=null, BROWSE_PAGE=0;
+let NS=null, DETAIL_MID=null, DETAIL_NS=null, BROWSE_PAGE=0, ALL_NS=false;
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmtBytes(n){if(n<1024)return n+" B";if(n<1048576)return(n/1024).toFixed(1)+" KB";return(n/1048576).toFixed(2)+" MB";}
@@ -274,6 +281,10 @@ function switchView(v){
   document.querySelectorAll('.nav-btn').forEach(el=>el.classList.remove('on'));
   $('view-'+v).classList.add('on');
   document.querySelector(`.nav-btn[data-view="${v}"]`).classList.add('on');
+  if(ALL_NS && v!=='search' && v!=='overview'){
+    $('view-'+v).innerHTML='<div class="empty">pick a namespace to use this view</div>';
+    return;
+  }
   if(v==='browse')doBrowse(0);
   if(v==='procedures')loadProcedures();
   if(v==='worldview')loadWorldview();
@@ -291,8 +302,48 @@ function setPills(h){
 }
 
 function renderNs(list,current){
-  $("nsList").innerHTML=list.map(n=>`<div class="ns ${n.name===current?'on':''}" data-ns="${n.name}"><b>${esc(n.name)}</b><i>${n.events}</i></div>`).join("")||`<div class="empty">none</div>`;
-  $("nsList").querySelectorAll(".ns").forEach(el=>{el.onclick=()=>loadNs(el.dataset.ns);});
+  const allOn=ALL_NS;
+  let html=`<div class="ns all-ns ${allOn?'on':''}" data-ns="__all__"><b>all namespaces</b><i>${list.reduce((s,n)=>s+(n.events||0),0)}</i></div>`;
+  html+=list.map(n=>`<div class="ns ${!allOn&&n.name===current?'on':''}" data-ns="${esc(n.name)}"><b>${esc(n.name)}</b><i>${n.events}</i></div>`).join("");
+  $("nsList").innerHTML=html||`<div class="empty">none</div>`;
+  $("nsList").querySelectorAll(".ns").forEach(el=>{
+    el.onclick=()=>{
+      if(el.dataset.ns==='__all__') selectAllNs();
+      else loadNs(el.dataset.ns);
+    };
+  });
+}
+
+function renderHealthGlobal(h,stats){
+  const e=h.embed||{},v=h.sqlite_vec||{};
+  let lastWrite=stats.last_write;
+  let age="unknown";
+  if(lastWrite){
+    const ms=Date.now()-new Date(lastWrite).getTime();
+    if(ms<60000)age=Math.round(ms/1000)+"s ago";
+    else if(ms<3600000)age=Math.round(ms/60000)+"m ago";
+    else if(ms<86400000)age=Math.round(ms/3600000)+"h ago";
+    else age=Math.round(ms/86400000)+"d ago";
+  }
+  let items;
+  if(ALL_NS){
+    items=[
+      `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?v.version:'off'}</div>`,
+      `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${e.loaded||'none'} ${e.dim||0}d</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>${stats.namespace_count||0} namespaces</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>${stats.haunt_home||''}</div>`,
+    ];
+  }else{
+    items=[
+      `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?v.version:'off'}</div>`,
+      `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${e.loaded||'none'} ${e.dim||0}d</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>ns: ${esc(stats.namespace||NS)}</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>${fmtBytes(stats.db_size_bytes||0)}</div>`,
+      `<div class="health-item"><span class="pulse ${lastWrite?'ok':'warn'}"></span>write ${age}</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>${stats.events||0} events</div>`,
+    ];
+  }
+  $("healthStripGlobal").innerHTML=items.join("");
 }
 
 function statCards(s){
@@ -326,6 +377,7 @@ function renderHealthStrip(h,stats){
     `<div class="health-item"><span class="pulse ok"></span>${stats.events||0} events</div>`,
     `<div class="health-item"><span class="pulse ok"></span>${stats.db_path||''}</div>`,
   ].join("");
+  renderHealthGlobal(h,stats);
 }
 
 function eventsTable(rows){
@@ -340,13 +392,15 @@ function eventsTable(rows){
 
 function hitsTable(hits){
   if(!hits.length){$("hits").innerHTML='<div class="empty">no hits</div>';return;}
-  $("hits").innerHTML=`<table><thead><tr><th>#</th><th>score</th><th>tier</th><th>memory_id</th><th>snippet</th><th></th></tr></thead><tbody>`+
-    hits.map((h,i)=>`<tr>
+  $("hits").innerHTML=`<table><thead><tr><th>#</th><th>score</th><th>tier</th><th>origin</th>${ALL_NS?'<th>namespace</th>':''}<th>memory_id</th><th>snippet</th><th></th></tr></thead><tbody>`+
+    hits.map((h,i)=>`<tr class="clickable" onclick="openDetail('${esc(h.memory_id)}','${esc(h.namespace||NS)}')">
       <td>${i+1}</td><td>${(h.score||0).toFixed(4)}</td>
       <td class="${tierCls(h.tier)}">${h.tier}</td>
+      <td style="font-size:11px;color:var(--mut)">${h.origin||''}</td>
+      ${ALL_NS?`<td><span class="ns-badge">${esc(h.namespace||'')}</span></td>`:''}
       <td style="font-size:11px;color:var(--mut)">${(h.memory_id||"").slice(0,12)}</td>
       <td class="snip">${esc(snip(h.content||h.snippet||"",200))}</td>
-      <td><button style="font-size:11px;padding:2px 8px" onclick="openDetail('${esc(h.memory_id)}')">detail</button></td>
+      <td><button style="font-size:11px;padding:2px 8px" onclick="event.stopPropagation();openDetail('${esc(h.memory_id)}','${esc(h.namespace||NS)}')">detail</button></td>
     </tr>`).join("")+"</tbody></table>";
 }
 
@@ -359,13 +413,15 @@ async function openEventMemory(eventId){
   if(!NS)return;
   const data=await j(`/api/namespace/${encodeURIComponent(NS)}/event/${encodeURIComponent(eventId)}/memories`);
   const mems=data.memories||[];
-  if(mems.length>0)openDetail(mems[0]);
+  if(mems.length>0)openDetail(mems[0],NS);
   else alert("No memories for this event");
 }
 
-async function openDetail(memId){
+async function openDetail(memId,ns){
+  ns=ns||NS;
   DETAIL_MID=memId;
-  const d=await j(`/api/namespace/${encodeURIComponent(NS)}/memory/${encodeURIComponent(memId)}`);
+  DETAIL_NS=ns;
+  const d=await j(`/api/namespace/${encodeURIComponent(ns)}/memory/${encodeURIComponent(memId)}`);
   const dp=$("detailPanel");
   dp.classList.add('open');
   const rows=[
@@ -390,7 +446,7 @@ async function openDetail(memId){
   if(d.related_memories&&d.related_memories.length){
     html+=`<h2 class="section" style="margin-top:12px;">related memories (same session)</h2>`;
     html+=`<table><thead><tr><th>id</th><th>tier</th><th>snippet</th></tr></thead><tbody>`;
-    html+=d.related_memories.map(r=>`<tr class="clickable" onclick="openDetail('${esc(r.memory_id)}')">
+    html+=d.related_memories.map(r=>`<tr class="clickable" onclick="openDetail('${esc(r.memory_id)}','${esc(ns)}')">
       <td style="font-size:11px">${(r.memory_id||"").slice(0,12)}</td>
       <td class="${tierCls(r.tier)}">${r.tier}</td>
       <td class="snip">${esc(snip(r.content||"",160))}</td>
@@ -398,9 +454,10 @@ async function openDetail(memId){
     html+="</tbody></table>";
   }
   $("detailBody").innerHTML=html;
+  dp.scrollIntoView({behavior:'smooth',block:'start'});
 }
 
-function closeDetail(){$("detailPanel").classList.remove('open');DETAIL_MID=null;}
+function closeDetail(){$("detailPanel").classList.remove('open');DETAIL_MID=null;DETAIL_NS=null;}
 
 function confirmPurge(){
   if(!DETAIL_MID)return;
@@ -410,12 +467,14 @@ function confirmPurge(){
 function closeModal(){$("confirmModal").classList.remove('open');}
 
 async function doPurge(){
-  if(!DETAIL_MID||!NS)return;
+  if(!DETAIL_MID)return;
+  const ns=DETAIL_NS||NS;
+  if(!ns)return;
   closeModal();
-  const r=await j(`/api/namespace/${encodeURIComponent(NS)}/memory/${encodeURIComponent(DETAIL_MID)}`,{method:'DELETE'});
+  const r=await j(`/api/namespace/${encodeURIComponent(ns)}/memory/${encodeURIComponent(DETAIL_MID)}`,{method:'DELETE'});
   if(r.ok){
     closeDetail();
-    loadNs(NS);
+    if(!ALL_NS)loadNs(NS);
     if($('view-browse').classList.contains('on'))doBrowse(BROWSE_PAGE);
   }else{
     alert("Delete failed: "+(r.error||"unknown error"));
@@ -423,7 +482,7 @@ async function doPurge(){
 }
 
 async function doBrowse(page){
-  if(!NS)return;
+  if(!NS||ALL_NS)return;
   BROWSE_PAGE=page;
   const limit=50;
   const params=new URLSearchParams({limit,offset:page*limit});
@@ -436,13 +495,13 @@ async function doBrowse(page){
   const mems=data.memories||[];
   if(!mems.length){$("browseResults").innerHTML='<div class="empty">no memories match</div>';$("browseNav").innerHTML="";return;}
   $("browseResults").innerHTML=`<table><thead><tr><th>created</th><th>tier</th><th>role</th><th>origin</th><th>session</th><th>snippet</th><th></th></tr></thead><tbody>`+
-    mems.map(m=>`<tr>
+    mems.map(m=>`<tr class="clickable" onclick="openDetail('${esc(m.memory_id)}','${esc(NS)}')">
       <td>${fmtTime(m.created_at)}</td>
       <td class="${tierCls(m.tier)}">${m.tier}</td>
       <td>${m.role||""}</td><td>${m.origin||""}</td>
       <td style="font-size:11px;color:var(--mut)">${(m.session_id||"").slice(0,8)}</td>
       <td class="snip">${esc(snip(m.content||"",160))}</td>
-      <td><button style="font-size:11px;padding:2px 8px" onclick="openDetail('${esc(m.memory_id)}')">detail</button></td>
+      <td><button style="font-size:11px;padding:2px 8px" onclick="event.stopPropagation();openDetail('${esc(m.memory_id)}','${esc(NS)}')">detail</button></td>
     </tr>`).join("")+"</tbody></table>";
   const total=data.total||0;
   const pages=Math.ceil(total/limit);
@@ -453,12 +512,12 @@ async function doBrowse(page){
 }
 
 async function loadProcedures(){
-  if(!NS)return;
+  if(!NS||ALL_NS)return;
   const data=await j(`/api/namespace/${encodeURIComponent(NS)}/procedures`);
   const procs=data.procedures||[];
   if(!procs.length){$("procList").innerHTML='<div class="empty">no procedures</div>';return;}
   $("procList").innerHTML=`<table><thead><tr><th>name</th><th>trigger</th><th>id</th><th>body</th></tr></thead><tbody>`+
-    procs.map(p=>`<tr class="clickable" onclick="openDetail('${esc(p.id)}')">
+    procs.map(p=>`<tr class="clickable" onclick="openDetail('${esc(p.id)}','${esc(NS)}')">
       <td>${esc(p.name)}</td><td>${esc(p.trigger||"")}</td>
       <td style="font-size:11px;color:var(--mut)">${(p.id||"").slice(0,12)}</td>
       <td class="snip">${esc(snip(p.body||"",200))}</td>
@@ -466,7 +525,7 @@ async function loadProcedures(){
 }
 
 async function loadWorldview(){
-  if(!NS)return;
+  if(!NS||ALL_NS)return;
   const data=await j(`/api/namespace/${encodeURIComponent(NS)}/worldview`);
   const facts=data.facts||[];
   $("wvFacts").innerHTML=facts.length?facts.map(f=>`<div class="ent"><span>${esc(snip(f.content,200))}</span><span class="ty">${(f.id||"").slice(0,8)}</span></div>`).join(""):'<div class="empty">no semantic facts</div>';
@@ -477,7 +536,7 @@ async function loadWorldview(){
 }
 
 async function loadHealth(){
-  if(!NS)return;
+  if(!NS||ALL_NS)return;
   const data=await j(`/api/namespace/${encodeURIComponent(NS)}/health`);
   const items=[
     ["haunt_home",data.haunt_home],
@@ -500,25 +559,52 @@ async function loadHealth(){
 }
 
 async function doRecall(){
-  const q=$("q").value.trim();if(!q||!NS)return;
+  const q=$("q").value.trim();if(!q)return;
+  if(!ALL_NS&&!NS)return;
   $("recallMeta").textContent="…";
   const tier=$("sTier").value;
-  let url=`/api/namespace/${encodeURIComponent(NS)}/recall?q=${encodeURIComponent(q)}`;
-  if(tier)url+=`&tier=${encodeURIComponent(tier)}`;
-  const data=await j(url);
-  $("recallMeta").textContent=(data.hits||[]).length+" hits";
+  let url,data;
+  if(ALL_NS){
+    url=`/api/recall?q=${encodeURIComponent(q)}`;
+    if(tier)url+=`&tier=${encodeURIComponent(tier)}`;
+    data=await j(url);
+  }else{
+    url=`/api/namespace/${encodeURIComponent(NS)}/recall?q=${encodeURIComponent(q)}`;
+    if(tier)url+=`&tier=${encodeURIComponent(tier)}`;
+    data=await j(url);
+  }
+  $("recallMeta").textContent=(data.hits||[]).length+" hits"+(ALL_NS?" (all namespaces)":"");
   hitsTable(data.hits||[]);
 }
 
 $("go").onclick=doRecall;
 $("q").addEventListener("keydown",e=>{if(e.key==="Enter")doRecall();});
 
+async function selectAllNs(){
+  ALL_NS=true;
+  NS=null;
+  $("title").textContent="all namespaces";
+  const boot=await j("/api/namespaces");
+  renderNs(boot.namespaces||[],null);
+  const h=_health_cache||{};
+  renderHealthGlobal(h,{namespace_count:(boot.namespaces||[]).length,haunt_home:boot.haunt_home||''});
+  $("stats").innerHTML='<div class="empty">pick a namespace for overview stats</div>';
+  $("events").innerHTML='<div class="empty">pick a namespace</div>';
+  $("ents").innerHTML='<div class="empty">pick a namespace</div>';
+  $("healthStrip").innerHTML='';
+  $("healthAge").textContent='';
+  switchView('search');
+}
+let _health_cache={};
+
 async function loadNs(name){
+  ALL_NS=false;
   NS=name;
   const data=await j("/api/namespace/"+encodeURIComponent(name));
   $("title").textContent=name;
   $("home").textContent=data.haunt_home||"";
   setPills(data.health||{});
+  _health_cache=data.health||{};
   renderNs(data.namespaces||[],name);
   statCards(data.stats||{});
   eventsTable(data.events||[]);
@@ -534,10 +620,16 @@ async function loadNs(name){
 })();
 
 setInterval(async()=>{
-  if(!NS)return;
   try{
-    const data=await j(`/api/namespace/${encodeURIComponent(NS)}/health`);
-    renderHealthStrip({embed:data.embed,sqlite_vec:data.sqlite_vec},data.stats||{});
+    if(ALL_NS){
+      const boot=await j("/api/namespaces");
+      const h=_health_cache.embed?_health_cache:{embed:{},sqlite_vec:{}};
+      renderHealthGlobal(h,{namespace_count:(boot.namespaces||[]).length,haunt_home:boot.haunt_home||''});
+    }else if(NS){
+      const data=await j(`/api/namespace/${encodeURIComponent(NS)}/health`);
+      _health_cache={embed:data.embed,sqlite_vec:data.sqlite_vec};
+      renderHealthStrip({embed:data.embed,sqlite_vec:data.sqlite_vec},data.stats||{});
+    }
   }catch(e){}
 },15000);
 </script>
@@ -596,6 +688,47 @@ async def api_namespace(request: Request) -> JSONResponse:
     )
 
 
+async def api_recall_all(request: Request) -> JSONResponse:
+    """Cross-namespace recall: fan out to every registered namespace, merge via RRF."""
+    q = request.query_params.get("q") or ""
+    if not q.strip():
+        return JSONResponse({"query": q, "hits": []})
+    k = int(request.query_params.get("k") or 10)
+    tier = request.query_params.get("tier") or None
+
+    ns_rows = list_namespace_rows()
+    all_hits: list[tuple[Hit, str]] = []
+    for row in ns_rows:
+        ns_name = row["name"]
+        try:
+            with Store(ns_name, create=False) as st:
+                if st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0:
+                    continue
+                hits = recall(q, namespace=ns_name, k=k, tier=tier, store=st)
+                for h in hits:
+                    all_hits.append((h, ns_name))
+        except (FileNotFoundError, Exception):
+            continue
+
+    rrf: dict[str, float] = {}
+    hit_map: dict[str, tuple[Hit, str]] = {}
+    for h, ns_name in all_hits:
+        key = f"{ns_name}:{h.memory_id}"
+        hit_map[key] = (h, ns_name)
+        rrf[key] = h.score
+
+    ranked = sorted(rrf.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    results = []
+    for key, score in ranked:
+        h, ns_name = hit_map[key]
+        d = h.as_dict()
+        d["namespace"] = ns_name
+        d["score"] = round(score, 6)
+        results.append(d)
+
+    return JSONResponse({"query": q, "hits": results})
+
+
 async def api_recall(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
     q = request.query_params.get("q") or ""
@@ -603,7 +736,12 @@ async def api_recall(request: Request) -> JSONResponse:
     tier = request.query_params.get("tier") or None
     with Store(name) as st:
         hits = recall(q, namespace=name, k=k, tier=tier, store=st)
-    return JSONResponse({"query": q, "hits": [h.as_dict() for h in hits]})
+    results = []
+    for h in hits:
+        d = h.as_dict()
+        d["namespace"] = name
+        results.append(d)
+    return JSONResponse({"query": q, "hits": results})
 
 
 async def api_browse(request: Request) -> JSONResponse:
@@ -681,6 +819,7 @@ async def api_health(request: Request) -> JSONResponse:
 routes = [
     Route("/", index),
     Route("/api/namespaces", api_namespaces),
+    Route("/api/recall", api_recall_all),
     Route("/api/namespace/{name}", api_namespace),
     Route("/api/namespace/{name}/recall", api_recall),
     Route("/api/namespace/{name}/browse", api_browse),
