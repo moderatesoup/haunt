@@ -17,7 +17,6 @@ from haunt.util import snippet
 
 app = typer.Typer(
     add_completion=False,
-    no_args_is_help=True,
     help="haunt — local-first verbatim memory for AI agents",
 )
 
@@ -252,12 +251,18 @@ def dash_cmd(
     run_dashboard(host=host, port=port)
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def _root(
-    version: bool = typer.Option(False, "--version", help="Print version and exit"),
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False, "--version", help="Print version and exit", is_eager=True
+    ),
 ) -> None:
     if version:
         typer.echo(__version__)
+        raise typer.Exit()
+    if ctx.invoked_subcommand is None and not version:
+        typer.echo(ctx.get_help())
         raise typer.Exit()
 
 
