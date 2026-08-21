@@ -289,9 +289,34 @@ def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def format_worldview_card(wv: dict[str, Any]) -> str:
+    """Render a worldview dict as a compact text card for additional_context."""
+    lines = [f"[haunt worldview ns={wv['namespace']}]"]
+    counts = wv.get("counts", {})
+    lines.append(
+        f"events={counts.get('events', 0)} memories={counts.get('memories', 0)} "
+        f"sessions={counts.get('sessions', 0)}"
+    )
+    facts = wv.get("facts", [])
+    if facts:
+        lines.append(f"facts ({len(facts)}):")
+        for f in facts[:12]:
+            lines.append(f"  {snippet(f.get('content', ''), 140)}")
+    names = wv.get("names", [])
+    if names:
+        lines.append(f"entities ({len(names)}):")
+        for n in names[:12]:
+            lines.append(f"  {n['name']} ({n['type']})")
+    procs = wv.get("procedures", [])
+    if procs:
+        lines.append(f"procedures ({len(procs)}):")
+        for p in procs:
+            trigger = f" — when: {p['trigger']}" if p.get("trigger") else ""
+            lines.append(f"  {p['name']}{trigger}")
+    return "\n".join(lines)
+
+
 def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dict[str, Any]:
-    rows = store.events(limit=5)
-    recent = format_timeline_block(rows, ns)
     _observe(
         store,
         payload,
@@ -299,14 +324,18 @@ def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dic
         role="system",
         tier="coordinate",
     )
+    wv = store.worldview()
+    card = format_worldview_card(wv)
     intro = (
-        "You have persistent local memory via haunt (MCP tools "
-        "memory_recall / memory_observe). Hooks LOG turns automatically — "
-        "do not re-observe what hooks already stored. Recall is NOT "
-        "automatic: call memory_recall with the user's wording before "
-        f"acting. Namespace: {ns}."
+        "You have persistent local memory via haunt (MCP server haunt). "
+        "Hooks store turns automatically — do not double-observe what hooks already log. "
+        "Hooks do NOT inject recall into your context on beforeSubmitPrompt "
+        "(additional_context there is unproven). You MUST call memory_recall "
+        "with the user's wording yourself unless a [haunt ns=…] block is "
+        "already visible in this context. "
+        f"Namespace: {ns}."
     )
-    return {"additional_context": f"{intro}\n\n{recent}"}
+    return {"additional_context": f"{intro}\n\n{card}"}
 
 
 def _handle_session_end(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
@@ -390,8 +419,32 @@ def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
     return existing
 
 
+def _install_rule_file() -> Path | None:
+    """Copy haunt.mdc into .cursor/rules/ (user-level or project-level)."""
+    import importlib.resources
+
+    try:
+        src = Path(__file__).resolve().parent.parent.parent / "contrib" / "cursor" / "haunt.mdc"
+        if not src.exists():
+            ref = importlib.resources.files("haunt").joinpath("../../../contrib/cursor/haunt.mdc")
+            src = Path(str(ref))
+        if not src.exists():
+            return None
+    except Exception:
+        return None
+
+    rules_dir = cursor_dir() / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    dest = rules_dir / "haunt.mdc"
+    dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    old = rules_dir / "engram.mdc"
+    if old.exists():
+        old.unlink()
+    return dest
+
+
 def install_cursor_hooks() -> dict[str, Any]:
-    """Write ~/.haunt/bin/haunt-hook and merge ~/.cursor/hooks.json."""
+    """Write ~/.haunt/bin/haunt-hook, merge ~/.cursor/hooks.json, install rule."""
     from haunt.bootstrap import write_hook_launcher, write_launcher
     from haunt.paths import ensure_layout
 
@@ -401,12 +454,14 @@ def install_cursor_hooks() -> dict[str, Any]:
     hooks_path = cursor_hooks_json()
     command = str(launcher)
     merge_hooks_json(hooks_path, command)
+    rule_path = _install_rule_file()
     return {
         "haunt_home": str(home),
         "lore_home": str(home),
         "launcher": command,
         "hooks_json": str(hooks_path),
         "events": list(HOOK_EVENTS),
+        "rule": str(rule_path) if rule_path else None,
     }
 
 

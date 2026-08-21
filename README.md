@@ -58,10 +58,11 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 |---|---|
 | `beforeSubmitPrompt` | observe user prompt, recall k=8 (results returned but Cursor ignores `additional_context`) |
 | `afterAgentResponse` | observe assistant text |
+| `afterAgentThought` | skipped by default (`HAUNT_STORE_THOUGHTS=1` to store as system/coordinate) |
 | `postToolUse` | observe tool_name + input + output |
 | `afterShellExecution` | observe command + output |
 | `afterMCPExecution` | observe MCP call (skips `memory_*` to avoid recursion) |
-| `sessionStart` | session-open event + last 5 memories + MCP reminder |
+| `sessionStart` | session-open coordinate event + worldview card (`additional_context`) |
 | `sessionEnd` | close session; no summary |
 
 ## CLI
@@ -75,6 +76,10 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 | `haunt timeline` | events by `event_time` |
 | `haunt namespaces` | list + counts |
 | `haunt health [-n NAMESPACE]` | vec / embed / counts / db path |
+| `haunt worldview [-n NAMESPACE]` | compact namespace briefing: facts, entities, procedures |
+| `haunt procedure write NAME --body BODY` | store a named procedure |
+| `haunt procedure get NAME` | retrieve a named procedure |
+| `haunt procedure list` | list all active procedures |
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
 | `haunt dash [--port 7340]` | local dashboard (127.0.0.1) |
 | `haunt cursor-install` | merge Cursor user hooks |
@@ -93,7 +98,7 @@ After bootstrap, configure your MCP client:
 }
 ```
 
-Tools: `memory_observe`, `memory_recall`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`.
+Tools: `memory_observe`, `memory_recall`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`.
 
 ## Environment variables
 

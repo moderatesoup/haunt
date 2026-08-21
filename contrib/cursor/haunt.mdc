@@ -1,34 +1,78 @@
 ---
-description: haunt local memory — verbatim store/recall
+description: haunt local memory — hooks store, agents must recall
 alwaysApply: true
 ---
 
 # haunt
 
-Hooks **store** prompts, replies, and tool calls automatically (verbatim,
-no summarization, no LLM). Recall is **not** automatic — Cursor does not
-inject `additional_context` from `beforeSubmitPrompt` into the model
-(output schema is `{continue, user_message}` only). The `sessionStart`
-hook injects a small worldview/recent-memory block once per session.
+Local-first verbatim memory. MCP server name is `haunt`; tools are
+prefixed `memory_`.
 
-- **Recall is your job.** Call `memory_recall` with the user's wording
-  before acting. Do not assume prior context was injected by a hook.
-- **Do not double-observe.** When hooks are active, prompts, responses,
-  and tool calls are already stored. Only call `memory_observe` for
-  genuinely new facts the agent discovers (not for content the hooks
-  already logged).
-- **Scores are rank-based.** `memory_recall` returns RRF
-  (Reciprocal Rank Fusion) scores — rank-normalized, not relevance
-  probabilities. A higher score means a better rank position, not
-  "more relevant." Ignore near-zero scores on off-corpus hits.
-- **Secrets.** Hooks store tool output verbatim. Avoid passing secrets,
-  API keys, or tokens through `memory_observe`. The hook applies a
-  small denylist to redact obvious secret patterns, but it is not
-  exhaustive.
-- **No-hooks environments.** Grok Bot, Claude Code, and Codex do not
-  have Cursor hooks. In those environments you must both observe and
-  recall manually via MCP.
-- Namespace is inferred from the project (`CURSOR_PROJECT_DIR` / git / cwd).
-  Do not invent a different namespace unless the user asks.
-- Hooks skip MCP tools whose names start with `memory_` to avoid recursion.
-- Home dir is `~/.haunt` (`HAUNT_HOME`; `LORE_HOME` / `ENGRAM_HOME` as legacy aliases).
+## What hooks do (automatic)
+
+Cursor hooks automatically LOG turns: prompts, replies, tool calls,
+shell output, MCP results. This happens without agent action.
+Do not double-observe what hooks already store.
+
+## What hooks do NOT do
+
+Hooks do NOT reliably inject recall context into your prompt.
+`beforeSubmitPrompt` returns `additional_context` but Cursor's official
+output schema for that hook is only `{continue, user_message}` —
+injection is unproven and may not arrive.
+
+## Agent responsibility: recall
+
+If no `[haunt ns=…]` block is visible in your current context, you MUST
+call `memory_recall` with the user's exact wording before acting.
+Do not assume prior context was injected.
+
+## Observe rules
+
+- Hooks handle episodic logging. Only call `memory_observe` manually
+  when hooks are absent (e.g. Grok Bot, Claude Code — no hook support).
+- tier=semantic for durable facts. tier=episodic for chat.
+- Always pass `origin` (e.g. "cursor", "cli") and `session` id when
+  available.
+- Never summarize. Never distill. Store verbatim or don't store.
+
+## Skip list (never observe)
+
+- Secrets, tokens, API keys, passwords
+- Acks: "ok", "got it", "sure", empty turns
+- `memory_*` tool inputs/outputs (hooks already skip these)
+- Entire READMEs or large file dumps — store a pointer, not the blob
+
+## Worldview
+
+Call `memory_worldview` when you need the full namespace briefing.
+The sessionStart hook tries to inject a compact worldview card, but
+verify it arrived (look for `[haunt worldview ns=…]`).
+
+## Procedures
+
+Use `memory_procedure` action=write only when deliberately promoting a
+how-to the user wants remembered. Include `name`, verbatim `body`, and
+optional `trigger`. Do not auto-extract procedures from every turn.
+
+## Contradict
+
+Use `memory_contradict` with the `memory_id` of a now-wrong fact.
+Optionally pass `replacement` to store the correction.
+
+## Recall scores
+
+RRF scores are rank-normalized, not relevance scores. A hit with
+score 0.03 is not "3% relevant" — it just ranked lower. Ignore hits
+that are clearly off-corpus rather than trusting the number.
+
+## Namespace
+
+Inferred from `CURSOR_PROJECT_DIR` / git / cwd. Do not invent
+namespaces unless the user asks.
+
+## No hooks environment (Grok Bot, Claude Code, etc.)
+
+When hooks are unavailable, the agent must both observe AND recall
+manually. Observe each user turn (tier=episodic) and each durable
+fact (tier=semantic). Recall before acting.
