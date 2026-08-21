@@ -4,7 +4,7 @@ Local-first **verbatim** memory for AI agents. Cursor first. One SQLite file per
 
 > Renamed from *engram* (2025) to avoid collisions with other agent-memory products.
 
-v1 stores every chat turn and tool call as-is, embeds on-device, and recalls with sqlite-vec + FTS5 + RRF. It does **not** summarize, does **not** talk to a model, and has **no** team/org HTTP tier.
+v1 stores every chat turn and tool call as-is, embeds on-device, and recalls with sqlite-vec + FTS5 + RRF. Recall scores are RRF rank-normalized (not relevance probabilities). It does **not** summarize, does **not** talk to a model, and has **no** team/org HTTP tier.
 
 ## Quickstart
 
@@ -26,6 +26,8 @@ Env: `HAUNT_HOME` (default `~/.haunt`; falls back to `~/.lore` if it exists; `LO
 
 Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summaries. Fail-open (`{}` + exit 0) so a hook never blocks the agent.
 
+**Hooks store; recall is not automatic.** The `beforeSubmitPrompt` hook observes the user prompt and runs recall, but Cursor does not inject the results into the model (`additional_context` is not in that hook's output schema). Agents must call `memory_recall` explicitly. When hooks are active, do **not** call `memory_observe` on content the hooks already stored (prompts, responses, tool calls) — that creates duplicates.
+
 ```bash
 haunt cursor-install
 ```
@@ -40,16 +42,20 @@ Project-level example: [`contrib/cursor/hooks.json`](contrib/cursor/hooks.json).
 
 | hook | what |
 |---|---|
-| `beforeSubmitPrompt` | observe user prompt (episodic), recall k=8, return `additional_context` |
+| `beforeSubmitPrompt` | observe user prompt (episodic), recall k=8. **Note:** Cursor's output schema for this hook is `{continue, user_message}` only — `additional_context` is returned optimistically but silently ignored. Per-turn recall is **not** injected into the model. |
 | `afterAgentResponse` | observe assistant text |
 | `afterAgentThought` | skipped by default (`HAUNT_STORE_THOUGHTS=1` to store as system/coordinate) |
-| `postToolUse` | observe tool_name + input + output (procedural) |
+| `postToolUse` | observe tool_name + input + output (tier=procedural; see **tier caveat** below) |
 | `afterShellExecution` | observe command + output (`tool_name=Shell`) |
 | `afterMCPExecution` | observe MCP call; skips `memory_*` to avoid recursion |
 | `sessionStart` | tiny session-open event + last 5 memories + MCP reminder |
 | `sessionEnd` | close session; no summary |
 
+**Secret redaction:** Hook-stored tool output is run through a best-effort denylist that redacts common secret patterns (API keys, bearer tokens, AWS access keys, GitHub PATs, JWTs, etc.). This is **not** exhaustive — do not rely on it as a security boundary. If a tool returns sensitive material you must not persist, avoid passing secrets through `memory_observe`.
+
 Namespace is inferred from `CURSOR_PROJECT_DIR` / git / cwd. Session id is `conversation_id` or `session_id`.
+
+**Tier caveat:** `postToolUse`, `afterShellExecution`, and `afterMCPExecution` currently store all tool I/O as `tier=procedural`. This is a lane mix — `procedural` is meant for named how-tos (`meta.kind=procedure`), not generic tool-call logs. A future version should store hook-originated tool events as `episodic` (or `coordinate`) unless the event carries `meta.kind=procedure`. This does not affect recall correctness but pollutes the procedural tier's semantic meaning.
 
 ## Embeddings
 
@@ -106,7 +112,7 @@ After `haunt bootstrap` (and `pip install -e .` so `python -m haunt.mcp_server` 
 
 **Does:** verbatim events + memories, bi-temporal `event_time` / `valid_from` / `valid_to`, namespaces as isolated SQLite files, deterministic graph extract (regex / noun-phrase / paths), hybrid recall, CLI, MCP, Cursor hooks, local dashboard.
 
-**Does not:** summarize or distill, call any reader-LLM, talk to the network at query time, require Docker/Postgres, expose a team HTTP API, support Claude Code / Grok / Codex as first-class clients yet (MCP is generic; Cursor is documented first).
+**Does not:** summarize or distill, call any reader-LLM, talk to the network at query time, require Docker/Postgres, expose a team HTTP API, auto-store in non-Cursor environments. Claude Code, Grok Bot, and Codex have no Cursor-style hooks — in those environments the agent must call `memory_observe` and `memory_recall` manually via MCP. (MCP is generic; Cursor is the only documented hooks integration.)
 
 ## Layout
 

@@ -175,3 +175,30 @@ def test_skips_memory_mcp_tools(fts_hook_env, capsys, monkeypatch):
     _run_hook(payload, capsys, monkeypatch)
     with Store("hooktest") as st:
         assert st.events() == []
+
+
+def test_secret_redaction_in_tool_output(fts_hook_env, capsys, monkeypatch):
+    project = fts_hook_env["project"]
+    payload = {
+        "hook_event_name": "postToolUse",
+        "tool_name": "Read",
+        "tool_input": '{"path": "config/.env"}',
+        "tool_output": (
+            "API_KEY=sk-live-abc123XYZ456def789ghi012jkl\n"
+            "DB_HOST=localhost\n"
+            "GITHUB_TOKEN=ghp_aAbBcCdDfFeEgGhHiIjJkKlLmMnNoOpPqQrRsS01\n"
+            "AWS_KEY=AKIAIOSFODNN7EXAMPLE\n"
+        ),
+        "conversation_id": "conv-secret",
+        "workspace_roots": [str(project)],
+    }
+    _run_hook(payload, capsys, monkeypatch)
+    with Store("hooktest") as st:
+        rows = st.events(session_id="conv-secret")
+        assert rows, "expected a stored tool event"
+        output = rows[0]["tool_output"] or ""
+        assert "sk-live-abc123" not in output
+        assert "ghp_aAbBcCdDfF" not in output
+        assert "AKIAIOSFODNN7EXAMPLE" not in output
+        assert "DB_HOST" in output or "localhost" in output
+        assert "[REDACTED]" in output

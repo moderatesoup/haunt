@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,35 @@ from haunt.store import Store
 from haunt.util import snippet
 
 ORIGIN = "cursor-hook"
+
+_SECRET_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"""(?i)"""
+        r"""(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token"""
+        r"""|auth[_-]?token|bearer|password|passwd|private[_-]?key"""
+        r"""|client[_-]?secret|webhook[_-]?secret|signing[_-]?secret"""
+        r"""|database[_-]?url|connection[_-]?string)"""
+        r"""[\s]*[=:]\s*["']?([^\s"']{8,})"""
+    ),
+    re.compile(r"""(?:sk|pk)[-_](?:live|test|prod)[A-Za-z0-9_\-]{16,}"""),
+    re.compile(r"""ghp_[A-Za-z0-9]{36,}"""),
+    re.compile(r"""glpat-[A-Za-z0-9\-_]{20,}"""),
+    re.compile(r"""xox[bsrap]-[A-Za-z0-9\-]{10,}"""),
+    re.compile(r"""eyJ[A-Za-z0-9_\-]{20,}\.eyJ[A-Za-z0-9_\-]{20,}"""),
+    re.compile(r"""AKIA[0-9A-Z]{16}"""),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    """Best-effort redaction of obvious secret patterns. Not exhaustive."""
+    if not text:
+        return text
+    out = text
+    for pat in _SECRET_PATTERNS:
+        out = pat.sub("[REDACTED]", out)
+    return out
+
+
 HOOK_EVENTS = (
     "beforeSubmitPrompt",
     "afterAgentResponse",
@@ -177,6 +207,10 @@ def _handle_before_submit(store: Store, payload: dict[str, Any], ns: str) -> dic
     prompt = _as_text(payload.get("prompt"))
     if prompt.strip():
         _observe(store, payload, content=prompt, role="user", tier="episodic")
+    # NOTE: Cursor's beforeSubmitPrompt output schema is {continue, user_message}
+    # only.  additional_context is NOT honored here (silently dropped).  We still
+    # return it so a future Cursor build or third-party runner *could* use it, but
+    # agents must not assume per-turn recall is injected into the model.
     hits: list[Hit] = []
     if prompt.strip():
         try:
@@ -209,6 +243,8 @@ def _handle_post_tool(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
     name = _as_text(payload.get("tool_name")) or "tool"
     if _is_memory_tool(name):
         return {}
+    # TODO: tier="procedural" is a lane mix — generic tool I/O is episodic,
+    # not a named how-to.  Should be "episodic" unless meta.kind=procedure.
     _observe(
         store,
         payload,
@@ -217,7 +253,7 @@ def _handle_post_tool(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         tier="procedural",
         tool_name=name,
         tool_input=_as_text(payload.get("tool_input")),
-        tool_output=_as_text(payload.get("tool_output")),
+        tool_output=_redact_secrets(_as_text(payload.get("tool_output"))),
     )
     return {}
 
@@ -231,7 +267,7 @@ def _handle_after_shell(store: Store, payload: dict[str, Any]) -> dict[str, Any]
         tier="procedural",
         tool_name="Shell",
         tool_input=_as_text(payload.get("command")),
-        tool_output=_as_text(payload.get("output")),
+        tool_output=_redact_secrets(_as_text(payload.get("output"))),
     )
     return {}
 
@@ -248,7 +284,7 @@ def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         tier="procedural",
         tool_name=name or "mcp",
         tool_input=_as_text(payload.get("tool_input")),
-        tool_output=_as_text(payload.get("result_json")),
+        tool_output=_redact_secrets(_as_text(payload.get("result_json"))),
     )
     return {}
 
@@ -265,9 +301,10 @@ def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dic
     )
     intro = (
         "You have persistent local memory via haunt (MCP tools "
-        "memory_recall / memory_observe). Before acting on a user request, "
-        "call memory_recall with their wording. Store new facts/tools with "
-        f"memory_observe. Namespace: {ns}."
+        "memory_recall / memory_observe). Hooks LOG turns automatically — "
+        "do not re-observe what hooks already stored. Recall is NOT "
+        "automatic: call memory_recall with the user's wording before "
+        f"acting. Namespace: {ns}."
     )
     return {"additional_context": f"{intro}\n\n{recent}"}
 
