@@ -40,12 +40,19 @@ def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
-    try:
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
-    except Exception:
-        pass
+    from haunt.embed import fts_only
+
+    if not fts_only():
+        try:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception as exc:
+            conn.close()
+            raise RuntimeError(
+                f"sqlite-vec failed to load: {exc}\n"
+                "Set HAUNT_FTS_ONLY=1 to run without vector search."
+            ) from exc
     return conn
 
 
