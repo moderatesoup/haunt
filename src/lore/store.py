@@ -1,0 +1,753 @@
+"""SQLite store: registry + per-namespace DBs. WAL. Verbatim writes only."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator
+
+import sqlite_vec
+
+from lore.embed import available as embed_available
+from lore.embed import dimension as embed_dim
+from lore.embed import embed_one
+from lore.embed import embed_texts
+from lore.embed import state as embed_state
+from lore.paths import (
+    ensure_layout,
+    infer_namespace,
+    lore_home,
+    namespace_db_path,
+    registry_path,
+    resolve_namespace,
+    safe_name,
+)
+from lore.util import dumps, iso_or_now, loads, new_id, now_iso
+
+ROLES = ("user", "assistant", "tool", "system")
+TIERS = ("episodic", "semantic", "procedural", "coordinate")
+
+
+def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
+    if not create and not path.exists():
+        raise FileNotFoundError(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except Exception:
+        # vec optional — brute-force cosine still works from memories.embedding
+        pass
+    return conn
+
+
+def _vec_loaded(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute("SELECT vec_version()")
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def init_registry() -> None:
+    ensure_layout()
+    conn = _connect(registry_path())
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS namespaces (
+                name TEXT PRIMARY KEY,
+                repo_path TEXT,
+                db_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _registry() -> sqlite3.Connection:
+    init_registry()
+    return _connect(registry_path())
+
+
+def _init_namespace_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            source TEXT,
+            meta TEXT
+        );
+        CREATE TABLE IF NOT EXISTS events (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_name TEXT,
+            tool_input TEXT,
+            tool_output TEXT,
+            origin TEXT,
+            tier TEXT NOT NULL,
+            meta TEXT,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        );
+        CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            content TEXT NOT NULL,
+            embedding BLOB,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (event_id) REFERENCES events(id)
+        );
+        CREATE TABLE IF NOT EXISTS entities (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            norm_name TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS relations (
+            id TEXT PRIMARY KEY,
+            src_entity TEXT NOT NULL,
+            rel TEXT NOT NULL,
+            dst_entity TEXT NOT NULL,
+            event_id TEXT,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            weight REAL NOT NULL DEFAULT 1.0
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+        CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time);
+        CREATE INDEX IF NOT EXISTS idx_events_tier ON events(tier);
+        CREATE INDEX IF NOT EXISTS idx_memories_event ON memories(event_id);
+        CREATE INDEX IF NOT EXISTS idx_memories_valid ON memories(valid_from, valid_to);
+        CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name, type);
+        CREATE INDEX IF NOT EXISTS idx_relations_src ON relations(src_entity);
+        CREATE INDEX IF NOT EXISTS idx_relations_dst ON relations(dst_entity);
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+            id UNINDEXED,
+            content,
+            tokenize='porter unicode61'
+        );
+        """
+    )
+    conn.commit()
+
+
+def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> bool:
+    if dim <= 0 or not _vec_loaded(conn):
+        return False
+    existing = conn.execute(
+        "SELECT value FROM meta WHERE key='embed_dim'"
+    ).fetchone()
+    if existing and int(existing["value"]) != dim:
+        conn.execute("DROP TABLE IF EXISTS vec_memories")
+    try:
+        conn.execute(
+            f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
+                id TEXT PRIMARY KEY,
+                embedding FLOAT[{int(dim)}] distance_metric=cosine
+            )
+            """
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_dim', ?)",
+            (str(dim),),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def register_namespace(name: str, repo_path: str | None = None) -> Path:
+    name = safe_name(name)
+    db = namespace_db_path(name)
+    now = now_iso()
+    repo = str(Path(repo_path).expanduser().resolve()) if repo_path else None
+    conn = _registry()
+    try:
+        row = conn.execute("SELECT name FROM namespaces WHERE name=?", (name,)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE namespaces SET repo_path=COALESCE(?, repo_path), db_path=?, updated_at=? WHERE name=?",
+                (repo, str(db), now, name),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO namespaces(name, repo_path, db_path, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (name, repo, str(db), now, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    ns = _connect(db)
+    try:
+        _init_namespace_schema(ns)
+        if repo:
+            ns.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('repo_path', ?)",
+                (repo,),
+            )
+            ns.commit()
+    finally:
+        ns.close()
+    return db
+
+
+def namespace_exists(name: str) -> bool:
+    name = safe_name(name)
+    conn = _registry()
+    try:
+        row = conn.execute("SELECT 1 FROM namespaces WHERE name=?", (name,)).fetchone()
+        return bool(row)
+    finally:
+        conn.close()
+
+
+def touch_namespace(name: str) -> None:
+    conn = _registry()
+    try:
+        conn.execute(
+            "UPDATE namespaces SET updated_at=? WHERE name=?",
+            (now_iso(), safe_name(name)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_namespace_rows() -> list[dict[str, Any]]:
+    init_registry()
+    conn = _registry()
+    try:
+        rows = conn.execute(
+            "SELECT name, repo_path, db_path, created_at, updated_at FROM namespaces ORDER BY name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def verbatim_text(
+    content: str = "",
+    tool_name: str | None = None,
+    tool_input: str | None = None,
+    tool_output: str | None = None,
+) -> str:
+    """Concatenate stored fields as-is. Not a summary."""
+    parts: list[str] = []
+    if content:
+        parts.append(content)
+    if tool_name:
+        parts.append(f"tool:{tool_name}")
+    if tool_input:
+        parts.append(tool_input)
+    if tool_output:
+        parts.append(tool_output)
+    return "\n".join(parts)
+
+
+@dataclass
+class ObserveResult:
+    event_id: str
+    memory_id: str
+    session_id: str
+    namespace: str
+    tier: str
+    entities: list[str] = field(default_factory=list)
+    embedded: bool = False
+
+
+class Store:
+    def __init__(self, name: str, repo_path: str | None = None, *, create: bool = True):
+        self.name = safe_name(name)
+        if create:
+            register_namespace(self.name, repo_path)
+        self.db_path = namespace_db_path(self.name)
+        self.conn = _connect(self.db_path, create=create)
+        _init_namespace_schema(self.conn)
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self) -> "Store":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def vec_ok(self) -> bool:
+        return _vec_loaded(self.conn)
+
+    def vec_version(self) -> str | None:
+        if not self.vec_ok():
+            return None
+        return str(self.conn.execute("SELECT vec_version()").fetchone()[0])
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return None if row is None else str(row["value"])
+
+    def ensure_session(
+        self,
+        session_id: str | None = None,
+        source: str = "cli",
+        meta: dict[str, Any] | None = None,
+    ) -> str:
+        if session_id:
+            row = self.conn.execute(
+                "SELECT id, ended_at FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if not row:
+                self.conn.execute(
+                    "INSERT INTO sessions(id, started_at, ended_at, source, meta) VALUES (?,?,?,?,?)",
+                    (session_id, now_iso(), None, source, dumps(meta or {})),
+                )
+                self.conn.commit()
+            return session_id
+        current = self.get_meta("current_session")
+        if current:
+            row = self.conn.execute(
+                "SELECT id, ended_at FROM sessions WHERE id=?", (current,)
+            ).fetchone()
+            if row and not row["ended_at"]:
+                return current
+        sid = new_id()
+        self.conn.execute(
+            "INSERT INTO sessions(id, started_at, ended_at, source, meta) VALUES (?,?,?,?,?)",
+            (sid, now_iso(), None, source, dumps(meta or {})),
+        )
+        self.set_meta("current_session", sid)
+        return sid
+
+    def end_session(self, session_id: str | None = None) -> str | None:
+        sid = session_id or self.get_meta("current_session")
+        if not sid:
+            return None
+        self.conn.execute(
+            "UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL",
+            (now_iso(), sid),
+        )
+        if self.get_meta("current_session") == sid:
+            self.conn.execute("DELETE FROM meta WHERE key='current_session'")
+        self.conn.commit()
+        return sid
+
+    def observe(
+        self,
+        content: str = "",
+        *,
+        role: str = "user",
+        tier: str = "episodic",
+        session_id: str | None = None,
+        tool_name: str | None = None,
+        tool_input: str | None = None,
+        tool_output: str | None = None,
+        event_time: str | None = None,
+        origin: str = "cli",
+        meta: dict[str, Any] | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+    ) -> ObserveResult:
+        if role not in ROLES:
+            raise ValueError(f"role must be one of {ROLES}")
+        if tier not in TIERS:
+            raise ValueError(f"tier must be one of {TIERS}")
+        self.ensure_current_embeddings()
+        sid = self.ensure_session(session_id, source=origin)
+        et = iso_or_now(event_time)
+        ts = now_iso()
+        vf = iso_or_now(valid_from) if valid_from else et
+        vt = iso_or_now(valid_to) if valid_to else None
+        event_id = new_id()
+        memory_id = new_id()
+        text = verbatim_text(content, tool_name, tool_input, tool_output)
+        self.conn.execute(
+            """
+            INSERT INTO events(
+                id, session_id, ts, event_time, role, content,
+                tool_name, tool_input, tool_output, origin, tier, meta
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                event_id,
+                sid,
+                ts,
+                et,
+                role,
+                content or "",
+                tool_name,
+                tool_input,
+                tool_output,
+                origin,
+                tier,
+                dumps(meta or {}),
+            ),
+        )
+        blob = None
+        embedded = False
+        vec = embed_one(text) if text.strip() else None
+        if vec is not None:
+            blob = sqlite_vec.serialize_float32(vec)
+            embedded = True
+            ensure_vec_table(self.conn, len(vec))
+            es = embed_state()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("embed_model", es.model_id),
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("embed_dim", str(len(vec))),
+            )
+        self.conn.execute(
+            """
+            INSERT INTO memories(
+                id, event_id, tier, content, embedding, valid_from, valid_to, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (memory_id, event_id, tier, text, blob, vf, vt, ts),
+        )
+        self.conn.execute(
+            "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
+            (memory_id, text),
+        )
+        if blob is not None and _vec_loaded(self.conn):
+            try:
+                self.conn.execute(
+                    "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
+                    (memory_id, blob),
+                )
+            except sqlite3.Error:
+                pass
+        self.conn.commit()
+        from lore.graph import extract_and_store
+
+        entity_names = extract_and_store(self.conn, event_id, text, et, tool_name)
+        touch_namespace(self.name)
+        return ObserveResult(
+            event_id=event_id,
+            memory_id=memory_id,
+            session_id=sid,
+            namespace=self.name,
+            tier=tier,
+            entities=entity_names,
+            embedded=embedded,
+        )
+
+
+    def embeddings_stale(self) -> bool:
+        """True when stored vectors do not match the currently loaded model."""
+        es = embed_state()
+        if not es.available:
+            return False
+        stored_dim = self.get_meta("embed_dim")
+        stored_model = self.get_meta("embed_model")
+        row = self.conn.execute(
+            "SELECT embedding FROM memories WHERE embedding IS NOT NULL LIMIT 1"
+        ).fetchone()
+        if row and row["embedding"]:
+            n = len(row["embedding"]) // 4
+            if n != es.dim:
+                return True
+        if stored_dim and int(stored_dim) != es.dim:
+            return True
+        if stored_model and stored_model != es.model_id:
+            return True
+        return False
+
+    def reembed(self) -> dict[str, Any]:
+        """Rebuild every memory embedding with the currently loaded model.
+
+        Drops and recreates vec_memories so a 384-d namespace can move to
+        BGE-M3 (1024-d) without silently mixing dimensions.
+        """
+        es = embed_state()
+        rows = self.conn.execute("SELECT id, content FROM memories").fetchall()
+        self.conn.execute("DROP TABLE IF EXISTS vec_memories")
+        if not es.available:
+            self.conn.execute("UPDATE memories SET embedding=NULL")
+            self.conn.commit()
+            return {
+                "updated": 0,
+                "total": len(rows),
+                "model": es.model_id,
+                "dim": es.dim,
+                "available": False,
+            }
+        ensure_vec_table(self.conn, es.dim)
+        ids = [r["id"] for r in rows]
+        texts = [r["content"] if r["content"] else " " for r in rows]
+        updated = 0
+        chunk = 16
+        for i in range(0, len(texts), chunk):
+            vecs = embed_texts(texts[i : i + chunk])
+            if not vecs:
+                continue
+            for mid, vec in zip(ids[i : i + chunk], vecs):
+                blob = sqlite_vec.serialize_float32(vec)
+                self.conn.execute(
+                    "UPDATE memories SET embedding=? WHERE id=?", (blob, mid)
+                )
+                if self.vec_ok():
+                    try:
+                        self.conn.execute(
+                            "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
+                            (mid, blob),
+                        )
+                    except sqlite3.Error:
+                        pass
+                updated += 1
+        self.set_meta("embed_model", es.model_id)
+        self.set_meta("embed_dim", str(es.dim))
+        self.conn.commit()
+        return {
+            "updated": updated,
+            "total": len(rows),
+            "model": es.model_id,
+            "dim": es.dim,
+            "available": True,
+        }
+
+    def ensure_current_embeddings(self) -> dict[str, Any] | None:
+        """Rebuild vectors if the loaded model/dim does not match this DB."""
+        if self.embeddings_stale():
+            return self.reembed()
+        return None
+
+    def events(
+        self,
+        *,
+        session_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM events WHERE 1=1"
+        params: list[Any] = []
+        if session_id:
+            sql += " AND session_id=?"
+            params.append(session_id)
+        if since:
+            sql += " AND event_time>=?"
+            params.append(iso_or_now(since))
+        if until:
+            sql += " AND event_time<=?"
+            params.append(iso_or_now(until))
+        sql += " ORDER BY event_time DESC, ts DESC LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def stats(self) -> dict[str, Any]:
+        def count(table: str) -> int:
+            return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+        tiers = {
+            r["tier"]: r["n"]
+            for r in self.conn.execute(
+                "SELECT tier, COUNT(*) AS n FROM events GROUP BY tier"
+            )
+        }
+        last = self.conn.execute(
+            "SELECT ts, event_time FROM events ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        db = Path(self.db_path)
+        size = db.stat().st_size if db.exists() else 0
+        wal = db.with_suffix(db.suffix + "-wal")
+        if wal.exists():
+            size += wal.stat().st_size
+        return {
+            "namespace": self.name,
+            "db_path": str(db.resolve()),
+            "db_size_bytes": size,
+            "events": count("events"),
+            "memories": count("memories"),
+            "sessions": count("sessions"),
+            "entities": count("entities"),
+            "relations": count("relations"),
+            "tiers": tiers,
+            "last_write": last["ts"] if last else None,
+            "last_event_time": last["event_time"] if last else None,
+            "wal": True,
+        }
+
+    def top_entities(self, limit: int = 15) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT e.id, e.name, e.type, e.norm_name, e.first_seen, e.last_seen,
+                   (SELECT COUNT(*) FROM relations r
+                    WHERE r.src_entity=e.id OR r.dst_entity=e.id) AS rels
+            FROM entities e
+            ORDER BY e.last_seen DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def graph(self, entity: str | None = None) -> dict[str, Any]:
+        if entity:
+            norm = entity.strip().lower()
+            ents = [
+                dict(r)
+                for r in self.conn.execute(
+                    "SELECT * FROM entities WHERE norm_name LIKE ? OR name LIKE ? OR id=?",
+                    (f"%{norm}%", f"%{entity}%", entity),
+                )
+            ]
+            ids = [e["id"] for e in ents]
+            rels: list[dict[str, Any]] = []
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                rels = [
+                    dict(r)
+                    for r in self.conn.execute(
+                        f"SELECT * FROM relations WHERE src_entity IN ({placeholders}) OR dst_entity IN ({placeholders})",
+                        ids + ids,
+                    )
+                ]
+            return {"entities": ents, "relations": rels}
+        return {
+            "entities": [dict(r) for r in self.conn.execute("SELECT * FROM entities ORDER BY last_seen DESC LIMIT 200")],
+            "relations": [dict(r) for r in self.conn.execute("SELECT * FROM relations ORDER BY valid_from DESC LIMIT 400")],
+        }
+
+    def rebuild_graph(self) -> dict[str, Any]:
+        """Wipe entities/relations and re-extract from stored events.
+
+        Events and memories are left untouched. Uses extract_and_store
+        (same path as observe) so a tighter extractor rewrites the graph.
+        """
+        from lore.graph import extract_and_store
+
+        def count(table: str) -> int:
+            return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+        before_ents = count("entities")
+        before_rels = count("relations")
+        events_n = count("events")
+        memories_n = count("memories")
+
+        self.conn.execute("DELETE FROM relations")
+        self.conn.execute("DELETE FROM entities")
+        self.conn.commit()
+
+        rows = self.conn.execute(
+            """
+            SELECT id, content, tool_name, tool_input, tool_output, event_time
+            FROM events
+            ORDER BY event_time ASC, ts ASC
+            """
+        ).fetchall()
+        for r in rows:
+            text = verbatim_text(
+                r["content"] or "",
+                r["tool_name"],
+                r["tool_input"],
+                r["tool_output"],
+            )
+            extract_and_store(
+                self.conn, r["id"], text, r["event_time"], r["tool_name"]
+            )
+
+        return {
+            "events": events_n,
+            "memories": memories_n,
+            "entities_before": before_ents,
+            "relations_before": before_rels,
+            "entities": count("entities"),
+            "relations": count("relations"),
+        }
+
+
+def get_store(name: str | None = None, repo_path: str | None = None) -> Store:
+    ns = resolve_namespace(name)
+    return Store(ns, repo_path=repo_path, create=True)
+
+
+def observe(
+    content: str = "",
+    *,
+    namespace: str | None = None,
+    **kwargs: Any,
+) -> ObserveResult:
+    with get_store(namespace) as store:
+        return store.observe(content, **kwargs)
+
+
+def list_namespaces() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in list_namespace_rows():
+        db = Path(row["db_path"])
+        extra: dict[str, Any] = {
+            "events": 0,
+            "memories": 0,
+            "sessions": 0,
+            "entities": 0,
+            "db_size_bytes": db.stat().st_size if db.exists() else 0,
+        }
+        if db.exists():
+            try:
+                with Store(row["name"], create=False) as st:
+                    extra.update(
+                        {
+                            "events": st.stats()["events"],
+                            "memories": st.stats()["memories"],
+                            "sessions": st.stats()["sessions"],
+                            "entities": st.stats()["entities"],
+                            "db_size_bytes": st.stats()["db_size_bytes"],
+                        }
+                    )
+            except sqlite3.Error:
+                pass
+        out.append({**row, **extra})
+    return out
+
+
+def iter_stores() -> Iterator[Store]:
+    for row in list_namespace_rows():
+        yield Store(row["name"], create=False)
+
+def reembed_all_namespaces() -> list[dict[str, Any]]:
+    """Rebuild embeddings in every registered namespace."""
+    out: list[dict[str, Any]] = []
+    for row in list_namespace_rows():
+        with Store(row["name"], create=False) as st:
+            report = st.reembed()
+            report["namespace"] = row["name"]
+            out.append(report)
+    return out

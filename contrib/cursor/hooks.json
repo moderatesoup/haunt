@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [{ "command": "~/.lore/bin/engram-hook" }],
+    "afterAgentResponse": [{ "command": "~/.lore/bin/engram-hook" }],
+    "postToolUse": [{ "command": "~/.lore/bin/engram-hook" }],
+    "afterShellExecution": [{ "command": "~/.lore/bin/engram-hook" }],
+    "afterMCPExecution": [{ "command": "~/.lore/bin/engram-hook" }],
+    "sessionStart": [{ "command": "~/.lore/bin/engram-hook" }],
+    "sessionEnd": [{ "command": "~/.lore/bin/engram-hook" }]
+  }
+}

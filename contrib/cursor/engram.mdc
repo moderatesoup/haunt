@@ -1,0 +1,19 @@
+---
+description: engram local memory — verbatim store/recall
+alwaysApply: true
+---
+
+# engram
+
+Hooks store prompts, replies, and tool calls automatically (verbatim, no
+summarization, no LLM). The Python package is still `lore`; MCP tools stay
+`memory_recall` / `memory_observe`.
+
+- If hook context is missing at the start of a turn, call `memory_recall`
+  with the user's wording before acting.
+- Store new facts and tool results with `memory_observe`. Never summarize
+  or distill into memory — pass text as-is.
+- Namespace is inferred from the project (`CURSOR_PROJECT_DIR` / git / cwd).
+  Do not invent a different namespace unless the user asks.
+- Hooks skip MCP tools whose names start with `memory_` to avoid recursion.
+- Home dir is `~/.lore` (`LORE_HOME`, or `ENGRAM_HOME` as an alias).
