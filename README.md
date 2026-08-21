@@ -81,11 +81,12 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 Features:
 
 - **Browse** memories with filters: tier, origin, session, time range. Paginated.
-- **Search / recall** with hybrid vec+FTS. Results link to detail view.
+- **Search / recall** with hybrid vec+FTS. Results link to detail view. Clicking any result row opens the detail panel.
+- **All-namespaces search**: select "all namespaces" in the sidebar to fan out a single query across every registered namespace. Results are merged by score and each hit shows a namespace badge. API: `GET /api/recall?q=&k=&tier=`.
 - **Memory detail** with full provenance: origin, session_id, event_id, memory_id, role, tier, event_time, valid_from/valid_to, db_path (absolute), haunt_home, tool name/input/output, related memories from the same session, entity mentions.
 - **Delete** a memory from the UI (with confirmation). Hard purge removes the memory, FTS index, vector embedding, graph rows, and orphan events. Recall will not return deleted content.
 - **Procedures and worldview** visible (browse, view detail; write stays CLI/MCP).
-- **Health** strip: sqlite-vec status/version, embed model+dim+availability, last write age, event count, namespace, absolute db_path. Live-updating (15s poll).
+- **Health** strip: sqlite-vec status/version, embed model+dim+availability, last write age, event count, namespace, absolute db_path. Always visible (persistent header), live-updating (15s poll).
 
 ### Desktop shortcut
 

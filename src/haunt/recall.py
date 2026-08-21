@@ -35,6 +35,7 @@ class Hit:
     valid_from: str
     valid_to: str | None
     tool_name: str | None
+    origin: str | None = None
     vec_rank: int | None = None
     fts_rank: int | None = None
     vec_distance: float | None = None
@@ -49,6 +50,7 @@ class Hit:
             "content": self.content,
             "snippet": snippet(self.content, 200),
             "role": self.role,
+            "origin": self.origin,
             "event_time": self.event_time,
             "valid_from": self.valid_from,
             "valid_to": self.valid_to,
@@ -214,7 +216,7 @@ def recall(
             row = store.conn.execute(
                 """
                 SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
-                       e.role, e.event_time, e.tool_name
+                       e.role, e.event_time, e.tool_name, e.origin
                 FROM memories m
                 JOIN events e ON e.id = m.event_id
                 WHERE m.id=?
@@ -237,6 +239,7 @@ def recall(
                     valid_from=row["valid_from"],
                     valid_to=row["valid_to"],
                     tool_name=row["tool_name"],
+                    origin=row["origin"],
                     vec_rank=vr[0] if vr else None,
                     fts_rank=fr[0] if fr else None,
                     vec_distance=vr[1] if vr else None,
