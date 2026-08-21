@@ -177,3 +177,24 @@ def test_run_dashboard_no_open_skips_browser(lore_env, monkeypatch):
         assert opened == [], "webbrowser.open should not be called when open_browser=False"
     finally:
         pass
+
+
+def test_api_namespace_nonexistent_returns_404(dash_client, lore_env):
+    """GET /api/namespace/{name} must return 404 for unknown namespaces, not auto-create them."""
+    from haunt.store import list_namespaces
+
+    names_before = {ns["name"] for ns in list_namespaces()}
+    assert "XYZZY_NEVER_EXISTS_99" not in names_before
+
+    r = dash_client.get("/api/namespace/XYZZY_NEVER_EXISTS_99")
+    assert r.status_code == 404, (
+        f"Nonexistent namespace should return 404, got {r.status_code}. "
+        "A GET must not auto-create namespaces."
+    )
+
+    names_after = {ns["name"] for ns in list_namespaces()}
+    created = names_after - names_before
+    assert "xyzzy-never-exists-99" not in created and "XYZZY_NEVER_EXISTS_99" not in created, (
+        f"GET auto-created namespace(s): {created}. "
+        "Reading a nonexistent namespace must not have write side-effects."
+    )

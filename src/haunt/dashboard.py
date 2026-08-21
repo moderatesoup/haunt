@@ -579,11 +579,14 @@ async def api_namespaces(_request: Request) -> JSONResponse:
 async def api_namespace(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
     if not namespace_exists(name):
-        pass
-    with Store(name) as st:
-        stats = st.stats()
-        events = st.events(limit=40)
-        entities = st.top_entities(20)
+        return JSONResponse({"error": f"namespace '{name}' not found"}, status_code=404)
+    try:
+        with Store(name, create=False) as st:
+            stats = st.stats()
+            events = st.events(limit=40)
+            entities = st.top_entities(20)
+    except FileNotFoundError:
+        return JSONResponse({"error": f"namespace '{name}' registered but database missing"}, status_code=404)
     return JSONResponse(
         {
             "haunt_home": str(haunt_home()),
