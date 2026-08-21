@@ -145,6 +145,7 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
     <div class="ns-list" id="nsList"></div>
     <div class="nav-section" style="margin-top:16px">views</div>
     <button class="nav-btn on" data-view="overview" onclick="switchView('overview')">overview</button>
+    <button class="nav-btn" data-view="timeline" onclick="switchView('timeline')">timeline</button>
     <button class="nav-btn" data-view="browse" onclick="switchView('browse')">browse memories</button>
     <button class="nav-btn" data-view="search" onclick="switchView('search')">search / recall</button>
     <button class="nav-btn" data-view="procedures" onclick="switchView('procedures')">procedures</button>
@@ -177,6 +178,20 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
       </div>
     </div>
 
+    <!-- TIMELINE VIEW -->
+    <div id="view-timeline" class="tab-content">
+      <div class="box">
+        <div class="box-header">timeline — what changed</div>
+        <div class="filters">
+          <label>since</label><input id="tlSince" type="date"/>
+          <label>until</label><input id="tlUntil" type="date"/>
+          <label>limit</label><input id="tlLimit" type="number" value="200" style="width:70px"/>
+          <button class="primary" onclick="loadTimeline()">filter</button>
+        </div>
+        <div id="timelineResults"><div class="empty">pick a namespace and click filter</div></div>
+      </div>
+    </div>
+
     <!-- BROWSE VIEW -->
     <div id="view-browse" class="tab-content">
       <div class="box">
@@ -202,6 +217,11 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
           <input id="q" placeholder="paraphrase or verbatim query"/>
           <select id="sTier"><option value="">all tiers</option><option>episodic</option><option>semantic</option><option>procedural</option><option>coordinate</option></select>
           <button class="primary" id="go">recall</button>
+        </div>
+        <div class="filters">
+          <label>as_of</label><input id="sAsOf" type="date" title="point-in-time snapshot: only memories valid at this date"/>
+          <label>since</label><input id="sSince" type="date" title="events from this date onward"/>
+          <label>until</label><input id="sUntil" type="date" title="events up to this date"/>
         </div>
         <div id="hits"><div class="empty">type a query</div></div>
       </div>
@@ -244,7 +264,8 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;">
         <h2 class="section">memory detail</h2>
         <div style="display:flex;gap:8px;">
-          <button class="danger" onclick="confirmPurge()">delete</button>
+          <button style="color:var(--amber);border-color:#5c3e00;" onclick="confirmContradict()">supersede</button>
+          <button class="danger" onclick="confirmPurge()">permanently delete</button>
           <button onclick="closeDetail()">close</button>
         </div>
       </div>
@@ -256,11 +277,27 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
 <!-- CONFIRM MODAL -->
 <div class="modal-bg" id="confirmModal">
   <div class="modal">
-    <h3>delete memory</h3>
-    <p id="confirmText">This will permanently delete the memory, its FTS index, vector embedding, and associated graph data. This cannot be undone.</p>
+    <h3>permanently delete memory</h3>
+    <p id="confirmText">This will permanently delete the memory, its FTS index, vector embedding, and associated graph data. This cannot be undone. To keep the data but mark it outdated, use <b>supersede</b> instead.</p>
     <div class="actions">
       <button onclick="closeModal()">cancel</button>
       <button class="danger" id="confirmBtn" onclick="doPurge()">delete permanently</button>
+    </div>
+  </div>
+</div>
+
+<!-- SUPERSEDE MODAL -->
+<div class="modal-bg" id="contradictModal">
+  <div class="modal">
+    <h3>supersede memory</h3>
+    <p>This marks the memory as superseded (sets valid_to = now). The original data is <b>kept</b> but excluded from current recall. This is NOT a delete.</p>
+    <div style="margin-bottom:12px;">
+      <label style="font-size:11px;color:var(--mut);font-family:var(--mono);display:block;margin-bottom:4px;">optional replacement text</label>
+      <input id="contradictReplacement" style="width:100%;" placeholder="new corrected fact (leave blank to just supersede)"/>
+    </div>
+    <div class="actions">
+      <button onclick="closeContradictModal()">cancel</button>
+      <button style="background:#3a2800;color:var(--amber);border-color:#5c3e00;" onclick="doContradict()">supersede</button>
     </div>
   </div>
 </div>
@@ -285,6 +322,7 @@ function switchView(v){
     $('view-'+v).innerHTML='<div class="empty">pick a namespace to use this view</div>';
     return;
   }
+  if(v==='timeline')loadTimeline();
   if(v==='browse')doBrowse(0);
   if(v==='procedures')loadProcedures();
   if(v==='worldview')loadWorldview();
@@ -558,19 +596,76 @@ async function loadHealth(){
   $("healthDetail").innerHTML=items.map(([k,v])=>`<div class="detail-row"><span class="lbl">${k}</span><span class="val">${v}</span></div>`).join("");
 }
 
+async function loadTimeline(){
+  if(!NS||ALL_NS)return;
+  const since=$("tlSince").value;
+  const until=$("tlUntil").value;
+  const limit=$("tlLimit").value||200;
+  const params=new URLSearchParams({limit});
+  if(since)params.set("since",since+"T00:00:00+00:00");
+  if(until)params.set("until",until+"T23:59:59+00:00");
+  const data=await j(`/api/namespace/${encodeURIComponent(NS)}/timeline?${params}`);
+  const rows=data.events||[];
+  if(!rows.length){$("timelineResults").innerHTML='<div class="empty">no events match</div>';return;}
+  $("timelineResults").innerHTML=`<table><thead><tr><th>event_time</th><th>origin</th><th>role</th><th>tier</th><th>snippet</th></tr></thead><tbody>`+
+    rows.map(r=>`<tr class="clickable" onclick="openEventMemory('${esc(r.id||"")}')">
+      <td>${fmtTime(r.event_time)}</td><td>${r.origin||""}</td>
+      <td>${r.role||""}</td>
+      <td class="${tierCls(r.tier)}">${r.tier}</td>
+      <td class="snip">${esc(snip(r.content||(r.tool_name?"tool:"+r.tool_name:""),180))}</td>
+    </tr>`).join("")+"</tbody></table>";
+}
+
+function confirmContradict(){
+  if(!DETAIL_MID)return;
+  $("contradictReplacement").value="";
+  $("contradictModal").classList.add('open');
+}
+function closeContradictModal(){$("contradictModal").classList.remove('open');}
+
+async function doContradict(){
+  if(!DETAIL_MID)return;
+  const ns=DETAIL_NS||NS;
+  if(!ns)return;
+  closeContradictModal();
+  const replacement=$("contradictReplacement").value.trim()||null;
+  const body={};
+  if(replacement)body.replacement=replacement;
+  const r=await j(`/api/namespace/${encodeURIComponent(ns)}/memory/${encodeURIComponent(DETAIL_MID)}/contradict`,{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)
+  });
+  if(r.ok){
+    closeDetail();
+    if(!ALL_NS)loadNs(NS);
+    if($('view-browse').classList.contains('on'))doBrowse(BROWSE_PAGE);
+    if($('view-timeline').classList.contains('on'))loadTimeline();
+  }else{
+    alert("Supersede failed: "+(r.error||"unknown error"));
+  }
+}
+
 async function doRecall(){
   const q=$("q").value.trim();if(!q)return;
   if(!ALL_NS&&!NS)return;
   $("recallMeta").textContent="…";
   const tier=$("sTier").value;
+  const asOf=$("sAsOf").value;
+  const since=$("sSince").value;
+  const until=$("sUntil").value;
   let url,data;
   if(ALL_NS){
     url=`/api/recall?q=${encodeURIComponent(q)}`;
     if(tier)url+=`&tier=${encodeURIComponent(tier)}`;
+    if(asOf)url+=`&as_of=${encodeURIComponent(asOf+"T23:59:59+00:00")}`;
+    if(since)url+=`&since=${encodeURIComponent(since+"T00:00:00+00:00")}`;
+    if(until)url+=`&until=${encodeURIComponent(until+"T23:59:59+00:00")}`;
     data=await j(url);
   }else{
     url=`/api/namespace/${encodeURIComponent(NS)}/recall?q=${encodeURIComponent(q)}`;
     if(tier)url+=`&tier=${encodeURIComponent(tier)}`;
+    if(asOf)url+=`&as_of=${encodeURIComponent(asOf+"T23:59:59+00:00")}`;
+    if(since)url+=`&since=${encodeURIComponent(since+"T00:00:00+00:00")}`;
+    if(until)url+=`&until=${encodeURIComponent(until+"T23:59:59+00:00")}`;
     data=await j(url);
   }
   $("recallMeta").textContent=(data.hits||[]).length+" hits"+(ALL_NS?" (all namespaces)":"");
@@ -697,6 +792,9 @@ async def api_recall_all(request: Request) -> JSONResponse:
         return JSONResponse({"query": q, "hits": []})
     k = int(request.query_params.get("k") or 10)
     tier = request.query_params.get("tier") or None
+    as_of = request.query_params.get("as_of") or None
+    since = request.query_params.get("since") or None
+    until = request.query_params.get("until") or None
 
     ns_rows = list_namespace_rows()
     all_hits: list[tuple[Hit, str]] = []
@@ -706,7 +804,8 @@ async def api_recall_all(request: Request) -> JSONResponse:
             with Store(ns_name, create=False) as st:
                 if st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0:
                     continue
-                hits = recall(q, namespace=ns_name, k=k, tier=tier, store=st)
+                hits = recall(q, namespace=ns_name, k=k, tier=tier,
+                              as_of=as_of, since=since, until=until, store=st)
                 for h in hits:
                     all_hits.append((h, ns_name))
         except (FileNotFoundError, Exception):
@@ -736,8 +835,12 @@ async def api_recall(request: Request) -> JSONResponse:
     q = request.query_params.get("q") or ""
     k = int(request.query_params.get("k") or 8)
     tier = request.query_params.get("tier") or None
+    as_of = request.query_params.get("as_of") or None
+    since = request.query_params.get("since") or None
+    until = request.query_params.get("until") or None
     with Store(name) as st:
-        hits = recall(q, namespace=name, k=k, tier=tier, store=st)
+        hits = recall(q, namespace=name, k=k, tier=tier,
+                      as_of=as_of, since=since, until=until, store=st)
     results = []
     for h in hits:
         d = h.as_dict()
@@ -818,6 +921,29 @@ async def api_health(request: Request) -> JSONResponse:
     return JSONResponse(health)
 
 
+async def api_timeline(request: Request) -> JSONResponse:
+    name = resolve_namespace(request.path_params["name"])
+    params = request.query_params
+    since = params.get("since") or None
+    until = params.get("until") or None
+    limit = int(params.get("limit") or 200)
+    with Store(name) as st:
+        events = st.events(since=since, until=until, limit=limit)
+    return JSONResponse({"namespace": name, "events": events})
+
+
+async def api_contradict(request: Request) -> JSONResponse:
+    name = resolve_namespace(request.path_params["name"])
+    memory_id = request.path_params["memory_id"]
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    replacement = body.get("replacement") or None
+    with Store(name) as st:
+        result = st.contradict(memory_id, replacement=replacement, origin="dashboard")
+    result["namespace"] = name
+    status = 200 if result.get("ok") else 404
+    return JSONResponse(result, status_code=status)
+
+
 routes = [
     Route("/", index),
     Route("/api/namespaces", api_namespaces),
@@ -825,8 +951,10 @@ routes = [
     Route("/api/namespace/{name}", api_namespace),
     Route("/api/namespace/{name}/recall", api_recall),
     Route("/api/namespace/{name}/browse", api_browse),
+    Route("/api/namespace/{name}/timeline", api_timeline),
     Route("/api/namespace/{name}/memory/{memory_id}", api_memory_detail),
     Route("/api/namespace/{name}/memory/{memory_id}", api_memory_delete, methods=["DELETE"]),
+    Route("/api/namespace/{name}/memory/{memory_id}/contradict", api_contradict, methods=["POST"]),
     Route("/api/namespace/{name}/event/{event_id}/memories", api_event_memories),
     Route("/api/namespace/{name}/procedures", api_procedures),
     Route("/api/namespace/{name}/worldview", api_worldview),
