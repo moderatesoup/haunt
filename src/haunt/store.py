@@ -497,7 +497,11 @@ class Store:
         return False
 
     def reembed(self) -> dict[str, Any]:
-        """Rebuild every memory embedding with the currently loaded model."""
+        """Rebuild every memory embedding with the currently loaded model.
+
+        ``updated`` is the number of rows that actually landed in
+        ``vec_memories``, not blob writes to ``memories.embedding``.
+        """
         es = embed_state()
         rows = self.conn.execute("SELECT id, content FROM memories").fetchall()
         self.conn.execute("DROP TABLE IF EXISTS vec_memories")
@@ -531,9 +535,9 @@ class Store:
                             "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
                             (mid, blob),
                         )
+                        updated += 1
                     except sqlite3.Error:
                         pass
-                updated += 1
         self.set_meta("embed_model", es.model_id)
         self.set_meta("embed_dim", str(es.dim))
         self.conn.commit()
