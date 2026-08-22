@@ -1087,26 +1087,22 @@ def list_namespaces() -> list[dict[str, Any]]:
     for row in list_namespace_rows():
         db = Path(row["db_path"])
         extra: dict[str, Any] = {
-            "events": 0,
-            "memories": 0,
-            "sessions": 0,
-            "entities": 0,
             "db_size_bytes": db.stat().st_size if db.exists() else 0,
         }
-        if db.exists():
-            try:
-                with Store(row["name"], create=False) as st:
-                    extra.update(
-                        {
-                            "events": st.stats()["events"],
-                            "memories": st.stats()["memories"],
-                            "sessions": st.stats()["sessions"],
-                            "entities": st.stats()["entities"],
-                            "db_size_bytes": st.stats()["db_size_bytes"],
-                        }
-                    )
-            except sqlite3.Error:
-                pass
+        try:
+            with Store(row["name"], create=False) as st:
+                stats = st.stats()
+                extra.update(
+                    {
+                        "events": stats["events"],
+                        "memories": stats["memories"],
+                        "sessions": stats["sessions"],
+                        "entities": stats["entities"],
+                        "db_size_bytes": stats["db_size_bytes"],
+                    }
+                )
+        except (sqlite3.Error, OSError) as exc:
+            extra["error"] = str(exc)
         out.append({**row, **extra})
     return out
 

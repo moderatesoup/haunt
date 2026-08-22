@@ -160,9 +160,13 @@ def namespaces_cmd() -> None:
         return
     typer.echo(f"{'name':<24} {'events':>7} {'mem':>7} {'sess':>6} {'ents':>6}  db")
     for r in rows:
-        typer.echo(
-            f"{r['name']:<24} {r['events']:>7} {r['memories']:>7} {r['sessions']:>6} {r['entities']:>6}  {r['db_path']}"
-        )
+        err = r.get("error")
+        if err:
+            typer.echo(f"{r['name']:<24}  error: {err}  {r['db_path']}")
+        else:
+            typer.echo(
+                f"{r['name']:<24} {r['events']:>7} {r['memories']:>7} {r['sessions']:>6} {r['entities']:>6}  {r['db_path']}"
+            )
 
 
 @app.command("health")

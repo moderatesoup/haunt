@@ -383,7 +383,7 @@ function setPills(h){
 function renderNs(list,current){
   const allOn=ALL_NS;
   let html=`<div class="ns all-ns ${allOn?'on':''}" data-ns="__all__"><b>all namespaces</b><i>${list.reduce((s,n)=>s+(n.events||0),0)}</i></div>`;
-  html+=list.map(n=>`<div class="ns ${!allOn&&n.name===current?'on':''}" data-ns="${esc(n.name)}"><b>${esc(n.name)}</b><i>${n.events}</i></div>`).join("");
+  html+=list.map(n=>`<div class="ns ${!allOn&&n.name===current?'on':''}" data-ns="${esc(n.name)}"><b>${esc(n.name)}</b><i>${n.error?'error':n.events}</i></div>`).join("");
   $("nsList").innerHTML=html||`<div class="empty">none</div>`;
   $("nsList").querySelectorAll(".ns").forEach(el=>{
     el.onclick=()=>{
