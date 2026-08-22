@@ -103,7 +103,11 @@ def recall_cmd(
     since: Optional[str] = typer.Option(None, "--since"),
     until: Optional[str] = typer.Option(None, "--until"),
     clock: Optional[str] = typer.Option(
-        None, "--clock", help="event_time | write_time (default event_time)"
+        None,
+        "--clock",
+        help="event_time | storage_time (default event_time). "
+        "storage_time is ingest time (events.ts), not source time. "
+        "write_time is a deprecated alias for storage_time.",
     ),
     tier: Optional[str] = typer.Option(None, "--tier"),
     k: int = typer.Option(8, "--k"),
@@ -147,7 +151,11 @@ def timeline_cmd(
     since: Optional[str] = typer.Option(None, "--since"),
     until: Optional[str] = typer.Option(None, "--until"),
     clock: Optional[str] = typer.Option(
-        None, "--clock", help="event_time | write_time (default event_time)"
+        None,
+        "--clock",
+        help="event_time | storage_time (default event_time). "
+        "storage_time is ingest time (events.ts), not source time. "
+        "write_time is a deprecated alias for storage_time.",
     ),
     limit: int = typer.Option(50, "--limit"),
 ) -> None:

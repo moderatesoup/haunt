@@ -33,21 +33,45 @@ def iso_or_now(value: str | None) -> str:
     return parse_iso(value).isoformat(timespec="seconds")
 
 
-CLOCKS = ("event_time", "write_time")
+CLOCKS = ("event_time", "storage_time")
+# write_time is a deprecated alias: ingest/storage time (events.ts), not source time.
+CLOCK_ALIASES = {"write_time": "storage_time"}
+
+
+def normalize_clock(clock: str | None, *, allow_unresolved: bool = False) -> str:
+    """Canonicalize a clock token.
+
+    storage_time is events.ts (ingest/storage time, not conversation/source time).
+    write_time is accepted as a deprecated alias for storage_time.
+    Default is event_time so existing since/until callers stay unchanged.
+    """
+    if clock is None:
+        return "event_time"
+    c = CLOCK_ALIASES.get(clock, clock)
+    allowed = CLOCKS + (("unresolved",) if allow_unresolved else ())
+    if c not in allowed:
+        extra = ", write_time (deprecated alias for storage_time)"
+        if allow_unresolved:
+            extra += ", unresolved"
+        raise ValueError(
+            f"clock must be event_time or storage_time{extra}, got {clock!r}"
+        )
+    return c
 
 
 def clock_sql_column(clock: str | None, *, qualified: bool = True) -> str:
-    """Map clock=event_time|write_time to the events column.
+    """Map clock=event_time|storage_time to the events column.
 
-    write_time is events.ts (ingest/write). event_time is events.event_time.
-    Default is event_time so existing since/until callers stay unchanged.
+    storage_time is events.ts (ingest/storage time, not source time).
+    write_time is a deprecated alias for storage_time.
+    event_time is events.event_time. Default is event_time.
     """
-    c = clock or "event_time"
+    c = normalize_clock(clock)
     if c == "event_time":
         return "e.event_time" if qualified else "event_time"
-    if c == "write_time":
+    if c == "storage_time":
         return "e.ts" if qualified else "ts"
-    raise ValueError(f"clock must be event_time or write_time, got {clock!r}")
+    raise ValueError(f"clock must be event_time or storage_time, got {clock!r}")
 
 
 def dumps(obj: Any) -> str:

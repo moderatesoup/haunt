@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
-Clock = Literal["event_time", "write_time", "unresolved"]
+Clock = Literal["event_time", "storage_time", "unresolved"]
 Granularity = Literal["day", "week", "month", "year"]
 Certainty = Literal["exact", "approximate"]
 
@@ -102,13 +102,21 @@ _DISCOURSE = re.compile(
     re.IGNORECASE,
 )
 
-_WRITE_RE = re.compile(
+# Speech verbs describe conversation, not ingest. They must not select events.ts.
+_SPEECH_RE = re.compile(
     r"\b(say|said|tell|told|telling|talking|talk|discuss(?:ed|ing)?|"
     r"mention(?:ed|ing)?)\b",
     re.IGNORECASE,
 )
 _EVENT_RE = re.compile(
     r"\b(happen(?:ed|ing)?|occur(?:red|ring)?|went|going|\bgo\b|when\s+was|\bdo\b)\b",
+    re.IGNORECASE,
+)
+# Operational only: haunt ingest/store. Ordinary NL never picks storage_time.
+_STORAGE_RE = re.compile(
+    r"\bhaunt\s+ingest(?:ed|ing|s)?\b"
+    r"|\bhaunt\s+(?:store|stored)\b"
+    r"|\bingest(?:ed|ing)?\s+by\s+haunt\b",
     re.IGNORECASE,
 )
 
@@ -480,6 +488,7 @@ def _best_match(tokens: list[str], now: datetime) -> _Match | None:
             _try_between,
             _try_in_the_past,
             _try_last_n,
+            _try_couple_ago,
             _try_ago,
             _try_preposition,
             _try_last_this_unit,
@@ -532,22 +541,34 @@ def _coarser(a: Granularity, b: Granularity) -> Granularity:
 
 
 def _try_in_the_past(tokens: list[str], i: int, now: datetime) -> _Match | None:
-    if tokens[i].lower() != "in":
+    """Range-to-now: (in|during|over) the past [N] unit.
+
+    N defaults to 1 so "during the past month" / "in the past month" match
+    the same family as "last N" / "in the past two weeks".
+    """
+    if tokens[i].lower().rstrip(".,") not in ("in", "during", "over"):
         return None
-    if i + 4 > len(tokens):
+    if i + 3 >= len(tokens):
         return None
     if tokens[i + 1].lower() != "the":
         return None
     if tokens[i + 2].lower() not in ("past", "last"):
         return None
-    num = _number(tokens[i + 3])
-    unit = _unit(tokens[i + 4]) if i + 4 < len(tokens) else None
-    if not num or not unit:
+    num = _number(tokens[i + 3]) if i + 3 < len(tokens) else None
+    if num:
+        unit_i = i + 4
+        n, nf = num
+    else:
+        unit_i = i + 3
+        n, nf = 1, False
+    if unit_i >= len(tokens):
         return None
-    n, nf = num
+    unit = _unit(tokens[unit_i])
+    if not unit:
+        return None
     gran, uf = unit
     start, end = _last_n_range(now, n, gran)
-    return _Match(i, i + 5, start, end, gran, "exact", 0.95, nf or uf)
+    return _Match(i, unit_i + 1, start, end, gran, "exact", 0.95, nf or uf)
 
 
 def _try_last_n(tokens: list[str], i: int, now: datetime) -> _Match | None:
@@ -563,6 +584,32 @@ def _try_last_n(tokens: list[str], i: int, now: datetime) -> _Match | None:
     gran, uf = unit
     start, end = _last_n_range(now, n, gran)
     return _Match(i, i + 3, start, end, gran, "exact", 0.95, nf or uf)
+
+
+def _try_couple_ago(tokens: list[str], i: int, now: datetime) -> _Match | None:
+    """a couple [of] days/weeks/months ago → quantity 2, approximate.
+
+    `a few` is not supported (precision-over-recall). Years are not in this form.
+    """
+    if tokens[i].lower().rstrip(".,;?!") != "a":
+        return None
+    if i + 1 >= len(tokens) or tokens[i + 1].lower().rstrip(".,;?!") != "couple":
+        return None
+    j = i + 2
+    if j < len(tokens) and tokens[j].lower().rstrip(".,;?!") == "of":
+        j += 1
+    if j >= len(tokens):
+        return None
+    unit = _unit(tokens[j])
+    if not unit:
+        return None
+    gran, uf = unit
+    if gran not in ("day", "week", "month"):
+        return None
+    if j + 1 >= len(tokens) or tokens[j + 1].lower().rstrip(".,;?!") != "ago":
+        return None
+    start, end = _offset_ago(now, 2, gran)
+    return _Match(i, j + 2, start, end, gran, "approximate", 0.75, uf)
 
 
 def _try_ago(tokens: list[str], i: int, now: datetime) -> _Match | None:
@@ -693,15 +740,22 @@ def _try_bare_date(tokens: list[str], i: int, now: datetime) -> _Match | None:
 
 
 def _infer_clock(query: str) -> Clock:
-    """Conservative clock. Mixed speech+occurrence cues stay unresolved."""
-    write = bool(_WRITE_RE.search(query))
+    """Ordinary NL temporal expressions use event_time.
+
+    Speech verbs (mentioned/said/told/discussed/talking about) do not select
+    events.ts. storage_time is ingest/storage time and is reserved for
+    operational queries ("what did haunt ingest yesterday"). Mixed
+    say+happened stays unresolved; unresolved must not become a ts-only filter.
+    """
+    speech = bool(_SPEECH_RE.search(query))
     event = bool(_EVENT_RE.search(query))
+    operational = bool(_STORAGE_RE.search(query))
     if re.search(r"\bdid\b", query, re.IGNORECASE):
         # Auxiliary "did I say/tell" is not an occurrence cue by itself.
-        if not write:
+        if not speech:
             event = True
-    if write and event:
+    if speech and event:
         return "unresolved"
-    if write:
-        return "write_time"
+    if operational and not speech:
+        return "storage_time"
     return "event_time"

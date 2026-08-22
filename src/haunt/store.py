@@ -24,7 +24,7 @@ from haunt.paths import (
     resolve_namespace,
     safe_name,
 )
-from haunt.util import clock_sql_column, dumps, iso_or_now, loads, new_id, now_iso
+from haunt.util import clock_sql_column, dumps, iso_or_now, loads, new_id, normalize_clock, now_iso
 
 ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
@@ -592,7 +592,7 @@ class Store:
         if until:
             sql += f" AND {col}<=?"
             params.append(iso_or_now(until))
-        if clock == "write_time":
+        if normalize_clock(clock) == "storage_time":
             sql += " ORDER BY ts DESC, event_time DESC LIMIT ?"
         else:
             sql += " ORDER BY event_time DESC, ts DESC LIMIT ?"
