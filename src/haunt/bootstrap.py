@@ -43,12 +43,20 @@ def write_hook_launcher() -> Path:
     return _write_sh_wrapper(bin_dir() / "haunt-hook", "haunt-hook", "haunt.cursor_hook")
 
 
+def write_claude_hook_launcher() -> Path:
+    """Space-free launcher at ~/.haunt/bin/haunt-hook-claude."""
+    return _write_sh_wrapper(
+        bin_dir() / "haunt-hook-claude", "haunt-hook-claude", "haunt.claude_hook"
+    )
+
+
 def write_launcher() -> Path:
     """Space-free absolute launchers at ~/.haunt/bin/{haunt,lore,engram}-{mcp,hook}."""
     dest = _write_sh_wrapper(bin_dir() / "haunt-mcp", "haunt-mcp", "haunt.mcp_server")
     _write_sh_wrapper(bin_dir() / "lore-mcp", "lore-mcp", "haunt.mcp_server")
     _write_sh_wrapper(bin_dir() / "engram-mcp", "engram-mcp", "haunt.mcp_server")
     write_hook_launcher()
+    write_claude_hook_launcher()
     return dest
 
 
@@ -116,6 +124,12 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
     from haunt.desktop import install_desktop_icon
     icon_result = install_desktop_icon()
 
+    from haunt.hosts import install_all_hosts
+
+    hook_cmd = str((bin_dir() / "haunt-hook").resolve())
+    mcp_cmd = str((bin_dir() / "haunt-mcp").resolve())
+    host_reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+
     hook_launcher = bin_dir() / "haunt-hook"
     report = {
         "haunt_home": str(home),
@@ -140,6 +154,17 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
         "reembed": reembed_report,
         "backend": getattr(embed_state, "backend", None),
         "download_bytes": getattr(embed_state, "download_bytes", None),
+        "hosts": [
+            {
+                "host": hr.host,
+                "hooks_path": hr.hooks_path,
+                "mcp_path": hr.mcp_path,
+                "rule_path": hr.rule_path,
+                "events": hr.events,
+                "seeded": hr.seeded,
+            }
+            for hr in host_reports
+        ],
     }
     diag("bootstrap", **{k: report[k] for k in ("haunt_home", "launcher")})
     return report
@@ -194,6 +219,13 @@ def format_report(report: dict) -> str:
         )
         lines.append(
             "            BAAI/bge-m3 can download (~2.28 GB)."
+        )
+    for h in report.get("hosts") or []:
+        status = "seeded" if h.get("seeded") else "merged"
+        lines.append(
+            f"host bind     {h['host']}: {status}  "
+            f"hooks={h.get('hooks_path', '-')}  mcp={h.get('mcp_path', '-')}  "
+            f"rule={h.get('rule_path', '-')}"
         )
     if os.environ.get("HAUNT_JSON") or os.environ.get("LORE_JSON"):
         return dumps(report)

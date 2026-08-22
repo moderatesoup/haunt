@@ -89,6 +89,10 @@ echo "    registry    ${HAUNT_HOME}/registry.db"
 echo "==> Installing desktop shortcut"
 haunt dash --install-icon || true
 
+# ── host bindings (Cursor + Claude Code) ─────────────────────────────
+echo "==> Binding hosts (Cursor, Claude Code)"
+haunt install
+
 echo ""
 echo "── next steps ──────────────────────────────────────────────────────"
 echo ""
@@ -99,12 +103,7 @@ echo "  2. Open the memory console:"
 echo "       haunt dash"
 echo "       → http://127.0.0.1:7340"
 echo ""
-echo "  3. Install Cursor hooks (optional):"
-echo "       haunt cursor-install"
-echo ""
-echo "  4. Add haunt as an MCP server (alongside any others you have):"
-echo "       {\"mcpServers\":{\"haunt\":{\"command\":\"${HAUNT_HOME}/bin/haunt-mcp\"}}}"
-echo ""
-echo "     haunt-mcp is a stdio server — do not run it directly."
+echo "  Hooks + MCP are already registered for Cursor and Claude Code."
+echo "  Re-run after adding another editor: haunt install"
 echo ""
 echo "  Done. Run 'haunt --help' to see all commands."

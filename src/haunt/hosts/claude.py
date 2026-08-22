@@ -1,0 +1,326 @@
+"""Claude Code host adapter: settings.json hooks + ~/.claude.json MCP + rule."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+from haunt.hosts import HostReport, HostStatus
+
+HOST_NAME = "claude-code"
+
+HOOK_EVENTS = (
+    "UserPromptSubmit",
+    "Stop",
+    "SessionStart",
+    "SessionEnd",
+    "PostToolUse",
+    "PostToolUseFailure",
+)
+
+
+def _claude_config_dir() -> Path:
+    """~/.claude or $CLAUDE_CONFIG_DIR."""
+    raw = os.environ.get("CLAUDE_CONFIG_DIR")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.home() / ".claude"
+
+
+def _claude_dotfile() -> Path:
+    """~/.claude.json (user-scope MCP) or $CLAUDE_CONFIG_DIR/.claude.json.
+
+    Claude Code silently ignores mcpServers in settings.json. User-scope
+    servers live in ~/.claude.json, or inside CLAUDE_CONFIG_DIR when set.
+    """
+    raw = os.environ.get("CLAUDE_CONFIG_DIR")
+    if raw:
+        return Path(raw).expanduser().resolve() / ".claude.json"
+    return Path.home() / ".claude.json"
+
+
+def _settings_json_path() -> Path:
+    return _claude_config_dir() / "settings.json"
+
+
+def _is_haunt_hook(command: str) -> bool:
+    name = command.replace("\\", "/").rstrip("/").split("/")[-1]
+    return name in {
+        "haunt-hook",
+        "haunt-hook-claude",
+        "engram-hook",
+        "lore-hook",
+    }
+
+
+def _merge_hooks_settings(path: Path, hook_cmd: str) -> dict[str, Any]:
+    """Merge haunt hook entries into Claude Code settings.json.
+
+    Schema: event → matcher group → hooks[] with type=command.
+    Matcher is omitted so the hook fires on every occurrence.
+    """
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except json.JSONDecodeError:
+            pass
+
+    hooks = existing.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        hooks = {}
+        existing["hooks"] = hooks
+
+    for event in HOOK_EVENTS:
+        matcher_groups = hooks.get(event)
+        if not isinstance(matcher_groups, list):
+            matcher_groups = []
+            hooks[event] = matcher_groups
+
+        haunt_hook_entry = {"type": "command", "command": hook_cmd}
+
+        found = False
+        for group in matcher_groups:
+            if not isinstance(group, dict):
+                continue
+            hook_list = group.get("hooks", [])
+            if not isinstance(hook_list, list):
+                continue
+            for h in hook_list:
+                if isinstance(h, dict) and _is_haunt_hook(str(h.get("command", ""))):
+                    h["command"] = hook_cmd
+                    h["type"] = "command"
+                    found = True
+
+        if not found:
+            matcher_groups.append({"hooks": [haunt_hook_entry]})
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    return existing
+
+
+def _is_haunt_mcp(key: str, entry: dict[str, Any]) -> bool:
+    if key == "haunt":
+        return True
+    cmd = str(entry.get("command", ""))
+    name = cmd.replace("\\", "/").rstrip("/").split("/")[-1]
+    return name in {"haunt-mcp", "engram-mcp", "lore-mcp"}
+
+
+def _merge_mcp_dotfile(path: Path, mcp_cmd: str) -> dict[str, Any]:
+    """Merge haunt MCP server into ~/.claude.json (user-scope).
+
+    MCP in settings.json is silently ignored by Claude Code — servers must
+    go in ~/.claude.json under the top-level "mcpServers" key.
+    Never replace the whole file.
+    """
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except json.JSONDecodeError:
+            pass
+
+    servers = existing.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+        existing["mcpServers"] = servers
+
+    found_key: str | None = None
+    for key, entry in list(servers.items()):
+        if isinstance(entry, dict) and _is_haunt_mcp(key, entry):
+            found_key = key
+            break
+
+    haunt_entry = {"command": mcp_cmd, "type": "stdio"}
+    if found_key:
+        servers[found_key] = haunt_entry
+    else:
+        servers["haunt"] = haunt_entry
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    return existing
+
+
+_HAUNT_CLAUDE_RULE = """\
+# haunt — local-first verbatim memory
+
+MCP server name is `haunt`; tools are prefixed `memory_`.
+
+## What hooks do (automatic)
+
+Claude Code hooks automatically LOG turns: prompts, replies, tool
+calls, session events. This happens without agent action.
+Do not double-observe what hooks already store.
+
+## What hooks do NOT do
+
+Hooks do NOT guarantee recall context injection into your prompt.
+SessionStart and UserPromptSubmit return additionalContext inside
+hookSpecificOutput; Claude Code may inject that, but it is not a
+guaranteed recall path and is not a kernel.
+
+## Agent responsibility: recall
+
+If no `[haunt ns=…]` block is visible in your current context, you MUST
+call `memory_recall` with the user's exact wording before acting.
+Do not assume prior context was injected.
+
+## Observe rules
+
+- Hooks handle episodic logging. Do not also call `memory_observe`
+  for content that hooks already capture.
+- tier=semantic for durable facts. tier=episodic for chat.
+- Always pass `origin` (e.g. "claude-code", "cli") and `session` id
+  when available.
+- Never summarize. Never distill. Store verbatim or don't store.
+
+## Skip list (never observe)
+
+- Secrets, tokens, API keys, passwords
+- Acks: "ok", "got it", "sure", empty turns
+- `memory_*` tool inputs/outputs (hooks already skip these)
+- Entire READMEs or large file dumps — store a pointer, not the blob
+
+## Worldview
+
+Call `memory_worldview` when you need the full namespace briefing.
+
+## Namespace
+
+Inferred from CLAUDE_PROJECT_DIR / git / cwd. Do not invent
+namespaces unless the user asks.
+"""
+
+
+def _install_rule(config_dir: Path) -> Path:
+    """Write a haunt-owned rule file into ~/.claude/rules/. Do not touch CLAUDE.md."""
+    rules_dir = config_dir / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    dest = rules_dir / "haunt.md"
+    dest.write_text(_HAUNT_CLAUDE_RULE, encoding="utf-8")
+    return dest
+
+
+def _claude_hook_cmd(haunt_home: str) -> str:
+    """Resolve the claude-specific hook launcher from haunt_home/bin/."""
+    return str(Path(haunt_home) / "bin" / "haunt-hook-claude")
+
+
+def install(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostReport:
+    """Bind Claude Code: settings.json hooks + ~/.claude.json MCP + rule.
+
+    hook_cmd is ignored; we use haunt-hook-claude from haunt_home/bin/.
+    """
+    config_dir = _claude_config_dir()
+    seeded = not config_dir.exists()
+
+    cc_hook_cmd = _claude_hook_cmd(haunt_home)
+    settings_path = _settings_json_path()
+    _merge_hooks_settings(settings_path, cc_hook_cmd)
+
+    dotfile_path = _claude_dotfile()
+    _merge_mcp_dotfile(dotfile_path, mcp_cmd)
+
+    rule_path = _install_rule(config_dir)
+
+    return HostReport(
+        host=HOST_NAME,
+        hooks_path=str(settings_path),
+        mcp_path=str(dotfile_path),
+        rule_path=str(rule_path),
+        events=list(HOOK_EVENTS),
+        seeded=seeded,
+    )
+
+
+def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
+    """Check Claude Code bindings.
+
+    hook_cmd is ignored; we look for haunt-hook-claude in config.
+    """
+    status = HostStatus(host=HOST_NAME)
+
+    settings_path = _settings_json_path()
+    status.hooks_path = str(settings_path)
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            hooks = data.get("hooks", {})
+            has_haunt = False
+            for event in HOOK_EVENTS:
+                groups = hooks.get(event, [])
+                if not isinstance(groups, list):
+                    continue
+                for group in groups:
+                    if not isinstance(group, dict):
+                        continue
+                    for h in group.get("hooks", []):
+                        if isinstance(h, dict) and _is_haunt_hook(
+                            str(h.get("command", ""))
+                        ):
+                            has_haunt = True
+            status.hooks_present = has_haunt
+            if not has_haunt:
+                status.issues.append("haunt hook entries missing from settings.json")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            status.issues.append("settings.json malformed")
+    else:
+        status.issues.append("settings.json not found")
+
+    dotfile_path = _claude_dotfile()
+    status.mcp_path = str(dotfile_path)
+    if dotfile_path.exists():
+        try:
+            data = json.loads(dotfile_path.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers", {})
+            if not isinstance(servers, dict):
+                servers = {}
+            status.mcp_present = any(
+                _is_haunt_mcp(k, v)
+                for k, v in servers.items()
+                if isinstance(v, dict)
+            )
+            if not status.mcp_present:
+                status.issues.append(
+                    "haunt MCP server missing from .claude.json"
+                )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            status.issues.append(".claude.json malformed")
+    else:
+        status.issues.append(".claude.json not found")
+
+    # MCP must NOT be treated as present if it only lives in settings.json
+    # (Claude Code silently ignores mcpServers there).
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings_servers = data.get("mcpServers", {})
+            if isinstance(settings_servers, dict) and any(
+                _is_haunt_mcp(k, v)
+                for k, v in settings_servers.items()
+                if isinstance(v, dict)
+            ):
+                status.issues.append(
+                    "haunt MCP in settings.json (silently ignored by Claude Code); "
+                    "must be in .claude.json"
+                )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    config_dir = _claude_config_dir()
+    rule = config_dir / "rules" / "haunt.md"
+    status.rule_path = str(rule)
+    status.rule_present = rule.exists()
+    if not status.rule_present:
+        status.issues.append("haunt.md rule not found")
+
+    return status

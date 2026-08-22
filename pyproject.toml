@@ -25,6 +25,7 @@ dev = ["pytest>=8.0", "httpx"]
 haunt = "haunt.cli:main"
 haunt-mcp = "haunt.mcp_server:main"
 haunt-hook = "haunt.cursor_hook:main"
+haunt-hook-claude = "haunt.claude_hook:main"
 lore = "haunt.cli:main"
 lore-mcp = "haunt.mcp_server:main"
 lore-hook = "haunt.cursor_hook:main"

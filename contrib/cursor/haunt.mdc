@@ -30,7 +30,7 @@ Do not assume prior context was injected.
 ## Observe rules
 
 - Hooks handle episodic logging. Only call `memory_observe` manually
-  when hooks are absent (e.g. Grok Bot, Claude Code — no hook support).
+  when hooks are absent (e.g. Grok Bot).
 - tier=semantic for durable facts. tier=episodic for chat.
 - Always pass `origin` (e.g. "cursor", "cli") and `session` id when
   available.
@@ -76,7 +76,7 @@ that are clearly off-corpus rather than trusting the number.
 Inferred from `CURSOR_PROJECT_DIR` / git / cwd. Do not invent
 namespaces unless the user asks.
 
-## No hooks environment (Grok Bot, Claude Code, etc.)
+## No hooks environment (Grok Bot)
 
 When hooks are unavailable, the agent must both observe AND recall
 manually. Observe each user turn (tier=episodic) and each durable
