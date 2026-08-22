@@ -360,18 +360,34 @@ class Store:
         self.set_meta("current_session", sid)
         return sid
 
-    def end_session(self, session_id: str | None = None) -> str | None:
+    def end_session(self, session_id: str | None = None) -> dict[str, Any]:
+        """Close an open session. Returns ok=False if nothing was ended."""
         sid = session_id or self.get_meta("current_session")
         if not sid:
-            return None
-        self.conn.execute(
+            return {"ok": False, "error": "no open session"}
+        cur = self.conn.execute(
             "UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL",
             (now_iso(), sid),
         )
+        if cur.rowcount == 0:
+            row = self.conn.execute(
+                "SELECT ended_at FROM sessions WHERE id=?", (sid,)
+            ).fetchone()
+            if not row:
+                return {
+                    "ok": False,
+                    "session_id": sid,
+                    "error": f"session {sid} not found",
+                }
+            return {
+                "ok": False,
+                "session_id": sid,
+                "error": f"session {sid} already ended",
+            }
         if self.get_meta("current_session") == sid:
             self.conn.execute("DELETE FROM meta WHERE key='current_session'")
         self.conn.commit()
-        return sid
+        return {"ok": True, "session_id": sid}
 
     def observe(
         self,

@@ -152,8 +152,16 @@ def memory_session_end(
 ) -> str:
     ns = resolve_namespace(namespace)
     with Store(ns) as st:
-        sid = st.end_session(session)
-    return _json({"ok": True, "namespace": ns, "session_id": sid, "distilled": False})
+        result = st.end_session(session)
+    payload = {
+        "ok": bool(result.get("ok")),
+        "namespace": ns,
+        "session_id": result.get("session_id"),
+        "distilled": False,
+    }
+    if not payload["ok"]:
+        payload["error"] = result.get("error") or "session was not ended"
+    return _json(payload)
 
 
 @server.tool(
