@@ -31,15 +31,15 @@ def fts_env(tmp_path, monkeypatch):
     embed.reset()
 
 
-def _ended_ok(result: object) -> bool:
-    """True only if the store actually reported a successful end.
+def _claimed_ok(result: object) -> bool:
+    """Whether the caller was told the session ended.
 
     The old always-ok path returned the requested session id (a truthy str)
-    even when no row was updated. That must not count as success.
+    even when no row was updated. That is a claimed success.
     """
     if isinstance(result, dict):
         return result.get("ok") is True
-    return False
+    return bool(result)
 
 
 def test_end_session_nonexistent_is_not_ok(fts_env):
@@ -53,15 +53,18 @@ def test_end_session_nonexistent_is_not_ok(fts_env):
             "SELECT id FROM sessions WHERE id=?", (missing,)
         ).fetchall()
 
-    assert not _ended_ok(result), (
+    assert not _claimed_ok(result), (
         "end_session must not succeed for a missing session "
         f"(result={result!r})"
     )
-    if isinstance(result, dict):
-        assert result.get("ok") is False
-        assert result.get("error")
-        assert missing in str(result.get("error"))
-        assert result.get("session_id") == missing
+    assert isinstance(result, dict), (
+        "end_session must return an honest report dict, not the requested id "
+        f"(result={result!r})"
+    )
+    assert result.get("ok") is False
+    assert result.get("error")
+    assert missing in str(result.get("error"))
+    assert result.get("session_id") == missing
     assert rows == []
 
 
@@ -71,20 +74,20 @@ def test_end_session_already_ended_is_not_ok(fts_env):
     with Store("default") as st:
         sid = st.ensure_session("already-ended-sess")
         first = st.end_session(sid)
-        assert _ended_ok(first), f"first close of an open session must succeed: {first!r}"
+        assert _claimed_ok(first), f"first close of an open session must succeed: {first!r}"
         again = st.end_session(sid)
         row = st.conn.execute(
             "SELECT ended_at FROM sessions WHERE id=?", (sid,)
         ).fetchone()
 
-    assert not _ended_ok(again), (
+    assert not _claimed_ok(again), (
         "end_session must not succeed for an already-ended session "
         f"(result={again!r})"
     )
-    if isinstance(again, dict):
-        assert again.get("ok") is False
-        assert again.get("error")
-        assert "already ended" in str(again.get("error")).lower()
+    assert isinstance(again, dict)
+    assert again.get("ok") is False
+    assert again.get("error")
+    assert "already ended" in str(again.get("error")).lower()
     assert row is not None and row["ended_at"]
 
 
@@ -95,13 +98,13 @@ def test_end_session_no_current_session_is_not_ok(fts_env):
         assert st.get_meta("current_session") is None
         result = st.end_session()
 
-    assert not _ended_ok(result), (
+    assert not _claimed_ok(result), (
         "end_session with no current session must not look like success "
         f"(result={result!r})"
     )
-    if isinstance(result, dict):
-        assert result.get("ok") is False
-        assert result.get("error")
+    assert isinstance(result, dict)
+    assert result.get("ok") is False
+    assert result.get("error")
 
 
 def test_end_session_open_session_succeeds(fts_env):
@@ -115,7 +118,9 @@ def test_end_session_open_session_succeeds(fts_env):
         ).fetchone()
         current = st.get_meta("current_session")
 
-    assert _ended_ok(result), f"open session must end successfully: {result!r}"
+    assert _claimed_ok(result), f"open session must end successfully: {result!r}"
+    assert isinstance(result, dict)
+    assert result["ok"] is True
     assert result["session_id"] == sid
     assert row is not None and row["ended_at"]
     assert current != sid
@@ -155,7 +160,7 @@ def test_memory_session_end_already_ended_is_not_ok(fts_env):
     sid = "ended-once"
     with Store("default") as st:
         st.ensure_session(sid)
-        assert _ended_ok(st.end_session(sid))
+        assert _claimed_ok(st.end_session(sid))
 
     data = json.loads(memory_session_end(session=sid, namespace="default"))
     assert data["ok"] is False
