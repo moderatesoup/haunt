@@ -313,6 +313,8 @@ def test_contradict_not_found(lore_env):
 
 
 def test_reembed_rebuilds_on_dim_mismatch(lore_env):
+    if not embed_available():
+        pytest.skip("embeddings unavailable — cannot test dim-mismatch reembed")
     observe("stripe webhook key lives in config/secrets.toml", namespace="default")
     with Store("default") as st:
         before = st.get_meta("embed_dim")
