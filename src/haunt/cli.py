@@ -330,12 +330,22 @@ def procedure_list_cmd(
 
 @app.command("delete")
 def delete_cmd(
-    memory_id: str = typer.Argument(..., help="Memory ID to permanently delete"),
+    memory_id: Optional[str] = typer.Argument(
+        None, help="Memory ID to permanently delete (omit when using --event-id)"
+    ),
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
-    event_id: Optional[str] = typer.Option(None, "--event-id", help="Delete all memories for this event"),
+    event_id: Optional[str] = typer.Option(
+        None, "--event-id", help="Delete all memories for this event"
+    ),
 ) -> None:
     """Hard-delete a memory and its provenance chain (FTS, vec, graph, orphan events)."""
+    if memory_id and event_id:
+        typer.echo("error: pass memory_id or --event-id, not both", err=True)
+        raise typer.Exit(2)
+    if not memory_id and not event_id:
+        typer.echo("error: memory_id or --event-id is required", err=True)
+        raise typer.Exit(2)
     ns = _ns(namespace)
     if event_id:
         with Store(ns) as st:
