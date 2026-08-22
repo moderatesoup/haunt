@@ -6,7 +6,16 @@ from datetime import datetime, timezone
 
 import pytest
 
-from haunt.planner import execute, plan, planned_recall, run_recall, run_timeline, run_union
+from haunt.planner import (
+    UNRESOLVED_CLOCK_FALLBACK,
+    execute,
+    has_topical_residue,
+    plan,
+    planned_recall,
+    run_recall,
+    run_timeline,
+    run_union,
+)
 from haunt.recall import recall
 from haunt.store import Store
 from haunt.temporal import compile
@@ -38,15 +47,22 @@ def _set_ts(store: Store, event_id: str, ts: str) -> None:
     store.conn.commit()
 
 
-def test_plan_nontemporal_is_recall_temporal_is_union():
+def test_plan_topical_is_recall_bare_temporal_is_timeline():
     assert compile("Azure architecture", NOW).temporal is False
     assert plan(compile("Azure architecture", NOW)) == "recall"
     tq = compile("Azure two weeks ago", NOW)
     assert tq.temporal
     assert "Azure" in tq.cleaned_query
-    # leftover words must not force recall-only
-    assert plan(tq) == "union"
-    assert plan(compile("two weeks ago", NOW)) == "union"
+    assert has_topical_residue(tq.cleaned_query)
+    assert plan(tq) == "recall"
+    bare = compile("two weeks ago", NOW)
+    assert bare.temporal
+    assert plan(bare) == "timeline"
+    happened = compile("what happened two weeks ago", NOW)
+    assert happened.temporal
+    assert not has_topical_residue(happened.cleaned_query)
+    assert plan(happened) == "timeline"
+    assert plan(compile("during the past month", NOW)) == "timeline"
 
 
 def test_write_time_vs_event_time_select_different_rows(fts_env):
@@ -66,13 +82,16 @@ def test_write_time_vs_event_time_select_different_rows(fts_env):
 
         win_since, win_until = "2026-08-20T00:00:00+00:00", "2026-08-20T23:59:59+00:00"
         by_event = st.events(since=win_since, until=win_until, clock="event_time")
-        by_write = st.events(since=win_since, until=win_until, clock="write_time")
+        by_storage = st.events(since=win_since, until=win_until, clock="storage_time")
+        by_write_alias = st.events(since=win_since, until=win_until, clock="write_time")
         event_ids = {r["id"] for r in by_event}
-        write_ids = {r["id"] for r in by_write}
+        storage_ids = {r["id"] for r in by_storage}
+        alias_ids = {r["id"] for r in by_write_alias}
         assert happened.event_id in event_ids
         assert wrote.event_id not in event_ids
-        assert wrote.event_id in write_ids
-        assert happened.event_id not in write_ids
+        assert wrote.event_id in storage_ids
+        assert happened.event_id not in storage_ids
+        assert alias_ids == storage_ids
 
         rec_event = recall(
             "lighthouse",
@@ -82,7 +101,15 @@ def test_write_time_vs_event_time_select_different_rows(fts_env):
             store=st,
             k=8,
         )
-        rec_write = recall(
+        rec_storage = recall(
+            "lighthouse",
+            since=win_since,
+            until=win_until,
+            clock="storage_time",
+            store=st,
+            k=8,
+        )
+        rec_write_alias = recall(
             "lighthouse",
             since=win_since,
             until=win_until,
@@ -91,7 +118,8 @@ def test_write_time_vs_event_time_select_different_rows(fts_env):
             k=8,
         )
         assert {h.event_id for h in rec_event} == {happened.event_id}
-        assert {h.event_id for h in rec_write} == {wrote.event_id}
+        assert {h.event_id for h in rec_storage} == {wrote.event_id}
+        assert {h.event_id for h in rec_write_alias} == {wrote.event_id}
 
 
 def test_nontemporal_planned_recall_matches_bare_recall(fts_env):
@@ -163,8 +191,59 @@ def test_union_includes_timeline_row_that_windowed_fts_misses(fts_env):
         assert gold.event_id in {h.event_id for h in union}
         assert other.event_id not in {h.event_id for h in union}
 
+        # union is opt-in only; topical residue defaults to recall.
+        assert plan(tq) == "recall"
         default = execute(tq, st, k=8)
-        assert gold.event_id in {h.event_id for h in default}
+        assert gold.event_id not in {h.event_id for h in default}
+        opt_in = execute(tq, st, strategy="union", k=8)
+        assert gold.event_id in {h.event_id for h in opt_in}
+
+
+def test_unresolved_clock_does_not_apply_storage_filter(fts_env):
+    """Mixed say+happened stays unresolved and must not filter events.ts."""
+    assert "storage_time" in UNRESOLVED_CLOCK_FALLBACK or "events.ts" in UNRESOLVED_CLOCK_FALLBACK
+    with Store("unresolved") as st:
+        by_event = st.observe(
+            "I said the outage happened then",
+            event_time="2026-08-08T12:00:00+00:00",
+            origin="test",
+        )
+        _set_ts(st, by_event.event_id, "2026-08-22T12:00:00+00:00")
+        by_storage = st.observe(
+            "I said the outage happened then (ingested later)",
+            event_time="2025-01-01T12:00:00+00:00",
+            origin="test",
+        )
+        _set_ts(st, by_storage.event_id, "2026-08-08T12:00:00+00:00")
+        tq = compile("What did I say happened two weeks ago?", NOW)
+        assert tq.clock == "unresolved"
+        hits = run_timeline(tq, st, limit=20)
+        ids = {h.event_id for h in hits}
+        assert by_event.event_id in ids
+        assert by_storage.event_id not in ids
+
+
+def test_mentioned_two_weeks_ago_filters_event_time_not_storage(fts_env):
+    with Store("mentioned") as st:
+        conversation = st.observe(
+            "I mentioned the lighthouse lamp",
+            event_time="2026-08-08T12:00:00+00:00",
+            origin="test",
+        )
+        _set_ts(st, conversation.event_id, "2026-08-22T09:00:00+00:00")
+        ingested = st.observe(
+            "I mentioned the lighthouse lamp at ingest",
+            event_time="2025-01-01T12:00:00+00:00",
+            origin="test",
+        )
+        _set_ts(st, ingested.event_id, "2026-08-08T12:00:00+00:00")
+        tq = compile("I mentioned the lighthouse two weeks ago", NOW)
+        assert tq.clock == "event_time"
+        assert plan(tq) == "recall"
+        hits = run_recall(tq, st, k=8)
+        ids = {h.event_id for h in hits}
+        assert conversation.event_id in ids
+        assert ingested.event_id not in ids
 
 
 def test_default_clock_is_event_time_when_unspecified(fts_env):

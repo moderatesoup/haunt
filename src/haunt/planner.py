@@ -1,42 +1,159 @@
 """Retrieval planner for a compiled TemporalQuery.
 
-compile() does language only. plan() chooses timeline | recall | union.
-When TemporalQuery.clock is unresolved (mixed speech vs occurrence cues),
-retrieval applies the compiled [start, end] to event_time OR write_time
-and unions the rows. We do not pick a single clock.
+compile() does language only. plan() chooses timeline or recall.
+union remains available for tests/experiments via execute(strategy="union")
+and run_union(); it is not the default.
 
-Default for temporal=true is union (C): leftover words must not force
-recall-only. Non-temporal queries never reach this module's window path.
+When TemporalQuery.clock is unresolved (mixed speech vs occurrence cues),
+retrieval applies the compiled [start, end] to event_time only. Unresolved
+must not apply a storage_time / events.ts filter.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Literal
 
 from haunt.recall import Hit, recall
 from haunt.store import Store
 from haunt.temporal import TemporalQuery, compile
-from haunt.util import iso_or_now
+from haunt.util import iso_or_now, normalize_clock
 
 Plan = Literal["timeline", "recall", "union"]
 
 # Documented fallback when compile() leaves clock unresolved.
 UNRESOLVED_CLOCK_FALLBACK = (
-    "unresolved clock: apply [start, end] to event_time OR write_time "
-    "(union). Do not guess a single clock."
+    "unresolved clock: apply [start, end] to event_time only. "
+    "Do not apply a storage_time / events.ts filter."
 )
+
+# Leftover words that are not a topic. Pure "what happened two weeks ago"
+# must plan as timeline, not recall.
+_RESIDUE_STOP = frozenset(
+    {
+        "what",
+        "when",
+        "where",
+        "who",
+        "why",
+        "how",
+        "which",
+        "did",
+        "do",
+        "does",
+        "doing",
+        "done",
+        "was",
+        "were",
+        "is",
+        "are",
+        "am",
+        "be",
+        "been",
+        "being",
+        "has",
+        "have",
+        "had",
+        "i",
+        "me",
+        "my",
+        "mine",
+        "we",
+        "us",
+        "our",
+        "you",
+        "your",
+        "they",
+        "them",
+        "their",
+        "he",
+        "she",
+        "it",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "the",
+        "a",
+        "an",
+        "about",
+        "of",
+        "to",
+        "for",
+        "in",
+        "on",
+        "at",
+        "with",
+        "from",
+        "by",
+        "into",
+        "over",
+        "during",
+        "as",
+        "please",
+        "just",
+        "also",
+        "any",
+        "anything",
+        "something",
+        "things",
+        "thing",
+        "there",
+        "mention",
+        "mentioned",
+        "mentioning",
+        "say",
+        "said",
+        "tell",
+        "told",
+        "telling",
+        "talk",
+        "talking",
+        "discuss",
+        "discussed",
+        "discussing",
+        "happen",
+        "happened",
+        "happening",
+        "occur",
+        "occurred",
+        "occurring",
+        "went",
+        "going",
+        "go",
+        "haunt",
+        "ingest",
+        "ingested",
+        "ingesting",
+        "store",
+        "stored",
+    }
+)
+_RESIDUE_TOKEN = re.compile(r"[A-Za-z0-9_./+-]+")
+
+
+def has_topical_residue(cleaned_query: str) -> bool:
+    """True when compile leftover contains a topic, not just function words."""
+    for tok in _RESIDUE_TOKEN.findall(cleaned_query or ""):
+        if tok.lower() not in _RESIDUE_STOP:
+            return True
+    return False
 
 
 def plan(tq: TemporalQuery) -> Plan:
     """Choose a retrieval strategy from a TemporalQuery.
 
-    Does not inspect leftover words to force recall. v1 default for any
-    temporal window is union so timeline can surface rows FTS misses.
+    Topical residue after compile → recall (cleaned query + event_time window).
+    Bare temporal ("what happened two weeks ago") → timeline.
+    union is not returned by plan().
     """
     if not tq.temporal:
         return "recall"
-    return "union"
+    if has_topical_residue(tq.cleaned_query):
+        return "recall"
+    return "timeline"
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -48,11 +165,10 @@ def _iso(dt: datetime | None) -> str | None:
 
 
 def _clocks(clock: str) -> tuple[str, ...]:
-    if clock == "unresolved":
-        return ("event_time", "write_time")
-    if clock in ("event_time", "write_time"):
-        return (clock,)
-    raise ValueError(f"clock must be event_time, write_time, or unresolved, got {clock!r}")
+    c = normalize_clock(clock, allow_unresolved=True)
+    if c == "unresolved":
+        return ("event_time",)
+    return (c,)
 
 
 def _hits_from_events(store: Store, events: list[dict], *, limit: int) -> list[Hit]:
@@ -235,8 +351,8 @@ def planned_recall(
     recall() path runs unchanged (no compiler window, no compiler clock).
     Caller-supplied since/until/clock stay as they were before this module.
     """
-    if clock is not None and clock not in ("event_time", "write_time"):
-        raise ValueError(f"clock must be event_time or write_time, got {clock!r}")
+    if clock is not None:
+        normalize_clock(clock)
     if since:
         iso_or_now(since)
     if until:
@@ -257,14 +373,16 @@ def planned_recall(
         )
 
     # Temporal: do not silently drop the compiled window. Explicit since/until
-    # from the caller are an override of the bounds only.
+    # from the caller are an override of the bounds only. write_time is
+    # canonicalized to storage_time (ingest time, not source time).
+    chosen_clock = normalize_clock(clock) if clock is not None else tq.clock
     if since is not None or until is not None:
         tq = TemporalQuery(
             temporal=True,
             cleaned_query=tq.cleaned_query,
             start=datetime.fromisoformat(iso_or_now(since)) if since else tq.start,
             end=datetime.fromisoformat(iso_or_now(until)) if until else tq.end,
-            clock=clock or tq.clock,
+            clock=chosen_clock,
             granularity=tq.granularity,
             certainty=tq.certainty,
             confidence=tq.confidence,
@@ -275,7 +393,7 @@ def planned_recall(
             cleaned_query=tq.cleaned_query,
             start=tq.start,
             end=tq.end,
-            clock=clock,
+            clock=chosen_clock,
             granularity=tq.granularity,
             certainty=tq.certainty,
             confidence=tq.confidence,

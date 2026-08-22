@@ -71,7 +71,7 @@ def memory_observe(
     )
 
 
-@server.tool(description="Hybrid recall over verbatim memories (vec + FTS5 + RRF). Scores are rank-normalized (not relevance probabilities).")
+@server.tool(description="Hybrid recall over verbatim memories (vec + FTS5 + RRF). Scores are rank-normalized (not relevance probabilities). clock is event_time (default) or storage_time (ingest time, events.ts — not source time). write_time is a deprecated alias for storage_time.")
 def memory_recall(
     query: str,
     namespace: Optional[str] = None,
@@ -101,7 +101,7 @@ def memory_recall(
     return _json({"namespace": ns, "query": query, "hits": [h.as_dict() for h in hits]})
 
 
-@server.tool(description="List stored events in time order.")
+@server.tool(description="List stored events in time order. clock is event_time (default) or storage_time (ingest time, events.ts — not source time). write_time is a deprecated alias for storage_time.")
 def memory_timeline(
     namespace: Optional[str] = None,
     session: Optional[str] = None,

@@ -169,7 +169,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
 | `haunt recall QUERY [--as-of --since --until --clock --tier --k]` | hybrid recall (vec + FTS5 + RRF); query-time temporal compile |
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |
-| `haunt timeline [--since --until --clock]` | events by `event_time` or write time (`ts`) |
+| `haunt timeline [--since --until --clock]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias) |
 | `haunt namespaces` | list + counts |
 | `haunt health [-n NAMESPACE]` | vec / embed / counts / db path |
 | `haunt worldview [-n NAMESPACE]` | compact namespace briefing: facts, entities, procedures |

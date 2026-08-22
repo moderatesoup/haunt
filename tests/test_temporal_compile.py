@@ -87,7 +87,7 @@ def test_tow_is_fuzzy_two_wks_is_alias():
 
 
 def test_last_two_weeks_is_range_to_now():
-    for query in ("last two weeks", "in the past two weeks"):
+    for query in ("last two weeks", "in the past two weeks", "over the past two weeks"):
         tq = compile(query, NOW)
         assert tq.temporal
         start_d, end_d = _day(tq)
@@ -95,6 +95,49 @@ def test_last_two_weeks_is_range_to_now():
         assert (NOW.date() - start_d).days == 14
         assert end_d == NOW.date()
         assert tq.granularity == "week"
+
+
+def test_during_in_the_past_month_is_range_to_now():
+    for query in ("during the past month", "in the past month", "over the past month"):
+        tq = compile(query, NOW)
+        assert tq.temporal, query
+        start_d, end_d = _day(tq)
+        assert start_d != end_d, f"{query} must not collapse to a single day"
+        assert end_d == NOW.date()
+        assert tq.granularity == "month"
+        assert tq.certainty == "exact"
+        assert tq.clock == "event_time"
+        # Range-to-now of 1 month (2026-07-22 → now), not calendar "last month".
+        assert start_d == datetime(2026, 7, 22).date()
+
+
+def test_couple_ago_is_quantity_two_approximate():
+    days = compile("a couple of days ago", NOW)
+    assert days.temporal
+    assert days.certainty == "approximate"
+    assert days.granularity == "day"
+    assert days.clock == "event_time"
+    start_d, end_d = _day(days)
+    assert start_d == end_d
+    assert (NOW.date() - start_d).days == 2
+
+    weeks = compile("a couple weeks ago", NOW)
+    assert weeks.temporal
+    assert weeks.certainty == "approximate"
+    assert weeks.granularity == "week"
+    assert (NOW.date() - weeks.start.date()).days == 14
+
+    months = compile("a couple of months ago", NOW)
+    assert months.temporal
+    assert months.certainty == "approximate"
+    assert months.granularity == "month"
+    assert months.start.date() == datetime(2026, 6, 22).date()
+
+
+def test_a_few_ago_is_not_temporal():
+    tq = compile("a few days ago", NOW)
+    assert tq.temporal is False
+    assert tq.start is None and tq.end is None
 
 
 def test_about_two_weeks_ago_is_approximate_centered_minus_14d():
@@ -170,17 +213,31 @@ def test_today_yesterday_this_last_units():
     assert last_year.end.year == 2025
 
 
-def test_say_is_write_time_happened_is_event_time():
+def test_speech_verbs_do_not_select_storage_time():
     said = compile("what did I say last week", NOW)
     assert said.temporal
-    assert said.clock == "write_time"
+    assert said.clock == "event_time"
     assert "say" in said.cleaned_query.lower()
     assert "week" not in said.cleaned_query.lower()
+
+    mentioned = compile("I mentioned the lighthouse two weeks ago", NOW)
+    assert mentioned.temporal
+    assert mentioned.clock == "event_time"
+    assert mentioned.certainty == "exact"
+    assert (NOW.date() - mentioned.start.date()).days == 14
+    assert "lighthouse" in mentioned.cleaned_query.lower()
 
     happened = compile("what happened last week", NOW)
     assert happened.temporal
     assert happened.clock == "event_time"
     assert "happened" in happened.cleaned_query.lower()
+
+
+def test_operational_haunt_ingest_is_storage_time():
+    tq = compile("what did haunt ingest yesterday", NOW)
+    assert tq.temporal
+    assert tq.clock == "storage_time"
+    assert (NOW.date() - tq.start.date()).days == 1
 
 
 def test_mixed_say_happened_is_unresolved_clock():
@@ -215,6 +272,8 @@ def test_does_not_spellcheck_non_grammar_tokens():
         "March release process",
         "three days before that",
         "two weeks before that",
+        "a few days ago",
+        "a few weeks ago",
     ],
 )
 def test_false_positive_negatives_are_not_temporal(query):
