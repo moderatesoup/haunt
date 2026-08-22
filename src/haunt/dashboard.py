@@ -842,6 +842,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
     as_of = request.query_params.get("as_of") or None
     since = request.query_params.get("since") or None
     until = request.query_params.get("until") or None
+    clock = request.query_params.get("clock") or None
 
     ns_rows = list_namespace_rows()
     all_hits: list[tuple[Hit, str]] = []
@@ -852,7 +853,8 @@ async def api_recall_all(request: Request) -> JSONResponse:
                 if st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0:
                     continue
                 hits = recall(q, namespace=ns_name, k=k, tier=tier,
-                              as_of=as_of, since=since, until=until, store=st)
+                              as_of=as_of, since=since, until=until,
+                              clock=clock, store=st)
                 for h in hits:
                     all_hits.append((h, ns_name))
         except (FileNotFoundError, Exception):
@@ -885,9 +887,11 @@ async def api_recall(request: Request) -> JSONResponse:
     as_of = request.query_params.get("as_of") or None
     since = request.query_params.get("since") or None
     until = request.query_params.get("until") or None
+    clock = request.query_params.get("clock") or None
     with Store(name) as st:
         hits = recall(q, namespace=name, k=k, tier=tier,
-                      as_of=as_of, since=since, until=until, store=st)
+                      as_of=as_of, since=since, until=until,
+                      clock=clock, store=st)
     results = []
     for h in hits:
         d = h.as_dict()
@@ -973,9 +977,10 @@ async def api_timeline(request: Request) -> JSONResponse:
     params = request.query_params
     since = params.get("since") or None
     until = params.get("until") or None
+    clock = params.get("clock") or None
     limit = int(params.get("limit") or 200)
     with Store(name) as st:
-        events = st.events(since=since, until=until, limit=limit)
+        events = st.events(since=since, until=until, clock=clock, limit=limit)
     return JSONResponse({"namespace": name, "events": events})
 
 

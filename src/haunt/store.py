@@ -24,7 +24,7 @@ from haunt.paths import (
     resolve_namespace,
     safe_name,
 )
-from haunt.util import dumps, iso_or_now, loads, new_id, now_iso
+from haunt.util import clock_sql_column, dumps, iso_or_now, loads, new_id, now_iso
 
 ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
@@ -577,20 +577,25 @@ class Store:
         session_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        clock: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
+        col = clock_sql_column(clock, qualified=False)
         sql = "SELECT * FROM events WHERE 1=1"
         params: list[Any] = []
         if session_id:
             sql += " AND session_id=?"
             params.append(session_id)
         if since:
-            sql += " AND event_time>=?"
+            sql += f" AND {col}>=?"
             params.append(iso_or_now(since))
         if until:
-            sql += " AND event_time<=?"
+            sql += f" AND {col}<=?"
             params.append(iso_or_now(until))
-        sql += " ORDER BY event_time DESC, ts DESC LIMIT ?"
+        if clock == "write_time":
+            sql += " ORDER BY ts DESC, event_time DESC LIMIT ?"
+        else:
+            sql += " ORDER BY event_time DESC, ts DESC LIMIT ?"
         params.append(int(limit))
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 

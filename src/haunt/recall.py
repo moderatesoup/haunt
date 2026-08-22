@@ -17,7 +17,7 @@ import sqlite_vec
 from haunt.embed import available as embed_available
 from haunt.embed import embed_one
 from haunt.store import Store
-from haunt.util import iso_or_now, snippet
+from haunt.util import clock_sql_column, iso_or_now, snippet
 
 RRF_K = 60
 CANDIDATES = 40
@@ -35,6 +35,7 @@ class Hit:
     valid_from: str
     valid_to: str | None
     tool_name: str | None
+    ts: str | None = None
     origin: str | None = None
     vec_rank: int | None = None
     fts_rank: int | None = None
@@ -52,6 +53,7 @@ class Hit:
             "role": self.role,
             "origin": self.origin,
             "event_time": self.event_time,
+            "ts": self.ts,
             "valid_from": self.valid_from,
             "valid_to": self.valid_to,
             "tool_name": self.tool_name,
@@ -77,6 +79,7 @@ def _filters(
     since: str | None,
     until: str | None,
     tier: str | None,
+    clock: str | None = None,
 ) -> tuple[str, list[Any]]:
     clauses = ["1=1"]
     params: list[Any] = []
@@ -88,11 +91,12 @@ def _filters(
         # Current slice: contradict/supersede writes valid_to, so hide those
         # rows unless the caller asked for an explicit as_of snapshot.
         clauses.append("m.valid_to IS NULL")
+    col = clock_sql_column(clock, qualified=True)
     if since:
-        clauses.append("e.event_time >= ?")
+        clauses.append(f"{col} >= ?")
         params.append(iso_or_now(since))
     if until:
-        clauses.append("e.event_time <= ?")
+        clauses.append(f"{col} <= ?")
         params.append(iso_or_now(until))
     if tier:
         clauses.append("m.tier = ?")
@@ -188,6 +192,7 @@ def recall(
     as_of: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    clock: str | None = None,
     tier: str | None = None,
     k: int = 8,
     store: Store | None = None,
@@ -196,7 +201,7 @@ def recall(
     store = store or Store(namespace or "default")
     try:
         store.ensure_current_embeddings()
-        where, params = _filters(as_of, since, until, tier)
+        where, params = _filters(as_of, since, until, tier, clock)
         fts = _fts_hits(store.conn, query, where, params, CANDIDATES)
         vec: list[tuple[str, int, float]] = []
         if embed_available():
@@ -220,7 +225,7 @@ def recall(
             row = store.conn.execute(
                 """
                 SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
-                       e.role, e.event_time, e.tool_name, e.origin
+                       e.role, e.event_time, e.ts, e.tool_name, e.origin
                 FROM memories m
                 JOIN events e ON e.id = m.event_id
                 WHERE m.id=?
@@ -240,6 +245,7 @@ def recall(
                     content=row["content"],
                     role=row["role"],
                     event_time=row["event_time"],
+                    ts=row["ts"],
                     valid_from=row["valid_from"],
                     valid_to=row["valid_to"],
                     tool_name=row["tool_name"],

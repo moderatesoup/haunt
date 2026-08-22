@@ -9,8 +9,9 @@ from typing import Any, Optional
 from mcp.server import MCPServer
 
 from haunt.paths import resolve_namespace
-from haunt.recall import recall
+from haunt.planner import planned_recall
 from haunt.store import Store, list_namespaces
+from haunt.temporal import TemporalParseError
 
 server = MCPServer(
     name="haunt",
@@ -77,21 +78,26 @@ def memory_recall(
     as_of: Optional[str] = None,
     since: Optional[str] = None,
     until: Optional[str] = None,
+    clock: Optional[str] = None,
     tier: Optional[str] = None,
     k: int = 8,
 ) -> str:
     ns = resolve_namespace(namespace)
-    with Store(ns) as st:
-        hits = recall(
-            query,
-            namespace=ns,
-            as_of=as_of,
-            since=since,
-            until=until,
-            tier=tier,
-            k=k,
-            store=st,
-        )
+    try:
+        with Store(ns) as st:
+            hits = planned_recall(
+                query,
+                namespace=ns,
+                as_of=as_of,
+                since=since,
+                until=until,
+                clock=clock,
+                tier=tier,
+                k=k,
+                store=st,
+            )
+    except (TemporalParseError, ValueError) as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns, "query": query})
     return _json({"namespace": ns, "query": query, "hits": [h.as_dict() for h in hits]})
 
 
@@ -101,11 +107,17 @@ def memory_timeline(
     session: Optional[str] = None,
     since: Optional[str] = None,
     until: Optional[str] = None,
+    clock: Optional[str] = None,
     limit: int = 50,
 ) -> str:
     ns = resolve_namespace(namespace)
-    with Store(ns) as st:
-        rows = st.events(session_id=session, since=since, until=until, limit=limit)
+    try:
+        with Store(ns) as st:
+            rows = st.events(
+                session_id=session, since=since, until=until, clock=clock, limit=limit
+            )
+    except ValueError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     return _json({"namespace": ns, "events": rows})
 
 

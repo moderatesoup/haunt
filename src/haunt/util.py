@@ -33,6 +33,23 @@ def iso_or_now(value: str | None) -> str:
     return parse_iso(value).isoformat(timespec="seconds")
 
 
+CLOCKS = ("event_time", "write_time")
+
+
+def clock_sql_column(clock: str | None, *, qualified: bool = True) -> str:
+    """Map clock=event_time|write_time to the events column.
+
+    write_time is events.ts (ingest/write). event_time is events.event_time.
+    Default is event_time so existing since/until callers stay unchanged.
+    """
+    c = clock or "event_time"
+    if c == "event_time":
+        return "e.event_time" if qualified else "event_time"
+    if c == "write_time":
+        return "e.ts" if qualified else "ts"
+    raise ValueError(f"clock must be event_time or write_time, got {clock!r}")
+
+
 def dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
