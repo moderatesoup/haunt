@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from haunt.recall import recall
 from haunt.store import Store
 
 
@@ -91,7 +92,7 @@ def test_post_tool_use_stores_verbatim(fts_hook_env, capsys, monkeypatch):
         assert rows, "expected a stored tool event"
         row = rows[0]
         assert row["role"] == "tool"
-        assert row["tier"] == "procedural"
+        assert row["tier"] == "episodic"
         assert row["tool_name"] == "Read"
         assert "src/haunt/store.py" in (row["tool_input"] or "")
         assert "init_schema" in (row["tool_output"] or "")
@@ -265,3 +266,93 @@ def test_secret_redaction_in_tool_input(fts_hook_env, capsys, monkeypatch):
         assert "api.stripe.com" in stored_input
         mem = st.conn.execute("SELECT content FROM memories").fetchone()
         assert mem and "sk-live-abc123" not in mem["content"]
+
+
+def test_generic_tool_shell_mcp_io_is_episodic_not_procedural(
+    fts_hook_env, capsys, monkeypatch
+):
+    """Published #23 falsifier: generic hook I/O is episodic, not a named how-to.
+
+    postToolUse / afterShell / afterMCP must store as tier=episodic so
+    recall(tier='episodic') hits them and recall(tier='procedural') does not.
+    Fails if those handlers hardcode tier='procedural'.
+    """
+    project = fts_hook_env["project"]
+    cases = [
+        {
+            "hook_event_name": "postToolUse",
+            "tool_name": "Read",
+            "tool_input": {"path": "src/haunt/store.py"},
+            "tool_output": "HOOK-EPISODIC-READ-ZX23 unique Read output",
+            "conversation_id": "conv-tier-read",
+            "workspace_roots": [str(project)],
+            "cwd": str(project),
+        },
+        {
+            "hook_event_name": "afterShellExecution",
+            "command": "ls -la",
+            "output": "HOOK-EPISODIC-SHELL-ZX23 unique ls output",
+            "conversation_id": "conv-tier-shell",
+            "workspace_roots": [str(project)],
+            "cwd": str(project),
+        },
+        {
+            "hook_event_name": "afterMCPExecution",
+            "tool_name": "some_external",
+            "tool_input": {"q": "ping"},
+            "result_json": '{"ok": true, "token": "HOOK-EPISODIC-MCP-ZX23"}',
+            "conversation_id": "conv-tier-mcp",
+            "workspace_roots": [str(project)],
+            "cwd": str(project),
+        },
+    ]
+    for payload in cases:
+        _run_hook(payload, capsys, monkeypatch)
+
+    with Store("hooktest") as st:
+        events = st.events()
+        assert len(events) == 3
+        by_tool = {r["tool_name"]: r for r in events}
+        assert by_tool["Read"]["tier"] == "episodic"
+        assert by_tool["Shell"]["tier"] == "episodic"
+        assert by_tool["some_external"]["tier"] == "episodic"
+        assert all(r["role"] == "tool" for r in events)
+        mems = st.conn.execute("SELECT content, tier FROM memories").fetchall()
+        assert len(mems) == 3
+        assert all(m["tier"] == "episodic" for m in mems)
+
+        named = st.procedure_write(
+            "deploy-zx23",
+            "git pull && make deploy HOOK-NAMED-PROC-ZX23",
+            trigger="when shipping",
+        )
+        assert named.tier == "procedural"
+        procs = st.procedure_list()
+        assert any(p["name"] == "deploy-zx23" for p in procs)
+        assert all(p["name"] != "Read" for p in procs)
+        assert all(p["name"] != "Shell" for p in procs)
+        assert all(p["name"] != "some_external" for p in procs)
+
+        for query, token in (
+            ("HOOK-EPISODIC-READ-ZX23", "HOOK-EPISODIC-READ-ZX23"),
+            ("HOOK-EPISODIC-SHELL-ZX23 ls -la", "HOOK-EPISODIC-SHELL-ZX23"),
+            ("HOOK-EPISODIC-MCP-ZX23 some_external", "HOOK-EPISODIC-MCP-ZX23"),
+        ):
+            epi = recall(query, namespace="hooktest", tier="episodic", k=8, store=st)
+            assert epi, f"expected episodic hit for {token!r}"
+            assert any(token in h.content and h.tier == "episodic" for h in epi)
+            proc = recall(query, namespace="hooktest", tier="procedural", k=8, store=st)
+            assert all(token not in h.content for h in proc)
+
+        proc_hits = recall(
+            "HOOK-NAMED-PROC-ZX23",
+            namespace="hooktest",
+            tier="procedural",
+            k=8,
+            store=st,
+        )
+        assert proc_hits
+        assert any(
+            "HOOK-NAMED-PROC-ZX23" in h.content and h.tier == "procedural"
+            for h in proc_hits
+        )

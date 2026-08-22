@@ -243,14 +243,13 @@ def _handle_post_tool(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
     name = _as_text(payload.get("tool_name")) or "tool"
     if _is_memory_tool(name):
         return {}
-    # TODO: tier="procedural" is a lane mix — generic tool I/O is episodic,
-    # not a named how-to.  Should be "episodic" unless meta.kind=procedure.
+    # Generic tool I/O is episodic, not a named how-to (meta.kind=procedure).
     _observe(
         store,
         payload,
         content="",
         role="tool",
-        tier="procedural",
+        tier="episodic",
         tool_name=name,
         tool_input=_redact_secrets(_as_text(payload.get("tool_input"))),
         tool_output=_redact_secrets(_as_text(payload.get("tool_output"))),
@@ -264,7 +263,7 @@ def _handle_after_shell(store: Store, payload: dict[str, Any]) -> dict[str, Any]
         payload,
         content="",
         role="tool",
-        tier="procedural",
+        tier="episodic",
         tool_name="Shell",
         tool_input=_redact_secrets(_as_text(payload.get("command"))),
         tool_output=_redact_secrets(_as_text(payload.get("output"))),
@@ -281,7 +280,7 @@ def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         payload,
         content="",
         role="tool",
-        tier="procedural",
+        tier="episodic",
         tool_name=name or "mcp",
         tool_input=_redact_secrets(_as_text(payload.get("tool_input"))),
         tool_output=_redact_secrets(_as_text(payload.get("result_json"))),
