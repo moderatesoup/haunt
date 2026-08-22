@@ -24,7 +24,9 @@ def test_delete_event_id_without_positional_missing_event(lore_env):
 
 def test_delete_by_event_id_purges_without_positional(lore_env):
     r = observe("DELETE-EVENT-ID-CANARY unique phrase", namespace="default")
-    result = runner.invoke(app, ["delete", "--event-id", r.event_id, "--yes"])
+    result = runner.invoke(
+        app, ["delete", "--event-id", r.event_id, "--yes", "-n", "default"]
+    )
     assert result.exit_code == 0, result.output
     assert "purged" in result.stdout
     with Store("default") as st:
@@ -36,7 +38,7 @@ def test_delete_by_event_id_purges_without_positional(lore_env):
 
 def test_delete_by_memory_id_still_works(lore_env):
     r = observe("DELETE-MEMORY-ID-CANARY unique phrase", namespace="default")
-    result = runner.invoke(app, ["delete", r.memory_id, "--yes"])
+    result = runner.invoke(app, ["delete", r.memory_id, "--yes", "-n", "default"])
     assert result.exit_code == 0, result.output
     assert "purged" in result.stdout
     with Store("default") as st:
