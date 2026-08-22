@@ -11,8 +11,9 @@ from haunt import __version__
 from haunt.bootstrap import bootstrap, format_report
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
-from haunt.recall import recall
+from haunt.planner import planned_recall
 from haunt.store import Store, list_namespaces, register_namespace
+from haunt.temporal import TemporalParseError
 from haunt.util import snippet
 
 app = typer.Typer(
@@ -101,22 +102,34 @@ def recall_cmd(
     as_of: Optional[str] = typer.Option(None, "--as-of"),
     since: Optional[str] = typer.Option(None, "--since"),
     until: Optional[str] = typer.Option(None, "--until"),
+    clock: Optional[str] = typer.Option(
+        None, "--clock", help="event_time | write_time (default event_time)"
+    ),
     tier: Optional[str] = typer.Option(None, "--tier"),
     k: int = typer.Option(8, "--k"),
 ) -> None:
-    """Hybrid recall (vec + FTS5 + RRF). Prints score, tier, id, snippet."""
+    """Hybrid recall (vec + FTS5 + RRF). Prints score, tier, id, snippet.
+
+    Natural-language time phrases are compiled at query time. Non-temporal
+    queries take the existing recall path unchanged.
+    """
     ns = _ns(namespace)
-    with Store(ns) as st:
-        hits = recall(
-            query,
-            namespace=ns,
-            as_of=as_of,
-            since=since,
-            until=until,
-            tier=tier,
-            k=k,
-            store=st,
-        )
+    try:
+        with Store(ns) as st:
+            hits = planned_recall(
+                query,
+                namespace=ns,
+                as_of=as_of,
+                since=since,
+                until=until,
+                clock=clock,
+                tier=tier,
+                k=k,
+                store=st,
+            )
+    except (TemporalParseError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
     if not hits:
         typer.echo("no hits")
         return
@@ -133,12 +146,21 @@ def timeline_cmd(
     session: Optional[str] = typer.Option(None, "--session"),
     since: Optional[str] = typer.Option(None, "--since"),
     until: Optional[str] = typer.Option(None, "--until"),
+    clock: Optional[str] = typer.Option(
+        None, "--clock", help="event_time | write_time (default event_time)"
+    ),
     limit: int = typer.Option(50, "--limit"),
 ) -> None:
-    """Events in event_time order (newest first)."""
+    """Events in clock order (newest first). Default clock is event_time."""
     ns = _ns(namespace)
-    with Store(ns) as st:
-        rows = st.events(session_id=session, since=since, until=until, limit=limit)
+    try:
+        with Store(ns) as st:
+            rows = st.events(
+                session_id=session, since=since, until=until, clock=clock, limit=limit
+            )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
     if not rows:
         typer.echo("no events")
         return
