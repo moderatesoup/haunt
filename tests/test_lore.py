@@ -312,6 +312,55 @@ def test_contradict_not_found(lore_env):
     assert "not found" in result["error"]
 
 
+def test_default_recall_excludes_superseded(lore_env):
+    """Current recall (no as_of) must hide valid_to-set rows.
+
+    Dashboard / contradict claim 'excluded from current recall'. That is the
+    current slice (valid_to IS NULL), not an implicit time-phrase parser.
+    """
+    with Store("default") as st:
+        r = st.observe(
+            "the port is 8080 UNIQUE-PORT-8080",
+            role="system",
+            tier="semantic",
+            event_time="2024-06-01T12:00:00+00:00",
+        )
+        st.contradict(r.memory_id, replacement="the port is 9090 UNIQUE-PORT-9090")
+
+    current = recall("UNIQUE-PORT", namespace="default", k=8)
+    assert current, "replacement should still recall"
+    assert all("8080" not in h.content for h in current)
+    assert any("9090" in h.content for h in current)
+
+
+def test_as_of_past_still_returns_later_superseded(lore_env):
+    """as_of is a valid_from/valid_to snapshot, not an event_time window."""
+    with Store("default") as st:
+        r = st.observe(
+            "the port is 8080 UNIQUE-ASOF-8080",
+            role="system",
+            tier="semantic",
+            event_time="2024-06-01T12:00:00+00:00",
+        )
+        st.contradict(r.memory_id, replacement="the port is 9090 UNIQUE-ASOF-9090")
+
+    past = recall(
+        "UNIQUE-ASOF",
+        namespace="default",
+        as_of="2024-06-15T00:00:00+00:00",
+        k=8,
+    )
+    assert past and any("8080" in h.content for h in past)
+    now = recall(
+        "UNIQUE-ASOF",
+        namespace="default",
+        as_of="2099-01-01T00:00:00+00:00",
+        k=8,
+    )
+    assert all("8080" not in h.content for h in now)
+    assert any("9090" in h.content for h in now)
+
+
 def test_reembed_rebuilds_on_dim_mismatch(lore_env):
     if not embed_available():
         pytest.skip("embeddings unavailable — cannot test dim-mismatch reembed")

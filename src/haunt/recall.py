@@ -84,6 +84,10 @@ def _filters(
         t = iso_or_now(as_of)
         clauses.append("m.valid_from <= ? AND (m.valid_to IS NULL OR m.valid_to > ?)")
         params.extend([t, t])
+    else:
+        # Current slice: contradict/supersede writes valid_to, so hide those
+        # rows unless the caller asked for an explicit as_of snapshot.
+        clauses.append("m.valid_to IS NULL")
     if since:
         clauses.append("e.event_time >= ?")
         params.append(iso_or_now(since))

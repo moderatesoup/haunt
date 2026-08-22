@@ -128,23 +128,38 @@ class TestRecallTemporalFilters:
             assert h["event_time"] <= "2024-03-11T00:00:00"
 
     def test_recall_as_of_excludes_superseded(self, dash_client):
-        """as_of filters on valid_from/valid_to — contradict-ed memories are excluded."""
+        """as_of=now (and default current slice) hide valid_to-set rows.
+
+        An as_of *before* valid_from also hides the row — that tests
+        valid_from, not contradict. Use a query unique to this memory
+        and as_of after valid_from.
+        """
         with Store("default") as st:
             r = st.observe(
-                "the port is 8080",
+                "the port is 8080 UNIQUE-DASH-8080",
                 role="system",
                 tier="semantic",
                 event_time="2024-03-10T10:00:00+00:00",
             )
-            st.contradict(r.memory_id, replacement="the port is 9090")
+            st.contradict(
+                r.memory_id, replacement="the port is 9090 UNIQUE-DASH-9090"
+            )
 
-        resp = dash_client.get(
-            "/api/namespace/default/recall?q=the+port&as_of=2024-03-09T00:00:00%2B00:00"
+        current = dash_client.get(
+            "/api/namespace/default/recall?q=UNIQUE-DASH"
         )
-        assert resp.status_code == 200
-        hits = resp.json()["hits"]
-        for h in hits:
-            assert "8080" not in h.get("content", "")
+        assert current.status_code == 200
+        contents = [h.get("content", "") for h in current.json()["hits"]]
+        assert not any("8080" in c for c in contents)
+        assert any("9090" in c for c in contents)
+
+        past = dash_client.get(
+            "/api/namespace/default/recall"
+            "?q=UNIQUE-DASH&as_of=2024-03-11T00:00:00%2B00:00"
+        )
+        assert past.status_code == 200
+        past_contents = [h.get("content", "") for h in past.json()["hits"]]
+        assert any("8080" in c for c in past_contents)
 
     def test_all_ns_recall_since(self, dash_client):
         r = dash_client.get(
