@@ -33,7 +33,7 @@ already visible in context.
 
 | Layer | What it does | Agent action needed? |
 |---|---|---|
-| Cursor hooks | Auto-log prompts, replies, tool calls, shell, MCP | No — automatic |
+| Cursor / Claude Code hooks | Auto-log prompts, replies, tool calls | No — automatic |
 | `beforeSubmitPrompt` recall | Attempts `additional_context` injection | Unproven — do not rely on it |
 | `sessionStart` worldview | Injects `[haunt worldview ns=…]` card | Check if present; if not, call `memory_worldview` |
 | Per-turn recall | Fetch relevant memories | YES — agent must call `memory_recall` |
@@ -62,8 +62,9 @@ already visible in context.
 - Never paste whole files into memory.
 
 ### Do NOT double-observe
-When hooks are active (Cursor with haunt installed), they log turns
-automatically. Do not also call `memory_observe` on the same content.
+When hooks are active (Cursor or Claude Code with haunt installed),
+they log turns automatically. Do not also call `memory_observe` on
+the same content.
 
 ### Worldview
 - Call `memory_worldview` for the full namespace briefing.
@@ -87,7 +88,7 @@ automatically. Do not also call `memory_observe` on the same content.
   orphaned entities, and the event if nothing else references it.
 - Data is gone — not just superseded. Use contradict to supersede.
 
-## No-hooks environments (Grok Bot, Claude Code, etc.)
+## No-hooks environments (Grok Bot, Codex, etc.)
 
 These clients have no hook support. The agent must:
 1. Observe each user turn (tier=episodic) and durable facts (tier=semantic).

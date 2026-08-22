@@ -388,35 +388,13 @@ def _is_haunt_command(command: str) -> bool:
 
 
 def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
-    """Merge haunt hook entries into a Cursor hooks.json. Do not clobber others."""
-    existing: dict[str, Any] = {"version": 1, "hooks": {}}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except json.JSONDecodeError:
-            existing = {"version": 1, "hooks": {}}
-    existing.setdefault("version", 1)
-    hooks = existing.setdefault("hooks", {})
-    if not isinstance(hooks, dict):
-        hooks = {}
-        existing["hooks"] = hooks
-    for event in HOOK_EVENTS:
-        entries = hooks.get(event)
-        if not isinstance(entries, list):
-            entries = []
-            hooks[event] = entries
-        updated = False
-        for item in entries:
-            if isinstance(item, dict) and _is_haunt_command(str(item.get("command", ""))):
-                item["command"] = command
-                updated = True
-        if not updated:
-            entries.append({"command": command})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
-    return existing
+    """Merge haunt hook entries into a Cursor hooks.json. Do not clobber others.
+
+    Delegates to the Cursor host adapter.
+    """
+    from haunt.hosts.cursor import _merge_hooks_json
+
+    return _merge_hooks_json(path, command)
 
 
 _HAUNT_MDC = """\
@@ -452,7 +430,7 @@ Do not assume prior context was injected.
 ## Observe rules
 
 - Hooks handle episodic logging. Only call `memory_observe` manually
-  when hooks are absent (e.g. Grok Bot, Claude Code — no hook support).
+  when hooks are absent (e.g. Grok Bot).
 - tier=semantic for durable facts. tier=episodic for chat.
 - Always pass `origin` (e.g. "cursor", "cli") and `session` id when
   available.
@@ -498,7 +476,7 @@ that are clearly off-corpus rather than trusting the number.
 Inferred from `CURSOR_PROJECT_DIR` / git / cwd. Do not invent
 namespaces unless the user asks.
 
-## No hooks environment (Grok Bot, Claude Code, etc.)
+## No hooks environment (Grok Bot)
 
 When hooks are unavailable, the agent must both observe AND recall
 manually. Observe each user turn (tier=episodic) and each durable
@@ -519,24 +497,28 @@ def _install_rule_file() -> Path | None:
 
 
 def install_cursor_hooks() -> dict[str, Any]:
-    """Write ~/.haunt/bin/haunt-hook, merge ~/.cursor/hooks.json, install rule."""
+    """Write ~/.haunt/bin/haunt-hook, merge ~/.cursor/hooks.json + mcp.json, install rule.
+
+    Delegates to the Cursor host adapter for the full bind.
+    """
     from haunt.bootstrap import write_hook_launcher, write_launcher
-    from haunt.paths import ensure_layout
+    from haunt.hosts.cursor import install as cursor_install
+    from haunt.paths import bin_dir, ensure_layout
 
     home = ensure_layout()
     write_launcher()
     launcher = write_hook_launcher()
-    hooks_path = cursor_hooks_json()
-    command = str(launcher)
-    merge_hooks_json(hooks_path, command)
-    rule_path = _install_rule_file()
+    hook_cmd = str(launcher)
+    mcp_cmd = str(bin_dir() / "haunt-mcp")
+    report = cursor_install(str(home), hook_cmd, mcp_cmd)
     return {
         "haunt_home": str(home),
         "lore_home": str(home),
-        "launcher": command,
-        "hooks_json": str(hooks_path),
-        "events": list(HOOK_EVENTS),
-        "rule": str(rule_path) if rule_path else None,
+        "launcher": hook_cmd,
+        "hooks_json": report.hooks_path,
+        "mcp_json": report.mcp_path,
+        "events": report.events,
+        "rule": report.rule_path,
     }
 
 

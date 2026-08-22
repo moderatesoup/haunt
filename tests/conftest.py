@@ -8,6 +8,19 @@ import pytest
 MODEL_CACHE = Path("/workspace/lore/.model-cache")
 
 
+@pytest.fixture(autouse=True)
+def isolate_host_homes(tmp_path, monkeypatch):
+    """Never write Cursor/Claude configs into the real (or cloud-agent) home.
+
+    Tests that need a specific layout set CURSOR_HOME / CLAUDE_CONFIG_DIR
+    themselves; those override this fixture.
+    """
+    if not os.environ.get("CURSOR_HOME"):
+        monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "cursor-home"))
+    if not os.environ.get("CLAUDE_CONFIG_DIR"):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+
+
 @pytest.fixture
 def lore_env(tmp_path, monkeypatch):
     home = tmp_path / "haunthome"

@@ -22,22 +22,21 @@ haunt bootstrap          # creates ~/.haunt, probes sqlite-vec, downloads BAAI/b
 haunt dash               # opens the memory console in your browser → http://127.0.0.1:7340
 ```
 
-To wire up Cursor hooks:
+To wire up all supported hosts (Cursor + Claude Code) in one command:
 
 ```bash
-haunt cursor-install     # merges hooks at ~/.cursor/hooks.json + writes ~/.cursor/rules/haunt.mdc
+haunt install            # hooks + MCP + rules for Cursor and Claude Code
 ```
 
-Then add haunt as an MCP server (it runs alongside any other servers you have — it does not replace them):
+This registers haunt hooks, MCP server, and agent rules for each host — even
+if the host is not installed yet (config dirs are pre-seeded). Re-run
+`haunt install` or `haunt doctor` after adding a new editor, or if an
+installer rewrote a config.
 
-```json
-{
-  "mcpServers": {
-    "haunt": {
-      "command": "~/.haunt/bin/haunt-mcp"
-    }
-  }
-}
+To wire up Cursor only:
+
+```bash
+haunt cursor-install     # hooks.json + mcp.json + haunt.mdc (Cursor only)
 ```
 
 > **Note:** `haunt-mcp` is a stdio server — do not run it with `--help` or directly in a terminal; it reads JSON on stdin and will hang. Use it only as an MCP server command.
@@ -69,10 +68,10 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 
 ### What is and isn't automatic
 
-- **Hooks store automatically.** Once `haunt cursor-install` runs, every prompt, response, and tool call is stored verbatim via Cursor hooks.
-- **Recall is NOT automatic.** Cursor does not reliably inject `additional_context` from `beforeSubmitPrompt` into the model context. Agents must call `memory_recall` explicitly via MCP.
-- **sessionStart** injects a worldview card via `additional_context` — this may appear as context but is not a guaranteed recall path.
-- **No-hook IDEs** (Grok Bot, Claude Code, Codex, etc.): call `memory_observe` and `memory_recall` manually via MCP. There is no Cursor-style hook integration for these environments — they have no auto-store hooks.
+- **Hooks store automatically.** Once `haunt install` runs, every prompt, response, and tool call is stored verbatim via hooks in both Cursor and Claude Code.
+- **Recall is NOT automatic.** Neither Cursor nor Claude Code reliably inject recall into the model context. Agents must call `memory_recall` explicitly via MCP unless a `[haunt ns=…]` block is already visible.
+- **sessionStart / SessionStart** may return a worldview card — this may appear as context but is not a guaranteed recall path and is not a kernel.
+- **No-hook IDEs** (Grok Bot, Codex, etc.): call `memory_observe` and `memory_recall` manually via MCP.
 
 ## Memory console (dashboard)
 
@@ -121,15 +120,19 @@ HAUNT_FTS_ONLY=1 haunt bootstrap
 
 CI runs FTS-only to avoid the 2 GB download.
 
-## Cursor hooks
+## Hooks
 
 Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summaries. Fail-open (`{}` + exit 0) so a hook never blocks the agent.
 
-`haunt cursor-install` does two things:
-1. Merges haunt hook entries into `~/.cursor/hooks.json` (preserving your existing hooks).
-2. Writes `~/.cursor/rules/haunt.mdc` — a Cursor rule file that tells agents how to use haunt (recall responsibility, observe rules, skip list).
+`haunt install` binds all known hosts (mkdir parents even if the app is not installed). `haunt cursor-install` binds Cursor only. Each bind:
+
+1. Merges capture hooks (preserving foreign hooks).
+2. Merges the `haunt` MCP stdio server (preserving other servers).
+3. Writes a small haunt-owned rule so agents still `memory_recall` if no `[haunt ns=…]` block is visible.
 
 **Secret redaction:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.). This is **not** a security boundary — see [SECURITY.md](SECURITY.md).
+
+### Cursor hooks
 
 | hook | what |
 |---|---|
@@ -141,6 +144,21 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 | `afterMCPExecution` | observe MCP call (skips `memory_*` to avoid recursion) |
 | `sessionStart` | session-open coordinate event + worldview card (`additional_context`); not a reliable recall path |
 | `sessionEnd` | close session; no summary |
+
+Cursor MCP is merged into `~/.cursor/mcp.json` (honors `CURSOR_HOME`) as an absolute `~/.haunt/bin/haunt-mcp` command.
+
+### Claude Code hooks
+
+| hook | what |
+|---|---|
+| `UserPromptSubmit` | observe `prompt`; return `additionalContext` inside `hookSpecificOutput` with `hookEventName` |
+| `Stop` | observe `last_assistant_message` (never exit 2) |
+| `SessionStart` | session-open coordinate event + worldview card (same JSON shape) |
+| `SessionEnd` | close session |
+| `PostToolUse` | observe tool I/O as episodic (skips `memory_*`) |
+| `PostToolUseFailure` | same as PostToolUse for failed tool calls |
+
+Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, absolute `haunt-hook-claude`). User-scope MCP **must** live in `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`) — `settings.json` silently ignores `mcpServers`. The rule is `~/.claude/rules/haunt.md` (does not overwrite `CLAUDE.md`).
 
 ## CLI
 
@@ -160,23 +178,15 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 | `haunt procedure list` | list all active procedures |
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
 | `haunt dash [--port 7340] [--install-icon] [--no-open]` | local memory console (127.0.0.1); opens browser automatically (use `--no-open` for CI/scripts) |
-| `haunt cursor-install` | merge Cursor user hooks + install haunt.mdc rule |
+| `haunt install` | bind all known hosts (Cursor, Claude Code): hooks + MCP + rules |
+| `haunt doctor` | check host bindings, re-merge if missing |
+| `haunt cursor-install` | bind Cursor only: hooks.json + mcp.json + haunt.mdc |
 
 ## MCP
 
 haunt is its own MCP server — it runs alongside any other servers you already have (IronRecall, etc.) without interfering.
 
-After bootstrap, add haunt to your MCP config:
-
-```json
-{
-  "mcpServers": {
-    "haunt": {
-      "command": "~/.haunt/bin/haunt-mcp"
-    }
-  }
-}
-```
+`haunt install` (or `haunt bootstrap`) automatically registers the MCP server in both Cursor (`~/.cursor/mcp.json`) and Claude Code (`~/.claude.json`). Merge only — other servers are kept. No manual JSON paste required.
 
 `haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
 
@@ -202,6 +212,7 @@ Legacy aliases `LORE_HOME`, `LORE_EMBED_MODEL`, etc. are accepted. CLI aliases `
 ├── namespaces/<name>.db
 ├── bin/haunt-mcp
 ├── bin/haunt-hook
+├── bin/haunt-hook-claude
 └── models/
 ```
 
@@ -209,6 +220,6 @@ Default home is `~/.haunt`. If `~/.haunt` does not exist and `~/.lore` does, hau
 
 ## What v1 does / does not
 
-**Does:** verbatim events + memories, bi-temporal filtering, namespaces as isolated SQLite files, deterministic graph extract, hybrid recall, hard purge (delete with full provenance chain cleanup), CLI, MCP, Cursor hooks, local memory management dashboard.
+**Does:** verbatim events + memories, bi-temporal filtering, namespaces as isolated SQLite files, deterministic graph extract, hybrid recall, hard purge (delete with full provenance chain cleanup), CLI, MCP, Cursor hooks, Claude Code hooks, local memory management dashboard.
 
 **Does not:** summarize or distill, call any LLM, talk to the network at query time, require Docker/Postgres, expose a team HTTP API, auto-recall into the model context.
