@@ -151,53 +151,36 @@ def _merge_mcp_dotfile(path: Path, mcp_cmd: str) -> dict[str, Any]:
 
 
 _HAUNT_CLAUDE_RULE = """\
-# haunt — local-first verbatim memory
+# haunt
 
-MCP server name is `haunt`; tools are prefixed `memory_`.
+MCP server `haunt`. Tools are `memory_*`. Hooks store; recall is not automatic.
 
-## What hooks do (automatic)
+## Automatic vs not
 
-Claude Code hooks automatically LOG turns: prompts, replies, tool
-calls, session events. This happens without agent action.
-Do not double-observe what hooks already store.
+Claude Code hooks auto-log prompts, replies, tool I/O (skip `memory_*`). Do not double-observe.
+SessionStart / UserPromptSubmit may inject additionalContext — do not assume it arrived.
+If no `[haunt ns=…]` block is visible, call `memory_recall` with the user's exact wording.
 
-## What hooks do NOT do
+## Temporal
 
-Hooks do NOT guarantee recall context injection into your prompt.
-SessionStart and UserPromptSubmit return additionalContext inside
-hookSpecificOutput; Claude Code may inject that, but it is not a
-guaranteed recall path and is not a kernel.
+`compile() runs automatically on memory_recall`. Pass the user's wording. Do not compute `since`/`until`. Clock is `event_time` (including speech verbs). Do not filter on storage `ts`.
+Default recall hides superseded rows unless you pass `as_of`.
 
-## Agent responsibility: recall
+## Call
 
-If no `[haunt ns=…]` block is visible in your current context, you MUST
-call `memory_recall` with the user's exact wording before acting.
-Do not assume prior context was injected.
-
-## Observe rules
-
-- Hooks handle episodic logging. Do not also call `memory_observe`
-  for content that hooks already capture.
-- tier=semantic for durable facts. tier=episodic for chat.
-- Always pass `origin` (e.g. "claude-code", "cli") and `session` id
-  when available.
-- Never summarize. Never distill. Store verbatim or don't store.
-
-## Skip list (never observe)
-
-- Secrets, tokens, API keys, passwords
-- Acks: "ok", "got it", "sure", empty turns
-- `memory_*` tool inputs/outputs (hooks already skip these)
-- Entire READMEs or large file dumps — store a pointer, not the blob
-
-## Worldview
-
-Call `memory_worldview` when you need the full namespace briefing.
+- `memory_recall` `query`=user wording. Optional `as_of`, `since`, `until`, `clock`, `k`.
+- `memory_observe` only if hooks are off. `text`, `tier`, `origin`, `session`. Never summarize.
+- `memory_worldview` if no `[haunt worldview ns=…]` card is in context.
+- `memory_procedure` `action`=`write`/`get`/`list`. Write needs `name`, `body`.
+- `memory_contradict` `memory_id`, optional `replacement`. Supersedes. Does not delete.
+- `memory_purge` `memory_id`. Hard delete.
+- `memory_timeline` only with ISO `since`/`until` or `session`. No NL compile.
+- `memory_session_end` `session`. `ok: false` if nothing ended.
+- `memory_health` / `memory_namespaces` when you need counts or the namespace list.
 
 ## Namespace
 
-Inferred from CLAUDE_PROJECT_DIR / git / cwd. Do not invent
-namespaces unless the user asks.
+Inferred from `CLAUDE_PROJECT_DIR` / git / cwd. Do not invent. When building haunt, namespace is `haunt`.
 """
 
 

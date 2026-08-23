@@ -1,119 +1,92 @@
-# haunt — local-first agent memory
+# haunt — local-first verbatim memory
 
-## What it is
+MCP server name is `haunt`. Store is verbatim. Never summarize. Never distill.
 
-haunt gives AI agents persistent verbatim memory
-backed by SQLite. No cloud, no API keys, no LLM summarization. One file
-per namespace, embeddings computed on-device.
+## Automatic vs not
 
-## Core principle
-
-**Hooks store; agents must recall unless context was injected.**
-
-Cursor hooks automatically log every turn. But recall is NOT automatic —
-the agent must call `memory_recall` unless a `[haunt ns=…]` block is
-already visible in context.
-
-## MCP tools (server name: `haunt`)
-
-| Tool | Purpose |
+| Automatic | Not automatic |
 |---|---|
-| `memory_recall` | Hybrid search (vec + FTS5 + RRF) over stored memories |
-| `memory_observe` | Store a verbatim turn or tool call |
-| `memory_worldview` | Compact namespace briefing: facts, entities, procedures, counts |
-| `memory_procedure` | Named how-to procedures — action: `write` / `get` / `list` |
-| `memory_contradict` | Mark a memory superseded, optionally store replacement |
-| `memory_purge` | Permanently hard-delete a memory and its provenance chain |
-| `memory_timeline` | List events in time order |
-| `memory_health` | Namespace health and counts |
-| `memory_namespaces` | List all namespaces |
-| `memory_session_end` | Close a session (no distillation) |
+| Hooks store prompts, replies, tool I/O (skip `memory_*`) | **Recall** — you must call `memory_recall` |
+| `sessionEnd` / `SessionEnd` close the session | `sessionStart` worldview — may or may not inject `[haunt worldview ns=…]` |
 
-## Hooks vs. agent actions
+If no `[haunt ns=…]` block is visible, call `memory_recall` with the user's exact wording before acting. Recall is not automatic.
 
-| Layer | What it does | Agent action needed? |
-|---|---|---|
-| Cursor / Claude Code hooks | Auto-log prompts, replies, tool calls | No — automatic |
-| `beforeSubmitPrompt` recall | Attempts `additional_context` injection | Unproven — do not rely on it |
-| `sessionStart` worldview | Injects `[haunt worldview ns=…]` card | Check if present; if not, call `memory_worldview` |
-| Per-turn recall | Fetch relevant memories | YES — agent must call `memory_recall` |
-| Manual observe | Store facts when hooks absent | Only when hooks unavailable |
+## Temporal — one path
 
-## Usage rules
+**`compile() runs automatically on memory_recall`.** Pass the user's wording. Do not compute `since`/`until` yourself. Do not do date arithmetic.
 
-### Recall
-1. If no `[haunt ns=…]` block is visible in context, call
-   `memory_recall` with the user's exact wording before acting.
-2. RRF scores are rank-normalized, not relevance. A score of 0.03 means
-   "ranked low", not "3% relevant." Ignore hits that are clearly
-   off-corpus rather than trusting the number.
+- Clock is `event_time` for normal user-facing time (including speech verbs: said, mentioned, told).
+- Do not filter on storage `ts`. `storage_time` is ingest time only (operational "what did haunt ingest…").
+- Default recall hides superseded rows (`valid_to IS NULL`) unless you pass `as_of`.
+- Topical leftover after compile → hybrid recall. Bare time ("what happened last week") → timeline internally. `union` is experimental — do not request it.
+- `memory_timeline` does **not** compile natural language. Use it only with ISO `since`/`until` or a session dump.
 
-### Observe (when hooks are absent)
-- tier=episodic for chat turns.
-- tier=semantic for durable facts.
-- Always pass `origin` (e.g. "cursor", "cli", "grok") and `session` id.
-- Never summarize or distill. Store verbatim or don't store.
+## Tools
 
-### Do NOT observe (skip list)
-- Secrets, tokens, API keys, passwords.
-- Acks and empty turns: "ok", "got it", "sure", "hey".
-- `memory_*` tool inputs/outputs (hooks already skip these).
-- Entire READMEs or large file contents — store a pointer, not the blob.
-- Never paste whole files into memory.
+### `memory_recall`
+`query` (user wording), optional `as_of`, `since`, `until`, `clock`, `k`
+Call before acting unless a `[haunt ns=…]` block is already visible. RRF scores are rank-normalized, not relevance — ignore off-corpus hits.
 
-### Do NOT double-observe
-When hooks are active (Cursor or Claude Code with haunt installed),
-they log turns automatically. Do not also call `memory_observe` on
-the same content.
+### `memory_observe`
+`text`, `tier` (`episodic` chat / `semantic` durable fact), `origin`, `session`
+Call only when hooks are absent. Never summarize. Never double-observe what hooks already stored.
 
-### Worldview
-- Call `memory_worldview` for the full namespace briefing.
-- `sessionStart` hook tries to inject a compact card — verify it arrived
-  by looking for `[haunt worldview ns=…]` in context.
+### `memory_worldview`
+optional `facts_cap`, `names_cap`
+Call when no `[haunt worldview ns=…]` card is in context.
 
-### Procedures
-- `memory_procedure` action=write only when deliberately promoting a
-  specific how-to the user wants remembered.
-- Provide: `name` (short identifier), `body` (verbatim steps), optional
-  `trigger` (one-liner: "when X happens").
-- Do NOT auto-extract procedures from every turn.
+### `memory_procedure`
+`action` = `write` / `get` / `list`. Write needs `name`, `body`, optional `trigger`.
+Write only when the user wants a named how-to remembered. Do not auto-extract.
 
-### Contradict
-- `memory_contradict` with the `memory_id` of the old row.
-- Optionally pass `replacement` to store the corrected fact as semantic.
+### `memory_contradict`
+`memory_id`, optional `replacement`
+Supersede a wrong fact (`valid_to=now`). Does not delete. Optional `replacement` is stored as semantic.
 
-### Purge (hard delete)
-- `memory_purge` with `memory_id` to permanently delete a memory.
-- Removes the memory, FTS index, vector embedding, graph relations,
-  orphaned entities, and the event if nothing else references it.
-- Data is gone — not just superseded. Use contradict to supersede.
+### `memory_purge`
+`memory_id`
+Hard-delete the memory and its provenance. Data is gone. Use contradict to supersede.
 
-## No-hooks environments (Grok Bot, Codex, etc.)
+### `memory_timeline`
+optional `session`, `since`, `until`, `clock`, `limit`
+ISO bounds or a session dump. No natural-language compile. Clock default is `event_time`.
 
-These clients have no hook support. The agent must:
-1. Observe each user turn (tier=episodic) and durable facts (tier=semantic).
-2. Recall before acting.
-3. Pass `origin` to identify the client.
+### `memory_session_end`
+optional `session`
+Close a session. No distillation. If nothing was ended (missing, already ended, no current session), returns `ok: false` — treat that as failure.
 
-## CLI quick reference
+### `memory_health`
+optional `namespace`
+Counts, sqlite-vec, embed status.
+
+### `memory_namespaces`
+No args. List namespaces.
+
+## Observe skip list
+
+- Secrets, tokens, API keys, passwords
+- Acks: "ok", "got it", "sure", empty turns
+- `memory_*` tool inputs/outputs (hooks already skip these)
+- Entire files / READMEs — store a pointer, not the blob
+
+## Namespace
+
+Inferred from git / `CURSOR_PROJECT_DIR` / `CLAUDE_PROJECT_DIR` / cwd. Do not invent. When building haunt itself, namespace is `haunt`.
+
+## No-hooks hosts (Grok Bot, Codex, …)
+
+Observe each user turn (`tier=episodic`) and each durable fact (`tier=semantic`). Recall before acting. Pass `origin`.
+
+## CLI
 
 ```bash
-haunt worldview                          # namespace briefing
-haunt procedure write NAME --body "..."  # store a procedure
-haunt procedure get NAME                 # retrieve by name
-haunt recall "search query"              # hybrid search
-haunt observe "fact text" --tier semantic # store a fact
-haunt delete MEMORY_ID -y                # hard-delete a memory
-haunt dash                               # open local memory console
+haunt recall "user wording"          # compile() runs automatically
+haunt timeline --since ISO --until ISO --clock event_time
+haunt observe "fact" --tier semantic --origin cli
+haunt worldview
+haunt procedure write NAME --body "..."
+haunt delete MEMORY_ID -y            # purge; no CLI contradict / session-end
+haunt health / namespaces / dash
 ```
 
-`lore` and `engram` are aliases for `haunt` (all commands work with any name).
-
-## Architecture
-
-- Home: `~/.haunt` (env `HAUNT_HOME` / `LORE_HOME` / `ENGRAM_HOME`)
-- Registry: `~/.haunt/registry.db`
-- Namespace DBs: `~/.haunt/namespaces/<name>.db`
-- Embeddings: on-device ONNX (BAAI/bge-m3 default, bge-small fallback)
-- No network calls at query time
-- No API keys required
+`lore` and `engram` are aliases for `haunt`.
