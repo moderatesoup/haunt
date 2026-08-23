@@ -12,6 +12,9 @@ from haunt.doctor import REQUIRED_CHECKS, diagnose
 from haunt.hosts.claude import HOOK_EVENTS as CLAUDE_EVENTS
 from haunt.hosts.cursor import HOOK_EVENTS as CURSOR_EVENTS
 
+# Live-tool fact from #44. Install must plant this, not the pre-rewrite essay.
+AUTO_COMPILE_PHRASE = "compile() runs automatically on memory_recall"
+
 
 @pytest.fixture
 def onboard_env(tmp_path, monkeypatch):
@@ -84,11 +87,17 @@ def test_install_writes_host_files_doctor_expects(onboard_env):
     cursor_rule = (env["cursor_home"] / "rules" / "haunt.mdc").read_text(encoding="utf-8")
     assert "memory_recall" in cursor_rule
     assert "alwaysApply: true" in cursor_rule
+    assert AUTO_COMPILE_PHRASE in cursor_rule, (
+        "planted Cursor rule must state the #44 temporal fact, not the old essay"
+    )
     cursor_skill = (env["cursor_home"] / "skills" / "haunt" / "SKILL.md").read_text(
         encoding="utf-8"
     )
     assert "memory_recall" in cursor_skill
     assert "verbatim" in cursor_skill
+    assert AUTO_COMPILE_PHRASE in cursor_skill, (
+        "planted Cursor skill must state the #44 temporal fact, not the old essay"
+    )
 
     settings = json.loads((env["claude_dir"] / "settings.json").read_text())
     for event in CLAUDE_EVENTS:
@@ -104,10 +113,27 @@ def test_install_writes_host_files_doctor_expects(onboard_env):
     assert haunt["type"] == "stdio"
     claude_rule = (env["claude_dir"] / "rules" / "haunt.md").read_text(encoding="utf-8")
     assert "memory_recall" in claude_rule
+    assert AUTO_COMPILE_PHRASE in claude_rule
     claude_skill = (env["claude_dir"] / "skills" / "haunt" / "SKILL.md").read_text(
         encoding="utf-8"
     )
     assert "memory_recall" in claude_skill
+    assert AUTO_COMPILE_PHRASE in claude_skill
+
+
+def test_install_plants_auto_compile_phrase(onboard_env):
+    """Regression lock for #44: isolated install must plant the live temporal fact."""
+    env = onboard_env
+    _install(env)
+    planted = [
+        env["cursor_home"] / "rules" / "haunt.mdc",
+        env["cursor_home"] / "skills" / "haunt" / "SKILL.md",
+        env["claude_dir"] / "rules" / "haunt.md",
+        env["claude_dir"] / "skills" / "haunt" / "SKILL.md",
+    ]
+    for path in planted:
+        text = path.read_text(encoding="utf-8")
+        assert AUTO_COMPILE_PHRASE in text, f"missing {AUTO_COMPILE_PHRASE!r} in {path}"
 
 
 def test_doctor_ok_after_install_runs_every_check(onboard_env):

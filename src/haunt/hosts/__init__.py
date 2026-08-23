@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 HAUNT_MCP_LEAVES = frozenset({"haunt-mcp", "engram-mcp", "lore-mcp"})
-RULE_MARKERS = ("memory_recall", "haunt")
+# Must stay in lockstep with #44 / contrib host rules. Doctor fails if install
+# plants the pre-rewrite essay that omitted the wired temporal path.
+RULE_MARKERS = ("memory_recall", "haunt", "compile() runs automatically on memory_recall")
 
 
 def command_leaf(command: str) -> str:

@@ -4,19 +4,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SKILL_MARKERS = ("memory_recall", "verbatim")
+SKILL_MARKERS = (
+    "memory_recall",
+    "verbatim",
+    "compile() runs automatically on memory_recall",
+)
 
 # Used when contrib/ is not on disk (wheel install, isolated tests).
+# Keep the #44 temporal sentence so a fallback plant is not the pre-rewrite essay.
 _SKILL_FALLBACK = """\
-# haunt — local-first agent memory
+# haunt — local-first verbatim memory
 
-Local-first verbatim memory. MCP server name is `haunt`.
-
-**Hooks store; agents must recall unless context was injected.**
+MCP server name is `haunt`. Store is verbatim. Never summarize. Never distill.
 
 If no `[haunt ns=…]` block is visible, call `memory_recall` with the
-user's exact wording before acting. Never summarize. Never distill.
-Store verbatim or don't store.
+user's exact wording before acting. Recall is not automatic.
+
+**compile() runs automatically on memory_recall.** Pass the user's wording.
 """
 
 
