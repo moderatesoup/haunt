@@ -28,10 +28,12 @@ To wire up all supported hosts (Cursor + Claude Code) in one command:
 haunt install            # hooks + MCP + rules for Cursor and Claude Code
 ```
 
-This registers haunt hooks, MCP server, and agent rules for each host — even
-if the host is not installed yet (config dirs are pre-seeded). Re-run
-`haunt install` or `haunt doctor` after adding a new editor, or if an
-installer rewrote a config.
+This registers haunt hooks, MCP server, agent rules, and the haunt skill for
+each host — even if the host is not installed yet (config dirs are pre-seeded).
+Re-run `haunt install` or `haunt doctor` after adding a new editor, or if an
+installer rewrote a config. `haunt doctor` checks the files install wrote,
+the `haunt-mcp` wrapper (not a PATH name), sqlite-vec load, and embed model
+presence (or explicit FTS-only) and exits 1 if any check fails.
 
 To wire up Cursor only:
 
@@ -127,8 +129,9 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 `haunt install` binds all known hosts (mkdir parents even if the app is not installed). `haunt cursor-install` binds Cursor only. Each bind:
 
 1. Merges capture hooks (preserving foreign hooks).
-2. Merges the `haunt` MCP stdio server (preserving other servers).
+2. Merges the `haunt` MCP stdio server (preserving other servers) as an absolute `~/.haunt/bin/haunt-mcp` command — not a PATH lookup.
 3. Writes a small haunt-owned rule so agents still `memory_recall` if no `[haunt ns=…]` block is visible.
+4. Writes `skills/haunt/SKILL.md` into the host config dir.
 
 **Secret redaction:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.). This is **not** a security boundary — see [SECURITY.md](SECURITY.md).
 
@@ -178,9 +181,9 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt procedure list` | list all active procedures |
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
 | `haunt dash [--port 7340] [--install-icon] [--no-open]` | local memory console (127.0.0.1); opens browser automatically (use `--no-open` for CI/scripts) |
-| `haunt install` | bind all known hosts (Cursor, Claude Code): hooks + MCP + rules |
-| `haunt doctor` | check host bindings, re-merge if missing |
-| `haunt cursor-install` | bind Cursor only: hooks.json + mcp.json + haunt.mdc |
+| `haunt install` | bind all known hosts (Cursor, Claude Code): hooks + MCP + rules + skill |
+| `haunt doctor` | check sqlite-vec, haunt-mcp wrapper/python, embed (or FTS-only), and host files; rematch host files if missing; exit 1 if any check fails |
+| `haunt cursor-install` | bind Cursor only: hooks.json + mcp.json + haunt.mdc + skill |
 
 ## MCP
 

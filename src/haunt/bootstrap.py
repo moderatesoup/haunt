@@ -60,6 +60,16 @@ def write_launcher() -> Path:
     return dest
 
 
+def bind_launchers() -> tuple[Path, str, str]:
+    """Write wrappers and return (haunt_home, hook_cmd, mcp_cmd).
+
+    MCP command is the haunt-mcp wrapper under HAUNT_HOME/bin — never a PATH name.
+    """
+    home = ensure_layout()
+    write_launcher()
+    return home, str(bin_dir() / "haunt-hook"), str(bin_dir() / "haunt-mcp")
+
+
 def probe_sqlite_vec() -> dict[str, str | bool]:
     import sqlite3
 
@@ -86,7 +96,6 @@ class BootstrapError(SystemExit):
 
 def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict:
     home = ensure_layout()
-    init_registry()
     launcher = write_launcher()
     vec = probe_sqlite_vec()
     if not vec.get("ok"):
@@ -101,6 +110,12 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
             "    PYTHON_CONFIGURE_OPTS=\"--enable-loadable-sqlite-extensions\" pyenv install\n"
         )
         raise BootstrapError(hint)
+    try:
+        init_registry()
+    except Exception as exc:
+        raise BootstrapError(
+            "failed to init registry after sqlite-vec probe: " + str(exc)
+        ) from exc
     embed_state = warmup()
     db = register_namespace(default_namespace, repo_path=None)
     # touch schema
@@ -126,8 +141,8 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
 
     from haunt.hosts import install_all_hosts
 
-    hook_cmd = str((bin_dir() / "haunt-hook").resolve())
-    mcp_cmd = str((bin_dir() / "haunt-mcp").resolve())
+    hook_cmd = str(bin_dir() / "haunt-hook")
+    mcp_cmd = str(bin_dir() / "haunt-mcp")
     host_reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
 
     hook_launcher = bin_dir() / "haunt-hook"
@@ -160,6 +175,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                 "hooks_path": hr.hooks_path,
                 "mcp_path": hr.mcp_path,
                 "rule_path": hr.rule_path,
+                "skill_path": hr.skill_path,
                 "events": hr.events,
                 "seeded": hr.seeded,
             }
@@ -225,7 +241,7 @@ def format_report(report: dict) -> str:
         lines.append(
             f"host bind     {h['host']}: {status}  "
             f"hooks={h.get('hooks_path', '-')}  mcp={h.get('mcp_path', '-')}  "
-            f"rule={h.get('rule_path', '-')}"
+            f"rule={h.get('rule_path', '-')}  skill={h.get('skill_path', '-')}"
         )
     if os.environ.get("HAUNT_JSON") or os.environ.get("LORE_JSON"):
         return dumps(report)

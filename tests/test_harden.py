@@ -47,6 +47,14 @@ def test_bootstrap_exits_1_when_vec_probe_fails(tmp_path, monkeypatch):
         assert exc_info.value.code == 1
         assert "sqlite-vec" in exc_info.value.message.lower()
 
+    home = tmp_path / "haunthome"
+    assert not (home / "registry.db").exists(), (
+        "bootstrap must not write registry.db when sqlite-vec fails"
+    )
+    assert not (home / "namespaces" / "default.db").exists(), (
+        "bootstrap must not write a namespace store when sqlite-vec fails"
+    )
+
     embed.reset()
 
 
