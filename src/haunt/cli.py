@@ -439,7 +439,7 @@ def install_cmd() -> None:
 
 @app.command("cursor-install")
 def cursor_install_cmd() -> None:
-    """Bind haunt to Cursor: hooks.json + mcp.json + haunt.mdc rule."""
+    """Bind haunt to Cursor: hooks.json + mcp.json + haunt.mdc + skill."""
     from haunt.cursor_hook import install_cursor_hooks
 
     report = install_cursor_hooks()
@@ -449,6 +449,8 @@ def cursor_install_cmd() -> None:
     typer.echo(f"events    {', '.join(report['events'])}")
     if report.get("rule"):
         typer.echo(f"rule      {report['rule']}")
+    if report.get("skill"):
+        typer.echo(f"skill     {report['skill']}")
     typer.echo("merged existing hooks/MCP; other entries were kept")
     typer.echo(f"home      {report['haunt_home']}  (HAUNT_HOME / LORE_HOME / ENGRAM_HOME)")
 

@@ -19,7 +19,6 @@ def onboard_env(tmp_path, monkeypatch):
     haunt_home = tmp_path / "haunthome"
     cursor_home = tmp_path / "cursor"
     claude_dir = tmp_path / "claude-config"
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("HAUNT_HOME", str(haunt_home))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
@@ -179,12 +178,18 @@ def test_doctor_fails_if_wrapper_python_cannot_import_haunt(onboard_env, tmp_pat
     assert "cannot import haunt or sqlite-vec" in blob
 
 
-def test_bootstrap_vec_fail_writes_no_namespace(onboard_env, monkeypatch):
+def test_bootstrap_vec_fail_writes_no_namespace(tmp_path, monkeypatch):
     from unittest.mock import patch
 
+    from haunt import embed
     from haunt.bootstrap import BootstrapError, bootstrap
     from haunt.paths import namespace_db_path, registry_path
 
+    monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "fresh-home"))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    monkeypatch.delenv("LORE_HOME", raising=False)
+    embed.reset()
     with patch(
         "haunt.bootstrap.probe_sqlite_vec",
         return_value={"ok": False, "error": "mocked: extension load failed"},
@@ -195,6 +200,7 @@ def test_bootstrap_vec_fail_writes_no_namespace(onboard_env, monkeypatch):
 
     assert not registry_path().exists()
     assert not namespace_db_path("default").exists()
+    embed.reset()
 
 
 def test_cli_doctor_exits_1_when_sqlite_vec_fails(onboard_env):

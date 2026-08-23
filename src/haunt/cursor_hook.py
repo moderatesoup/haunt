@@ -428,6 +428,7 @@ def install_cursor_hooks() -> dict[str, Any]:
         "mcp_json": report.mcp_path,
         "events": report.events,
         "rule": report.rule_path,
+        "skill": report.skill_path,
     }
 
 
