@@ -415,15 +415,10 @@ def install_cursor_hooks() -> dict[str, Any]:
 
     Delegates to the Cursor host adapter for the full bind.
     """
-    from haunt.bootstrap import write_hook_launcher, write_launcher
+    from haunt.bootstrap import bind_launchers
     from haunt.hosts.cursor import install as cursor_install
-    from haunt.paths import bin_dir, ensure_layout
 
-    home = ensure_layout()
-    write_launcher()
-    launcher = write_hook_launcher()
-    hook_cmd = str(launcher)
-    mcp_cmd = str(bin_dir() / "haunt-mcp")
+    home, hook_cmd, mcp_cmd = bind_launchers()
     report = cursor_install(str(home), hook_cmd, mcp_cmd)
     return {
         "haunt_home": str(home),
@@ -433,6 +428,7 @@ def install_cursor_hooks() -> dict[str, Any]:
         "mcp_json": report.mcp_path,
         "events": report.events,
         "rule": report.rule_path,
+        "skill": report.skill_path,
     }
 
 

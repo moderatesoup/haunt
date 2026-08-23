@@ -12,7 +12,48 @@ A later host (Codex, …) is another module added to _adapters().
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+HAUNT_MCP_LEAVES = frozenset({"haunt-mcp", "engram-mcp", "lore-mcp"})
+# Must stay in lockstep with #44 / contrib host rules. Doctor fails if install
+# plants the pre-rewrite essay that omitted the wired temporal path.
+RULE_MARKERS = ("memory_recall", "haunt", "compile() runs automatically on memory_recall")
+
+
+def command_leaf(command: str) -> str:
+    return command.replace("\\", "/").rstrip("/").split("/")[-1]
+
+
+def mcp_command_issues(command: str, expected: str | None = None) -> list[str]:
+    """Specific errors when a host MCP command is not the haunt-mcp wrapper."""
+    issues: list[str] = []
+    leaf = command_leaf(command)
+    if leaf not in HAUNT_MCP_LEAVES:
+        issues.append(f"MCP command is not haunt-mcp: {command}")
+        return issues
+    path = Path(command)
+    if not path.is_absolute():
+        issues.append(f"MCP command is not an absolute haunt-mcp wrapper: {command}")
+        return issues
+    if expected and command != expected:
+        try:
+            same = path.is_file() and Path(expected).is_file() and path.samefile(expected)
+        except OSError:
+            same = False
+        if not same:
+            issues.append(f"MCP command is not the haunt-mcp wrapper: {command}")
+    return issues
+
+
+def rule_issue(path: Path, label: str) -> str | None:
+    if not path.is_file():
+        return f"{label} not found"
+    text = path.read_text(encoding="utf-8")
+    missing = [m for m in RULE_MARKERS if m not in text]
+    if missing:
+        return f"{label} missing expected text: {', '.join(missing)}"
+    return None
 
 
 @dataclass
@@ -23,6 +64,7 @@ class HostReport:
     hooks_path: str | None = None
     mcp_path: str | None = None
     rule_path: str | None = None
+    skill_path: str | None = None
     events: list[str] = field(default_factory=list)
     seeded: bool = False  # True if the config dir was created fresh
     details: dict[str, Any] = field(default_factory=dict)
@@ -36,9 +78,11 @@ class HostStatus:
     hooks_present: bool = False
     mcp_present: bool = False
     rule_present: bool = False
+    skill_present: bool = False
     hooks_path: str | None = None
     mcp_path: str | None = None
     rule_path: str | None = None
+    skill_path: str | None = None
     issues: list[str] = field(default_factory=list)
 
 

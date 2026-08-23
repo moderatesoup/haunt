@@ -420,14 +420,10 @@ def delete_cmd(
 @app.command("install")
 def install_cmd() -> None:
     """Bind haunt to all known hosts (Cursor, Claude Code). Idempotent."""
-    from haunt.bootstrap import write_hook_launcher, write_launcher
+    from haunt.bootstrap import bind_launchers
     from haunt.hosts import install_all_hosts
-    from haunt.paths import bin_dir, ensure_layout
 
-    home = ensure_layout()
-    write_launcher()
-    hook_cmd = str(write_hook_launcher())
-    mcp_cmd = str(bin_dir() / "haunt-mcp")
+    home, hook_cmd, mcp_cmd = bind_launchers()
     reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
     for r in reports:
         status = "seeded" if r.seeded else "merged"
@@ -435,6 +431,7 @@ def install_cmd() -> None:
         typer.echo(f"  hooks   {r.hooks_path}")
         typer.echo(f"  mcp     {r.mcp_path}")
         typer.echo(f"  rule    {r.rule_path}")
+        typer.echo(f"  skill   {r.skill_path}")
         typer.echo(f"  events  {', '.join(r.events)}")
     typer.echo(f"home      {home}  (HAUNT_HOME)")
     typer.echo("Re-run after adding another editor: haunt install")
@@ -442,7 +439,7 @@ def install_cmd() -> None:
 
 @app.command("cursor-install")
 def cursor_install_cmd() -> None:
-    """Bind haunt to Cursor: hooks.json + mcp.json + haunt.mdc rule."""
+    """Bind haunt to Cursor: hooks.json + mcp.json + haunt.mdc + skill."""
     from haunt.cursor_hook import install_cursor_hooks
 
     report = install_cursor_hooks()
@@ -452,39 +449,35 @@ def cursor_install_cmd() -> None:
     typer.echo(f"events    {', '.join(report['events'])}")
     if report.get("rule"):
         typer.echo(f"rule      {report['rule']}")
+    if report.get("skill"):
+        typer.echo(f"skill     {report['skill']}")
     typer.echo("merged existing hooks/MCP; other entries were kept")
     typer.echo(f"home      {report['haunt_home']}  (HAUNT_HOME / LORE_HOME / ENGRAM_HOME)")
 
 
 @app.command("doctor")
 def doctor_cmd() -> None:
-    """Check host bindings and re-merge if missing. Idempotent."""
-    from haunt.bootstrap import write_hook_launcher, write_launcher
-    from haunt.hosts import doctor_all_hosts, install_all_hosts
-    from haunt.paths import bin_dir, ensure_layout
+    """Check sqlite-vec, haunt-mcp, embed, and host files. Exit 1 if any check fails."""
+    from haunt.bootstrap import bind_launchers
+    from haunt.doctor import diagnose, format_doctor
+    from haunt.hosts import install_all_hosts
 
-    home = ensure_layout()
-    write_launcher()
-    hook_cmd = str(write_hook_launcher())
-    mcp_cmd = str(bin_dir() / "haunt-mcp")
+    home, hook_cmd, mcp_cmd = bind_launchers()
+    report = diagnose(str(home), hook_cmd, mcp_cmd)
+    typer.echo(format_doctor(report))
 
-    statuses = doctor_all_hosts(str(home), hook_cmd, mcp_cmd)
-    any_issues = False
-    for s in statuses:
-        ok = "ok" if not s.issues else "ISSUES"
-        typer.echo(f"[{s.host}]  {ok}")
-        typer.echo(f"  hooks   {'present' if s.hooks_present else 'MISSING'}  {s.hooks_path}")
-        typer.echo(f"  mcp     {'present' if s.mcp_present else 'MISSING'}  {s.mcp_path}")
-        typer.echo(f"  rule    {'present' if s.rule_present else 'MISSING'}  {s.rule_path}")
-        for issue in s.issues:
-            typer.echo(f"  ! {issue}")
-            any_issues = True
-
-    if any_issues:
+    if not report.ok and report.host_file_issues:
         typer.echo("")
         typer.echo("Re-merging all hosts...")
         install_all_hosts(str(home), hook_cmd, mcp_cmd)
-        typer.echo("Done. Run 'haunt doctor' again to verify.")
+        report = diagnose(str(home), hook_cmd, mcp_cmd)
+        typer.echo(format_doctor(report))
+        if report.ok:
+            typer.echo("Re-merged. All checks ok.")
+            return
+
+    if not report.ok:
+        raise typer.Exit(1)
 
 
 @app.command("dash")

@@ -7,7 +7,14 @@ import os
 from pathlib import Path
 from typing import Any
 
-from haunt.hosts import HostReport, HostStatus
+from haunt.hosts import (
+    HostReport,
+    HostStatus,
+    command_leaf,
+    mcp_command_issues,
+    rule_issue,
+)
+from haunt.hosts.skill import install_host_skill, skill_issue
 
 HOST_NAME = "cursor"
 
@@ -41,8 +48,7 @@ def _mcp_json_path() -> Path:
 
 
 def _is_haunt_command(command: str) -> bool:
-    name = command.replace("\\", "/").rstrip("/").split("/")[-1]
-    return name in {"haunt-hook", "engram-hook", "lore-hook"}
+    return command_leaf(command) in {"haunt-hook", "engram-hook", "lore-hook"}
 
 
 def _merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
@@ -82,9 +88,11 @@ def _merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
 def _is_haunt_mcp(key: str, entry: dict[str, Any]) -> bool:
     if key == "haunt":
         return True
-    cmd = str(entry.get("command", ""))
-    name = cmd.replace("\\", "/").rstrip("/").split("/")[-1]
-    return name in {"haunt-mcp", "engram-mcp", "lore-mcp"}
+    return command_leaf(str(entry.get("command", ""))) in {
+        "haunt-mcp",
+        "engram-mcp",
+        "lore-mcp",
+    }
 
 
 def _merge_mcp_json(path: Path, mcp_cmd: str) -> dict[str, Any]:
@@ -181,12 +189,14 @@ def install(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostReport:
     _merge_mcp_json(mcp_path, mcp_cmd)
 
     rule_path = _install_rule(cdir)
+    skill_path = install_host_skill(cdir)
 
     return HostReport(
         host=HOST_NAME,
         hooks_path=str(hooks_path),
         mcp_path=str(mcp_path),
         rule_path=str(rule_path),
+        skill_path=str(skill_path),
         events=list(HOOK_EVENTS),
         seeded=seeded,
     )
@@ -202,17 +212,21 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
         try:
             data = json.loads(hooks_path.read_text(encoding="utf-8"))
             hooks = data.get("hooks", {})
-            has_haunt = False
+            if not isinstance(hooks, dict):
+                hooks = {}
+            missing_events: list[str] = []
             for event in HOOK_EVENTS:
                 entries = hooks.get(event, [])
-                if any(
+                if not isinstance(entries, list) or not any(
                     isinstance(e, dict) and _is_haunt_command(str(e.get("command", "")))
                     for e in entries
                 ):
-                    has_haunt = True
-            status.hooks_present = has_haunt
-            if not has_haunt:
-                status.issues.append("haunt hook entries missing from hooks.json")
+                    missing_events.append(event)
+            status.hooks_present = not missing_events
+            if missing_events:
+                status.issues.append(
+                    "haunt hook missing for events: " + ", ".join(missing_events)
+                )
         except (json.JSONDecodeError, KeyError, TypeError):
             status.issues.append("hooks.json malformed")
     else:
@@ -226,13 +240,20 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
             servers = data.get("mcpServers", {})
             if not isinstance(servers, dict):
                 servers = {}
-            status.mcp_present = any(
-                _is_haunt_mcp(k, v)
+            haunt_entries = [
+                (k, v)
                 for k, v in servers.items()
-                if isinstance(v, dict)
-            )
-            if not status.mcp_present:
+                if isinstance(v, dict) and _is_haunt_mcp(k, v)
+            ]
+            if not haunt_entries:
                 status.issues.append("haunt MCP server missing from mcp.json")
+            else:
+                _key, entry = haunt_entries[0]
+                cmd_issues = mcp_command_issues(str(entry.get("command", "")), mcp_cmd)
+                if cmd_issues:
+                    status.issues.extend(cmd_issues)
+                else:
+                    status.mcp_present = True
         except (json.JSONDecodeError, KeyError, TypeError):
             status.issues.append("mcp.json malformed")
     else:
@@ -241,8 +262,16 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
     cdir = _cursor_dir()
     rule = cdir / "rules" / "haunt.mdc"
     status.rule_path = str(rule)
-    status.rule_present = rule.exists()
-    if not status.rule_present:
-        status.issues.append("haunt.mdc rule not found")
+    r_issue = rule_issue(rule, "haunt.mdc rule")
+    status.rule_present = r_issue is None
+    if r_issue:
+        status.issues.append(r_issue)
+
+    skill = cdir / "skills" / "haunt" / "SKILL.md"
+    status.skill_path = str(skill)
+    s_issue = skill_issue(skill)
+    status.skill_present = s_issue is None
+    if s_issue:
+        status.issues.append(s_issue)
 
     return status

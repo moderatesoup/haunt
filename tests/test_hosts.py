@@ -99,6 +99,10 @@ def test_install_seeds_when_host_dirs_missing(host_env):
     assert cursor_mcp["mcpServers"]["haunt"]["command"] == env["mcp_cmd"]
     assert "type" not in cursor_mcp["mcpServers"]["haunt"]
     assert (env["cursor_home"] / "rules" / "haunt.mdc").is_file()
+    cursor_skill = env["cursor_home"] / "skills" / "haunt" / "SKILL.md"
+    assert cursor_skill.is_file()
+    assert "memory_recall" in cursor_skill.read_text(encoding="utf-8")
+    assert "verbatim" in cursor_skill.read_text(encoding="utf-8")
 
     settings = json.loads((env["claude_dir"] / "settings.json").read_text())
     for event in CLAUDE_EVENTS:
@@ -113,6 +117,9 @@ def test_install_seeds_when_host_dirs_missing(host_env):
     assert haunt["command"] == env["mcp_cmd"]
     assert haunt["type"] == "stdio"
     assert (env["claude_dir"] / "rules" / "haunt.md").is_file()
+    claude_skill = env["claude_dir"] / "skills" / "haunt" / "SKILL.md"
+    assert claude_skill.is_file()
+    assert "memory_recall" in claude_skill.read_text(encoding="utf-8")
     assert "mcpServers" not in settings
 
 
