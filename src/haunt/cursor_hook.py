@@ -396,95 +396,10 @@ def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
     return _merge_hooks_json(path, command)
 
 
-_HAUNT_MDC = """\
----
-description: haunt local memory — hooks store, agents must recall
-alwaysApply: true
----
-
-# haunt
-
-Local-first verbatim memory. MCP server name is `haunt`; tools are
-prefixed `memory_`.
-
-## What hooks do (automatic)
-
-Cursor hooks automatically LOG turns: prompts, replies, tool calls,
-shell output, MCP results. This happens without agent action.
-Do not double-observe what hooks already store.
-
-## What hooks do NOT do
-
-Hooks do NOT reliably inject recall context into your prompt.
-`beforeSubmitPrompt` returns `additional_context` but Cursor's official
-output schema for that hook is only `{continue, user_message}` —
-injection is unproven and may not arrive.
-
-## Agent responsibility: recall
-
-If no `[haunt ns=…]` block is visible in your current context, you MUST
-call `memory_recall` with the user's exact wording before acting.
-Do not assume prior context was injected.
-
-## Observe rules
-
-- Hooks handle episodic logging. Only call `memory_observe` manually
-  when hooks are absent (e.g. Grok Bot).
-- tier=semantic for durable facts. tier=episodic for chat.
-- Always pass `origin` (e.g. "cursor", "cli") and `session` id when
-  available.
-- Never summarize. Never distill. Store verbatim or don't store.
-
-## Skip list (never observe)
-
-- Secrets, tokens, API keys, passwords
-- Acks: "ok", "got it", "sure", empty turns
-- `memory_*` tool inputs/outputs (hooks already skip these)
-- Entire READMEs or large file dumps — store a pointer, not the blob
-
-## Worldview
-
-Call `memory_worldview` when you need the full namespace briefing.
-The sessionStart hook tries to inject a compact worldview card, but
-verify it arrived (look for `[haunt worldview ns=…]`).
-
-## Procedures
-
-Use `memory_procedure` action=write only when deliberately promoting a
-how-to the user wants remembered. Include `name`, verbatim `body`, and
-optional `trigger`. Do not auto-extract procedures from every turn.
-
-## Contradict / purge
-
-Use `memory_contradict` with the `memory_id` of a now-wrong fact to
-supersede it (sets valid_to). Optionally pass `replacement` to store
-the correction.
-
-Use `memory_purge` to permanently hard-delete a memory and its entire
-provenance chain (FTS, embedding, graph, orphaned event). Data is gone
-after purge — not just marked superseded.
-
-## Recall scores
-
-RRF scores are rank-normalized, not relevance scores. A hit with
-score 0.03 is not "3% relevant" — it just ranked lower. Ignore hits
-that are clearly off-corpus rather than trusting the number.
-
-## Namespace
-
-Inferred from `CURSOR_PROJECT_DIR` / git / cwd. Do not invent
-namespaces unless the user asks.
-
-## No hooks environment (Grok Bot)
-
-When hooks are unavailable, the agent must both observe AND recall
-manually. Observe each user turn (tier=episodic) and each durable
-fact (tier=semantic). Recall before acting.
-"""
-
-
 def _install_rule_file() -> Path | None:
     """Write haunt.mdc into .cursor/rules/."""
+    from haunt.hosts.cursor import _HAUNT_MDC
+
     rules_dir = cursor_dir() / "rules"
     rules_dir.mkdir(parents=True, exist_ok=True)
     dest = rules_dir / "haunt.mdc"

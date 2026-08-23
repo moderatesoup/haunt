@@ -127,82 +127,34 @@ alwaysApply: true
 
 # haunt
 
-Local-first verbatim memory. MCP server name is `haunt`; tools are
-prefixed `memory_`.
+MCP server `haunt`. Tools are `memory_*`. Hooks store; recall is not automatic.
 
-## What hooks do (automatic)
+## Automatic vs not
 
-Cursor hooks automatically LOG turns: prompts, replies, tool calls,
-shell output, MCP results. This happens without agent action.
-Do not double-observe what hooks already store.
+Hooks auto-log prompts, replies, tool I/O, shell, MCP (skip `memory_*`). Do not double-observe.
+`sessionStart` may inject `[haunt worldview ns=…]` — do not assume it arrived.
+If no `[haunt ns=…]` block is visible, call `memory_recall` with the user's exact wording.
 
-## What hooks do NOT do
+## Temporal
 
-Hooks do NOT reliably inject recall context into your prompt.
-`beforeSubmitPrompt` returns `additional_context` but Cursor's official
-output schema for that hook is only `{continue, user_message}` —
-injection is unproven and may not arrive.
+`compile() runs automatically on memory_recall`. Pass the user's wording. Do not compute `since`/`until`. Clock is `event_time` (including speech verbs). Do not filter on storage `ts`.
+Default recall hides superseded rows unless you pass `as_of`.
 
-## Agent responsibility: recall
+## Call
 
-If no `[haunt ns=…]` block is visible in your current context, you MUST
-call `memory_recall` with the user's exact wording before acting.
-Do not assume prior context was injected.
-
-## Observe rules
-
-- Hooks handle episodic logging. Only call `memory_observe` manually
-  when hooks are absent (e.g. Grok Bot).
-- tier=semantic for durable facts. tier=episodic for chat.
-- Always pass `origin` (e.g. "cursor", "cli") and `session` id when
-  available.
-- Never summarize. Never distill. Store verbatim or don't store.
-
-## Skip list (never observe)
-
-- Secrets, tokens, API keys, passwords
-- Acks: "ok", "got it", "sure", empty turns
-- `memory_*` tool inputs/outputs (hooks already skip these)
-- Entire READMEs or large file dumps — store a pointer, not the blob
-
-## Worldview
-
-Call `memory_worldview` when you need the full namespace briefing.
-The sessionStart hook tries to inject a compact worldview card, but
-verify it arrived (look for `[haunt worldview ns=…]`).
-
-## Procedures
-
-Use `memory_procedure` action=write only when deliberately promoting a
-how-to the user wants remembered. Include `name`, verbatim `body`, and
-optional `trigger`. Do not auto-extract procedures from every turn.
-
-## Contradict / purge
-
-Use `memory_contradict` with the `memory_id` of a now-wrong fact to
-supersede it (sets valid_to). Optionally pass `replacement` to store
-the correction.
-
-Use `memory_purge` to permanently hard-delete a memory and its entire
-provenance chain (FTS, embedding, graph, orphaned event). Data is gone
-after purge — not just marked superseded.
-
-## Recall scores
-
-RRF scores are rank-normalized, not relevance scores. A hit with
-score 0.03 is not "3% relevant" — it just ranked lower. Ignore hits
-that are clearly off-corpus rather than trusting the number.
+- `memory_recall` `query`=user wording. Optional `as_of`, `since`, `until`, `clock`, `k`.
+- `memory_observe` only if hooks are off. `text`, `tier`, `origin`, `session`. Never summarize.
+- `memory_worldview` if no worldview card is in context.
+- `memory_procedure` `action`=`write`/`get`/`list`. Write needs `name`, `body`.
+- `memory_contradict` `memory_id`, optional `replacement`. Supersedes. Does not delete.
+- `memory_purge` `memory_id`. Hard delete.
+- `memory_timeline` only with ISO `since`/`until` or `session`. No NL compile.
+- `memory_session_end` `session`. `ok: false` if nothing ended.
+- `memory_health` / `memory_namespaces` when you need counts or the namespace list.
 
 ## Namespace
 
-Inferred from `CURSOR_PROJECT_DIR` / git / cwd. Do not invent
-namespaces unless the user asks.
-
-## No hooks environment (Grok Bot)
-
-When hooks are unavailable, the agent must both observe AND recall
-manually. Observe each user turn (tier=episodic) and each durable
-fact (tier=semantic). Recall before acting.
+Inferred. Do not invent. When building haunt, namespace is `haunt`.
 """
 
 
