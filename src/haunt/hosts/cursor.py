@@ -11,6 +11,7 @@ from haunt.hosts import (
     HostReport,
     HostStatus,
     command_leaf,
+    hook_command_issues,
     mcp_command_issues,
     rule_issue,
 )
@@ -211,18 +212,32 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
             if not isinstance(hooks, dict):
                 hooks = {}
             missing_events: list[str] = []
+            command_issues: list[str] = []
+            seen_cmds: set[str] = set()
             for event in HOOK_EVENTS:
                 entries = hooks.get(event, [])
-                if not isinstance(entries, list) or not any(
-                    isinstance(e, dict) and _is_haunt_command(str(e.get("command", "")))
-                    for e in entries
-                ):
+                haunt_cmds = [
+                    str(e.get("command", ""))
+                    for e in (entries if isinstance(entries, list) else [])
+                    if isinstance(e, dict)
+                    and _is_haunt_command(str(e.get("command", "")))
+                ]
+                if not haunt_cmds:
                     missing_events.append(event)
-            status.hooks_present = not missing_events
+                    continue
+                for cmd in haunt_cmds:
+                    if cmd in seen_cmds:
+                        continue
+                    seen_cmds.add(cmd)
+                    command_issues.extend(hook_command_issues(cmd, hook_cmd))
             if missing_events:
                 status.issues.append(
                     "haunt hook missing for events: " + ", ".join(missing_events)
                 )
+            if command_issues:
+                uniq = list(dict.fromkeys(command_issues))
+                status.issues.append(uniq[0] if len(uniq) == 1 else "; ".join(uniq))
+            status.hooks_present = not missing_events and not command_issues
         except (json.JSONDecodeError, KeyError, TypeError):
             status.issues.append("hooks.json malformed")
     else:

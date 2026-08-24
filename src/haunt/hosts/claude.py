@@ -11,6 +11,7 @@ from haunt.hosts import (
     HostReport,
     HostStatus,
     command_leaf,
+    hook_command_issues,
     mcp_command_issues,
     rule_issue,
 )
@@ -200,6 +201,20 @@ def _claude_hook_cmd(haunt_home: str) -> str:
     return str(Path(haunt_home) / "bin" / "haunt-hook-claude")
 
 
+def _expected_claude_hook(haunt_home: str, hook_cmd: str) -> str:
+    """Expected Claude wrapper, derived from hook_cmd the way MCP uses mcp_cmd.
+
+    install() plants haunt-hook-claude next to haunt-hook. Doctor uses that
+    sibling so a leaf-named missing hook_cmd fails the path-exists check
+    (samefile-when-different is skipped when planted == expected).
+    """
+    if hook_cmd:
+        if command_leaf(hook_cmd) == "haunt-hook-claude":
+            return hook_cmd
+        return str(Path(hook_cmd).parent / "haunt-hook-claude")
+    return _claude_hook_cmd(haunt_home)
+
+
 def install(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostReport:
     """Bind Claude Code: settings.json hooks + ~/.claude.json MCP + rule.
 
@@ -232,9 +247,10 @@ def install(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostReport:
 def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
     """Check Claude Code bindings.
 
-    hook_cmd is ignored; we look for haunt-hook-claude in config.
+    Expected hook is haunt-hook-claude next to hook_cmd (else haunt_home/bin/).
     """
     status = HostStatus(host=HOST_NAME)
+    expected_hook = _expected_claude_hook(haunt_home, hook_cmd)
 
     settings_path = _settings_json_path()
     status.hooks_path = str(settings_path)
@@ -245,9 +261,11 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
             if not isinstance(hooks, dict):
                 hooks = {}
             missing_events: list[str] = []
+            command_issues: list[str] = []
+            seen_cmds: set[str] = set()
             for event in HOOK_EVENTS:
                 groups = hooks.get(event, [])
-                found = False
+                haunt_cmds: list[str] = []
                 if isinstance(groups, list):
                     for group in groups:
                         if not isinstance(group, dict):
@@ -256,14 +274,23 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
                             if isinstance(h, dict) and _is_haunt_hook(
                                 str(h.get("command", ""))
                             ):
-                                found = True
-                if not found:
+                                haunt_cmds.append(str(h.get("command", "")))
+                if not haunt_cmds:
                     missing_events.append(event)
-            status.hooks_present = not missing_events
+                    continue
+                for cmd in haunt_cmds:
+                    if cmd in seen_cmds:
+                        continue
+                    seen_cmds.add(cmd)
+                    command_issues.extend(hook_command_issues(cmd, expected_hook))
             if missing_events:
                 status.issues.append(
                     "haunt hook missing for events: " + ", ".join(missing_events)
                 )
+            if command_issues:
+                uniq = list(dict.fromkeys(command_issues))
+                status.issues.append(uniq[0] if len(uniq) == 1 else "; ".join(uniq))
+            status.hooks_present = not missing_events and not command_issues
         except (json.JSONDecodeError, KeyError, TypeError):
             status.issues.append("settings.json malformed")
     else:

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Doctor honesty: `{host}.hooks` fails when the planted haunt-hook path is missing or is not the expected wrapper. Leaf name alone is not enough. Runtime hook fail-open is unchanged.
+
 DELETE `/api/namespace/{name}/memory/{id}` and POST contradict 404 `unknown namespace` on a missing namespace (`Store(..., create=False)`). A typo no longer creates an empty DB, then 404s `memory not found`.
 
 GET `/api/recall` (all-namespaces) attaches a non-empty `errors` list when a registered namespace fails to open or search, and the console recall meta surfaces those failures instead of only `N hits (all namespaces)`.
