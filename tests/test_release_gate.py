@@ -1,4 +1,4 @@
-"""Release-gate holes: honesty, modes, MCP pin, bind, XSS, GET-create, limits, redaction.
+"""Release-gate holes: honesty, modes, MCP pin, bind, XSS, GET/DELETE-create, limits, redaction.
 
 Each test is a mutation check — revert the corresponding fix and this file fails.
 """
@@ -292,6 +292,109 @@ def test_get_unknown_namespace_uses_create_false():
     assert "create=False" in src
     assert "404" in helper
     assert "namespace_exists" in helper
+
+
+# ---------------------------------------------------------------------------
+# 6b. Dashboard DELETE / contradict must not create namespaces (#56)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_unknown_namespace_is_404_and_does_not_create(gate_env):
+    """#56: DELETE on a typo'd ns must not create the DB then 404 memory-not-found."""
+    from starlette.testclient import TestClient
+    from haunt.dashboard import app
+    from haunt.store import namespace_exists
+
+    client = TestClient(app)
+    mystery = "typo-ns-delete-never-created"
+    assert not namespace_exists(mystery)
+    r = client.request("DELETE", f"/api/namespace/{mystery}/memory/does-not-exist")
+    assert r.status_code == 404
+    err = (r.json().get("error") or "")
+    assert "unknown namespace" in err, f"expected unknown namespace, got {r.json()!r}"
+    assert "memory" not in err, f"must not imply the namespace exists: {r.json()!r}"
+    assert not namespace_exists(mystery)
+    db = gate_env / "namespaces" / f"{mystery}.db"
+    assert not db.exists(), "DELETE must not create the namespace db"
+
+
+def test_contradict_unknown_namespace_is_404_and_does_not_create(gate_env):
+    """#56: POST contradict on a typo'd ns must not create the DB."""
+    from starlette.testclient import TestClient
+    from haunt.dashboard import app
+    from haunt.store import namespace_exists
+
+    client = TestClient(app)
+    mystery = "typo-ns-contradict-never-created"
+    assert not namespace_exists(mystery)
+    r = client.post(
+        f"/api/namespace/{mystery}/memory/does-not-exist/contradict",
+        json={},
+    )
+    assert r.status_code == 404
+    err = (r.json().get("error") or "")
+    assert "unknown namespace" in err, f"expected unknown namespace, got {r.json()!r}"
+    assert "memory" not in err, f"must not imply the namespace exists: {r.json()!r}"
+    assert not namespace_exists(mystery)
+    db = gate_env / "namespaces" / f"{mystery}.db"
+    assert not db.exists(), "POST contradict must not create the namespace db"
+
+
+def test_delete_existing_ns_missing_memory_is_404_memory_not_found(gate_env):
+    """#56: existing ns + missing memory still 404s memory-not-found, no extra ns."""
+    from starlette.testclient import TestClient
+    from haunt.dashboard import app
+    from haunt.store import list_namespaces, namespace_exists
+
+    client = TestClient(app)
+    assert namespace_exists("default")
+    before = {ns["name"] for ns in list_namespaces()}
+    r = client.request("DELETE", "/api/namespace/default/memory/does-not-exist")
+    assert r.status_code == 404
+    err = (r.json().get("error") or "")
+    assert "memory" in err and "not found" in err, f"expected memory not found, got {r.json()!r}"
+    assert "unknown namespace" not in err
+    after = {ns["name"] for ns in list_namespaces()}
+    assert after == before
+
+
+def test_contradict_existing_ns_missing_memory_is_404_memory_not_found(gate_env):
+    """#56: existing ns + missing memory still 404s memory-not-found, no extra ns."""
+    from starlette.testclient import TestClient
+    from haunt.dashboard import app
+    from haunt.store import list_namespaces, namespace_exists
+
+    client = TestClient(app)
+    assert namespace_exists("default")
+    before = {ns["name"] for ns in list_namespaces()}
+    r = client.post(
+        "/api/namespace/default/memory/does-not-exist/contradict",
+        json={},
+    )
+    assert r.status_code == 404
+    err = (r.json().get("error") or "")
+    assert "memory" in err and "not found" in err, f"expected memory not found, got {r.json()!r}"
+    assert "unknown namespace" not in err
+    after = {ns["name"] for ns in list_namespaces()}
+    assert after == before
+
+
+def test_delete_and_contradict_use_create_false():
+    """#56 mutation: restoring Store(name) default create=True fails this test."""
+    import haunt.dashboard as dash
+
+    delete_src = inspect.getsource(dash.api_memory_delete)
+    contradict_src = inspect.getsource(dash.api_contradict)
+    helper = inspect.getsource(dash._missing_namespace)
+    assert "Store(name, create=False)" in delete_src
+    assert "Store(name, create=False)" in contradict_src
+    assert "_missing_namespace" in delete_src
+    assert "_missing_namespace" in contradict_src
+    assert "namespace_exists" in helper
+    assert "404" in helper
+    # Explicit create=True (or dropping the kwarg) must not sneak back in.
+    assert "create=True" not in delete_src
+    assert "create=True" not in contradict_src
 
 
 # ---------------------------------------------------------------------------
