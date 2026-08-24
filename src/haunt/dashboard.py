@@ -413,7 +413,7 @@ function renderHealthGlobal(h,stats){
       `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?v.version:'off'}</div>`,
       `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${e.loaded||'none'} ${e.dim||0}d</div>`,
       `<div class="health-item"><span class="pulse ok"></span>${stats.namespace_count||0} namespaces</div>`,
-      `<div class="health-item"><span class="pulse ok"></span>${stats.haunt_home||''}</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>${esc(stats.haunt_home||'')}</div>`,
     ];
   }else{
     items=[
@@ -432,7 +432,7 @@ function statCards(s){
   const items=[
     ["events",s.events,""],["memories",s.memories,""],["sessions",s.sessions,""],
     ["entities",s.entities,s.relations+" rels"],
-    ["db",fmtBytes(s.db_size_bytes||0),s.db_path?s.db_path.split("/").slice(-2).join("/"):""],
+    ["db",fmtBytes(s.db_size_bytes||0),s.db_path?esc(s.db_path.split("/").slice(-2).join("/")):""],
     ["last write",fmtTime(s.last_write),""],
   ];
   $("stats").innerHTML=items.map(([k,v,sub])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`).join("");
@@ -457,7 +457,7 @@ function renderHealthStrip(h,stats){
     `<div class="health-item"><span class="pulse ok"></span>${fmtBytes(stats.db_size_bytes||0)}</div>`,
     `<div class="health-item"><span class="pulse ${lastWrite?'ok':'warn'}"></span>last write ${age}</div>`,
     `<div class="health-item"><span class="pulse ok"></span>${stats.events||0} events</div>`,
-    `<div class="health-item"><span class="pulse ok"></span>${stats.db_path||''}</div>`,
+    `<div class="health-item"><span class="pulse ok"></span>${esc(stats.db_path||'')}</div>`,
   ].join("");
   renderHealthGlobal(h,stats);
 }
@@ -488,7 +488,7 @@ function hitsTable(hits){
 
 function entsList(ents){
   if(!ents.length){$("ents").innerHTML='<div class="empty">none</div>';return;}
-  $("ents").innerHTML=ents.map(e=>`<div class="ent"><span>${esc(e.name)}</span><span class="ty">${e.type}</span></div>`).join("");
+  $("ents").innerHTML=ents.map(e=>`<div class="ent"><span>${esc(e.name)}</span><span class="ty">${esc(e.type)}</span></div>`).join("");
 }
 
 async function openEventMemory(eventId){

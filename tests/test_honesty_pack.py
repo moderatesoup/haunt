@@ -483,6 +483,8 @@ def test_health_detail_escapes_haunt_home_and_db_path():
     assert '["db_path",esc(data.db_path' in HTML
     assert '["haunt_home",data.haunt_home]' not in HTML
     assert '["db_path",data.db_path]' not in HTML
+    assert "esc(stats.haunt_home" in HTML
+    assert "esc(stats.db_path" in HTML
 
 
 def test_browse_escapes_session_id_slice():
