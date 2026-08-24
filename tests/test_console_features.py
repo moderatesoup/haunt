@@ -248,6 +248,8 @@ class TestContradictRoute:
         data = resp.json()
         assert data["ok"] is False
         assert "not found" in data["error"]
+        assert "memory" in data["error"]
+        assert "unknown namespace" not in data["error"]
 
     def test_contradict_does_not_purge(self, dash_client):
         """Contradict MUST NOT delete the memory row — that's purge's job."""

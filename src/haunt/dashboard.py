@@ -955,8 +955,11 @@ async def api_memory_detail(request: Request) -> JSONResponse:
 
 async def api_memory_delete(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
     memory_id = request.path_params["memory_id"]
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         result = st.purge(memory_id)
     status = 200 if result.get("ok") else 404
     return JSONResponse(result, status_code=status)
@@ -1028,10 +1031,13 @@ async def api_timeline(request: Request) -> JSONResponse:
 
 async def api_contradict(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
     memory_id = request.path_params["memory_id"]
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
     replacement = body.get("replacement") or None
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         result = st.contradict(memory_id, replacement=replacement, origin="dashboard")
     result["namespace"] = name
     status = 200 if result.get("ok") else 404

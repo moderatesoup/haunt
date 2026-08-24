@@ -100,6 +100,9 @@ def test_api_delete_memory(dash_client):
 def test_api_delete_not_found(dash_client):
     resp = dash_client.request("DELETE", "/api/namespace/default/memory/nonexistent-id")
     assert resp.status_code == 404
+    err = (resp.json().get("error") or "")
+    assert "memory" in err and "not found" in err
+    assert "unknown namespace" not in err
 
 
 def test_api_procedures(dash_client):
