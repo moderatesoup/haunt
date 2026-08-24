@@ -369,11 +369,15 @@ def test_wrapper_crafted_haunt_home_does_not_execute(tmp_path, monkeypatch):
     ensure_layout()
     dest = write_hook_launcher()
     body = dest.read_text(encoding="utf-8")
-    export_line = next(line for line in body.splitlines() if "HAUNT_HOME" in line)
-    assert "touch" in export_line
+    assign = next(
+        line.strip()
+        for line in body.splitlines()
+        if line.strip().startswith("HAUNT_HOME=")
+    )
+    assert "touch" in assign
     env = {k: v for k, v in os.environ.items() if k != "HAUNT_HOME"}
-    subprocess.run(["/bin/sh", "-c", export_line], env=env, check=True)
-    assert not marker.exists(), f"export line executed; marker at {marker}"
+    subprocess.run(["/bin/sh", "-c", assign], env=env, check=True)
+    assert not marker.exists(), f"assignment executed; marker at {marker}"
     subprocess.run(
         ["/bin/sh", str(dest)],
         env=env,
@@ -394,11 +398,13 @@ def test_wrapper_backtick_haunt_home_does_not_execute(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     ensure_layout()
     dest = write_hook_launcher()
-    export_line = next(
-        line for line in dest.read_text(encoding="utf-8").splitlines() if "HAUNT_HOME" in line
+    assign = next(
+        line.strip()
+        for line in dest.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("HAUNT_HOME=")
     )
     env = {k: v for k, v in os.environ.items() if k != "HAUNT_HOME"}
-    subprocess.run(["/bin/sh", "-c", export_line], env=env, check=True)
+    subprocess.run(["/bin/sh", "-c", assign], env=env, check=True)
     assert not marker.exists()
 
 
@@ -417,7 +423,7 @@ def test_cli_timeline_negative_limit_does_not_dump(honesty_env):
         total = st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     assert total >= 12
 
-    result = CliRunner().invoke(app, ["timeline", "--limit", "-1"])
+    result = CliRunner().invoke(app, ["timeline", "-n", "default", "--limit", "-1"])
     assert result.exit_code == 0, result.stdout + (result.stderr or "")
     lines = [ln for ln in result.stdout.splitlines() if ln.strip() and ln != "no events"]
     assert len(lines) == 1, (
@@ -448,7 +454,7 @@ def test_worldview_negative_caps_are_not_unlimited(honesty_env):
 
     result = CliRunner().invoke(
         app,
-        ["worldview", "--facts-cap", "-1", "--names-cap", "-1", "--json"],
+        ["worldview", "-n", "default", "--facts-cap", "-1", "--names-cap", "-1", "--json"],
     )
     assert result.exit_code == 0, result.stdout + (result.stderr or "")
     cli_wv = json.loads(result.stdout)
