@@ -523,14 +523,14 @@ async function openDetail(memId,ns){
   if(d.tool_output)html+=`<h2 class="section">tool output</h2><div class="detail-content">${esc(d.tool_output)}</div>`;
   if(d.entity_mentions&&d.entity_mentions.length){
     html+=`<h2 class="section" style="margin-top:12px;">entity mentions (${d.entity_mentions.length})</h2>`;
-    html+=d.entity_mentions.map(e=>`<div class="ent"><span>${esc(e.name)}</span><span class="ty">${e.type}</span></div>`).join("");
+    html+=d.entity_mentions.map(e=>`<div class="ent"><span>${esc(e.name)}</span><span class="ty">${esc(e.type)}</span></div>`).join("");
   }
   if(d.related_memories&&d.related_memories.length){
     html+=`<h2 class="section" style="margin-top:12px;">related memories (same session)</h2>`;
     html+=`<table><thead><tr><th>id</th><th>tier</th><th>snippet</th></tr></thead><tbody>`;
     html+=d.related_memories.map(r=>`<tr class="clickable" onclick="openDetail('${esc(r.memory_id)}','${esc(ns)}')">
-      <td style="font-size:11px">${(r.memory_id||"").slice(0,12)}</td>
-      <td class="${tierCls(r.tier)}">${r.tier}</td>
+      <td style="font-size:11px">${esc((r.memory_id||"").slice(0,12))}</td>
+      <td class="${esc(tierCls(r.tier))}">${esc(r.tier||"")}</td>
       <td class="snip">${esc(snip(r.content||"",160))}</td>
     </tr>`).join("");
     html+="</tbody></table>";
@@ -581,7 +581,7 @@ async function doBrowse(page){
       <td>${fmtTime(m.created_at)}</td>
       <td class="${tierCls(m.tier)}">${m.tier}</td>
       <td>${esc(m.role||"")}</td><td>${esc(m.origin||"")}</td>
-      <td style="font-size:11px;color:var(--mut)">${(m.session_id||"").slice(0,8)}</td>
+      <td style="font-size:11px;color:var(--mut)">${esc((m.session_id||"").slice(0,8))}</td>
       <td class="snip">${esc(snip(m.content||"",160))}</td>
       <td><button style="font-size:11px;padding:2px 8px" onclick="event.stopPropagation();openDetail('${esc(m.memory_id)}','${esc(NS)}')">detail</button></td>
     </tr>`).join("")+"</tbody></table>";
@@ -621,21 +621,21 @@ async function loadHealth(){
   if(!NS||ALL_NS)return;
   const data=await j(`/api/namespace/${encodeURIComponent(NS)}/health`);
   const items=[
-    ["haunt_home",data.haunt_home],
-    ["namespace",data.namespace],
-    ["db_path",data.db_path],
-    ["sqlite_vec",data.sqlite_vec?.ok?`ok · ${data.sqlite_vec.version}`:`FAIL · ${data.sqlite_vec?.error||"unknown"}`],
-    ["embed model",data.embed?.loaded||"none"],
-    ["embed dim",data.embed?.dim||0],
-    ["embed available",data.embed?.available?"yes":"no"],
-    ["embed requested",data.embed?.requested||""],
-    ["events",data.stats?.events||0],
-    ["memories",data.stats?.memories||0],
-    ["sessions",data.stats?.sessions||0],
-    ["entities",data.stats?.entities||0],
-    ["relations",data.stats?.relations||0],
-    ["db size",fmtBytes(data.stats?.db_size_bytes||0)],
-    ["last write",fmtTime(data.stats?.last_write)],
+    ["haunt_home",esc(data.haunt_home||"")],
+    ["namespace",esc(data.namespace||"")],
+    ["db_path",esc(data.db_path||"")],
+    ["sqlite_vec",esc(data.sqlite_vec?.ok?`ok · ${data.sqlite_vec.version}`:`FAIL · ${data.sqlite_vec?.error||"unknown"}`)],
+    ["embed model",esc(data.embed?.loaded||"none")],
+    ["embed dim",esc(data.embed?.dim||0)],
+    ["embed available",esc(data.embed?.available?"yes":"no")],
+    ["embed requested",esc(data.embed?.requested||"")],
+    ["events",esc(data.stats?.events||0)],
+    ["memories",esc(data.stats?.memories||0)],
+    ["sessions",esc(data.stats?.sessions||0)],
+    ["entities",esc(data.stats?.entities||0)],
+    ["relations",esc(data.stats?.relations||0)],
+    ["db size",esc(fmtBytes(data.stats?.db_size_bytes||0))],
+    ["last write",esc(fmtTime(data.stats?.last_write))],
   ];
   $("healthDetail").innerHTML=items.map(([k,v])=>`<div class="detail-row"><span class="lbl">${k}</span><span class="val">${v}</span></div>`).join("");
 }
