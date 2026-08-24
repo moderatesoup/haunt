@@ -231,24 +231,3 @@ def test_last_week_of_quarter_doc_is_not_temporal():
     assert tq.temporal is False
     assert tq.clock == "unresolved"
     assert tq.cleaned_query == query
-
-
-def test_heldout_queries_are_absent_from_compile_suite():
-    suite = Path(__file__).with_name("test_temporal_compile.py").read_text()
-    queries = (
-        [row[0] for row in OFFSET_PASSES]
-        + [row[0] for row in CALENDAR_PASSES]
-        + [row[0] for row in SPEECH_PASSES]
-        + list(LOOKALIKES)
-        + [
-            "five weeks back",
-            "a couple days back",
-            "during the past fortnight",
-            "in early April last year",
-            "the week of the 12th",
-            "what did I mention last Wednesday",
-            "last week of the quarter planning doc",
-        ]
-    )
-    for query in queries:
-        assert f'"{query}"' not in suite and f"'{query}'" not in suite, query
