@@ -21,6 +21,7 @@ from haunt.util import snippet
 ORIGIN = "cursor-hook"
 
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?i)authorization\s*:\s*bearer\s+\S+"),
     re.compile(
         r"""(?i)"""
         r"""(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token"""

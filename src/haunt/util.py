@@ -93,6 +93,23 @@ def diag(msg: str, **fields: Any) -> None:
     print(dumps(payload), file=sys.stderr, flush=True)
 
 
+LIMIT_MIN = 1
+LIMIT_MAX = 100
+
+
+def clamp_limit(value: Any, default: int = 10, *, lo: int = LIMIT_MIN, hi: int = LIMIT_MAX) -> int:
+    """Clamp k/limit so negative never becomes an unbounded SQLite LIMIT."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if n < lo:
+        return lo
+    if n > hi:
+        return hi
+    return n
+
+
 def snippet(text: str, n: int = 160) -> str:
     one = " ".join((text or "").split())
     if len(one) <= n:

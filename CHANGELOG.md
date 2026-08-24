@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+Release-gate hardening (storage isolation honesty, private HAUNT_HOME modes, mcp>=2 pin, loopback dashboard bind, dashboard XSS/GET-create/limit clamps, Authorization Bearer hook redaction).
+
 ## 0.2.0 — 2026-08-24
 
 Naming cleanup. Product name is **haunt** only.

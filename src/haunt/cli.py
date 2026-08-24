@@ -463,6 +463,9 @@ def doctor_cmd() -> None:
     from haunt.hosts import install_all_hosts
 
     home, hook_cmd, mcp_cmd = bind_launchers()
+    from haunt.paths import repair_private_modes
+
+    repair_private_modes(home)
     report = diagnose(str(home), hook_cmd, mcp_cmd)
     typer.echo(format_doctor(report))
 
@@ -486,6 +489,11 @@ def dash_cmd(
     host: str = typer.Option("127.0.0.1", "--host"),
     install_icon: bool = typer.Option(False, "--install-icon", help="Write a desktop shortcut and exit"),
     no_open: bool = typer.Option(False, "--no-open", help="Do not open the browser automatically"),
+    allow_remote: bool = typer.Option(
+        False,
+        "--allow-remote",
+        help="Allow binding beyond loopback (exposes local memories on the network).",
+    ),
 ) -> None:
     """Start the local memory console (127.0.0.1), or install a desktop shortcut."""
     if install_icon:
@@ -498,10 +506,16 @@ def dash_cmd(
             typer.echo(f"desktop icon  skipped ({result.get('reason', 'unsupported platform')})")
         return
 
-    from haunt.dashboard import run_dashboard
+    from haunt.dashboard import check_dashboard_bind, run_dashboard
+
+    try:
+        check_dashboard_bind(host, allow_remote=allow_remote)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
 
     typer.echo(f"haunt dash  http://{host}:{port}  home={haunt_home()}")
-    run_dashboard(host=host, port=port, open_browser=not no_open)
+    run_dashboard(host=host, port=port, open_browser=not no_open, allow_remote=allow_remote)
 
 
 @app.callback(invoke_without_command=True)
