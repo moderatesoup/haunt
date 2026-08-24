@@ -26,7 +26,7 @@ from haunt.paths import (
     safe_name,
     tighten_db_files,
 )
-from haunt.util import clock_sql_column, dumps, iso_or_now, loads, new_id, normalize_clock, now_iso
+from haunt.util import clamp_limit, clock_sql_column, dumps, iso_or_now, loads, new_id, normalize_clock, now_iso
 
 ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
@@ -336,6 +336,8 @@ class Store:
         session_id: str | None = None,
         source: str = "cli",
         meta: dict[str, Any] | None = None,
+        *,
+        commit: bool = True,
     ) -> str:
         if session_id:
             row = self.conn.execute(
@@ -346,7 +348,8 @@ class Store:
                     "INSERT INTO sessions(id, started_at, ended_at, source, meta) VALUES (?,?,?,?,?)",
                     (session_id, now_iso(), None, source, dumps(meta or {})),
                 )
-                self.conn.commit()
+                if commit:
+                    self.conn.commit()
             return session_id
         current = self.get_meta("current_session")
         if current:
@@ -360,7 +363,13 @@ class Store:
             "INSERT INTO sessions(id, started_at, ended_at, source, meta) VALUES (?,?,?,?,?)",
             (sid, now_iso(), None, source, dumps(meta or {})),
         )
-        self.set_meta("current_session", sid)
+        if commit:
+            self.set_meta("current_session", sid)
+        else:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("current_session", sid),
+            )
         return sid
 
     def end_session(self, session_id: str | None = None) -> dict[str, Any]:
@@ -407,13 +416,15 @@ class Store:
         meta: dict[str, Any] | None = None,
         valid_from: str | None = None,
         valid_to: str | None = None,
+        commit: bool = True,
     ) -> ObserveResult:
         if role not in ROLES:
             raise ValueError(f"role must be one of {ROLES}")
         if tier not in TIERS:
             raise ValueError(f"tier must be one of {TIERS}")
-        self.ensure_current_embeddings()
-        sid = self.ensure_session(session_id, source=origin)
+        if commit:
+            self.ensure_current_embeddings()
+        sid = self.ensure_session(session_id, source=origin, commit=commit)
         et = iso_or_now(event_time)
         ts = now_iso()
         vf = iso_or_now(valid_from) if valid_from else et
@@ -479,11 +490,15 @@ class Store:
                 embedded = True
             except sqlite3.Error:
                 pass
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         from haunt.graph import extract_and_store
 
-        entity_names = extract_and_store(self.conn, event_id, text, et, tool_name)
-        touch_namespace(self.name)
+        entity_names = extract_and_store(
+            self.conn, event_id, text, et, tool_name, commit=commit
+        )
+        if commit:
+            touch_namespace(self.name)
         return ObserveResult(
             event_id=event_id,
             memory_id=memory_id,
@@ -599,7 +614,7 @@ class Store:
             sql += " ORDER BY ts DESC, event_time DESC LIMIT ?"
         else:
             sql += " ORDER BY event_time DESC, ts DESC LIMIT ?"
-        params.append(int(limit))
+        params.append(clamp_limit(limit, default=100))
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
     def stats(self) -> dict[str, Any]:
@@ -645,7 +660,7 @@ class Store:
             ORDER BY e.last_seen DESC
             LIMIT ?
             """,
-            (int(limit),),
+            (clamp_limit(limit, default=15),),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -920,6 +935,8 @@ class Store:
 
         No LLM. Pure read queries over stored semantic/procedural/entity data.
         """
+        facts_cap = clamp_limit(facts_cap, default=12)
+        names_cap = clamp_limit(names_cap, default=12)
         facts = [
             dict(r)
             for r in self.conn.execute(
@@ -930,7 +947,7 @@ class Store:
                 ORDER BY m.created_at DESC
                 LIMIT ?
                 """,
-                (int(facts_cap),),
+                (facts_cap,),
             ).fetchall()
         ]
 
@@ -1070,26 +1087,59 @@ class Store:
         ).fetchone()
         if not row:
             return {"ok": False, "error": f"memory {memory_id} not found"}
-        self.conn.execute(
-            "UPDATE memories SET valid_to=? WHERE id=?", (ts, memory_id)
-        )
-        self.conn.commit()
-        result: dict[str, Any] = {
-            "ok": True,
-            "superseded": memory_id,
-            "valid_to": ts,
-        }
-        if replacement and replacement.strip():
-            r = self.observe(
-                replacement,
-                role="system",
-                tier="semantic",
-                session_id=session_id,
-                origin=origin,
+        if row["valid_to"] is not None:
+            return {
+                "ok": False,
+                "error": f"memory {memory_id} already superseded",
+                "valid_to": row["valid_to"],
+            }
+
+        replacement_text = (replacement or "").strip() or None
+        if replacement_text is not None:
+            if "system" not in ROLES:
+                return {"ok": False, "error": "invalid replacement role"}
+            if "semantic" not in TIERS:
+                return {"ok": False, "error": "invalid replacement tier"}
+            self.ensure_current_embeddings()
+            self.ensure_session(session_id, source=origin)
+
+        try:
+            cur = self.conn.execute(
+                "UPDATE memories SET valid_to=? WHERE id=? AND valid_to IS NULL",
+                (ts, memory_id),
             )
-            result["replacement_memory_id"] = r.memory_id
-            result["replacement_event_id"] = r.event_id
-        return result
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                again = self.conn.execute(
+                    "SELECT valid_to FROM memories WHERE id=?", (memory_id,)
+                ).fetchone()
+                return {
+                    "ok": False,
+                    "error": f"memory {memory_id} already superseded",
+                    "valid_to": None if again is None else again["valid_to"],
+                }
+            result: dict[str, Any] = {
+                "ok": True,
+                "superseded": memory_id,
+                "valid_to": ts,
+            }
+            if replacement_text:
+                r = self.observe(
+                    replacement_text,
+                    role="system",
+                    tier="semantic",
+                    session_id=session_id,
+                    origin=origin,
+                    commit=False,
+                )
+                result["replacement_memory_id"] = r.memory_id
+                result["replacement_event_id"] = r.event_id
+            self.conn.commit()
+            touch_namespace(self.name)
+            return result
+        except Exception:
+            self.conn.rollback()
+            raise
 
 
 def get_store(name: str | None = None, repo_path: str | None = None) -> Store:

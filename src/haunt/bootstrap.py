@@ -13,12 +13,17 @@ from haunt.store import Store, init_registry, register_namespace, list_namespace
 from haunt.util import diag, dumps
 
 
+def _sh_single_quote(value: str) -> str:
+    """Quote a string for /bin/sh so command substitution cannot run."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
 def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
     """Space-free /bin/sh launcher. Do not Path.resolve() the venv python."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     python = str(Path(sys.executable).absolute())
     sibling = Path(python).parent / sibling_name
-    home = haunt_home()
+    home = _sh_single_quote(str(haunt_home()))
     if sibling.is_file():
         body = (
             "#!/bin/sh\n"

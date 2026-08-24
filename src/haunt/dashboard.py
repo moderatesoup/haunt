@@ -507,14 +507,14 @@ async function openDetail(memId,ns){
   const dp=$("detailPanel");
   dp.classList.add('open');
   const rows=[
-    ["memory_id",d.memory_id],["event_id",d.event_id],["session_id",d.session_id],
-    ["namespace",d.namespace],["tier",`<span class="${tierCls(d.tier)}">${d.tier}</span>`],
+    ["memory_id",esc(d.memory_id||"")],["event_id",esc(d.event_id||"")],["session_id",esc(d.session_id||"")],
+    ["namespace",esc(d.namespace||"")],["tier",`<span class="${esc(tierCls(d.tier))}">${esc(d.tier||"")}</span>`],
     ["role",esc(d.role||"")],["origin",esc(d.origin||"")],
-    ["event_time",fmtTime(d.event_time)],["valid_from",fmtTime(d.valid_from)],
-    ["valid_to",d.valid_to?fmtTime(d.valid_to):"<em>current</em>"],
-    ["created_at",fmtTime(d.created_at)],
-    ["has_embedding",d.has_embedding?"yes":"no"],
-    ["db_path",d.db_path],["haunt_home",d.haunt_home],
+    ["event_time",esc(fmtTime(d.event_time))],["valid_from",esc(fmtTime(d.valid_from))],
+    ["valid_to",d.valid_to?esc(fmtTime(d.valid_to)):"<em>current</em>"],
+    ["created_at",esc(fmtTime(d.created_at))],
+    ["has_embedding",esc(d.has_embedding?"yes":"no")],
+    ["db_path",esc(d.db_path||"")],["haunt_home",esc(d.haunt_home||"")],
   ];
   if(d.tool_name)rows.push(["tool_name",esc(d.tool_name)]);
   let html=rows.map(([l,v])=>`<div class="detail-row"><span class="lbl">${l}</span><span class="val">${v}</span></div>`).join("");
@@ -1040,7 +1040,12 @@ async def api_contradict(request: Request) -> JSONResponse:
     with Store(name, create=False) as st:
         result = st.contradict(memory_id, replacement=replacement, origin="dashboard")
     result["namespace"] = name
-    status = 200 if result.get("ok") else 404
+    if result.get("ok"):
+        status = 200
+    elif "not found" in (result.get("error") or ""):
+        status = 404
+    else:
+        status = 200
     return JSONResponse(result, status_code=status)
 
 

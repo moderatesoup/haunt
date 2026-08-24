@@ -11,9 +11,14 @@ A later host (Codex, …) is another module added to _adapters().
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+class HostConfigError(ValueError):
+    """Existing host JSON is malformed. Refuse to overwrite it."""
 
 HAUNT_MCP_LEAVES = frozenset({"haunt-mcp"})
 HAUNT_HOOK_LEAVES = frozenset({"haunt-hook"})
@@ -125,6 +130,38 @@ class HostStatus:
     rule_path: str | None = None
     skill_path: str | None = None
     issues: list[str] = field(default_factory=list)
+
+
+def read_json_object(path: Path) -> dict[str, Any] | None:
+    """Load a JSON object, or None if the file does not exist.
+
+    Malformed or non-object JSON raises HostConfigError. Never invent {}.
+    """
+    if not path.exists():
+        return None
+    raw = path.read_text(encoding="utf-8")
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HostConfigError(
+            f"{path} is malformed JSON; leaving it unchanged"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise HostConfigError(
+            f"{path} is not a JSON object; leaving it unchanged"
+        )
+    return loaded
+
+
+def write_json_atomic(path: Path, data: dict[str, Any], *, backup: bool = True) -> None:
+    """Backup the previous file (if any), then replace it atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if backup and path.exists():
+        bak = path.with_name(path.name + ".bak")
+        bak.write_bytes(path.read_bytes())
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
 
 
 def _adapters() -> list:
