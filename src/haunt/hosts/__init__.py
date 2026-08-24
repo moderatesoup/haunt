@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 HAUNT_MCP_LEAVES = frozenset({"haunt-mcp"})
+HAUNT_HOOK_LEAVES = frozenset({"haunt-hook"})
 # Must stay in lockstep with #44 / contrib host rules. Doctor fails if install
 # plants the pre-rewrite essay that omitted the wired temporal path.
 RULE_MARKERS = ("memory_recall", "haunt", "compile() runs automatically on memory_recall")
@@ -43,6 +44,46 @@ def mcp_command_issues(command: str, expected: str | None = None) -> list[str]:
             same = False
         if not same:
             issues.append(f"MCP command is not the haunt-mcp wrapper: {command}")
+    return issues
+
+
+def hook_command_issues(
+    command: str,
+    expected: str | None = None,
+    leaves: frozenset[str] | None = None,
+) -> list[str]:
+    """Specific errors when a host hook command is not the expected wrapper.
+
+    Same honesty bar as MCP (leaf + absolute + samefile against expected),
+    plus a missing-file FAIL. MCP existence lives on the wrapper probe;
+    hooks have no equivalent, so doctor must check the planted path here.
+    """
+    issues: list[str] = []
+    if leaves is not None:
+        allowed = leaves
+    elif expected:
+        allowed = frozenset({command_leaf(expected)})
+    else:
+        allowed = HAUNT_HOOK_LEAVES
+    leaf = command_leaf(command)
+    if leaf not in allowed:
+        label = command_leaf(expected) if expected else "haunt-hook"
+        issues.append(f"hook command is not {label}: {command}")
+        return issues
+    path = Path(command)
+    if not path.is_absolute():
+        issues.append(f"hook command is not an absolute haunt-hook wrapper: {command}")
+        return issues
+    if not path.is_file():
+        issues.append(f"hook command not found: {command}")
+        return issues
+    if expected and command != expected:
+        try:
+            same = Path(expected).is_file() and path.samefile(expected)
+        except OSError:
+            same = False
+        if not same:
+            issues.append(f"hook command is not the haunt-hook wrapper: {command}")
     return issues
 
 

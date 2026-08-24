@@ -146,6 +146,65 @@ def test_doctor_ok_after_install_runs_every_check(onboard_env):
     assert "FTS-only" in embed.detail
 
 
+def _plant_cursor_hook_command(env, command: str) -> None:
+    path = env["cursor_home"] / "hooks.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for entries in data.get("hooks", {}).values():
+        if not isinstance(entries, list):
+            continue
+        for item in entries:
+            if isinstance(item, dict) and str(item.get("command", "")).endswith(
+                "haunt-hook"
+            ):
+                item["command"] = command
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _plant_claude_hook_command(env, command: str) -> None:
+    path = env["claude_dir"] / "settings.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for groups in data.get("hooks", {}).values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for item in group.get("hooks") or []:
+                if isinstance(item, dict) and "haunt-hook" in str(
+                    item.get("command", "")
+                ):
+                    item["command"] = command
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def test_doctor_fails_if_hook_command_is_missing_leaf_named_path(onboard_env):
+    """#57: leaf-named missing haunt-hook must FAIL diagnose(), not paint ok.
+
+    hook_cmd equals the planted missing path so samefile-when-different is
+    skipped. Revert the path-exists check in hook_command_issues and this fails.
+    MCP checks must stay ok — do not weaken MCP doctor honesty.
+    """
+    env = onboard_env
+    _install(env)
+    missing_hook = "/tmp/does-not-exist/haunt-hook"
+    missing_claude = "/tmp/does-not-exist/haunt-hook-claude"
+    assert not Path(missing_hook).exists()
+    assert not Path(missing_claude).exists()
+    _plant_cursor_hook_command(env, missing_hook)
+    _plant_claude_hook_command(env, missing_claude)
+
+    report = diagnose(str(env["haunt_home"]), missing_hook, env["mcp_cmd"])
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["cursor.hooks"].ok is False
+    assert by_name["claude-code.hooks"].ok is False
+    assert report.ok is False
+    blob = " ".join(report.issues)
+    assert "not found" in blob
+    assert "does-not-exist" in blob
+    assert by_name["cursor.mcp"].ok is True
+    assert by_name["claude-code.mcp"].ok is True
+
+
 def test_doctor_fails_if_hooks_json_deleted(onboard_env):
     env = onboard_env
     _install(env)

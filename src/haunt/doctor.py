@@ -205,35 +205,46 @@ def _check_embed() -> Check:
     )
 
 
-def _issue_matching(status: HostStatus, *needles: str) -> str | None:
+def _issues_matching(status: HostStatus, *needles: str) -> list[str]:
+    found: list[str] = []
     for issue in status.issues:
         low = issue.lower()
         if any(n.lower() in low for n in needles):
-            return issue
-    return None
+            found.append(issue)
+    return found
+
+
+def _issue_matching(status: HostStatus, *needles: str) -> str | None:
+    found = _issues_matching(status, *needles)
+    return found[0] if found else None
 
 
 def _host_checks(status: HostStatus) -> list[Check]:
     prefix = status.host
-    hooks_issue = _issue_matching(
-        status, "hooks.json", "settings.json", "hook missing", "hook entries"
+    hooks_needles = (
+        "hooks.json",
+        "settings.json",
+        "hook missing",
+        "hook entries",
+        "hook command",
     )
-    mcp_issue = _issue_matching(
-        status,
+    mcp_needles = (
         "mcp.json",
         ".claude.json",
         "mcp command",
         "mcp server",
         "settings.json (silently",
     )
-    rule_issue_text = _issue_matching(status, "rule", "haunt.mdc", "haunt.md")
-    skill_issue_text = _issue_matching(status, "skill")
-    leftover = [
-        i
-        for i in status.issues
-        if i
-        not in {hooks_issue, mcp_issue, rule_issue_text, skill_issue_text}
-    ]
+    hooks_issues = _issues_matching(status, *hooks_needles)
+    mcp_issues = _issues_matching(status, *mcp_needles)
+    rule_issues = _issues_matching(status, "rule", "haunt.mdc", "haunt.md")
+    skill_issues = _issues_matching(status, "skill")
+    hooks_issue = "; ".join(hooks_issues) if hooks_issues else None
+    mcp_issue = mcp_issues[0] if mcp_issues else None
+    rule_issue_text = rule_issues[0] if rule_issues else None
+    skill_issue_text = skill_issues[0] if skill_issues else None
+    claimed = set(hooks_issues + mcp_issues + rule_issues + skill_issues)
+    leftover = [i for i in status.issues if i not in claimed]
     if leftover and mcp_issue is None:
         mcp_issue = leftover[0]
         leftover = leftover[1:]

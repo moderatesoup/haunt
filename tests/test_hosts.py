@@ -8,11 +8,14 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from haunt.hosts import doctor_all_hosts, install_all_hosts
+from haunt.hosts import doctor_all_hosts, hook_command_issues, install_all_hosts
 from haunt.hosts.claude import HOOK_EVENTS as CLAUDE_EVENTS
 from haunt.hosts.claude import HOST_NAME as CLAUDE_HOST
 from haunt.hosts.cursor import HOOK_EVENTS as CURSOR_EVENTS
 from haunt.hosts.cursor import HOST_NAME as CURSOR_HOST
+
+MISSING_HOOK = "/tmp/does-not-exist/haunt-hook"
+MISSING_CLAUDE_HOOK = "/tmp/does-not-exist/haunt-hook-claude"
 
 
 @pytest.fixture
@@ -63,6 +66,37 @@ def _count_haunt_cursor_hooks(hooks: dict, event: str) -> int:
         if name == "haunt-hook":
             n += 1
     return n
+
+
+def _plant_cursor_hook_command(env, command: str) -> None:
+    path = env["cursor_home"] / "hooks.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for entries in data.get("hooks", {}).values():
+        if not isinstance(entries, list):
+            continue
+        for item in entries:
+            if isinstance(item, dict) and str(item.get("command", "")).endswith(
+                "haunt-hook"
+            ):
+                item["command"] = command
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _plant_claude_hook_command(env, command: str) -> None:
+    path = env["claude_dir"] / "settings.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for groups in data.get("hooks", {}).values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for item in group.get("hooks") or []:
+                if isinstance(item, dict) and "haunt-hook" in str(
+                    item.get("command", "")
+                ):
+                    item["command"] = command
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def _count_haunt_claude_hooks(hooks: dict, event: str) -> int:
@@ -334,3 +368,68 @@ def test_cursor_install_alias_writes_mcp(host_env):
     # Cursor-only: Claude files should not be required by this alias.
     # (autouse isolation may have an empty claude-config dir; do not bind it.)
     assert not (host_env["claude_dir"] / "settings.json").exists()
+
+
+def test_hook_command_issues_missing_path_fails_when_expected_matches():
+    """#57 sabotage: revert path.is_file() in hook_command_issues and this fails.
+
+    Planted command == expected, so samefile-when-different is skipped.
+    Leaf name alone used to paint this ok.
+    """
+    assert not Path(MISSING_HOOK).exists()
+    issues = hook_command_issues(MISSING_HOOK, expected=MISSING_HOOK)
+    assert issues, "leaf-named missing haunt-hook must be a doctor issue"
+    assert any("not found" in i for i in issues)
+    assert all("MCP" not in i for i in issues)
+
+
+def test_hook_command_issues_real_wrapper_passes(host_env):
+    from haunt.bootstrap import bind_launchers
+
+    bind_launchers()
+    issues = hook_command_issues(host_env["hook_cmd"], expected=host_env["hook_cmd"])
+    assert issues == []
+    claude_issues = hook_command_issues(
+        host_env["claude_hook"], expected=host_env["claude_hook"]
+    )
+    assert claude_issues == []
+
+
+def test_doctor_fails_if_hook_command_is_missing_leaf_named_path(host_env):
+    """Plant /tmp/does-not-exist/haunt-hook. cursor.hooks and claude-code.hooks FAIL.
+
+    hook_cmd is the same missing path so samefile-when-different is skipped.
+    Revert the path-exists check and this test fails.
+    """
+    env = host_env
+    _install(env)
+    assert not Path(MISSING_HOOK).exists()
+    assert not Path(MISSING_CLAUDE_HOOK).exists()
+    _plant_cursor_hook_command(env, MISSING_HOOK)
+    _plant_claude_hook_command(env, MISSING_CLAUDE_HOOK)
+
+    statuses = {
+        s.host: s
+        for s in doctor_all_hosts(str(env["haunt_home"]), MISSING_HOOK, env["mcp_cmd"])
+    }
+    cursor = statuses[CURSOR_HOST]
+    claude = statuses[CLAUDE_HOST]
+    assert cursor.hooks_present is False
+    assert claude.hooks_present is False
+    assert any("not found" in i for i in cursor.issues)
+    assert any("not found" in i for i in claude.issues)
+    assert cursor.mcp_present is True
+    assert claude.mcp_present is True
+
+
+def test_doctor_ok_for_real_expected_hook_wrapper(host_env):
+    env = host_env
+    from haunt.bootstrap import bind_launchers
+
+    bind_launchers()
+    _install(env)
+    statuses = {s.host: s for s in _doctor(env)}
+    assert statuses[CURSOR_HOST].hooks_present is True
+    assert statuses[CLAUDE_HOST].hooks_present is True
+    assert statuses[CURSOR_HOST].mcp_present is True
+    assert statuses[CLAUDE_HOST].mcp_present is True
