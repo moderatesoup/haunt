@@ -13,8 +13,31 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
+K_MIN = 1
+K_MAX = 100
+
+
+def clamp_k(k: Any, *, default: int = 8) -> int:
+    """Clamp a retrieval k to a safe range. Callers share this bound."""
+    if k is None:
+        n = default
+    else:
+        try:
+            n = int(k)
+        except (TypeError, ValueError):
+            n = default
+    return max(K_MIN, min(K_MAX, n))
+
+
+def utc_iso(dt: datetime) -> str:
+    """Canonical storage/order form: UTC with an explicit +00:00 offset."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return utc_iso(datetime.now(timezone.utc))
 
 
 def parse_iso(value: str) -> datetime:
@@ -30,7 +53,17 @@ def parse_iso(value: str) -> datetime:
 def iso_or_now(value: str | None) -> str:
     if not value:
         return now_iso()
-    return parse_iso(value).isoformat(timespec="seconds")
+    return utc_iso(parse_iso(value))
+
+
+def format_iso(value: str | None) -> str:
+    """Display form of a stored timestamp (always UTC)."""
+    if not value:
+        return ""
+    try:
+        return utc_iso(parse_iso(value))
+    except (TypeError, ValueError):
+        return value
 
 
 CLOCKS = ("event_time", "storage_time")

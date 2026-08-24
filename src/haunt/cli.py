@@ -14,7 +14,7 @@ from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
 from haunt.store import Store, list_namespaces, register_namespace
 from haunt.temporal import TemporalParseError
-from haunt.util import snippet
+from haunt.util import format_iso, snippet
 
 app = typer.Typer(
     add_completion=False,
@@ -177,7 +177,7 @@ def timeline_cmd(
         if r["tool_name"]:
             body = f"[tool:{r['tool_name']}] {body}".strip()
         typer.echo(
-            f"{r['event_time']}  {r['role']:<10} {r['tier']:<12} {r['id']}  {snippet(body, 120)}"
+            f"{format_iso(r['event_time'])}  {r['role']:<10} {r['tier']:<12} {r['id']}  {snippet(body, 120)}"
         )
 
 

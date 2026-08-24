@@ -17,7 +17,12 @@ import sqlite_vec
 from haunt.embed import available as embed_available
 from haunt.embed import embed_one
 from haunt.store import Store
-from haunt.util import clock_sql_column, iso_or_now, snippet
+from haunt.util import clamp_k, clock_sql_column, iso_or_now, snippet
+
+# Match FTS5 unicode61 word characters (letters/digits) plus the same
+# extras the previous ASCII class allowed. ASCII-only [A-Za-z0-9_...]
+# drops non-Latin queries while the index still tokenizes them.
+_FTS_TOKEN = re.compile(r"[\w./+-]+", re.UNICODE)
 
 RRF_K = 60
 CANDIDATES = 40
@@ -63,7 +68,7 @@ class Hit:
 
 
 def _fts_match_query(q: str) -> str | None:
-    tokens = re.findall(r"[A-Za-z0-9_./+-]+", q)
+    tokens = _FTS_TOKEN.findall(q)
     tokens = [t for t in tokens if t]
     if not tokens:
         return None
@@ -197,6 +202,7 @@ def recall(
     k: int = 8,
     store: Store | None = None,
 ) -> list[Hit]:
+    k = clamp_k(k)
     own = store is None
     store = store or Store(namespace or "default")
     try:

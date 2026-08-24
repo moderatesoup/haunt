@@ -58,14 +58,40 @@ def test_user_prompt_submit_observes_prompt(fts_cc_env, capsys, monkeypatch):
     hso = out["hookSpecificOutput"]
     assert hso["hookEventName"] == "UserPromptSubmit"
     assert "additionalContext" in hso
-    assert "ZX-CC-TOKEN" in hso["additionalContext"]
     assert "[haunt ns=cctest]" in hso["additionalContext"]
+    # Just-written prompt must not appear in this turn's recall (self-hit).
+    assert "ZX-CC-TOKEN" not in hso["additionalContext"]
     with Store("cctest") as st:
         rows = st.events(session_id="sess-cc-1")
         assert any(r["content"] == unique and r["role"] == "user" for r in rows)
         assert any(r["origin"] == "claude-code" for r in rows)
         mem = st.conn.execute("SELECT content, tier FROM memories").fetchall()
         assert any(unique in (m["content"] or "") and m["tier"] == "episodic" for m in mem)
+
+
+def test_user_prompt_submit_recalls_history_not_just_written(
+    fts_cc_env, capsys, monkeypatch
+):
+    """Observe-before-recall would let the new prompt outrank stored history."""
+    history = "The vault combination is HISTORY-CC-991 and lives in this older turn."
+    with Store("cctest") as st:
+        prior = st.observe(history, role="user", origin="test")
+
+    prompt = "where is the vault combination? HISTORY-CC-991 also UNIQUE-NEW-CC"
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": prompt,
+        "session_id": "sess-cc-self",
+        "cwd": str(fts_cc_env["project"]),
+    }
+    out = _run_hook(payload, capsys, monkeypatch)
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "HISTORY-CC-991" in ctx
+    assert prior.memory_id in ctx
+    assert "UNIQUE-NEW-CC" not in ctx
+    with Store("cctest") as st:
+        rows = st.events(session_id="sess-cc-self")
+        assert any(r["content"] == prompt for r in rows)
 
 
 def test_post_tool_use_skips_memory_tools(fts_cc_env, capsys, monkeypatch):

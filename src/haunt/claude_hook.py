@@ -88,17 +88,15 @@ def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
 def _handle_user_prompt_submit(
     store: Store, payload: dict[str, Any], ns: str
 ) -> dict[str, Any]:
-    """UserPromptSubmit: observe user prompt, return recall context."""
+    """UserPromptSubmit: recall first, then observe the prompt."""
     prompt = _as_text(payload.get("prompt") or payload.get("user_prompt", ""))
-    if prompt.strip():
-        _observe(store, payload, content=prompt, role="user", tier="episodic")
-
     hits = []
     if prompt.strip():
         try:
             hits = recall(prompt, namespace=ns, k=8, store=store)
         except Exception:
             hits = []
+        _observe(store, payload, content=prompt, role="user", tier="episodic")
 
     return _hook_specific_output("UserPromptSubmit", format_recall_block(hits, ns))
 
