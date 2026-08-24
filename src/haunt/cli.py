@@ -452,7 +452,7 @@ def cursor_install_cmd() -> None:
     if report.get("skill"):
         typer.echo(f"skill     {report['skill']}")
     typer.echo("merged existing hooks/MCP; other entries were kept")
-    typer.echo(f"home      {report['haunt_home']}  (HAUNT_HOME / LORE_HOME / ENGRAM_HOME)")
+    typer.echo(f"home      {report['haunt_home']}  (HAUNT_HOME)")
 
 
 @app.command("doctor")

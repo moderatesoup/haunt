@@ -25,7 +25,7 @@ def _corrupt_ns_db(name: str) -> Path:
     return db
 
 
-def test_list_namespaces_corrupt_db_is_not_empty_zeros(lore_env):
+def test_list_namespaces_corrupt_db_is_not_empty_zeros(haunt_env):
     """Published #18 falsifier: overwrite the DB with GARBAGE; listing
     must surface an error and must not report events=0, memories=0.
     """
@@ -55,7 +55,7 @@ def test_list_namespaces_corrupt_db_is_not_empty_zeros(lore_env):
     assert row.get("entities") != 0
 
 
-def test_list_namespaces_empty_healthy_still_zeros(lore_env):
+def test_list_namespaces_empty_healthy_still_zeros(haunt_env):
     """A real empty namespace still reports zero counts and no error."""
     with Store("empty-ns") as st:
         stats = st.stats()
@@ -73,7 +73,7 @@ def test_list_namespaces_empty_healthy_still_zeros(lore_env):
     assert "memories" in row
 
 
-def test_list_namespaces_healthy_keeps_count_keys(lore_env):
+def test_list_namespaces_healthy_keeps_count_keys(haunt_env):
     observe("healthy namespace phrase HEALTHY-NS-18", namespace="healthy-ns", role="user")
     rows = {r["name"]: r for r in list_namespaces()}
     row = rows["healthy-ns"]
@@ -86,7 +86,7 @@ def test_list_namespaces_healthy_keeps_count_keys(lore_env):
     assert row["db_size_bytes"] > 0
 
 
-def test_list_namespaces_missing_db_is_not_empty_zeros(lore_env):
+def test_list_namespaces_missing_db_is_not_empty_zeros(haunt_env):
     """Registered namespace whose file is gone is unreadable, not empty."""
     with Store("missing-ns"):
         pass
@@ -99,11 +99,11 @@ def test_list_namespaces_missing_db_is_not_empty_zeros(lore_env):
     assert row.get("memories") != 0
 
 
-def test_cli_namespaces_prints_error_not_zeros(lore_env):
+def test_cli_namespaces_prints_error_not_zeros(haunt_env):
     observe("cli corrupt canary CLI-CORRUPT-18", namespace="cli-corrupt", role="user")
     _corrupt_ns_db("cli-corrupt")
     env = os.environ.copy()
-    env["HAUNT_HOME"] = str(lore_env)
+    env["HAUNT_HOME"] = str(haunt_env)
     env["HAUNT_FTS_ONLY"] = "1"
     env["HAUNT_EMBED_MODEL"] = "off"
     p = subprocess.run(
@@ -124,7 +124,7 @@ def test_cli_namespaces_prints_error_not_zeros(lore_env):
             assert not line.split()[1:2] == ["0"]
 
 
-def test_mcp_memory_namespaces_surfaces_error(lore_env):
+def test_mcp_memory_namespaces_surfaces_error(haunt_env):
     observe("mcp corrupt canary MCP-CORRUPT-18", namespace="mcp-corrupt", role="user")
     _corrupt_ns_db("mcp-corrupt")
     from haunt.mcp_server import memory_namespaces
@@ -136,7 +136,7 @@ def test_mcp_memory_namespaces_surfaces_error(lore_env):
     assert row.get("memories") != 0
 
 
-def test_dash_api_namespaces_surfaces_error(lore_env):
+def test_dash_api_namespaces_surfaces_error(haunt_env):
     observe("dash corrupt canary DASH-CORRUPT-18", namespace="dash-corrupt", role="user")
     _corrupt_ns_db("dash-corrupt")
     from starlette.testclient import TestClient

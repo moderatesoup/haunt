@@ -17,9 +17,7 @@ def fts_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(home))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
-    monkeypatch.delenv("LORE_NAMESPACE", raising=False)
     from haunt import embed
     from haunt.paths import ensure_layout
     from haunt.store import init_registry

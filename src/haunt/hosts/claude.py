@@ -56,8 +56,6 @@ def _is_haunt_hook(command: str) -> bool:
     return command_leaf(command) in {
         "haunt-hook",
         "haunt-hook-claude",
-        "engram-hook",
-        "lore-hook",
     }
 
 
@@ -113,11 +111,7 @@ def _merge_hooks_settings(path: Path, hook_cmd: str) -> dict[str, Any]:
 def _is_haunt_mcp(key: str, entry: dict[str, Any]) -> bool:
     if key == "haunt":
         return True
-    return command_leaf(str(entry.get("command", ""))) in {
-        "haunt-mcp",
-        "engram-mcp",
-        "lore-mcp",
-    }
+    return command_leaf(str(entry.get("command", ""))) in {"haunt-mcp"}
 
 
 def _merge_mcp_dotfile(path: Path, mcp_cmd: str) -> dict[str, Any]:

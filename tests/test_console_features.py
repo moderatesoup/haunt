@@ -8,7 +8,7 @@ from haunt.store import Store, observe
 
 
 @pytest.fixture
-def dash_client(lore_env):
+def dash_client(haunt_env):
     """HTTPX test client with pre-populated data for console feature tests."""
     from starlette.testclient import TestClient
     from haunt.dashboard import app

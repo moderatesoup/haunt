@@ -1,6 +1,6 @@
 [project]
 name = "haunt"
-version = "0.1.0"
+version = "0.2.0"
 description = "haunt — local-first verbatim memory for AI agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,12 +26,6 @@ haunt = "haunt.cli:main"
 haunt-mcp = "haunt.mcp_server:main"
 haunt-hook = "haunt.cursor_hook:main"
 haunt-hook-claude = "haunt.claude_hook:main"
-lore = "haunt.cli:main"
-lore-mcp = "haunt.mcp_server:main"
-lore-hook = "haunt.cursor_hook:main"
-engram = "haunt.cli:main"
-engram-mcp = "haunt.mcp_server:main"
-engram-hook = "haunt.cursor_hook:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

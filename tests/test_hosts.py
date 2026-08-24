@@ -26,8 +26,6 @@ def host_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
     monkeypatch.setenv("CURSOR_HOME", str(cursor_home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_dir))
-    monkeypatch.delenv("LORE_HOME", raising=False)
-    monkeypatch.delenv("ENGRAM_HOME", raising=False)
     monkeypatch.delenv("CURSOR_HOOKS_JSON", raising=False)
     from haunt import embed
     from haunt.paths import ensure_layout
@@ -62,7 +60,7 @@ def _count_haunt_cursor_hooks(hooks: dict, event: str) -> int:
         if not isinstance(item, dict):
             continue
         name = str(item.get("command", "")).replace("\\", "/").split("/")[-1]
-        if name in {"haunt-hook", "engram-hook", "lore-hook"}:
+        if name == "haunt-hook":
             n += 1
     return n
 
@@ -76,7 +74,7 @@ def _count_haunt_claude_hooks(hooks: dict, event: str) -> int:
             if not isinstance(h, dict):
                 continue
             name = str(h.get("command", "")).replace("\\", "/").split("/")[-1]
-            if name in {"haunt-hook", "haunt-hook-claude", "engram-hook", "lore-hook"}:
+            if name in {"haunt-hook", "haunt-hook-claude"}:
                 n += 1
     return n
 

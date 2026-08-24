@@ -15,7 +15,6 @@ def test_embedded_false_when_vec_not_loaded(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt import embed
@@ -47,7 +46,6 @@ def test_embedded_false_when_vec_insert_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt import embed
@@ -74,7 +72,7 @@ def test_embedded_false_when_vec_insert_raises(tmp_path, monkeypatch):
     embed.reset()
 
 
-def test_embedded_true_when_vec_insert_succeeds(lore_env):
+def test_embedded_true_when_vec_insert_succeeds(haunt_env):
     """When vec is loaded and insert succeeds, embedded must be True."""
     from haunt.embed import embed_one as real_embed_one
     from haunt.store import Store, _vec_loaded
@@ -98,7 +96,6 @@ def test_fts_only_embedded_always_false(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt import embed
@@ -125,7 +122,6 @@ def test_embedded_false_not_vacuous(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt import embed

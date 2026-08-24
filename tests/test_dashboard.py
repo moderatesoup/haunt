@@ -10,7 +10,7 @@ from haunt.store import Store, observe
 
 
 @pytest.fixture
-def dash_client(lore_env):
+def dash_client(haunt_env):
     """HTTPX test client for the dashboard app."""
     from starlette.testclient import TestClient
     from haunt.dashboard import app
@@ -155,7 +155,7 @@ def test_run_dashboard_opens_browser_by_default():
     )
 
 
-def test_run_dashboard_no_open_skips_browser(lore_env, monkeypatch):
+def test_run_dashboard_no_open_skips_browser(haunt_env, monkeypatch):
     """open_browser=False must not attempt webbrowser.open."""
     import threading
 

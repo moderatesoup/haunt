@@ -24,10 +24,6 @@ def fts_cc_env(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "cursor-home"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
-    monkeypatch.delenv("LORE_HOME", raising=False)
-    monkeypatch.delenv("LORE_NAMESPACE", raising=False)
-    monkeypatch.delenv("ENGRAM_NAMESPACE", raising=False)
-    monkeypatch.delenv("ENGRAM_HOME", raising=False)
     from haunt import embed
     from haunt.paths import ensure_layout
     from haunt.store import init_registry

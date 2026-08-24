@@ -15,7 +15,7 @@ from haunt.temporal import TemporalParseError
 
 server = MCPServer(
     name="haunt",
-    version="0.1.0",
+    version="0.2.0",
     instructions=(
         "haunt is local-first verbatim agent memory. "
         "If hooks are active (Cursor or Claude Code), they log turns "

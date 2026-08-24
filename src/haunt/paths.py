@@ -11,26 +11,14 @@ SAFE_NS = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
 def haunt_home() -> Path:
-    raw = (
-        os.environ.get("HAUNT_HOME")
-        or os.environ.get("LORE_HOME")
-        or os.environ.get("ENGRAM_HOME")
-    )
+    raw = os.environ.get("HAUNT_HOME")
     if raw:
         return Path(raw).expanduser().resolve()
-    default = Path.home() / ".haunt"
-    legacy = Path.home() / ".lore"
-    if not default.exists() and legacy.exists():
-        return legacy.resolve()
-    return default.resolve()
-
-
-# Keep lore_home as an alias for backwards compatibility in internal code
-lore_home = haunt_home
+    return (Path.home() / ".haunt").resolve()
 
 
 def models_dir() -> Path:
-    raw = os.environ.get("HAUNT_MODEL_CACHE") or os.environ.get("LORE_MODEL_CACHE")
+    raw = os.environ.get("HAUNT_MODEL_CACHE")
     if raw:
         return Path(raw).expanduser().resolve()
     return haunt_home() / "models"
@@ -61,11 +49,7 @@ def safe_name(name: str) -> str:
 
 def infer_namespace(cwd: Path | None = None) -> str:
     """Infer a namespace from git remote, repo folder, or cwd name."""
-    env = (
-        os.environ.get("HAUNT_NAMESPACE")
-        or os.environ.get("LORE_NAMESPACE")
-        or os.environ.get("ENGRAM_NAMESPACE")
-    )
+    env = os.environ.get("HAUNT_NAMESPACE")
     if env:
         return safe_name(env)
     if cwd is None:

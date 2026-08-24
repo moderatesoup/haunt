@@ -37,9 +37,7 @@ def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
 
 
 def write_hook_launcher() -> Path:
-    """Space-free launcher at ~/.haunt/bin/haunt-hook (plus legacy aliases)."""
-    _write_sh_wrapper(bin_dir() / "lore-hook", "lore-hook", "haunt.cursor_hook")
-    _write_sh_wrapper(bin_dir() / "engram-hook", "engram-hook", "haunt.cursor_hook")
+    """Space-free launcher at ~/.haunt/bin/haunt-hook."""
     return _write_sh_wrapper(bin_dir() / "haunt-hook", "haunt-hook", "haunt.cursor_hook")
 
 
@@ -51,10 +49,8 @@ def write_claude_hook_launcher() -> Path:
 
 
 def write_launcher() -> Path:
-    """Space-free absolute launchers at ~/.haunt/bin/{haunt,lore,engram}-{mcp,hook}."""
+    """Space-free absolute launchers at ~/.haunt/bin/haunt-{mcp,hook,hook-claude}."""
     dest = _write_sh_wrapper(bin_dir() / "haunt-mcp", "haunt-mcp", "haunt.mcp_server")
-    _write_sh_wrapper(bin_dir() / "lore-mcp", "lore-mcp", "haunt.mcp_server")
-    _write_sh_wrapper(bin_dir() / "engram-mcp", "engram-mcp", "haunt.mcp_server")
     write_hook_launcher()
     write_claude_hook_launcher()
     return dest
@@ -148,7 +144,6 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
     hook_launcher = bin_dir() / "haunt-hook"
     report = {
         "haunt_home": str(home),
-        "lore_home": str(home),
         "launcher": str(launcher.resolve()),
         "hook_launcher": str(hook_launcher.resolve()),
         "models_dir": str(models_dir()),
@@ -187,7 +182,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
 
 
 def format_report(report: dict) -> str:
-    home = report.get('haunt_home') or report.get('lore_home', '')
+    home = report.get('haunt_home', '')
     icon = report.get('desktop_icon')
     lines = [
         f"haunt home    {home}",
@@ -243,6 +238,6 @@ def format_report(report: dict) -> str:
             f"hooks={h.get('hooks_path', '-')}  mcp={h.get('mcp_path', '-')}  "
             f"rule={h.get('rule_path', '-')}  skill={h.get('skill_path', '-')}"
         )
-    if os.environ.get("HAUNT_JSON") or os.environ.get("LORE_JSON"):
+    if os.environ.get("HAUNT_JSON"):
         return dumps(report)
     return "\n".join(lines)

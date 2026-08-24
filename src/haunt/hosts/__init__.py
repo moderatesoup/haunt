@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-HAUNT_MCP_LEAVES = frozenset({"haunt-mcp", "engram-mcp", "lore-mcp"})
+HAUNT_MCP_LEAVES = frozenset({"haunt-mcp"})
 # Must stay in lockstep with #44 / contrib host rules. Doctor fails if install
 # plants the pre-rewrite essay that omitted the wired temporal path.
 RULE_MARKERS = ("memory_recall", "haunt", "compile() runs automatically on memory_recall")

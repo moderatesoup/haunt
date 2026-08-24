@@ -57,7 +57,7 @@ HOOK_EVENTS = (
     "sessionStart",
     "sessionEnd",
 )
-STORE_THOUGHTS_ENV = ("HAUNT_STORE_THOUGHTS", "ENGRAM_STORE_THOUGHTS", "LORE_STORE_THOUGHTS")
+STORE_THOUGHTS_ENV = ("HAUNT_STORE_THOUGHTS",)
 
 
 def _as_text(value: Any) -> str:
@@ -142,11 +142,7 @@ def hook_cwd(payload: dict[str, Any]) -> Path | None:
 
 
 def hook_namespace(payload: dict[str, Any]) -> str:
-    env = (
-        os.environ.get("HAUNT_NAMESPACE")
-        or os.environ.get("LORE_NAMESPACE")
-        or os.environ.get("ENGRAM_NAMESPACE")
-    )
+    env = os.environ.get("HAUNT_NAMESPACE")
     if env:
         return safe_name(env)
     return infer_namespace(hook_cwd(payload))
@@ -383,7 +379,7 @@ def run(raw: str) -> dict[str, Any]:
 
 def _is_haunt_command(command: str) -> bool:
     name = command.replace("\\", "/").rstrip("/").split("/")[-1]
-    return name in {"haunt-hook", "engram-hook", "lore-hook"}
+    return name in {"haunt-hook"}
 
 
 def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
@@ -422,7 +418,6 @@ def install_cursor_hooks() -> dict[str, Any]:
     report = cursor_install(str(home), hook_cmd, mcp_cmd)
     return {
         "haunt_home": str(home),
-        "lore_home": str(home),
         "launcher": hook_cmd,
         "hooks_json": report.hooks_path,
         "mcp_json": report.mcp_path,

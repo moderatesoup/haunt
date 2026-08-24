@@ -48,7 +48,7 @@ def _mcp_json_path() -> Path:
 
 
 def _is_haunt_command(command: str) -> bool:
-    return command_leaf(command) in {"haunt-hook", "engram-hook", "lore-hook"}
+    return command_leaf(command) in {"haunt-hook"}
 
 
 def _merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
@@ -88,11 +88,7 @@ def _merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
 def _is_haunt_mcp(key: str, entry: dict[str, Any]) -> bool:
     if key == "haunt":
         return True
-    return command_leaf(str(entry.get("command", ""))) in {
-        "haunt-mcp",
-        "engram-mcp",
-        "lore-mcp",
-    }
+    return command_leaf(str(entry.get("command", ""))) in {"haunt-mcp"}
 
 
 def _merge_mcp_json(path: Path, mcp_cmd: str) -> dict[str, Any]:

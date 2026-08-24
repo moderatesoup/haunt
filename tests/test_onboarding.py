@@ -27,8 +27,6 @@ def onboard_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
     monkeypatch.setenv("CURSOR_HOME", str(cursor_home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_dir))
-    monkeypatch.delenv("LORE_HOME", raising=False)
-    monkeypatch.delenv("ENGRAM_HOME", raising=False)
     monkeypatch.delenv("CURSOR_HOOKS_JSON", raising=False)
     from haunt import embed
     from haunt.paths import ensure_layout
@@ -157,6 +155,32 @@ def test_doctor_fails_if_hooks_json_deleted(onboard_env):
     assert any("hooks.json" in i for i in report.issues)
 
 
+def test_install_plants_haunt_named_binaries_only(onboard_env):
+    env = onboard_env
+    _install(env)
+    bin_dir = env["haunt_home"] / "bin"
+    names = {p.name for p in bin_dir.iterdir()}
+    leftover = {n for n in names if n.startswith(("lore", "engram"))}
+    assert leftover == set(), leftover
+    assert {"haunt-mcp", "haunt-hook", "haunt-hook-claude"} <= names
+    cursor_mcp = json.loads((env["cursor_home"] / "mcp.json").read_text(encoding="utf-8"))
+    assert Path(cursor_mcp["mcpServers"]["haunt"]["command"]).name == "haunt-mcp"
+
+
+def test_doctor_fails_if_mcp_is_lore_mcp(onboard_env):
+    env = onboard_env
+    _install(env)
+    mcp_path = env["cursor_home"] / "mcp.json"
+    data = json.loads(mcp_path.read_text(encoding="utf-8"))
+    data["mcpServers"]["haunt"]["command"] = str(env["haunt_home"] / "bin" / "lore-mcp")
+    mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    report = _diagnose(env)
+    assert report.ok is False
+    blob = " ".join(report.issues)
+    assert "lore-mcp" in blob
+    assert "not haunt-mcp" in blob
+
+
 def test_doctor_fails_if_mcp_points_at_bin_false(onboard_env):
     env = onboard_env
     _install(env)
@@ -214,7 +238,6 @@ def test_bootstrap_vec_fail_writes_no_namespace(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "fresh-home"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     embed.reset()
     with patch(
         "haunt.bootstrap.probe_sqlite_vec",

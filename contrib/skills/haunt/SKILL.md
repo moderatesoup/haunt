@@ -88,5 +88,3 @@ haunt procedure write NAME --body "..."
 haunt delete MEMORY_ID -y            # purge; no CLI contradict / session-end
 haunt health / namespaces / dash
 ```
-
-`lore` and `engram` are aliases for `haunt`.

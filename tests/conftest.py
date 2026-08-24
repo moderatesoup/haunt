@@ -22,14 +22,11 @@ def isolate_host_homes(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def lore_env(tmp_path, monkeypatch):
+def haunt_env(tmp_path, monkeypatch):
     home = tmp_path / "haunthome"
     monkeypatch.setenv("HAUNT_HOME", str(home))
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
-    monkeypatch.delenv("LORE_NAMESPACE", raising=False)
     monkeypatch.delenv("HAUNT_FTS_ONLY", raising=False)
-    monkeypatch.delenv("LORE_FTS_ONLY", raising=False)
     if MODEL_CACHE.exists():
         monkeypatch.setenv("HAUNT_MODEL_CACHE", str(MODEL_CACHE))
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "BAAI/bge-small-en-v1.5")

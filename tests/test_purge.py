@@ -6,7 +6,7 @@ from haunt.recall import recall
 from haunt.store import Store, observe
 
 
-def test_purge_removes_memory_and_keeps_other(lore_env):
+def test_purge_removes_memory_and_keeps_other(haunt_env):
     """Observe two memories, purge one, assert the other remains intact."""
     r1 = observe("alpha memory XRAY-11 unique text", namespace="default", role="user")
     r2 = observe("beta memory ZULU-22 different text", namespace="default", role="assistant")
@@ -29,7 +29,7 @@ def test_purge_removes_memory_and_keeps_other(lore_env):
         assert kept is not None, "other memory should still exist"
 
 
-def test_purge_removes_fts_entry(lore_env):
+def test_purge_removes_fts_entry(haunt_env):
     """After purge, FTS should not contain the deleted memory."""
     unique = "FTS-PURGE-CANARY-77 this phrase only appears once"
     r = observe(unique, namespace="default", role="user")
@@ -48,7 +48,7 @@ def test_purge_removes_fts_entry(lore_env):
         assert fts_after is None, "FTS entry should be deleted after purge"
 
 
-def test_purge_removes_vec_entry(lore_env):
+def test_purge_removes_vec_entry(haunt_env):
     """After purge, vec_memories should not contain the deleted memory."""
     r = observe("VEC-PURGE-CANARY vector data test", namespace="default", role="user")
 
@@ -77,7 +77,7 @@ def test_purge_removes_vec_entry(lore_env):
                 assert vec_after is None, "vec entry should be deleted after purge"
 
 
-def test_purge_removes_graph_rows(lore_env):
+def test_purge_removes_graph_rows(haunt_env):
     """After purge, relations tied to the event should be removed."""
     text = "Alice updated src/haunt/store.py in function init_schema()"
     r = observe(text, namespace="default", role="user")
@@ -95,7 +95,7 @@ def test_purge_removes_graph_rows(lore_env):
         assert rels_after == 0, "graph relations should be deleted after purge"
 
 
-def test_purge_removes_orphan_event(lore_env):
+def test_purge_removes_orphan_event(haunt_env):
     """If no other memories reference the event, the event itself is deleted."""
     r = observe("orphan event test CANARY-88", namespace="default", role="user")
 
@@ -114,7 +114,7 @@ def test_purge_removes_orphan_event(lore_env):
         assert event_after is None, "orphan event should be deleted"
 
 
-def test_purge_recall_does_not_return_deleted(lore_env):
+def test_purge_recall_does_not_return_deleted(haunt_env):
     """After purge, recall must not return the purged text."""
     unique = "PURGE-RECALL-CANARY-99 absolutely unique text for recall test"
     r = observe(unique, namespace="default", role="user")
@@ -131,7 +131,7 @@ def test_purge_recall_does_not_return_deleted(lore_env):
     )
 
 
-def test_purge_not_found(lore_env):
+def test_purge_not_found(haunt_env):
     """Purging a nonexistent memory returns ok=False."""
     with Store("default") as st:
         result = st.purge("nonexistent-id-12345")
