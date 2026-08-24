@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Honesty pack (#61): dashboard `openDetail` escapes every `.val` field (including `session_id`); host hook/settings merge fail-closed on malformed JSON; `Store.contradict` is one transaction and refuses already-superseded rows; timeline fills `k` current memories; generated wrappers quote `HAUNT_HOME`; CLI timeline / worldview size params use the same clamp helpers as recall `k`.
+
 Doctor honesty: `{host}.hooks` fails when the planted haunt-hook path is missing or is not the expected wrapper. Leaf name alone is not enough. Runtime hook fail-open is unchanged.
 
 DELETE `/api/namespace/{name}/memory/{id}` and POST contradict 404 `unknown namespace` on a missing namespace (`Store(..., create=False)`). A typo no longer creates an empty DB, then 404s `memory not found`.

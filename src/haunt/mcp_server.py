@@ -220,6 +220,8 @@ def memory_worldview(
     names_cap: int = 12,
 ) -> str:
     ns = resolve_namespace(namespace)
+    facts_cap = clamp_limit(facts_cap, default=12)
+    names_cap = clamp_limit(names_cap, default=12)
     with Store(ns) as st:
         wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
     return _json(wv)

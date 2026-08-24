@@ -13,24 +13,30 @@ from haunt.store import Store, init_registry, register_namespace, list_namespace
 from haunt.util import diag, dumps
 
 
+def _sh_single_quote(value: str) -> str:
+    """Quote a string for /bin/sh so command substitution cannot run."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
 def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
     """Space-free /bin/sh launcher. Do not Path.resolve() the venv python."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     python = str(Path(sys.executable).absolute())
     sibling = Path(python).parent / sibling_name
-    home = haunt_home()
+    home = _sh_single_quote(str(haunt_home()))
+    # Do not use export HAUNT_HOME="${HAUNT_HOME:-...}". The default word
+    # inside double quotes still runs command substitution.
+    prefix = (
+        "#!/bin/sh\n"
+        "if [ -z \"${HAUNT_HOME}\" ]; then\n"
+        f"  HAUNT_HOME={home}\n"
+        "  export HAUNT_HOME\n"
+        "fi\n"
+    )
     if sibling.is_file():
-        body = (
-            "#!/bin/sh\n"
-            f'export HAUNT_HOME="${{HAUNT_HOME:-{home}}}"\n'
-            f'exec "{sibling}" "$@"\n'
-        )
+        body = prefix + f'exec "{sibling}" "$@"\n'
     else:
-        body = (
-            "#!/bin/sh\n"
-            f'export HAUNT_HOME="${{HAUNT_HOME:-{home}}}"\n'
-            f'exec "{python}" -m {module} "$@"\n'
-        )
+        body = prefix + f'exec "{python}" -m {module} "$@"\n'
     dest.write_text(body, encoding="utf-8")
     dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return dest

@@ -217,20 +217,37 @@ def run_timeline(
     limit: int = 50,
     clock: str | None = None,
 ) -> list[Hit]:
-    """A: events in [start, end] on the chosen clock(s)."""
+    """A: events in [start, end] on the chosen clock(s).
+
+    Fetch enough events to fill ``limit`` *current* memories. Superseded
+    rows (valid_to IS NOT NULL) are skipped by ``_hits_from_events``; a
+    short prefix of recent superseded events must not starve k.
+    """
     since, until = _iso(tq.start), _iso(tq.end)
     chosen = clock or tq.clock
     merged: dict[str, Hit] = {}
     for clk in _clocks(chosen):
-        rows = store.events(
-            session_id=session_id,
-            since=since,
-            until=until,
-            clock=clk,
-            limit=limit,
-        )
-        for h in _hits_from_events(store, rows, limit=limit):
-            merged.setdefault(h.memory_id, h)
+        # Page through events. store.events clamps LIMIT to 100; doubling
+        # fetch_n past that made len(rows) < fetch_n and starved refill.
+        batch = max(int(limit), 1)
+        offset = 0
+        while True:
+            rows = store.events(
+                session_id=session_id,
+                since=since,
+                until=until,
+                clock=clk,
+                limit=batch,
+                offset=offset,
+            )
+            for h in _hits_from_events(store, rows, limit=limit):
+                merged.setdefault(h.memory_id, h)
+            if len(merged) >= limit or len(rows) < batch:
+                break
+            nxt = offset + len(rows)
+            if nxt <= offset:
+                break
+            offset = nxt
     return list(merged.values())[:limit]
 
 

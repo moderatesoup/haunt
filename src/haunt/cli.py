@@ -14,7 +14,7 @@ from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
 from haunt.store import Store, list_namespaces, register_namespace
 from haunt.temporal import TemporalParseError
-from haunt.util import format_iso, snippet
+from haunt.util import clamp_limit, format_iso, snippet
 
 app = typer.Typer(
     add_completion=False,
@@ -161,6 +161,7 @@ def timeline_cmd(
 ) -> None:
     """Events in clock order (newest first). Default clock is event_time."""
     ns = _ns(namespace)
+    limit = clamp_limit(limit, default=50)
     try:
         with Store(ns) as st:
             rows = st.events(
@@ -277,6 +278,8 @@ def worldview_cmd(
     import json as _json
 
     ns = _ns(namespace)
+    facts_cap = clamp_limit(facts_cap, default=12)
+    names_cap = clamp_limit(names_cap, default=12)
     with Store(ns) as st:
         wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
     if json_out:
@@ -421,10 +424,14 @@ def delete_cmd(
 def install_cmd() -> None:
     """Bind haunt to all known hosts (Cursor, Claude Code). Idempotent."""
     from haunt.bootstrap import bind_launchers
-    from haunt.hosts import install_all_hosts
+    from haunt.hosts import HostConfigError, install_all_hosts
 
     home, hook_cmd, mcp_cmd = bind_launchers()
-    reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+    try:
+        reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+    except HostConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
     for r in reports:
         status = "seeded" if r.seeded else "merged"
         typer.echo(f"[{r.host}]  {status}")
@@ -442,7 +449,13 @@ def cursor_install_cmd() -> None:
     """Bind haunt to Cursor: hooks.json + mcp.json + haunt.mdc + skill."""
     from haunt.cursor_hook import install_cursor_hooks
 
-    report = install_cursor_hooks()
+    from haunt.hosts import HostConfigError
+
+    try:
+        report = install_cursor_hooks()
+    except HostConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
     typer.echo(f"hooks     {report['hooks_json']}")
     typer.echo(f"mcp       {report.get('mcp_json', '-')}")
     typer.echo(f"launcher  {report['launcher']}")
@@ -472,7 +485,13 @@ def doctor_cmd() -> None:
     if not report.ok and report.host_file_issues:
         typer.echo("")
         typer.echo("Re-merging all hosts...")
-        install_all_hosts(str(home), hook_cmd, mcp_cmd)
+        from haunt.hosts import HostConfigError
+
+        try:
+            install_all_hosts(str(home), hook_cmd, mcp_cmd)
+        except HostConfigError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(1) from exc
         report = diagnose(str(home), hook_cmd, mcp_cmd)
         typer.echo(format_doctor(report))
         if report.ok:

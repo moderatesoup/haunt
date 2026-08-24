@@ -13,7 +13,9 @@ from haunt.hosts import (
     command_leaf,
     hook_command_issues,
     mcp_command_issues,
+    read_json_object,
     rule_issue,
+    write_json_atomic,
 )
 from haunt.hosts.skill import install_host_skill, skill_issue
 
@@ -53,15 +55,14 @@ def _is_haunt_command(command: str) -> bool:
 
 
 def _merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
-    """Merge haunt hook entries into a Cursor hooks.json. Do not clobber others."""
-    existing: dict[str, Any] = {"version": 1, "hooks": {}}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except json.JSONDecodeError:
-            existing = {"version": 1, "hooks": {}}
+    """Merge haunt hook entries into a Cursor hooks.json. Do not clobber others.
+
+    Fail closed on malformed JSON: raise, leave the broken file in place.
+    """
+    loaded = read_json_object(path)
+    existing: dict[str, Any] = (
+        loaded if loaded is not None else {"version": 1, "hooks": {}}
+    )
     existing.setdefault("version", 1)
     hooks = existing.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -81,8 +82,7 @@ def _merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
                 updated = True
         if not updated:
             entries.append({"command": command})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    write_json_atomic(path, existing)
     return existing
 
 
@@ -93,15 +93,12 @@ def _is_haunt_mcp(key: str, entry: dict[str, Any]) -> bool:
 
 
 def _merge_mcp_json(path: Path, mcp_cmd: str) -> dict[str, Any]:
-    """Merge haunt MCP server into Cursor's mcp.json. Do not clobber others."""
-    existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except json.JSONDecodeError:
-            pass
+    """Merge haunt MCP server into Cursor's mcp.json. Do not clobber others.
+
+    Fail closed on malformed JSON: raise, leave the broken file in place.
+    """
+    loaded = read_json_object(path)
+    existing: dict[str, Any] = loaded if loaded is not None else {}
     servers = existing.setdefault("mcpServers", {})
     if not isinstance(servers, dict):
         servers = {}
@@ -119,8 +116,7 @@ def _merge_mcp_json(path: Path, mcp_cmd: str) -> dict[str, Any]:
     else:
         servers["haunt"] = haunt_entry
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    write_json_atomic(path, existing)
     return existing
 
 

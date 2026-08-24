@@ -13,7 +13,9 @@ from haunt.hosts import (
     command_leaf,
     hook_command_issues,
     mcp_command_issues,
+    read_json_object,
     rule_issue,
+    write_json_atomic,
 )
 from haunt.hosts.skill import install_host_skill, skill_issue
 
@@ -65,15 +67,10 @@ def _merge_hooks_settings(path: Path, hook_cmd: str) -> dict[str, Any]:
 
     Schema: event → matcher group → hooks[] with type=command.
     Matcher is omitted so the hook fires on every occurrence.
+    Fail closed on malformed JSON: raise, leave the broken file in place.
     """
-    existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except json.JSONDecodeError:
-            pass
+    loaded = read_json_object(path)
+    existing: dict[str, Any] = loaded if loaded is not None else {}
 
     hooks = existing.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -104,8 +101,7 @@ def _merge_hooks_settings(path: Path, hook_cmd: str) -> dict[str, Any]:
         if not found:
             matcher_groups.append({"hooks": [haunt_hook_entry]})
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    write_json_atomic(path, existing)
     return existing
 
 
@@ -121,15 +117,10 @@ def _merge_mcp_dotfile(path: Path, mcp_cmd: str) -> dict[str, Any]:
     MCP in settings.json is silently ignored by Claude Code — servers must
     go in ~/.claude.json under the top-level "mcpServers" key.
     Never replace the whole file.
+    Fail closed on malformed JSON: raise, leave the broken file in place.
     """
-    existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except json.JSONDecodeError:
-            pass
+    loaded = read_json_object(path)
+    existing: dict[str, Any] = loaded if loaded is not None else {}
 
     servers = existing.setdefault("mcpServers", {})
     if not isinstance(servers, dict):
@@ -148,8 +139,7 @@ def _merge_mcp_dotfile(path: Path, mcp_cmd: str) -> dict[str, Any]:
     else:
         servers["haunt"] = haunt_entry
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    write_json_atomic(path, existing)
     return existing
 
 

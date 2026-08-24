@@ -225,6 +225,8 @@ def extract_and_store(
     text: str,
     event_time: str,
     tool_name: str | None = None,
+    *,
+    commit: bool = True,
 ) -> list[str]:
     ents = extract_entities(text)
     if tool_name:
@@ -298,7 +300,8 @@ def extract_and_store(
         for fid in files:
             rel(fn, "LOCATED_IN", fid, 1.0)
 
-    conn.commit()
+    if commit:
+        conn.commit()
     return names
 
 
