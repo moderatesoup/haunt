@@ -7,7 +7,7 @@ import stat
 import sys
 from pathlib import Path
 
-from haunt.embed import warmup
+from haunt.embed import fts_only, warmup
 from haunt.paths import bin_dir, ensure_layout, haunt_home, models_dir, repair_private_modes
 from haunt.store import Store, init_registry, register_namespace, list_namespace_rows, reembed_all_namespaces
 from haunt.util import diag, dumps
@@ -101,7 +101,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
     repair_private_modes(home)
     launcher = write_launcher()
     vec = probe_sqlite_vec()
-    if not vec.get("ok"):
+    if not vec.get("ok") and not fts_only():
         hint = (
             "sqlite-vec failed to load: " + str(vec.get("error", "unknown")) + "\n"
             "\n"
@@ -111,6 +111,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
             "  - Ensure 'pip install sqlite-vec' succeeded.\n"
             "  - On macOS with pyenv: rebuild with\n"
             "    PYTHON_CONFIGURE_OPTS=\"--enable-loadable-sqlite-extensions\" pyenv install\n"
+            "  - Or set HAUNT_FTS_ONLY=1 (or HAUNT_EMBED_MODEL=off) to bootstrap FTS-only.\n"
         )
         raise BootstrapError(hint)
     try:
@@ -189,6 +190,16 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
     return report
 
 
+def _format_sqlite_vec_line(report: dict) -> str:
+    vec = report.get("sqlite_vec") or {}
+    if vec.get("ok"):
+        return "ok " + str(vec.get("version", ""))
+    err = str(vec.get("error", "unknown"))
+    if report.get("fts_only"):
+        return "skipped (FTS-only) " + err
+    return "FAIL " + err
+
+
 def format_report(report: dict) -> str:
     home = report.get('haunt_home', '')
     icon = report.get('desktop_icon')
@@ -198,7 +209,7 @@ def format_report(report: dict) -> str:
         f"hook          {report.get('hook_launcher', '')}",
         f"desktop icon  {icon or 'skipped (unsupported platform)'}",
         f"python        {report['python']}",
-        f"sqlite-vec    {'ok ' + str(report['sqlite_vec'].get('version', '')) if report['sqlite_vec'].get('ok') else 'FAIL ' + str(report['sqlite_vec'].get('error'))}",
+        f"sqlite-vec    {_format_sqlite_vec_line(report)}",
         f"embed         loaded={report['embed']['loaded']} dim={report['embed']['dim']} requested={report['embed']['requested']}"
         + (" (fallback)" if report["embed"]["fallback"] else ""),
     ]

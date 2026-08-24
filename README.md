@@ -10,7 +10,7 @@ Local-first **verbatim** memory for AI agents. One SQLite file per namespace. No
 # Option A: pip install from git (no clone needed)
 # PyPI name `haunt` is taken (mikepqr's stow); git install is the path.
 pip install git+https://github.com/moderatesoup/haunt.git
-haunt bootstrap          # creates ~/.haunt, probes sqlite-vec, downloads embed model, installs desktop shortcut
+haunt bootstrap          # creates ~/.haunt; probes sqlite-vec + downloads embed model unless HAUNT_FTS_ONLY=1
 haunt dash               # opens the memory console in your browser → http://127.0.0.1:7340
 
 # Option B: one-command bootstrap (git clone)
@@ -19,7 +19,7 @@ scripts/bootstrap.sh
 # Option C: manual (git clone)
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
-haunt bootstrap          # creates ~/.haunt, probes sqlite-vec, downloads BAAI/bge-m3 (~2.28 GB), installs desktop shortcut
+haunt bootstrap          # creates ~/.haunt; probes sqlite-vec + downloads BAAI/bge-m3 (~2.28 GB) unless HAUNT_FTS_ONLY=1
 haunt dash               # opens the memory console in your browser → http://127.0.0.1:7340
 ```
 
@@ -33,7 +33,7 @@ This registers haunt hooks, MCP server, agent rules, and the haunt skill for
 each host — even if the host is not installed yet (config dirs are pre-seeded).
 Re-run `haunt install` or `haunt doctor` after adding a new editor, or if an
 installer rewrote a config. `haunt doctor` checks the files install wrote,
-the `haunt-mcp` wrapper (not a PATH name), sqlite-vec load, and embed model
+the `haunt-mcp` wrapper (not a PATH name), sqlite-vec load (or explicit FTS-only), and embed model
 presence (or explicit FTS-only) and exits 1 if any check fails.
 
 To wire up Cursor only:
@@ -46,7 +46,7 @@ haunt cursor-install     # hooks.json + mcp.json + haunt.mdc (Cursor only)
 
 ### macOS: use Homebrew Python, not pyenv
 
-pyenv-compiled CPython typically lacks `--enable-loadable-sqlite-extensions`, which means `sqlite-vec` cannot load (`enable_load_extension` is missing or disabled). `haunt bootstrap` will correctly fail loud if this happens.
+pyenv-compiled CPython typically lacks `--enable-loadable-sqlite-extensions`, which means `sqlite-vec` cannot load (`enable_load_extension` is missing or disabled). `haunt bootstrap` will correctly fail loud if this happens, unless `HAUNT_FTS_ONLY=1` (or `HAUNT_EMBED_MODEL=off`) is set — then bootstrap still creates the layout and a usable FTS-only default namespace.
 
 The working pattern on macOS:
 
@@ -115,13 +115,13 @@ For machines that cannot spare 2 GB, use the small model as an explicit opt-in:
 HAUNT_EMBED_MODEL=BAAI/bge-small-en-v1.5 haunt bootstrap
 ```
 
-For FTS-only (no embeddings at all):
+For FTS-only (no embeddings, sqlite-vec not required):
 
 ```bash
 HAUNT_FTS_ONLY=1 haunt bootstrap
 ```
 
-CI runs FTS-only to avoid the 2 GB download.
+This still creates `~/.haunt` and the default namespace. It does not download BGE-M3 and does not fail if sqlite-vec cannot load. `HAUNT_EMBED_MODEL=off` is the same FTS gate. CI uses this to avoid the 2 GB download.
 
 ## Hooks
 
@@ -168,7 +168,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 
 | command | what |
 |---|---|
-| `haunt bootstrap [--reembed]` | first-run setup; installs desktop shortcut; exits 1 if sqlite-vec fails |
+| `haunt bootstrap [--reembed]` | first-run setup; installs desktop shortcut; exits 1 if sqlite-vec fails (unless `HAUNT_FTS_ONLY=1`) |
 | `haunt init [name] [--repo PATH]` | create a namespace |
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
 | `haunt recall QUERY [--as-of --since --until --clock --tier --k]` | hybrid recall (vec + FTS5 + RRF); query-time temporal compile |
@@ -183,7 +183,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
 | `haunt dash [--port 7340] [--install-icon] [--no-open]` | local memory console (127.0.0.1); opens browser automatically (use `--no-open` for CI/scripts) |
 | `haunt install` | bind all known hosts (Cursor, Claude Code): hooks + MCP + rules + skill |
-| `haunt doctor` | check sqlite-vec, haunt-mcp wrapper/python, embed (or FTS-only), and host files; rematch host files if missing; exit 1 if any check fails |
+| `haunt doctor` | check sqlite-vec (or FTS-only), haunt-mcp wrapper/python, embed (or FTS-only), and host files; rematch host files if missing; exit 1 if any check fails |
 | `haunt cursor-install` | bind Cursor only: hooks.json + mcp.json + haunt.mdc + skill |
 
 ## MCP
@@ -202,7 +202,7 @@ Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `m
 |---|---|---|
 | `HAUNT_HOME` | `~/.haunt` | data directory |
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
-| `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings) |
+| `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
 | `HAUNT_NAMESPACE` | inferred from git | override namespace |
 | `HAUNT_MODEL_CACHE` | `$HAUNT_HOME/models` | model download directory |
 
