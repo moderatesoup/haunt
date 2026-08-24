@@ -10,7 +10,7 @@ from haunt.store import Store, observe
 runner = CliRunner()
 
 
-def test_delete_event_id_without_positional_missing_event(lore_env):
+def test_delete_event_id_without_positional_missing_event(haunt_env):
     """haunt delete --event-id <eid> --yes must not require a dummy memory_id.
 
     Old required-argument behavior: Missing argument 'memory_id', exit=2.
@@ -22,7 +22,7 @@ def test_delete_event_id_without_positional_missing_event(lore_env):
     assert "no memories for event fake-event-123" in result.stdout
 
 
-def test_delete_by_event_id_purges_without_positional(lore_env):
+def test_delete_by_event_id_purges_without_positional(haunt_env):
     r = observe("DELETE-EVENT-ID-CANARY unique phrase", namespace="default")
     result = runner.invoke(
         app, ["delete", "--event-id", r.event_id, "--yes", "-n", "default"]
@@ -36,7 +36,7 @@ def test_delete_by_event_id_purges_without_positional(lore_env):
         assert gone is None
 
 
-def test_delete_by_memory_id_still_works(lore_env):
+def test_delete_by_memory_id_still_works(haunt_env):
     r = observe("DELETE-MEMORY-ID-CANARY unique phrase", namespace="default")
     result = runner.invoke(app, ["delete", r.memory_id, "--yes", "-n", "default"])
     assert result.exit_code == 0, result.output
@@ -48,7 +48,7 @@ def test_delete_by_memory_id_still_works(lore_env):
         assert gone is None
 
 
-def test_delete_rejects_both_memory_id_and_event_id(lore_env):
+def test_delete_rejects_both_memory_id_and_event_id(haunt_env):
     result = runner.invoke(
         app, ["delete", "real-memory-id", "--event-id", "real-event-id", "--yes"]
     )
@@ -57,7 +57,7 @@ def test_delete_rejects_both_memory_id_and_event_id(lore_env):
     assert "not both" in combined
 
 
-def test_delete_requires_memory_id_or_event_id(lore_env):
+def test_delete_requires_memory_id_or_event_id(haunt_env):
     result = runner.invoke(app, ["delete", "--yes"])
     combined = f"{result.stdout}{result.stderr}{result.output}"
     assert result.exit_code == 2

@@ -8,7 +8,7 @@ from haunt.store import Store, observe
 
 
 @pytest.fixture
-def multi_ns_client(lore_env):
+def multi_ns_client(haunt_env):
     """Set up two namespaces with distinct memories, return test client."""
     from starlette.testclient import TestClient
     from haunt.dashboard import app

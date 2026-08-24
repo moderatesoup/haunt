@@ -31,7 +31,6 @@ def test_bootstrap_exits_1_when_vec_probe_fails(tmp_path, monkeypatch):
     """If sqlite-vec cannot load, bootstrap must exit 1 — not silently continue."""
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
-    monkeypatch.delenv("LORE_HOME", raising=False)
 
     from haunt import embed
     from haunt.bootstrap import BootstrapError, bootstrap
@@ -64,8 +63,6 @@ def test_health_includes_db_path(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
     monkeypatch.setenv("HAUNT_NAMESPACE", "healthtest")
-    monkeypatch.delenv("LORE_HOME", raising=False)
-    monkeypatch.delenv("LORE_NAMESPACE", raising=False)
 
     from haunt import embed
     from haunt.paths import ensure_layout
@@ -96,8 +93,6 @@ def test_health_mcp_includes_db_path_and_namespace(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
-    monkeypatch.delenv("LORE_NAMESPACE", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt import embed
@@ -132,7 +127,6 @@ def test_bootstrap_report_includes_desktop_icon(tmp_path, monkeypatch):
     """bootstrap() report must include a desktop_icon path when HOME is a temp dir."""
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
-    monkeypatch.delenv("LORE_HOME", raising=False)
 
     from haunt import embed
     from haunt.bootstrap import bootstrap
@@ -166,7 +160,6 @@ def test_memory_procedure_rejects_invalid_action(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt import embed
@@ -197,10 +190,7 @@ def test_vec_load_failure_is_fatal_without_fts_only(tmp_path, monkeypatch):
     _connect must raise — not silently continue with a vec-less connection."""
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.delenv("HAUNT_FTS_ONLY", raising=False)
-    monkeypatch.delenv("LORE_FTS_ONLY", raising=False)
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_EMBED_MODEL", raising=False)
-    monkeypatch.delenv("LORE_EMBED_MODEL", raising=False)
 
     from haunt import embed
     from haunt.paths import ensure_layout, namespace_db_path
@@ -225,7 +215,6 @@ def test_fts_only_skips_vec_load_entirely(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
 
     from haunt import embed
     from haunt.paths import ensure_layout
@@ -260,8 +249,6 @@ def test_no_split_brain_health_matches_store(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
-    monkeypatch.delenv("LORE_NAMESPACE", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt import embed
@@ -299,7 +286,6 @@ def test_split_brain_impossible_with_sabotaged_load(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt.bootstrap import probe_sqlite_vec

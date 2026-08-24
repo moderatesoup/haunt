@@ -7,8 +7,9 @@ Local-first **verbatim** memory for AI agents. One SQLite file per namespace. No
 ## 60-second start
 
 ```bash
-# Option A: pip install (no clone needed)
-pip install haunt
+# Option A: pip install from git (no clone needed)
+# PyPI name `haunt` is taken (mikepqr's stow); git install is the path.
+pip install git+https://github.com/moderatesoup/haunt.git
 haunt bootstrap          # creates ~/.haunt, probes sqlite-vec, downloads embed model, installs desktop shortcut
 haunt dash               # opens the memory console in your browser → http://127.0.0.1:7340
 
@@ -56,7 +57,7 @@ brew install python@3.14      # or python@3.12, python@3.13
 # Create a venv from Homebrew Python — NOT from pyenv Python
 /opt/homebrew/bin/python3 -m venv ~/.haunt/venv
 source ~/.haunt/venv/bin/activate
-pip install -e .              # or: pip install haunt
+pip install -e .              # or: pip install git+https://github.com/moderatesoup/haunt.git
 haunt bootstrap               # should succeed — sqlite-vec loads
 
 # ~/.haunt/bin/haunt-mcp execs the venv Python, so MCP works everywhere
@@ -205,8 +206,6 @@ Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `m
 | `HAUNT_NAMESPACE` | inferred from git | override namespace |
 | `HAUNT_MODEL_CACHE` | `$HAUNT_HOME/models` | model download directory |
 
-Legacy aliases `LORE_HOME`, `LORE_EMBED_MODEL`, etc. are accepted. CLI aliases `lore` and `engram` still work.
-
 ## Layout
 
 ```
@@ -219,7 +218,7 @@ Legacy aliases `LORE_HOME`, `LORE_EMBED_MODEL`, etc. are accepted. CLI aliases `
 └── models/
 ```
 
-Default home is `~/.haunt`. If `~/.haunt` does not exist and `~/.lore` does, haunt falls back to `~/.lore` (no silent migration — existing data stays in place).
+Default home is `~/.haunt` (`HAUNT_HOME`).
 
 ## What v1 does / does not
 

@@ -21,10 +21,6 @@ def fts_hook_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
     monkeypatch.setenv("HAUNT_NAMESPACE", "hooktest")
-    monkeypatch.delenv("LORE_HOME", raising=False)
-    monkeypatch.delenv("LORE_NAMESPACE", raising=False)
-    monkeypatch.delenv("ENGRAM_NAMESPACE", raising=False)
-    monkeypatch.delenv("ENGRAM_HOME", raising=False)
     monkeypatch.delenv("CURSOR_PROJECT_DIR", raising=False)
     from haunt import embed
     from haunt.paths import ensure_layout

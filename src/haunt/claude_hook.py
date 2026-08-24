@@ -51,11 +51,7 @@ def _hook_cwd(payload: dict[str, Any]) -> Path | None:
 
 
 def _hook_namespace(payload: dict[str, Any]) -> str:
-    env = (
-        os.environ.get("HAUNT_NAMESPACE")
-        or os.environ.get("LORE_NAMESPACE")
-        or os.environ.get("ENGRAM_NAMESPACE")
-    )
+    env = os.environ.get("HAUNT_NAMESPACE")
     if env:
         return safe_name(env)
     return infer_namespace(_hook_cwd(payload))

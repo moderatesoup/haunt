@@ -30,7 +30,6 @@ def _fts_only_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("LORE_HOME", raising=False)
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
 
     from haunt import embed
@@ -172,7 +171,7 @@ def test_reembed_fts_only_available_false(tmp_path, monkeypatch):
     embed.reset()
 
 
-def test_reembed_updated_matches_vec_rows_live(lore_env):
+def test_reembed_updated_matches_vec_rows_live(haunt_env):
     """Live path when sqlite-vec and the embed model are actually loaded."""
     from haunt.embed import embed_one as real_embed_one
     from haunt.store import Store, _vec_loaded

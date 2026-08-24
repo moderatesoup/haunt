@@ -13,7 +13,7 @@ from haunt.recall import recall
 from haunt.store import Store, list_namespaces, observe
 
 
-def test_observe_recall_verbatim_rank1(lore_env):
+def test_observe_recall_verbatim_rank1(haunt_env):
     unique = "The purple widget token ZX-991 lives only in this sentence."
     observe(unique, namespace="default", role="user")
     hits = recall(unique, namespace="default", k=5)
@@ -22,7 +22,7 @@ def test_observe_recall_verbatim_rank1(lore_env):
     assert hits[0].score > 0
 
 
-def test_paraphrase_or_fts_only(lore_env):
+def test_paraphrase_or_fts_only(haunt_env):
     text = (
         "The production deployment failed because the primary database "
         "connection timed out during the midnight migration."
@@ -39,7 +39,7 @@ def test_paraphrase_or_fts_only(lore_env):
         assert "database" in hits[0].content.lower()
 
 
-def test_namespace_isolation(lore_env):
+def test_namespace_isolation(haunt_env):
     secret = "namespace-A-only secret phrase QUOKKA-77"
     observe(secret, namespace="alpha", role="user")
     observe("harmless note in the other silo", namespace="beta", role="user")
@@ -51,7 +51,7 @@ def test_namespace_isolation(lore_env):
     assert "alpha" in names and "beta" in names
 
 
-def test_temporal_as_of(lore_env):
+def test_temporal_as_of(haunt_env):
     past = "ancient ritual: the brass compass was stored in vault 4"
     observe(past, namespace="default", event_time="2020-01-15T12:00:00+00:00")
     before = recall(past, namespace="default", as_of="2020-01-01T00:00:00+00:00", k=8)
@@ -60,7 +60,7 @@ def test_temporal_as_of(lore_env):
     assert after and past in after[0].content
 
 
-def test_tool_call_verbatim(lore_env):
+def test_tool_call_verbatim(haunt_env):
     inp = '{"path": "src/haunt/store.py", "offset": 1}'
     out = "def init_schema(conn):\n    conn.execute('create table events')"
     r = observe(
@@ -83,7 +83,7 @@ def test_tool_call_verbatim(lore_env):
     assert "init_schema" in hits[0].content or "store.py" in hits[0].content
 
 
-def test_graph_extract_entities(lore_env):
+def test_graph_extract_entities(haunt_env):
     sentence = "Alice updated src/haunt/store.py in function init_schema() after reviewing Store."
     ents = extract_entities(sentence)
     types = {e.type for e in ents}
@@ -99,9 +99,9 @@ def test_graph_extract_entities(lore_env):
         assert any("store.py" in n or "init_schema" in n or n == "Alice" for n in stored)
 
 
-def test_cli_smoke(lore_env):
+def test_cli_smoke(haunt_env):
     env = os.environ.copy()
-    env["HAUNT_HOME"] = str(lore_env)
+    env["HAUNT_HOME"] = str(haunt_env)
     env["HAUNT_EMBED_MODEL"] = "BAAI/bge-small-en-v1.5"
     if Path("/workspace/lore/.model-cache").exists():
         env["HAUNT_MODEL_CACHE"] = "/workspace/lore/.model-cache"
@@ -158,7 +158,7 @@ def test_graph_drops_discourse_keeps_identifiers():
     assert any("webhooks.py" in n for n in names2), names2
 
 
-def test_graph_no_duplicate_triples_same_event(lore_env):
+def test_graph_no_duplicate_triples_same_event(haunt_env):
     text = (
         "Noted. handle_stripe_event reads config/secrets.toml "
         "and config/secrets.toml again."
@@ -187,7 +187,7 @@ def test_graph_no_duplicate_triples_same_event(lore_env):
 # --------------------------------------------------------------------------
 
 
-def test_worldview_lists_semantic_facts_and_procedures(lore_env):
+def test_worldview_lists_semantic_facts_and_procedures(haunt_env):
     """Write a semantic fact + a named procedure; worldview lists both."""
     with Store("default") as st:
         st.observe(
@@ -213,7 +213,7 @@ def test_worldview_lists_semantic_facts_and_procedures(lore_env):
     assert any("deploying to production" in p.get("trigger", "") for p in wv["procedures"])
 
 
-def test_worldview_excludes_episodic_from_facts(lore_env):
+def test_worldview_excludes_episodic_from_facts(haunt_env):
     """Chat-only episodic turns do NOT show up as facts or procedures."""
     with Store("default") as st:
         st.observe("user asked about the weather", role="user", tier="episodic")
@@ -234,7 +234,7 @@ def test_worldview_excludes_episodic_from_facts(lore_env):
 # --------------------------------------------------------------------------
 
 
-def test_procedure_write_and_get_verbatim(lore_env):
+def test_procedure_write_and_get_verbatim(haunt_env):
     """procedure get returns verbatim body."""
     body = "1. Stop the server\n2. Run migrations\n3. Restart"
     with Store("default") as st:
@@ -247,7 +247,7 @@ def test_procedure_write_and_get_verbatim(lore_env):
     assert proc["trigger"] == "when doing maintenance"
 
 
-def test_procedure_list(lore_env):
+def test_procedure_list(haunt_env):
     with Store("default") as st:
         st.procedure_write("deploy", "git pull && make deploy", origin="test")
         st.procedure_write("rollback", "git revert HEAD && make deploy", trigger="when deploy fails", origin="test")
@@ -258,7 +258,7 @@ def test_procedure_list(lore_env):
     assert "rollback" in names
 
 
-def test_episodic_not_in_procedure_list(lore_env):
+def test_episodic_not_in_procedure_list(haunt_env):
     """Chat-only episodic turns do NOT show up as procedures."""
     with Store("default") as st:
         st.observe("just chatting about code", role="user", tier="episodic")
@@ -284,7 +284,7 @@ def test_episodic_not_in_procedure_list(lore_env):
 # --------------------------------------------------------------------------
 
 
-def test_contradict_supersedes_memory(lore_env):
+def test_contradict_supersedes_memory(haunt_env):
     with Store("default") as st:
         r = st.observe("the port is 8080", role="system", tier="semantic")
         result = st.contradict(r.memory_id, replacement="the port is 9090")
@@ -305,14 +305,14 @@ def test_contradict_supersedes_memory(lore_env):
         assert not any("8080" in c for c in contents)
 
 
-def test_contradict_not_found(lore_env):
+def test_contradict_not_found(haunt_env):
     with Store("default") as st:
         result = st.contradict("nonexistent-id-12345")
     assert result["ok"] is False
     assert "not found" in result["error"]
 
 
-def test_default_recall_excludes_superseded(lore_env):
+def test_default_recall_excludes_superseded(haunt_env):
     """Current recall (no as_of) must hide valid_to-set rows.
 
     Dashboard / contradict claim 'excluded from current recall'. That is the
@@ -333,7 +333,7 @@ def test_default_recall_excludes_superseded(lore_env):
     assert any("9090" in h.content for h in current)
 
 
-def test_as_of_past_still_returns_later_superseded(lore_env):
+def test_as_of_past_still_returns_later_superseded(haunt_env):
     """as_of is a valid_from/valid_to snapshot, not an event_time window."""
     with Store("default") as st:
         r = st.observe(
@@ -361,7 +361,7 @@ def test_as_of_past_still_returns_later_superseded(lore_env):
     assert any("9090" in h.content for h in now)
 
 
-def test_reembed_rebuilds_on_dim_mismatch(lore_env):
+def test_reembed_rebuilds_on_dim_mismatch(haunt_env):
     if not embed_available():
         pytest.skip("embeddings unavailable — cannot test dim-mismatch reembed")
     observe("stripe webhook key lives in config/secrets.toml", namespace="default")
@@ -378,7 +378,7 @@ def test_reembed_rebuilds_on_dim_mismatch(lore_env):
         assert st.get_meta("embed_model") != "fake-old-model"
 
 
-def test_rebuild_graph_rewrites_entities(lore_env):
+def test_rebuild_graph_rewrites_entities(haunt_env):
     text = (
         "Noted. config/secrets.toml holds stripe.webhook_secret. "
         "The handler is handle_stripe_event()."

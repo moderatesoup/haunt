@@ -2,8 +2,8 @@
 
 Never calls a remote LLM or embedding API. Never fakes vectors.
 
-Load order when HAUNT_EMBED_MODEL / LORE_EMBED_MODEL is BAAI/bge-m3 (the default):
-  1. Local ONNX under ~/.haunt/models (or $HAUNT_MODEL_CACHE / $LORE_MODEL_CACHE)
+Load order when HAUNT_EMBED_MODEL is BAAI/bge-m3 (the default):
+  1. Local ONNX under ~/.haunt/models (or $HAUNT_MODEL_CACHE)
   2. Download BAAI/bge-m3 ONNX + tokenizer from Hugging Face
   3. Newer fastembed if it lists BAAI/bge-m3
   4. BAAI/bge-small-en-v1.5 via fastembed (384-d) — automatic fallback
@@ -60,20 +60,12 @@ class EmbedState:
 
 
 def _env_model() -> str:
-    raw = (
-        os.environ.get("HAUNT_EMBED_MODEL")
-        or os.environ.get("LORE_EMBED_MODEL")
-        or DEFAULT_REQUESTED
-    ).strip()
+    raw = (os.environ.get("HAUNT_EMBED_MODEL") or DEFAULT_REQUESTED).strip()
     return raw
 
 
 def fts_only() -> bool:
-    fts_env = (
-        os.environ.get("HAUNT_FTS_ONLY")
-        or os.environ.get("LORE_FTS_ONLY")
-        or ""
-    ).strip()
+    fts_env = (os.environ.get("HAUNT_FTS_ONLY") or "").strip()
     if fts_env in {"1", "true", "yes"}:
         return True
     model = _env_model().lower()
@@ -81,11 +73,7 @@ def fts_only() -> bool:
 
 
 def _max_len() -> int:
-    raw = (
-        os.environ.get("HAUNT_EMBED_MAX_LEN")
-        or os.environ.get("LORE_EMBED_MAX_LEN")
-        or "512"
-    ).strip()
+    raw = (os.environ.get("HAUNT_EMBED_MAX_LEN") or "512").strip()
     try:
         n = int(raw)
     except ValueError:
