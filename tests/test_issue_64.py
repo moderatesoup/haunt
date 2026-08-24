@@ -333,7 +333,7 @@ def test_bootstrap_source_skips_vec_fatal_only_when_fts_only():
 
 
 def test_doctor_sqlite_vec_ok_when_fts_only_and_probe_fails(leftover_env):
-    from haunt.doctor import _check_mcp_python, _check_sqlite_vec, diagnose
+    from haunt.doctor import REQUIRED_CHECKS, _check_mcp_python, _check_sqlite_vec
 
     with patch(
         "haunt.doctor.probe_sqlite_vec",
@@ -348,8 +348,7 @@ def test_doctor_sqlite_vec_ok_when_fts_only_and_probe_fails(leftover_env):
     assert "fts_only()" in src
     mcp_src = inspect.getsource(_check_mcp_python)
     assert "fts_only()" in mcp_src
-    # diagnose still runs the named check
-    assert "sqlite-vec" in inspect.getsource(diagnose)
+    assert "sqlite-vec" in REQUIRED_CHECKS
 
 
 def test_readme_advertises_fts_only_bootstrap_without_requiring_vec():
