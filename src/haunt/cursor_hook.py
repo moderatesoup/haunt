@@ -201,18 +201,18 @@ def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
 
 def _handle_before_submit(store: Store, payload: dict[str, Any], ns: str) -> dict[str, Any]:
     prompt = _as_text(payload.get("prompt"))
-    if prompt.strip():
-        _observe(store, payload, content=prompt, role="user", tier="episodic")
-    # NOTE: Cursor's beforeSubmitPrompt output schema is {continue, user_message}
-    # only.  additional_context is NOT honored here (silently dropped).  We still
-    # return it so a future Cursor build or third-party runner *could* use it, but
-    # agents must not assume per-turn recall is injected into the model.
+    # Recall first so the just-written prompt cannot outrank history.
     hits: list[Hit] = []
     if prompt.strip():
         try:
             hits = recall(prompt, namespace=ns, k=8, store=store)
         except Exception:
             hits = []
+        _observe(store, payload, content=prompt, role="user", tier="episodic")
+    # NOTE: Cursor's beforeSubmitPrompt output schema is {continue, user_message}
+    # only.  additional_context is NOT honored here (silently dropped).  We still
+    # return it so a future Cursor build or third-party runner *could* use it, but
+    # agents must not assume per-turn recall is injected into the model.
     return {
         "continue": True,
         "additional_context": format_recall_block(hits, ns),

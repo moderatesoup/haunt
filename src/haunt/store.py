@@ -1003,11 +1003,12 @@ class Store:
             JOIN events e ON e.id = m.event_id
             WHERE m.tier='procedural'
               AND m.valid_to IS NULL
-              AND e.meta LIKE ?
+              AND json_extract(e.meta, '$.kind') = 'procedure'
+              AND json_extract(e.meta, '$.name') = ?
             ORDER BY m.created_at DESC
             LIMIT 1
             """,
-            (f'%"name": "{name}"%',),
+            (name,),
         ).fetchone()
         if not row:
             return None

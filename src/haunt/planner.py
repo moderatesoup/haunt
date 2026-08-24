@@ -12,13 +12,13 @@ must not apply a storage_time / events.ts filter.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Literal
 
 from haunt.recall import Hit, recall
 from haunt.store import Store
 from haunt.temporal import TemporalQuery, compile
-from haunt.util import iso_or_now, normalize_clock
+from haunt.util import clamp_k, iso_or_now, normalize_clock, utc_iso
 
 Plan = Literal["timeline", "recall", "union"]
 
@@ -159,9 +159,7 @@ def plan(tq: TemporalQuery) -> Plan:
 def _iso(dt: datetime | None) -> str | None:
     if dt is None:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.isoformat(timespec="seconds")
+    return utc_iso(dt)
 
 
 def _clocks(clock: str) -> tuple[str, ...]:
@@ -247,6 +245,7 @@ def run_recall(
     namespace: str | None = None,
 ) -> list[Hit]:
     """B: recall(cleaned_query, window, clock)."""
+    k = clamp_k(k)
     since, until = _iso(tq.start), _iso(tq.end)
     chosen = clock or tq.clock
     merged: dict[str, Hit] = {}
@@ -283,6 +282,7 @@ def run_union(
     timeline_limit: int = 50,
 ) -> list[Hit]:
     """C: union of timeline(window, clock) and windowed recall."""
+    k = clamp_k(k)
     by_id: dict[str, Hit] = {}
     for h in run_timeline(
         tq, store, session_id=session_id, limit=timeline_limit, clock=clock
@@ -295,7 +295,7 @@ def run_union(
         if prev is None or h.score > prev.score:
             by_id[h.memory_id] = h
     ranked = sorted(by_id.values(), key=lambda h: h.score, reverse=True)
-    return ranked[: max(k, len(by_id))]
+    return ranked[:k]
 
 
 def execute(
@@ -310,9 +310,10 @@ def execute(
     namespace: str | None = None,
     session_id: str | None = None,
 ) -> list[Hit]:
+    k = clamp_k(k)
     chosen = strategy or plan(tq)
     if chosen == "timeline":
-        return run_timeline(tq, store, session_id=session_id, limit=max(k, 50), clock=clock)
+        return run_timeline(tq, store, session_id=session_id, limit=k, clock=clock)
     if chosen == "recall":
         return run_recall(
             tq, store, as_of=as_of, tier=tier, k=k, clock=clock, namespace=namespace
@@ -351,6 +352,7 @@ def planned_recall(
     recall() path runs unchanged (no compiler window, no compiler clock).
     Caller-supplied since/until/clock stay as they were before this module.
     """
+    k = clamp_k(k)
     if clock is not None:
         normalize_clock(clock)
     if since:

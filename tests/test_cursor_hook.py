@@ -58,13 +58,40 @@ def test_before_submit_prompt_stores_verbatim_and_recalls(fts_hook_env, capsys, 
     assert out["continue"] is True
     assert "additional_context" in out
     assert isinstance(out["additional_context"], str)
-    assert "ZX-HOOK-TOKEN" in out["additional_context"]
-    assert "episodic" in out["additional_context"]
+    # Just-written prompt must not appear in this turn's recall (self-hit).
+    assert "ZX-HOOK-TOKEN" not in out["additional_context"]
     with Store("hooktest") as st:
         rows = st.events(session_id="conv-hook-1")
         assert any(r["content"] == unique and r["role"] == "user" for r in rows)
         mem = st.conn.execute("SELECT content, tier FROM memories").fetchall()
         assert any(unique in (m["content"] or "") and m["tier"] == "episodic" for m in mem)
+
+
+def test_before_submit_recalls_history_not_just_written(
+    fts_hook_env, capsys, monkeypatch
+):
+    """Observe-before-recall would let the new prompt outrank stored history."""
+    project = fts_hook_env["project"]
+    history = "The vault combination is HISTORY-ZX-991 and lives in this older turn."
+    with Store("hooktest") as st:
+        prior = st.observe(history, role="user", origin="test")
+
+    prompt = "where is the vault combination? HISTORY-ZX-991 also UNIQUE-NEW-PROMPT"
+    payload = {
+        "hook_event_name": "beforeSubmitPrompt",
+        "prompt": prompt,
+        "conversation_id": "conv-hook-self",
+        "workspace_roots": [str(project)],
+        "cwd": str(project),
+    }
+    out = _run_hook(payload, capsys, monkeypatch)
+    ctx = out["additional_context"]
+    assert "HISTORY-ZX-991" in ctx
+    assert prior.memory_id in ctx
+    assert "UNIQUE-NEW-PROMPT" not in ctx
+    with Store("hooktest") as st:
+        rows = st.events(session_id="conv-hook-self")
+        assert any(r["content"] == prompt for r in rows)
 
 
 def test_post_tool_use_stores_verbatim(fts_hook_env, capsys, monkeypatch):
