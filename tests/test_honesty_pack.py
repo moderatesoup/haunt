@@ -467,3 +467,164 @@ def test_cli_and_mcp_worldview_call_clamp_helpers():
     assert "clamp_limit" in inspect.getsource(cli.timeline_cmd)
     assert "clamp_limit" in inspect.getsource(cli.worldview_cmd)
     assert "clamp_limit" in inspect.getsource(mcp_server.memory_worldview)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: leftover XSS sinks, MCP JSON, embedding-path atomicity,
+# timeline refill past events() LIMIT_MAX.
+# ---------------------------------------------------------------------------
+
+
+def test_health_detail_escapes_haunt_home_and_db_path():
+    """loadHealth .val used the same fields as openDetail without esc()."""
+    from haunt.dashboard import HTML
+
+    assert '["haunt_home",esc(data.haunt_home' in HTML
+    assert '["db_path",esc(data.db_path' in HTML
+    assert '["haunt_home",data.haunt_home]' not in HTML
+    assert '["db_path",data.db_path]' not in HTML
+    assert "esc(stats.haunt_home" in HTML
+    assert "esc(stats.db_path" in HTML
+
+
+def test_browse_escapes_session_id_slice():
+    from haunt.dashboard import HTML
+
+    assert "esc((m.session_id||\"\").slice(0,8))" in HTML
+    assert '${(m.session_id||"").slice(0,8)}' not in HTML
+
+
+def test_malformed_cursor_mcp_json_is_not_replaced(host_env):
+    from haunt.hosts import HostConfigError
+    from haunt.hosts.cursor import install as cursor_install
+
+    env = host_env
+    env["cursor_home"].mkdir(parents=True)
+    (env["cursor_home"] / "hooks.json").write_text(
+        '{"version":1,"hooks":{}}', encoding="utf-8"
+    )
+    path = env["cursor_home"] / "mcp.json"
+    broken = "{not json, leftover cursor mcp"
+    path.write_text(broken, encoding="utf-8")
+
+    with pytest.raises(HostConfigError, match="malformed"):
+        cursor_install(str(env["haunt_home"]), env["hook_cmd"], env["mcp_cmd"])
+    assert path.read_text(encoding="utf-8") == broken
+
+
+def test_malformed_claude_mcp_json_is_not_replaced(host_env):
+    from haunt.hosts import HostConfigError
+    from haunt.hosts.claude import install as claude_install
+
+    env = host_env
+    env["claude_dir"].mkdir(parents=True)
+    (env["claude_dir"] / "settings.json").write_text("{}", encoding="utf-8")
+    path = env["claude_dir"] / ".claude.json"
+    broken = "{not json, leftover claude mcp"
+    path.write_text(broken, encoding="utf-8")
+
+    with pytest.raises(HostConfigError, match="malformed"):
+        claude_install(str(env["haunt_home"]), env["hook_cmd"], env["mcp_cmd"])
+    assert path.read_text(encoding="utf-8") == broken
+
+
+def test_contradict_graph_raise_leaves_original_current(honesty_env, monkeypatch):
+    """Real observe() path: extract_and_store raising must roll back valid_to."""
+    from haunt.store import Store
+    import haunt.graph as graph
+
+    with Store("default") as st:
+        r = st.observe("original fact stays current", role="system", tier="semantic")
+
+        def boom(*_a, **_k):
+            raise RuntimeError("graph exploded")
+
+        monkeypatch.setattr(graph, "extract_and_store", boom)
+        with pytest.raises(RuntimeError, match="graph exploded"):
+            st.contradict(r.memory_id, replacement="should not land")
+        row = st.conn.execute(
+            "SELECT valid_to FROM memories WHERE id=?", (r.memory_id,)
+        ).fetchone()
+        assert row["valid_to"] is None
+        n = st.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        assert n == 1
+
+
+def test_contradict_ensure_vec_table_does_not_commit_supersede(honesty_env, monkeypatch):
+    """observe(commit=False) must not let ensure_vec_table commit the UPDATE."""
+    from haunt import store as store_mod
+    from haunt.store import Store
+
+    with Store("default") as st:
+        r = st.observe("original fact stays current", role="system", tier="semantic")
+        commits = {"n": 0}
+
+        def fake_embed(_text):
+            return [0.1, 0.2, 0.3, 0.4]
+
+        def tracking_vec(conn, dim, *, commit=True):
+            if commit:
+                commits["n"] += 1
+                conn.commit()
+            return True
+
+        def boom_graph(*_a, **_k):
+            raise RuntimeError("after vec")
+
+        monkeypatch.setattr(store_mod, "embed_one", fake_embed)
+        monkeypatch.setattr(store_mod, "ensure_vec_table", tracking_vec)
+        monkeypatch.setattr("haunt.graph.extract_and_store", boom_graph)
+        with pytest.raises(RuntimeError, match="after vec"):
+            st.contradict(r.memory_id, replacement="should not land")
+        assert commits["n"] == 0
+        row = st.conn.execute(
+            "SELECT valid_to FROM memories WHERE id=?", (r.memory_id,)
+        ).fetchone()
+        assert row["valid_to"] is None
+
+
+def test_timeline_k_fills_past_events_limit_max(honesty_env):
+    """100 recent superseded + 2 older current, k=8 must still return the two current.
+
+    store.events clamps LIMIT to 100. Doubling fetch_n past that used to
+    treat a clamped page as end-of-stream and return zero hits.
+    """
+    from haunt.planner import execute
+    from haunt.store import Store
+    from haunt.temporal import TemporalQuery
+
+    with Store("default") as st:
+        older1 = st.observe(
+            "current older ALPHA",
+            event_time="2026-01-01T12:00:00+00:00",
+        )
+        older2 = st.observe(
+            "current older BETA",
+            event_time="2026-01-02T12:00:00+00:00",
+        )
+        recent_ids = []
+        for i in range(100):
+            rec = st.observe(
+                f"superseded recent {i:03d}",
+                event_time=f"2026-08-{(i % 28) + 1:02d}T12:00:00+00:00",
+            )
+            recent_ids.append(rec.memory_id)
+        for mid in recent_ids:
+            st.contradict(mid)
+
+        tq = TemporalQuery(
+            temporal=True,
+            cleaned_query="",
+            start=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+            clock="event_time",
+            granularity="year",
+            certainty="exact",
+            confidence=1.0,
+        )
+        hits = execute(tq, st, strategy="timeline", k=8)
+        ids = [h.memory_id for h in hits]
+        assert len(hits) == 2
+        assert older1.memory_id in ids
+        assert older2.memory_id in ids
+        assert not any(mid in ids for mid in recent_ids)

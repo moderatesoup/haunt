@@ -168,7 +168,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> bool:
+def ensure_vec_table(conn: sqlite3.Connection, dim: int, *, commit: bool = True) -> bool:
     if dim <= 0 or not _vec_loaded(conn):
         return False
     existing = conn.execute(
@@ -189,7 +189,8 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> bool:
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_dim', ?)",
             (str(dim),),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return True
     except sqlite3.Error:
         return False
@@ -459,7 +460,7 @@ class Store:
         vec = embed_one(text) if text.strip() else None
         if vec is not None:
             blob = sqlite_vec.serialize_float32(vec)
-            ensure_vec_table(self.conn, len(vec))
+            ensure_vec_table(self.conn, len(vec), commit=commit)
             es = embed_state()
             self.conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
@@ -597,6 +598,7 @@ class Store:
         until: str | None = None,
         clock: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         col = clock_sql_column(clock, qualified=False)
         sql = "SELECT * FROM events WHERE 1=1"
@@ -611,10 +613,15 @@ class Store:
             sql += f" AND {col}<=?"
             params.append(iso_or_now(until))
         if normalize_clock(clock) == "storage_time":
-            sql += " ORDER BY ts DESC, event_time DESC LIMIT ?"
+            sql += " ORDER BY ts DESC, event_time DESC LIMIT ? OFFSET ?"
         else:
-            sql += " ORDER BY event_time DESC, ts DESC LIMIT ?"
+            sql += " ORDER BY event_time DESC, ts DESC LIMIT ? OFFSET ?"
         params.append(clamp_limit(limit, default=100))
+        try:
+            off = int(offset)
+        except (TypeError, ValueError):
+            off = 0
+        params.append(max(0, off))
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
     def stats(self) -> dict[str, Any]:
@@ -1096,10 +1103,6 @@ class Store:
 
         replacement_text = (replacement or "").strip() or None
         if replacement_text is not None:
-            if "system" not in ROLES:
-                return {"ok": False, "error": "invalid replacement role"}
-            if "semantic" not in TIERS:
-                return {"ok": False, "error": "invalid replacement tier"}
             self.ensure_current_embeddings()
             self.ensure_session(session_id, source=origin)
 

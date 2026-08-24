@@ -227,23 +227,27 @@ def run_timeline(
     chosen = clock or tq.clock
     merged: dict[str, Hit] = {}
     for clk in _clocks(chosen):
-        fetch_n = max(int(limit), 1)
+        # Page through events. store.events clamps LIMIT to 100; doubling
+        # fetch_n past that made len(rows) < fetch_n and starved refill.
+        batch = max(int(limit), 1)
+        offset = 0
         while True:
             rows = store.events(
                 session_id=session_id,
                 since=since,
                 until=until,
                 clock=clk,
-                limit=fetch_n,
+                limit=batch,
+                offset=offset,
             )
             for h in _hits_from_events(store, rows, limit=limit):
                 merged.setdefault(h.memory_id, h)
-            if len(merged) >= limit or len(rows) < fetch_n:
+            if len(merged) >= limit or len(rows) < batch:
                 break
-            nxt = fetch_n * 2
-            if nxt <= fetch_n:
+            nxt = offset + len(rows)
+            if nxt <= offset:
                 break
-            fetch_n = nxt
+            offset = nxt
     return list(merged.values())[:limit]
 
 
