@@ -295,8 +295,8 @@ def test_bootstrap_vec_fail_writes_no_namespace(tmp_path, monkeypatch):
     from haunt.paths import namespace_db_path, registry_path
 
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "fresh-home"))
-    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
-    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    monkeypatch.delenv("HAUNT_FTS_ONLY", raising=False)
+    monkeypatch.delenv("HAUNT_EMBED_MODEL", raising=False)
     embed.reset()
     with patch(
         "haunt.bootstrap.probe_sqlite_vec",
@@ -311,7 +311,8 @@ def test_bootstrap_vec_fail_writes_no_namespace(tmp_path, monkeypatch):
     embed.reset()
 
 
-def test_cli_doctor_exits_1_when_sqlite_vec_fails(onboard_env):
+def test_cli_doctor_sqlite_vec_not_fatal_when_fts_only(onboard_env):
+    """#64: HAUNT_FTS_ONLY=1 must not fail doctor on a failed vec probe."""
     from unittest.mock import patch
 
     from haunt.cli import app
@@ -322,6 +323,11 @@ def test_cli_doctor_exits_1_when_sqlite_vec_fails(onboard_env):
         return_value={"ok": False, "error": "mocked: extension load failed"},
     ):
         result = CliRunner().invoke(app, ["doctor"])
-    assert result.exit_code == 1
+    assert result.exit_code == 0, result.stdout + result.stderr
     assert "sqlite-vec" in result.stdout
-    assert "FAIL" in result.stdout
+    assert "FTS-only" in result.stdout
+    sqlite_lines = [
+        line for line in result.stdout.splitlines() if "sqlite-vec" in line
+    ]
+    assert sqlite_lines, result.stdout
+    assert all("FAIL" not in line for line in sqlite_lines), result.stdout

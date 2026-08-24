@@ -34,7 +34,7 @@ def bootstrap_cmd(
         help="Rebuild embeddings in every namespace for the loaded model (required after a dim change).",
     ),
 ) -> None:
-    """Create ~/.haunt, probe sqlite-vec, download the embed model, init default."""
+    """Create ~/.haunt, probe sqlite-vec (unless FTS-only), download the embed model, init default."""
     from haunt.bootstrap import BootstrapError
 
     try:

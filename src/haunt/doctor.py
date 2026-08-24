@@ -134,11 +134,10 @@ def _check_sqlite_vec() -> Check:
     vec = probe_sqlite_vec()
     if vec.get("ok"):
         return Check("sqlite-vec", True, f"ok {vec.get('version', '')}".strip())
-    return Check(
-        "sqlite-vec",
-        False,
-        "sqlite-vec failed to load: " + str(vec.get("error", "unknown")),
-    )
+    err = "sqlite-vec failed to load: " + str(vec.get("error", "unknown"))
+    if fts_only():
+        return Check("sqlite-vec", True, "FTS-only (sqlite-vec not required): " + err)
+    return Check("sqlite-vec", False, err)
 
 
 def _check_wrapper(mcp_cmd: str) -> Check:
@@ -154,9 +153,12 @@ def _check_mcp_python(mcp_cmd: str) -> Check:
     python, err = python_for_mcp_command(mcp_cmd)
     if err:
         return Check("mcp-python", False, err, mcp_cmd)
+    probe = (
+        "import haunt\nprint('fts-only')\n" if fts_only() else _MCP_PROBE
+    )
     try:
         proc = subprocess.run(
-            [python, "-c", _MCP_PROBE],
+            [python, "-c", probe],
             capture_output=True,
             text=True,
             timeout=20,
@@ -178,6 +180,13 @@ def _check_mcp_python(mcp_cmd: str) -> Check:
             python,
         )
     ver = proc.stdout.strip() or "?"
+    if fts_only():
+        return Check(
+            "mcp-python",
+            True,
+            f"import haunt ok via {python} (FTS-only; sqlite-vec not required)",
+            python,
+        )
     return Check(
         "mcp-python",
         True,

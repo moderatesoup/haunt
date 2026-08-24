@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Dashboard POST contradict rejects non-JSON (415), invalid/non-object JSON and non-string `replacement` (400) without setting `valid_to`. `Store.contradict` raises `ValueError` if `replacement` is not a string or null. `HAUNT_FTS_ONLY=1` / `HAUNT_EMBED_MODEL=off` bootstrap no longer fatals on a failed sqlite-vec probe; layout + default namespace still come up FTS-only, without downloading BGE-M3. Doctor treats sqlite-vec as optional in that mode. (#64)
+
 Honesty pack (#61): dashboard `openDetail` escapes every `.val` field (including `session_id`); host hook/settings merge fail-closed on malformed JSON; `Store.contradict` is one transaction and refuses already-superseded rows; timeline fills `k` current memories; generated wrappers quote `HAUNT_HOME`; CLI timeline / worldview size params use the same clamp helpers as recall `k`.
 
 Doctor honesty: `{host}.hooks` fails when the planted haunt-hook path is missing or is not the expected wrapper. Leaf name alone is not enough. Runtime hook fail-open is unchanged.

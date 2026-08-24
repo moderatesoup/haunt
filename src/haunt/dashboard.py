@@ -1030,13 +1030,35 @@ async def api_timeline(request: Request) -> JSONResponse:
 
 
 async def api_contradict(request: Request) -> JSONResponse:
+    ct = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if ct != "application/json":
+        return JSONResponse(
+            {"error": "content-type must be application/json"},
+            status_code=415,
+        )
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+    if "replacement" in body:
+        replacement = body["replacement"]
+        if replacement is not None and not isinstance(replacement, str):
+            return JSONResponse(
+                {"error": "replacement must be a string or null"},
+                status_code=400,
+            )
+        if isinstance(replacement, str):
+            replacement = replacement.strip() or None
+    else:
+        replacement = None
+
     name = resolve_namespace(request.path_params["name"])
     missing = _missing_namespace(name)
     if missing:
         return missing
     memory_id = request.path_params["memory_id"]
-    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-    replacement = body.get("replacement") or None
     with Store(name, create=False) as st:
         result = st.contradict(memory_id, replacement=replacement, origin="dashboard")
     result["namespace"] = name

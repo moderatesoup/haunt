@@ -28,9 +28,13 @@ def test_version_prints_and_exits_zero():
 
 
 def test_bootstrap_exits_1_when_vec_probe_fails(tmp_path, monkeypatch):
-    """If sqlite-vec cannot load, bootstrap must exit 1 — not silently continue."""
+    """If sqlite-vec cannot load, bootstrap must exit 1 — not silently continue.
+
+    Quality path: FTS-only unset. HAUNT_FTS_ONLY=1 is the opt-out (#64).
+    """
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
-    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.delenv("HAUNT_FTS_ONLY", raising=False)
+    monkeypatch.delenv("HAUNT_EMBED_MODEL", raising=False)
 
     from haunt import embed
     from haunt.bootstrap import BootstrapError, bootstrap

@@ -1088,6 +1088,8 @@ class Store:
         session_id: str | None = None,
     ) -> dict[str, Any]:
         """Mark memory_id superseded (set valid_to=now). Optionally store replacement as semantic."""
+        if replacement is not None and not isinstance(replacement, str):
+            raise ValueError("replacement must be a string or null")
         ts = now_iso()
         row = self.conn.execute(
             "SELECT id, valid_to FROM memories WHERE id=?", (memory_id,)
