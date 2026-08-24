@@ -66,17 +66,25 @@ def test_execute_temporal_honors_k(fts_env):
 def test_fts_query_tokenizes_unicode_like_index(fts_env):
     """Query-side tokenize must keep Unicode word chars the FTS index stores."""
     text = "Пароль от хранилища лежит в сейфе TOK-UNI-77"
-    match = _fts_match_query("хранилище")
+    # Exact stored form — porter does not stem Russian.
+    query = "хранилища"
+    match = _fts_match_query(query)
     assert match is not None
-    assert "хранилище" in match
+    assert query in match
+    assert _fts_match_query("東京サーバー") is not None
     assert _fts_match_query("only-ascii") is not None
 
     with Store("unicode") as st:
         wrote = st.observe(text, role="user", origin="test")
-        hits = recall("хранилище", store=st, k=8)
+        hits = recall(query, store=st, k=8)
         assert hits, "non-Latin query must hit a matching observed memory"
         assert any(h.memory_id == wrote.memory_id for h in hits)
-        assert any("хранилище" in h.content for h in hits)
+        assert any(query in h.content for h in hits)
+
+        jp = st.observe("東京 サーバー の設定", role="user", origin="test")
+        jp_hits = recall("東京 サーバー", store=st, k=8)
+        assert jp_hits, "CJK query must hit a matching observed memory"
+        assert any(h.memory_id == jp.memory_id for h in jp_hits)
 
 
 def test_offset_timestamps_sort_by_utc_not_text(fts_env):
