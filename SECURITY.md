@@ -22,7 +22,9 @@ Cursor hooks are **fail-open**: if a hook errors, it prints `{}` and exits 0. A 
 
 ## File-per-namespace isolation
 
-Each namespace is a separate SQLite file under `~/.haunt/namespaces/`. Namespaces do not share tables, connections, or queries. A `recall` in namespace A cannot return results from namespace B.
+Each namespace is a **separate SQLite file** under `~/.haunt/namespaces/`. That is **storage isolation** (separate files, tables, connections, and queries) — **not authorization**. A `recall` in namespace A cannot return rows from namespace B's file.
+
+This is not a security kernel. The same local user can open every namespace file via MCP (`memory_recall` with any `namespace`) or the CLI (`haunt recall -n …`). haunt does not authenticate callers or enforce per-namespace access control.
 
 ## Reporting a vulnerability
 

@@ -19,10 +19,12 @@ from haunt.paths import (
     ensure_layout,
     infer_namespace,
     haunt_home,
+    mkdir_private,
     namespace_db_path,
     registry_path,
     resolve_namespace,
     safe_name,
+    tighten_db_files,
 )
 from haunt.util import clock_sql_column, dumps, iso_or_now, loads, new_id, normalize_clock, now_iso
 
@@ -33,13 +35,14 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     if not create and not path.exists():
         raise FileNotFoundError(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_private(path.parent)
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    tighten_db_files(path)
     from haunt.embed import fts_only
 
     if not fts_only():

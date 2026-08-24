@@ -4,14 +4,44 @@ from __future__ import annotations
 
 import asyncio
 import json
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 from typing import Any, Optional
 
-from mcp.server import MCPServer
+try:
+    from mcp.server import MCPServer
+except ImportError as exc:  # MCP 1.x has no MCPServer
+    raise ImportError(
+        "haunt requires mcp>=2 (MCPServer API). MCP 1.x cannot be used."
+    ) from exc
 
 from haunt.paths import resolve_namespace
 from haunt.planner import planned_recall
 from haunt.store import Store, list_namespaces
 from haunt.temporal import TemporalParseError
+from haunt.util import clamp_limit
+
+
+def _mcp_package_version() -> str:
+    try:
+        return pkg_version("mcp")
+    except PackageNotFoundError:
+        return "0"
+
+
+def _require_mcp_v2() -> None:
+    raw = _mcp_package_version()
+    major_s = raw.split(".", 1)[0]
+    try:
+        major = int(major_s)
+    except ValueError:
+        major = 0
+    if major < 2:
+        raise RuntimeError(
+            f"haunt requires mcp>=2 (MCPServer API); found {raw!r}"
+        )
+
+
+_require_mcp_v2()
 
 server = MCPServer(
     name="haunt",
@@ -83,6 +113,7 @@ def memory_recall(
     k: int = 8,
 ) -> str:
     ns = resolve_namespace(namespace)
+    k = clamp_limit(k, default=8)
     try:
         with Store(ns) as st:
             hits = planned_recall(
@@ -111,6 +142,7 @@ def memory_timeline(
     limit: int = 50,
 ) -> str:
     ns = resolve_namespace(namespace)
+    limit = clamp_limit(limit, default=50)
     try:
         with Store(ns) as st:
             rows = st.events(

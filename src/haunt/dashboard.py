@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import sys
 from typing import Any
 
 from starlette.applications import Starlette
@@ -14,6 +16,7 @@ from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.recall import recall, Hit, RRF_K
 from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
+from haunt.util import clamp_limit
 
 def pick_default_namespace(namespaces: list[dict[str, Any]]) -> str:
     """Choose the best namespace to display on boot.
@@ -463,8 +466,8 @@ function eventsTable(rows){
   if(!rows.length){$("events").innerHTML='<div class="empty">none</div>';return;}
   $("events").innerHTML=`<table><thead><tr><th>event_time</th><th>role</th><th>tier</th><th>origin</th><th>snippet</th></tr></thead><tbody>`+
     rows.map(r=>`<tr class="clickable" onclick="openEventMemory('${esc(r.id||"")}')">
-      <td>${fmtTime(r.event_time)}</td><td>${r.role||""}</td>
-      <td class="${tierCls(r.tier)}">${r.tier}</td><td>${r.origin||""}</td>
+      <td>${fmtTime(r.event_time)}</td><td>${esc(r.role||"")}</td>
+      <td class="${tierCls(r.tier)}">${esc(r.tier||"")}</td><td>${esc(r.origin||"")}</td>
       <td class="snip">${esc(snip(r.content||(r.tool_name?"tool:"+r.tool_name:""),180))}</td>
     </tr>`).join("")+"</tbody></table>";
 }
@@ -475,7 +478,7 @@ function hitsTable(hits){
     hits.map((h,i)=>`<tr class="clickable" onclick="openDetail('${esc(h.memory_id)}','${esc(h.namespace||NS)}')">
       <td>${i+1}</td><td>${(h.score||0).toFixed(4)}</td>
       <td class="${tierCls(h.tier)}">${h.tier}</td>
-      <td style="font-size:11px;color:var(--mut)">${h.origin||''}</td>
+      <td style="font-size:11px;color:var(--mut)">${esc(h.origin||'')}</td>
       ${ALL_NS?`<td><span class="ns-badge">${esc(h.namespace||'')}</span></td>`:''}
       <td style="font-size:11px;color:var(--mut)">${(h.memory_id||"").slice(0,12)}</td>
       <td class="snip">${esc(snip(h.content||h.snippet||"",200))}</td>
@@ -506,14 +509,14 @@ async function openDetail(memId,ns){
   const rows=[
     ["memory_id",d.memory_id],["event_id",d.event_id],["session_id",d.session_id],
     ["namespace",d.namespace],["tier",`<span class="${tierCls(d.tier)}">${d.tier}</span>`],
-    ["role",d.role],["origin",d.origin],
+    ["role",esc(d.role||"")],["origin",esc(d.origin||"")],
     ["event_time",fmtTime(d.event_time)],["valid_from",fmtTime(d.valid_from)],
     ["valid_to",d.valid_to?fmtTime(d.valid_to):"<em>current</em>"],
     ["created_at",fmtTime(d.created_at)],
     ["has_embedding",d.has_embedding?"yes":"no"],
     ["db_path",d.db_path],["haunt_home",d.haunt_home],
   ];
-  if(d.tool_name)rows.push(["tool_name",d.tool_name]);
+  if(d.tool_name)rows.push(["tool_name",esc(d.tool_name)]);
   let html=rows.map(([l,v])=>`<div class="detail-row"><span class="lbl">${l}</span><span class="val">${v}</span></div>`).join("");
   html+=`<h2 class="section" style="margin-top:12px;">content</h2><div class="detail-content">${esc(d.content||d.event_content||"(empty)")}</div>`;
   if(d.tool_input)html+=`<h2 class="section">tool input</h2><div class="detail-content">${esc(d.tool_input)}</div>`;
@@ -577,7 +580,7 @@ async function doBrowse(page){
     mems.map(m=>`<tr class="clickable" onclick="openDetail('${esc(m.memory_id)}','${esc(NS)}')">
       <td>${fmtTime(m.created_at)}</td>
       <td class="${tierCls(m.tier)}">${m.tier}</td>
-      <td>${m.role||""}</td><td>${m.origin||""}</td>
+      <td>${esc(m.role||"")}</td><td>${esc(m.origin||"")}</td>
       <td style="font-size:11px;color:var(--mut)">${(m.session_id||"").slice(0,8)}</td>
       <td class="snip">${esc(snip(m.content||"",160))}</td>
       <td><button style="font-size:11px;padding:2px 8px" onclick="event.stopPropagation();openDetail('${esc(m.memory_id)}','${esc(NS)}')">detail</button></td>
@@ -650,8 +653,8 @@ async function loadTimeline(){
   if(!rows.length){$("timelineResults").innerHTML='<div class="empty">no events match</div>';return;}
   $("timelineResults").innerHTML=`<table><thead><tr><th>event_time</th><th>origin</th><th>role</th><th>tier</th><th>snippet</th></tr></thead><tbody>`+
     rows.map(r=>`<tr class="clickable" onclick="openEventMemory('${esc(r.id||"")}')">
-      <td>${fmtTime(r.event_time)}</td><td>${r.origin||""}</td>
-      <td>${r.role||""}</td>
+      <td>${fmtTime(r.event_time)}</td><td>${esc(r.origin||"")}</td>
+      <td>${esc(r.role||"")}</td>
       <td class="${tierCls(r.tier)}">${r.tier}</td>
       <td class="snip">${esc(snip(r.content||(r.tool_name?"tool:"+r.tool_name:""),180))}</td>
     </tr>`).join("")+"</tbody></table>";
@@ -811,11 +814,18 @@ async def api_namespaces(_request: Request) -> JSONResponse:
     })
 
 
+def _missing_namespace(name: str) -> JSONResponse | None:
+    if namespace_exists(name):
+        return None
+    return JSONResponse({"error": f"unknown namespace: {name}"}, status_code=404)
+
+
 async def api_namespace(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
-    if not namespace_exists(name):
-        pass
-    with Store(name) as st:
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
+    with Store(name, create=False) as st:
         stats = st.stats()
         events = st.events(limit=40)
         entities = st.top_entities(20)
@@ -837,7 +847,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
     q = request.query_params.get("q") or ""
     if not q.strip():
         return JSONResponse({"query": q, "hits": []})
-    k = int(request.query_params.get("k") or 10)
+    k = clamp_limit(request.query_params.get("k") or 10, default=10)
     tier = request.query_params.get("tier") or None
     as_of = request.query_params.get("as_of") or None
     since = request.query_params.get("since") or None
@@ -881,14 +891,17 @@ async def api_recall_all(request: Request) -> JSONResponse:
 
 async def api_recall(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
     q = request.query_params.get("q") or ""
-    k = int(request.query_params.get("k") or 8)
+    k = clamp_limit(request.query_params.get("k") or 8, default=8)
     tier = request.query_params.get("tier") or None
     as_of = request.query_params.get("as_of") or None
     since = request.query_params.get("since") or None
     until = request.query_params.get("until") or None
     clock = request.query_params.get("clock") or None
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         hits = recall(q, namespace=name, k=k, tier=tier,
                       as_of=as_of, since=since, until=until,
                       clock=clock, store=st)
@@ -902,24 +915,30 @@ async def api_recall(request: Request) -> JSONResponse:
 
 async def api_browse(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
     params = request.query_params
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         result = st.browse_memories(
             session_id=params.get("session") or None,
             origin=params.get("origin") or None,
             tier=params.get("tier") or None,
             since=params.get("since") or None,
             until=params.get("until") or None,
-            limit=int(params.get("limit") or 100),
-            offset=int(params.get("offset") or 0),
+            limit=clamp_limit(params.get("limit") or 100, default=100),
+            offset=max(0, int(params.get("offset") or 0)),
         )
     return JSONResponse(result)
 
 
 async def api_memory_detail(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
     memory_id = request.path_params["memory_id"]
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         detail = st.get_memory(memory_id)
     if not detail:
         return JSONResponse({"error": f"memory {memory_id} not found"}, status_code=404)
@@ -937,8 +956,11 @@ async def api_memory_delete(request: Request) -> JSONResponse:
 
 async def api_event_memories(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
     event_id = request.path_params["event_id"]
-    with Store(name) as st:
+    with Store(name, create=False) as st:
         rows = st.conn.execute(
             "SELECT id FROM memories WHERE event_id=? ORDER BY created_at DESC",
             (event_id,),
@@ -949,21 +971,30 @@ async def api_event_memories(request: Request) -> JSONResponse:
 
 async def api_procedures(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
-    with Store(name) as st:
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
+    with Store(name, create=False) as st:
         procs = st.procedure_list()
     return JSONResponse({"procedures": procs})
 
 
 async def api_worldview(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
-    with Store(name) as st:
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
+    with Store(name, create=False) as st:
         wv = st.worldview()
     return JSONResponse(wv)
 
 
 async def api_health(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
-    with Store(name) as st:
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
+    with Store(name, create=False) as st:
         health = _health_from_store(st)
         stats = st.stats()
     health["namespace"] = name
@@ -974,12 +1005,15 @@ async def api_health(request: Request) -> JSONResponse:
 
 async def api_timeline(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
     params = request.query_params
     since = params.get("since") or None
     until = params.get("until") or None
     clock = params.get("clock") or None
-    limit = int(params.get("limit") or 200)
-    with Store(name) as st:
+    limit = clamp_limit(params.get("limit") or 100, default=100)
+    with Store(name, create=False) as st:
         events = st.events(since=since, until=until, clock=clock, limit=limit)
     return JSONResponse({"namespace": name, "events": events})
 
@@ -1016,10 +1050,37 @@ routes = [
 app = Starlette(debug=False, routes=routes)
 
 
+def is_loopback_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if h in {"127.0.0.1", "::1", "localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def check_dashboard_bind(host: str, allow_remote: bool = False) -> None:
+    """Refuse non-loopback binds unless --allow-remote is explicit."""
+    if is_loopback_host(host):
+        return
+    if not allow_remote:
+        raise ValueError(
+            f"refusing to bind dashboard to {host!r} (not loopback). "
+            "Pass --allow-remote to expose the local memory console on the network."
+        )
+    print(
+        f"WARNING: binding haunt dashboard to {host} — "
+        "local memories are reachable beyond loopback.",
+        file=sys.stderr,
+    )
+
+
 def run_dashboard(
     host: str = "127.0.0.1",
     port: int = 7340,
     open_browser: bool = True,
+    allow_remote: bool = False,
 ) -> None:
     import threading
     import time
@@ -1027,6 +1088,7 @@ def run_dashboard(
     import uvicorn
     import webbrowser
 
+    check_dashboard_bind(host, allow_remote=allow_remote)
     url = f"http://{host}:{port}"
 
     if open_browser:

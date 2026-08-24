@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from haunt.embed import warmup
-from haunt.paths import bin_dir, ensure_layout, haunt_home, models_dir
+from haunt.paths import bin_dir, ensure_layout, haunt_home, models_dir, repair_private_modes
 from haunt.store import Store, init_registry, register_namespace, list_namespace_rows, reembed_all_namespaces
 from haunt.util import diag, dumps
 
@@ -92,6 +92,7 @@ class BootstrapError(SystemExit):
 
 def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict:
     home = ensure_layout()
+    repair_private_modes(home)
     launcher = write_launcher()
     vec = probe_sqlite_vec()
     if not vec.get("ok"):
@@ -177,6 +178,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
             for hr in host_reports
         ],
     }
+    repair_private_modes(home)
     diag("bootstrap", **{k: report[k] for k in ("haunt_home", "launcher")})
     return report
 
