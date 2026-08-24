@@ -712,7 +712,14 @@ async function doRecall(){
     if(until)url+=`&until=${encodeURIComponent(until+"T23:59:59+00:00")}`;
     data=await j(url);
   }
-  $("recallMeta").textContent=(data.hits||[]).length+" hits"+(ALL_NS?" (all namespaces)":"");
+  const errs=data.errors||[];
+  let meta=(data.hits||[]).length+" hits"+(ALL_NS?" (all namespaces)":"");
+  if(errs.length){
+    const names=errs.map(e=>e.namespace||"?").join(", ");
+    meta+=" — "+errs.length+" namespace"+(errs.length===1?"":"s")+" failed ("+names+")";
+  }
+  $("recallMeta").textContent=meta;
+  $("recallMeta").style.color=errs.length?"var(--red)":"";
   hitsTable(data.hits||[]);
 }
 
@@ -846,7 +853,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
     """Cross-namespace recall: fan out to every registered namespace, merge via RRF."""
     q = request.query_params.get("q") or ""
     if not q.strip():
-        return JSONResponse({"query": q, "hits": []})
+        return JSONResponse({"query": q, "hits": [], "errors": []})
     k = clamp_limit(request.query_params.get("k") or 10, default=10)
     tier = request.query_params.get("tier") or None
     as_of = request.query_params.get("as_of") or None
@@ -856,6 +863,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
 
     ns_rows = list_namespace_rows()
     all_hits: list[tuple[Hit, str]] = []
+    errors: list[dict[str, str]] = []
     for row in ns_rows:
         ns_name = row["name"]
         try:
@@ -867,8 +875,8 @@ async def api_recall_all(request: Request) -> JSONResponse:
                               clock=clock, store=st)
                 for h in hits:
                     all_hits.append((h, ns_name))
-        except (FileNotFoundError, Exception):
-            continue
+        except Exception as exc:
+            errors.append({"namespace": ns_name, "error": str(exc)})
 
     rrf: dict[str, float] = {}
     hit_map: dict[str, tuple[Hit, str]] = {}
@@ -886,7 +894,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
         d["score"] = round(score, 6)
         results.append(d)
 
-    return JSONResponse({"query": q, "hits": results})
+    return JSONResponse({"query": q, "hits": results, "errors": errors})
 
 
 async def api_recall(request: Request) -> JSONResponse:
