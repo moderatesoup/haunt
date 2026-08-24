@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from haunt.paths import namespace_db_path
 from haunt.store import Store, observe
 
 
@@ -132,3 +133,55 @@ def test_per_ns_recall_includes_namespace(multi_ns_client):
     data = r.json()
     for h in data["hits"]:
         assert h["namespace"] == "alpha"
+
+
+def test_all_ns_recall_surfaces_corrupt_namespace_errors(haunt_env):
+    """#55: one good ns + one corrupt registered DB is not a clean hits-only 200.
+
+    Partial success is ok: hits from the good namespace stay, but the payload
+    must include a non-empty errors list with namespace + error string.
+    Deleting the errors field from the JSON fails this test.
+    """
+    from starlette.testclient import TestClient
+    from haunt.dashboard import app
+
+    canary = "CANARY-RECALL-ALL-55"
+    observe(canary, namespace="goodns", role="user")
+    observe("this db will be overwritten with garbage", namespace="badns", role="user")
+    db = namespace_db_path("badns")
+    assert db.exists(), f"expected registered db at {db}"
+    db.write_text("GARBAGE")
+
+    client = TestClient(app)
+    r = client.get(f"/api/recall?q={canary}")
+    assert r.status_code == 200
+    data = r.json()
+    assert "hits" in data
+    assert "errors" in data, (
+        "GET /api/recall must include an errors field when a namespace fails; "
+        "a hits-only body looks like success"
+    )
+    assert data["errors"], (
+        "errors must be non-empty when a registered DB is corrupt "
+        f"(body={data!r})"
+    )
+    for err in data["errors"]:
+        assert err.get("namespace"), f"error entry missing namespace: {err!r}"
+        assert isinstance(err.get("error"), str) and err["error"].strip(), (
+            f"error entry missing error string: {err!r}"
+        )
+    err_ns = {err["namespace"] for err in data["errors"]}
+    assert "badns" in err_ns
+    assert "goodns" not in err_ns
+    assert any(canary in (h.get("content") or "") for h in data["hits"])
+    assert all(h.get("namespace") != "badns" for h in data["hits"])
+
+
+def test_do_recall_surfaces_errors_in_recall_meta():
+    """#55: recallMeta must not only say 'N hits (all namespaces)'."""
+    from haunt.dashboard import HTML
+
+    assert 'recallMeta").textContent=(data.hits||[]).length+" hits"+(ALL_NS?" (all namespaces)":"")' not in HTML
+    assert "data.errors" in HTML
+    assert "failed" in HTML
+    assert "recallMeta" in HTML

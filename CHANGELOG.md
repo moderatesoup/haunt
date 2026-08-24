@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+GET `/api/recall` (all-namespaces) attaches a non-empty `errors` list when a registered namespace fails to open or search, and the console recall meta surfaces those failures instead of only `N hits (all namespaces)`.
+
 Release-gate hardening (storage isolation honesty, private HAUNT_HOME modes, mcp>=2 pin, loopback dashboard bind, dashboard XSS/GET-create/limit clamps, Authorization Bearer hook redaction).
 
 ## 0.2.0 — 2026-08-24
