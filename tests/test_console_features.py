@@ -10,8 +10,7 @@ from haunt.store import Store, observe
 @pytest.fixture
 def dash_client(haunt_env):
     """HTTPX test client with pre-populated data for console feature tests."""
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
 
     observe(
         "early event about database migration",
@@ -34,7 +33,7 @@ def dash_client(haunt_env):
         event_time="2024-03-15T09:00:00+00:00",
         origin="cli",
     )
-    return TestClient(app)
+    return make_dash_client()
 
 
 # --------------------------------------------------------------------------

@@ -5,7 +5,19 @@ from pathlib import Path
 
 import pytest
 
+from tests.dashutil import TEST_DASH_TOKEN
+
 MODEL_CACHE = Path("/workspace/lore/.model-cache")
+
+
+@pytest.fixture(autouse=True)
+def _dashboard_security_defaults():
+    """Every test starts with a configured launch token and loopback bind host."""
+    from haunt.dashboard import configure_dashboard_security, reset_dashboard_security
+
+    configure_dashboard_security(token=TEST_DASH_TOKEN, bind_host="127.0.0.1")
+    yield
+    reset_dashboard_security()
 
 
 @pytest.fixture(autouse=True)

@@ -80,6 +80,10 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 
 `haunt dash` serves a local-only memory management UI at `http://127.0.0.1:7340` and opens it in your default browser once the server is ready. Pass `--no-open` to suppress the browser (useful for CI or scripting). No React, no npm — single-file inline HTML.
 
+The console binds **127.0.0.1** by default. At start it mints a random launch token, prints it, and requires it (`X-Haunt-Token` or `?token=`) on every `/api` route, including GET. The HTML page can still load locally; the API is gated. On loopback the page injects the token so the local UI works. `--allow-remote` / a non-loopback bind does **not** embed the token in HTML — it is printed only on `haunt dash` stdout. Requests with an untrusted `Host` (DNS rebind) are rejected. Mutation routes also check `Origin`.
+
+`--allow-remote` binds beyond loopback and is **unsafe without the launch token** — it exposes the memory admin API on the network. Namespaces are storage isolation, not authorization. See [SECURITY.md](SECURITY.md).
+
 Features:
 
 - **Browse** memories with filters: tier, origin, session, time range. Paginated.
@@ -181,7 +185,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt procedure get NAME` | retrieve a named procedure |
 | `haunt procedure list` | list all active procedures |
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
-| `haunt dash [--port 7340] [--install-icon] [--no-open]` | local memory console (127.0.0.1); opens browser automatically (use `--no-open` for CI/scripts) |
+| `haunt dash [--port 7340] [--install-icon] [--no-open] [--allow-remote]` | local memory console (127.0.0.1); prints a launch token required on `/api/*`; `--allow-remote` is unsafe without that token; namespaces are not auth |
 | `haunt install` | bind all known hosts (Cursor, Claude Code): hooks + MCP + rules + skill |
 | `haunt doctor` | check sqlite-vec (or FTS-only), haunt-mcp wrapper/python, embed (or FTS-only), and host files; rematch host files if missing; exit 1 if any check fails |
 | `haunt cursor-install` | bind Cursor only: hooks.json + mcp.json + haunt.mdc + skill |

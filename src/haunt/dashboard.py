@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import json
+import secrets
 import sys
 from typing import Any
+from urllib.parse import urlencode, urlparse
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
@@ -17,6 +21,16 @@ from haunt.paths import haunt_home, resolve_namespace
 from haunt.recall import recall, Hit, RRF_K
 from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
 from haunt.util import clamp_limit
+
+TOKEN_HEADER = "X-Haunt-Token"
+TOKEN_QUERY = "token"
+_HTML_TOKEN_PLACEHOLDER = "__HAUNT_LAUNCH_TOKEN_JSON__"
+_LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+_dash_token: str | None = None
+_dash_bind_host: str = "127.0.0.1"
+_dash_allow_remote: bool = False
+
 
 def pick_default_namespace(namespaces: list[dict[str, Any]]) -> str:
     """Choose the best namespace to display on boot.
@@ -325,6 +339,7 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
 
 <script>
 const $=id=>document.getElementById(id);
+const HAUNT_TOKEN=__HAUNT_LAUNCH_TOKEN_JSON__;
 let NS=null, DETAIL_MID=null, DETAIL_NS=null, BROWSE_PAGE=0, ALL_NS=false;
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -332,7 +347,16 @@ function fmtBytes(n){if(n<1024)return n+" B";if(n<1048576)return(n/1024).toFixed
 function tierCls(t){return "t-"+(t||"");}
 function fmtTime(s){return(s||"—").replace("T"," ").replace(/\+00:00$/,"Z").slice(0,19);}
 function snip(s,n){s=(s||"").replace(/\s+/g," ");return s.length<=n?s:s.slice(0,n-1)+"…";}
-async function j(url,opts){const r=await fetch(url,opts);if(!r.ok)throw new Error(await r.text());return r.json();}
+async function j(url,opts){
+  opts=opts||{};
+  const headers=Object.assign({},opts.headers||{});
+  const tok=HAUNT_TOKEN||new URLSearchParams(location.search).get("token")||"";
+  if(tok)headers["X-Haunt-Token"]=tok;
+  opts.headers=headers;
+  const r=await fetch(url,opts);
+  if(!r.ok)throw new Error(await r.text());
+  return r.json();
+}
 
 function showAllNsHint(container){
   Array.from(container.children).forEach(el=>{
@@ -809,7 +833,14 @@ def _health_from_store(st: Store) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def index(_request: Request) -> HTMLResponse:
-    return HTMLResponse(HTML)
+    token = (_dash_token or "") if embed_launch_token_in_html() else ""
+    token_json = (
+        json.dumps(token)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    return HTMLResponse(HTML.replace(_HTML_TOKEN_PLACEHOLDER, token_json))
 
 
 async def api_namespaces(_request: Request) -> JSONResponse:
@@ -1088,7 +1119,164 @@ routes = [
     Route("/api/namespace/{name}/health", api_health),
 ]
 
-app = Starlette(debug=False, routes=routes)
+
+def normalize_host_header(host: str) -> str:
+    """Strip port and brackets from a Host header or bind address."""
+    h = (host or "").strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        end = h.find("]")
+        if end != -1:
+            return h[1:end]
+        return h.strip("[]")
+    if h.count(":") == 1:
+        return h.rsplit(":", 1)[0]
+    return h
+
+
+def configure_dashboard_security(
+    *,
+    token: str | None,
+    bind_host: str = "127.0.0.1",
+    allow_remote: bool = False,
+) -> None:
+    """Set Host/token policy for this dashboard process (or a test)."""
+    global _dash_token, _dash_bind_host, _dash_allow_remote
+    _dash_token = token
+    _dash_bind_host = bind_host
+    _dash_allow_remote = allow_remote
+
+
+def reset_dashboard_security() -> None:
+    configure_dashboard_security(token=None, bind_host="127.0.0.1", allow_remote=False)
+
+
+def dashboard_token() -> str | None:
+    return _dash_token
+
+
+def embed_launch_token_in_html() -> bool:
+    """Publish the token in GET / only for a loopback, non-remote bind.
+
+    ``--allow-remote`` / a non-loopback bind must not put X-Haunt-Token in the
+    unauthenticated HTML. The operator still sees it on haunt dash stdout.
+    """
+    if _dash_allow_remote:
+        return False
+    return is_loopback_host(normalize_host_header(_dash_bind_host))
+
+
+def mint_dashboard_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def host_name_is_trusted(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if n in _LOOPBACK_NAMES or is_loopback_host(n):
+        return True
+    bind = normalize_host_header(_dash_bind_host)
+    try:
+        bind_ip = ipaddress.ip_address(bind)
+    except ValueError:
+        bind_ip = None
+    if bind_ip is not None and bind_ip.is_unspecified:
+        try:
+            ipaddress.ip_address(n)
+            return True
+        except ValueError:
+            return False
+    return bool(bind) and n == bind
+
+
+def request_host_is_trusted(host_header: str) -> bool:
+    return host_name_is_trusted(normalize_host_header(host_header))
+
+
+def _effective_port(scheme: str, port: int | None) -> int | None:
+    if port is not None:
+        return port
+    return {"http": 80, "https": 443}.get(scheme)
+
+
+def request_origin_is_trusted(origin: str, request: Request) -> bool:
+    parsed = urlparse(origin)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    request_host = request.url.hostname
+    if not request_host or not host_name_is_trusted(host.lower()):
+        return False
+    return (
+        parsed.scheme == request.url.scheme
+        and host.lower() == request_host.lower()
+        and _effective_port(parsed.scheme, parsed.port)
+        == _effective_port(request.url.scheme, request.url.port)
+    )
+
+
+def _tokens_match(provided: str, expected: str) -> bool:
+    a = provided.encode("utf-8")
+    b = expected.encode("utf-8")
+    if len(a) != len(b):
+        return False
+    return hmac.compare_digest(a, b)
+
+
+def request_token(request: Request) -> str | None:
+    header = request.headers.get(TOKEN_HEADER)
+    if header:
+        return header
+    return request.query_params.get(TOKEN_QUERY)
+
+
+def guard_dashboard_request(request: Request) -> JSONResponse | None:
+    """Host on every request; token on /api; Origin on cookie-less mutations."""
+    host = request.headers.get("host") or ""
+    if not request_host_is_trusted(host):
+        return JSONResponse({"error": "untrusted host"}, status_code=400)
+
+    path = request.url.path
+    if not path.startswith("/api"):
+        return None
+
+    expected = _dash_token
+    provided = request_token(request)
+    if not expected or not provided or not _tokens_match(provided, expected):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    if request.method in {"POST", "DELETE", "PUT", "PATCH"}:
+        origin = request.headers.get("origin")
+        if origin and not request_origin_is_trusted(origin, request):
+            return JSONResponse({"error": "untrusted origin"}, status_code=403)
+    return None
+
+
+class DashboardGuardMiddleware:
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        denied = guard_dashboard_request(request)
+        if denied is not None:
+            await denied(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app = Starlette(
+    debug=False,
+    routes=routes,
+    middleware=[Middleware(DashboardGuardMiddleware)],
+)
 
 
 def is_loopback_host(host: str) -> bool:
@@ -1112,7 +1300,9 @@ def check_dashboard_bind(host: str, allow_remote: bool = False) -> None:
         )
     print(
         f"WARNING: binding haunt dashboard to {host} — "
-        "local memories are reachable beyond loopback.",
+        "local memories are reachable beyond loopback. "
+        "--allow-remote is unsafe without the launch token; "
+        "namespaces are not authorization.",
         file=sys.stderr,
     )
 
@@ -1122,6 +1312,7 @@ def run_dashboard(
     port: int = 7340,
     open_browser: bool = True,
     allow_remote: bool = False,
+    token: str | None = None,
 ) -> None:
     import threading
     import time
@@ -1130,14 +1321,41 @@ def run_dashboard(
     import webbrowser
 
     check_dashboard_bind(host, allow_remote=allow_remote)
+    launch_token = mint_dashboard_token() if token is None else token
+    if allow_remote and not (launch_token or "").strip():
+        raise ValueError(
+            "refusing --allow-remote without a dashboard token. "
+            "An empty token would expose an unauthenticated admin API."
+        )
+    configure_dashboard_security(
+        token=launch_token or None,
+        bind_host=host,
+        allow_remote=allow_remote,
+    )
+    if launch_token:
+        print(f"haunt dash token  {launch_token}")
+        print("  send as X-Haunt-Token or ?token= on every /api route")
+        if not embed_launch_token_in_html():
+            print("  not embedded in HTML (--allow-remote / non-loopback bind)")
+    else:
+        print(
+            "WARNING: dashboard launch token is empty — every /api route returns 401.",
+            file=sys.stderr,
+        )
+
     url = f"http://{host}:{port}"
+    open_url = (
+        f"{url}/?{urlencode({TOKEN_QUERY: launch_token})}"
+        if launch_token and embed_launch_token_in_html()
+        else url
+    )
 
     if open_browser:
         def _open_when_ready() -> None:
             for _ in range(40):
                 try:
                     with socket.create_connection((host, port), timeout=0.5):
-                        webbrowser.open(url)
+                        webbrowser.open(open_url)
                         return
                 except OSError:
                     time.sleep(0.25)

@@ -247,12 +247,11 @@ def test_dashboard_js_does_not_interpolate_origin_raw():
 
 
 def test_stored_xss_origin_does_not_appear_raw_in_html(gate_env):
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
     from haunt.store import observe
 
     observe("xss canary body", namespace="default", role="user", origin=XSS_ORIGIN)
-    client = TestClient(app)
+    client = make_dash_client()
     page = client.get("/")
     assert page.status_code == 200
     assert XSS_ORIGIN not in page.text
@@ -270,11 +269,10 @@ def test_stored_xss_origin_does_not_appear_raw_in_html(gate_env):
 
 
 def test_get_unknown_namespace_is_404_and_does_not_create(gate_env):
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
     from haunt.store import namespace_exists
 
-    client = TestClient(app)
+    client = make_dash_client()
     mystery = "never-created-ns-xyz"
     assert not namespace_exists(mystery)
     r = client.get(f"/api/namespace/{mystery}")
@@ -301,11 +299,10 @@ def test_get_unknown_namespace_uses_create_false():
 
 def test_delete_unknown_namespace_is_404_and_does_not_create(gate_env):
     """#56: DELETE on a typo'd ns must not create the DB then 404 memory-not-found."""
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
     from haunt.store import namespace_exists
 
-    client = TestClient(app)
+    client = make_dash_client()
     mystery = "typo-ns-delete-never-created"
     assert not namespace_exists(mystery)
     r = client.request("DELETE", f"/api/namespace/{mystery}/memory/does-not-exist")
@@ -320,11 +317,10 @@ def test_delete_unknown_namespace_is_404_and_does_not_create(gate_env):
 
 def test_contradict_unknown_namespace_is_404_and_does_not_create(gate_env):
     """#56: POST contradict on a typo'd ns must not create the DB."""
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
     from haunt.store import namespace_exists
 
-    client = TestClient(app)
+    client = make_dash_client()
     mystery = "typo-ns-contradict-never-created"
     assert not namespace_exists(mystery)
     r = client.post(
@@ -342,11 +338,10 @@ def test_contradict_unknown_namespace_is_404_and_does_not_create(gate_env):
 
 def test_delete_existing_ns_missing_memory_is_404_memory_not_found(gate_env):
     """#56: existing ns + missing memory still 404s memory-not-found, no extra ns."""
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
     from haunt.store import list_namespaces, namespace_exists
 
-    client = TestClient(app)
+    client = make_dash_client()
     assert namespace_exists("default")
     before = {ns["name"] for ns in list_namespaces()}
     r = client.request("DELETE", "/api/namespace/default/memory/does-not-exist")
@@ -360,11 +355,10 @@ def test_delete_existing_ns_missing_memory_is_404_memory_not_found(gate_env):
 
 def test_contradict_existing_ns_missing_memory_is_404_memory_not_found(gate_env):
     """#56: existing ns + missing memory still 404s memory-not-found, no extra ns."""
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
     from haunt.store import list_namespaces, namespace_exists
 
-    client = TestClient(app)
+    client = make_dash_client()
     assert namespace_exists("default")
     before = {ns["name"] for ns in list_namespaces()}
     r = client.post(
@@ -415,14 +409,13 @@ def test_clamp_limit_bounds():
 
 def test_negative_timeline_limit_is_not_unbounded(gate_env):
     """SQLite LIMIT -1 means no limit. Negative must clamp, not dump the table."""
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
     from haunt.store import Store, observe
 
     for i in range(12):
         observe(f"limit-canary-{i}", namespace="default", role="user")
 
-    client = TestClient(app)
+    client = make_dash_client()
     r = client.get("/api/namespace/default/timeline?limit=-1")
     assert r.status_code == 200
     events = r.json()["events"]
@@ -435,13 +428,12 @@ def test_negative_timeline_limit_is_not_unbounded(gate_env):
 
 
 def test_huge_k_is_clamped_on_dashboard_and_mcp(gate_env):
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
     from haunt.mcp_server import memory_recall, memory_timeline
     from haunt.store import observe
 
     observe("huge-limit-canary UNIQUE-CLAMP-99", namespace="default", role="user")
-    client = TestClient(app)
+    client = make_dash_client()
     r = client.get("/api/namespace/default/recall?q=UNIQUE-CLAMP-99&k=99999")
     assert r.status_code == 200
     assert len(r.json()["hits"]) <= 100
