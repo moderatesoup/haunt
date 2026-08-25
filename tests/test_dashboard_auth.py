@@ -53,6 +53,7 @@ def test_index_loads_locally_without_token(auth_env):
 
 
 def test_index_injects_launch_token_into_html(auth_env):
+    """Loopback GET / may still contain the token so the local UI works."""
     client = make_dash_client()
     r = client.get("/")
     assert r.status_code == 200
@@ -227,6 +228,49 @@ def test_run_dashboard_mints_token_when_omitted(capsys, monkeypatch):
     assert token in capsys.readouterr().out
 
 
+def test_allow_remote_does_not_embed_token_in_html(auth_env, capsys, monkeypatch):
+    """#66 leftover: GET / on a remote bind must not publish the launch token.
+
+    Revert index() to always inject and this fails: token_in_html becomes True,
+    and an unauthenticated GET / is enough to mint X-Haunt-Token for /api.
+    """
+    import uvicorn
+    from haunt.dashboard import embed_launch_token_in_html, run_dashboard
+
+    secret = "remote-operator-token-XYZ"
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+    run_dashboard(
+        host="0.0.0.0",
+        allow_remote=True,
+        token=secret,
+        open_browser=False,
+    )
+    out = capsys.readouterr().out
+    assert secret in out
+    assert embed_launch_token_in_html() is False
+
+    r = _observe("ALLOW-REMOTE-HTML-LEAK-CANARY must stay")
+
+    # Trusted Host toward a 0.0.0.0 bind: 127.0.0.1 and the bind IP itself.
+    for host in ("127.0.0.1", "0.0.0.0"):
+        page = make_dash_client(token=None, host=host).get("/")
+        assert page.status_code == 200, host
+        assert secret not in page.text, f"token_in_html=True host={host}"
+        assert TEST_DASH_TOKEN not in page.text
+        assert "__HAUNT_LAUNCH_TOKEN__" not in page.text
+
+        anon = make_dash_client(token=None, host=host)
+        assert anon.get("/api/namespaces").status_code == 401
+        denied = anon.request(
+            "DELETE", f"/api/namespace/default/memory/{r.memory_id}"
+        )
+        assert denied.status_code == 401
+        assert _memory_row(r.memory_id) is not None
+
+        authed = make_dash_client(token=secret, host=host)
+        assert authed.get("/api/namespaces").status_code == 200
+
+
 def test_allow_remote_without_token_refuses_to_start(monkeypatch):
     import uvicorn
     from haunt.dashboard import run_dashboard
@@ -244,6 +288,7 @@ def test_docs_say_allow_remote_is_unsafe_without_token():
     assert "--allow-remote" in blob
     assert "unsafe without" in blob.lower()
     assert "launch token" in blob.lower() or "X-Haunt-Token" in blob
+    assert "does not embed" in blob.lower() or "not embed" in blob.lower()
     assert "namespaces" in security.lower()
     assert "not authorization" in security.lower() or "not auth" in blob.lower()
     assert "#66" in changelog

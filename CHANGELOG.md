@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Dashboard Host/Origin/launch-token (#66): `haunt dash` still defaults to 127.0.0.1, rejects untrusted `Host`, requires a minted launch token (`X-Haunt-Token` or `?token=`) on every `/api` route, and validates `Origin` on DELETE/contradict. `--allow-remote` without that token refuses to start (empty token → every `/api` route 401). HTML index still loads locally. `--allow-remote` is unsafe without the token; namespaces are not authorization.
+Dashboard Host/Origin/launch-token (#66): `haunt dash` still defaults to 127.0.0.1, rejects untrusted `Host`, requires a minted launch token (`X-Haunt-Token` or `?token=`) on every `/api` route, and validates `Origin` on DELETE/contradict. `--allow-remote` without that token refuses to start (empty token → every `/api` route 401). HTML index still loads without the token. Loopback injects the token into the console HTML; `--allow-remote` / non-loopback bind does not embed it (stdout only). `--allow-remote` is unsafe without the token; namespaces are not authorization.
 
 New timestamps keep microseconds (or finer) and stay UTC. Opening a namespace runs a schema-versioned one-time rewrite of offset/naive clocks; queries do not rewrite history. Newest-procedure / latest-row picks break ties with `rowid`, not second-resolution `created_at` alone. (#67)
 

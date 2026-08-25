@@ -833,7 +833,7 @@ def _health_from_store(st: Store) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def index(_request: Request) -> HTMLResponse:
-    token = _dash_token or ""
+    token = (_dash_token or "") if embed_launch_token_in_html() else ""
     return HTMLResponse(HTML.replace(_HTML_TOKEN_PLACEHOLDER, token))
 
 
@@ -1150,6 +1150,17 @@ def dashboard_token() -> str | None:
     return _dash_token
 
 
+def embed_launch_token_in_html() -> bool:
+    """Publish the token in GET / only for a loopback, non-remote bind.
+
+    ``--allow-remote`` / a non-loopback bind must not put X-Haunt-Token in the
+    unauthenticated HTML. The operator still sees it on haunt dash stdout.
+    """
+    if _dash_allow_remote:
+        return False
+    return is_loopback_host(normalize_host_header(_dash_bind_host))
+
+
 def mint_dashboard_token() -> str:
     return secrets.token_urlsafe(32)
 
@@ -1294,6 +1305,8 @@ def run_dashboard(
     if launch_token:
         print(f"haunt dash token  {launch_token}")
         print("  send as X-Haunt-Token or ?token= on every /api route")
+        if not embed_launch_token_in_html():
+            print("  not embedded in HTML (--allow-remote / non-loopback bind)")
     else:
         print(
             "WARNING: dashboard launch token is empty — every /api route returns 401.",
@@ -1301,7 +1314,11 @@ def run_dashboard(
         )
 
     url = f"http://{host}:{port}"
-    open_url = f"{url}/?token={launch_token}" if launch_token else url
+    open_url = (
+        f"{url}/?token={launch_token}"
+        if launch_token and embed_launch_token_in_html()
+        else url
+    )
 
     if open_browser:
         def _open_when_ready() -> None:

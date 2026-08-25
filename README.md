@@ -80,7 +80,7 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 
 `haunt dash` serves a local-only memory management UI at `http://127.0.0.1:7340` and opens it in your default browser once the server is ready. Pass `--no-open` to suppress the browser (useful for CI or scripting). No React, no npm — single-file inline HTML.
 
-The console binds **127.0.0.1** by default. At start it mints a random launch token, prints it, and requires it (`X-Haunt-Token` or `?token=`) on every `/api` route, including GET. The HTML page can still load locally; the API is gated. Requests with an untrusted `Host` (DNS rebind) are rejected. Mutation routes also check `Origin`.
+The console binds **127.0.0.1** by default. At start it mints a random launch token, prints it, and requires it (`X-Haunt-Token` or `?token=`) on every `/api` route, including GET. The HTML page can still load locally; the API is gated. On loopback the page injects the token so the local UI works. `--allow-remote` / a non-loopback bind does **not** embed the token in HTML — it is printed only on `haunt dash` stdout. Requests with an untrusted `Host` (DNS rebind) are rejected. Mutation routes also check `Origin`.
 
 `--allow-remote` binds beyond loopback and is **unsafe without the launch token** — it exposes the memory admin API on the network. Namespaces are storage isolation, not authorization. See [SECURITY.md](SECURITY.md).
 
