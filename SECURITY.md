@@ -29,6 +29,17 @@ Guidance:
 - Treat `~/.haunt/namespaces/*.db` files as sensitive — they contain verbatim agent conversation history.
 - The redaction layer is defense-in-depth, not a guarantee.
 
+## Persistent recalled content and prompt injection
+
+Stored text is untrusted data. In particular, tool input/output can contain hostile instructions copied from files, web pages, command output, or another MCP server.
+
+- Hooks exclude raw tool I/O from automatically injected recall and worldview content. Hook recall is FTS-only and never initializes the embedding model.
+- Explicit CLI/MCP recall may return tool I/O for audit/search, but every such hit is marked `trusted=false` with `trust_reason=untrusted-tool-io`.
+- Recalled content cannot authorize `observe`, `contradict`, `purge`, shell commands, or any other mutation. MCP purge has its own launch-time capability and remains off by default.
+- New hook tool-input/output fields are capped at 12,000 characters by default. Set `HAUNT_TOOL_IO_MAX_CHARS` to a smaller value, and use comma-separated `HAUNT_EXCLUDE_TOOLS` globs for tools whose output must never be stored.
+
+These controls reduce persistent prompt-injection exposure. They do not make arbitrary recalled text safe, and they do not rewrite or delete tool rows stored by older versions.
+
 ## Fail-open hooks
 
 Cursor hooks are **fail-open**: if a hook errors, it prints `{}` and exits 0. A hook will never block your agent or prevent a prompt from being submitted. This is a deliberate trade-off — reliability of the agent takes priority over memory completeness.

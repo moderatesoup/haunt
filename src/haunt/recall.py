@@ -47,6 +47,15 @@ class Hit:
     vec_distance: float | None = None
     fts_rank_raw: float | None = None
 
+    @property
+    def trusted(self) -> bool:
+        """False for raw tool I/O. Recalled text is always data, not authority."""
+        return self.role != "tool" and self.tool_name is None
+
+    @property
+    def trust_reason(self) -> str:
+        return "ordinary-memory" if self.trusted else "untrusted-tool-io"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "memory_id": self.memory_id,
@@ -62,6 +71,8 @@ class Hit:
             "valid_from": self.valid_from,
             "valid_to": self.valid_to,
             "tool_name": self.tool_name,
+            "trusted": self.trusted,
+            "trust_reason": self.trust_reason,
             "vec_rank": self.vec_rank,
             "fts_rank": self.fts_rank,
         }
@@ -85,6 +96,7 @@ def _filters(
     until: str | None,
     tier: str | None,
     clock: str | None = None,
+    include_untrusted: bool = True,
 ) -> tuple[str, list[Any]]:
     clauses = ["1=1"]
     params: list[Any] = []
@@ -106,6 +118,8 @@ def _filters(
     if tier:
         clauses.append("m.tier = ?")
         params.append(tier)
+    if not include_untrusted:
+        clauses.append("e.role != 'tool' AND e.tool_name IS NULL")
     return " AND ".join(clauses), params
 
 
@@ -201,16 +215,27 @@ def recall(
     tier: str | None = None,
     k: int = 8,
     store: Store | None = None,
+    include_untrusted: bool = True,
+    use_vectors: bool = True,
 ) -> list[Hit]:
     k = clamp_k(k)
     own = store is None
     store = store or open_existing(namespace or "default")
     try:
-        store.ensure_current_embeddings()
-        where, params = _filters(as_of, since, until, tier, clock)
+        if use_vectors:
+            store.ensure_current_embeddings()
+            store.process_embedding_jobs(limit=64)
+        where, params = _filters(
+            as_of,
+            since,
+            until,
+            tier,
+            clock,
+            include_untrusted=include_untrusted,
+        )
         fts = _fts_hits(store.conn, query, where, params, CANDIDATES)
         vec: list[tuple[str, int, float]] = []
-        if embed_available():
+        if use_vectors and embed_available():
             qv = embed_one(query)
             if qv:
                 vec = _vec_hits(store, qv, where, params, CANDIDATES)

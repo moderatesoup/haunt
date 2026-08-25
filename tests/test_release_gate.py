@@ -159,7 +159,7 @@ def test_repair_private_modes_skips_user_home(tmp_path, monkeypatch):
 
 def test_pyproject_requires_mcp_v2():
     text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert "mcp>=2" in text
+    assert '"mcp>=2,<3"' in text
     assert "mcp>=1.0.0" not in text
     assert "mcp>=1." not in text
 
@@ -172,7 +172,11 @@ def test_mcp_server_import_rejects_mcp_1x(monkeypatch):
         "mcp_server must expose _require_mcp_v2 so MCP 1.x cannot slip through"
     )
     monkeypatch.setattr(ms, "_mcp_package_version", lambda: "1.13.0")
-    with pytest.raises((RuntimeError, ImportError), match=r"mcp>=2|MCP 1"):
+    with pytest.raises((RuntimeError, ImportError), match=r"mcp>=2,<3"):
+        ms._require_mcp_v2()
+
+    monkeypatch.setattr(ms, "_mcp_package_version", lambda: "3.0.0")
+    with pytest.raises((RuntimeError, ImportError), match=r"mcp>=2,<3"):
         ms._require_mcp_v2()
 
 

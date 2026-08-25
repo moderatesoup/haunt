@@ -305,7 +305,7 @@ def test_claude_tool_retry_uses_official_tool_use_id(graph_env):
 
 def test_v1_database_migrates_idempotency_and_graph_evidence(graph_env):
     from haunt.paths import namespace_db_path
-    from haunt.store import Store, register_namespace
+    from haunt.store import SCHEMA_VERSION, Store, register_namespace
 
     register_namespace("legacy-v1")
     path = namespace_db_path("legacy-v1")
@@ -340,7 +340,7 @@ def test_v1_database_migrates_idempotency_and_graph_evidence(graph_env):
             for row in store.conn.execute("PRAGMA table_info(events)").fetchall()
         }
         assert "idempotency_key" in columns
-        assert store.get_meta("schema_version") == "2"
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
         assert store.get_meta("graph_evidence_version") == "1"
         first = store.observe(
             "MIGRATED-IDEMPOTENCY-CANARY",

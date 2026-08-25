@@ -71,7 +71,7 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 
 ### What is and isn't automatic
 
-- **Hooks store automatically.** Once `haunt install` runs, every prompt, response, and tool call is stored verbatim via hooks in both Cursor and Claude Code.
+- **Hooks store automatically.** Once `haunt install` runs, prompts and responses are stored verbatim in Cursor and Claude Code. Tool input/output is best-effort redacted, capped per field, and can be skipped with `HAUNT_EXCLUDE_TOOLS`.
 - **Recall is NOT automatic.** Neither Cursor nor Claude Code reliably inject recall into the model context. Agents must call `memory_recall` explicitly via MCP unless a `[haunt ns=…]` block is already visible.
 - **sessionStart / SessionStart** may return a worldview card — this may appear as context but is not a guaranteed recall path and is not a kernel.
 - **No-hook IDEs** (Grok Bot, Codex, etc.): call `memory_observe` and `memory_recall` manually via MCP.
@@ -129,7 +129,7 @@ This still creates `~/.haunt` and the default namespace. It does not download BG
 
 ## Hooks
 
-Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summaries. Fail-open (`{}` + exit 0) so a hook never blocks the agent.
+Auto-store prompts and replies verbatim, plus best-effort-redacted and capped tool I/O. No LLM and no summaries. Fail-open (`{}` + exit 0) so a hook never blocks the agent.
 
 `haunt install` binds all known hosts (mkdir parents even if the app is not installed). `haunt cursor-install` binds Cursor only. Each bind:
 
@@ -138,7 +138,9 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 3. Writes a small haunt-owned rule so agents still `memory_recall` if no `[haunt ns=…]` block is visible.
 4. Writes `skills/haunt/SKILL.md` into the host config dir.
 
-**Secret redaction:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.). This is **not** a security boundary — see [SECURITY.md](SECURITY.md).
+**Hook ingest and trust:** Hooks write FTS rows immediately but never initialize the embedding model. They queue missing vectors in the namespace DB; a normal model-owning recall/observe path drains that queue in bounded batches. Hook recall is FTS-only. Raw tool I/O is excluded from hook-injected recall/worldview context by default, while explicit recall still returns it marked `trusted=false`. Recalled text is data and cannot authorize mutations.
+
+**Secret redaction and size controls:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.) and capped at 12,000 characters per field by default. `HAUNT_EXCLUDE_TOOLS` accepts comma-separated, case-insensitive globs for tools that must not be stored. These are **not** security boundaries — see [SECURITY.md](SECURITY.md).
 
 ### Cursor hooks
 
@@ -198,6 +200,8 @@ By default, one `haunt-mcp` process is bound immutably to one project namespace.
 
 `memory_purge` is marked destructive and is off for MCP by default. Use the confirmed `haunt delete` CLI flow, or explicitly launch a process with `HAUNT_MCP_ALLOW_PURGE=1`. Admin mode alone does not enable purge.
 
+Every explicit recall hit includes `trusted` and `trust_reason`. Tool input/output is retained for audit and explicit search but is labeled `untrusted-tool-io`; it is excluded from automatic hook context. No recalled row—trusted or untrusted—is permission to call a mutating tool.
+
 `haunt install` (or `haunt bootstrap`) automatically registers the MCP server in both Cursor (`~/.cursor/mcp.json`) and Claude Code (`~/.claude.json`). Merge only — other servers are kept. No manual JSON paste required.
 
 `haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
@@ -214,6 +218,8 @@ Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `m
 | `HAUNT_NAMESPACE` | inferred from full git remote | override and bind the project namespace |
 | `HAUNT_MCP_ADMIN` | unset | set to `1` only for an admin MCP process that may cross/list namespaces |
 | `HAUNT_MCP_ALLOW_PURGE` | unset | set to `1` to expose hard purge in that MCP process; off by default |
+| `HAUNT_EXCLUDE_TOOLS` | unset | comma-separated case-insensitive tool globs to skip in hook storage (for example `Read,Shell,secret_*`) |
+| `HAUNT_TOOL_IO_MAX_CHARS` | `12000` | maximum stored characters for each hook tool-input/output field (clamped 256–100000) |
 | `HAUNT_MODEL_CACHE` | `$HAUNT_HOME/models` | model download directory |
 
 ## Layout

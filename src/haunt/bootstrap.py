@@ -34,9 +34,9 @@ def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
         "fi\n"
     )
     if sibling.is_file():
-        body = prefix + f'exec "{sibling}" "$@"\n'
+        body = prefix + f"exec {_sh_single_quote(str(sibling))} \"$@\"\n"
     else:
-        body = prefix + f'exec "{python}" -m {module} "$@"\n'
+        body = prefix + f"exec {_sh_single_quote(python)} -m {module} \"$@\"\n"
     dest.write_text(body, encoding="utf-8")
     dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return dest

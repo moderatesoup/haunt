@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +27,6 @@ REQUIRED_CHECKS = (
     "claude-code.skill",
 )
 
-_EXEC_RE = re.compile(r'^exec\s+"([^"]+)"')
 _MCP_PROBE = (
     "import haunt, sqlite3, sqlite_vec\n"
     "c = sqlite3.connect(':memory:')\n"
@@ -84,9 +83,12 @@ def python_for_mcp_command(command: str) -> tuple[str | None, str | None]:
 
     exec_target: str | None = None
     for line in text.splitlines():
-        match = _EXEC_RE.match(line.strip())
-        if match:
-            exec_target = match.group(1)
+        try:
+            parts = shlex.split(line.strip())
+        except ValueError:
+            continue
+        if len(parts) >= 2 and parts[0] == "exec":
+            exec_target = parts[1]
             break
 
     if exec_target is None:
