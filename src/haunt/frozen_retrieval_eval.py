@@ -168,15 +168,16 @@ def _run_case(
     }
     if case.get("lock_returned_metadata"):
         # Keep the public lock portable: fixture IDs, rather than generated
-        # Store IDs, identify the returned records.  This projection locks the
-        # trust boundary for raw tool I/O without broadening every case shape.
+        # Store IDs, identify the returned records. Read trust labels from the
+        # public serialization path, but allowlist this projection so additive
+        # Hit.as_dict() fields do not change the frozen artifact's contract.
         result["returned_metadata"] = [
             {
-                "id": by_memory_id[hit.memory_id],
-                "trusted": hit.trusted,
-                "trust_reason": hit.trust_reason,
+                "id": by_memory_id[serialized["memory_id"]],
+                "trusted": serialized["trusted"],
+                "trust_reason": serialized["trust_reason"],
             }
-            for hit in hits
+            for serialized in (hit.as_dict() for hit in hits)
         ]
     return result
 

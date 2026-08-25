@@ -11,6 +11,7 @@ import pytest
 
 from haunt import frozen_retrieval_eval
 from haunt.frozen_retrieval_eval import DEFAULT_BASELINE, evaluate, load_corpus
+from haunt.recall import Hit
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
@@ -42,29 +43,33 @@ def test_frozen_retrieval_baseline():
     assert metrics["false_positive_rate"] == 0.0
 
 
-@pytest.mark.parametrize(
-    ("field", "drifted_value"),
-    [("trusted", True), ("trust_reason", "ordinary-memory")],
-)
-def test_frozen_retrieval_metadata_lock_rejects_trust_drift(
-    monkeypatch, field, drifted_value
-):
+def test_frozen_retrieval_metadata_lock_rejects_serialized_trust_drift(monkeypatch):
     """A trust-label regression cannot hide behind unchanged logical IDs."""
     baseline = json.loads(DEFAULT_BASELINE.read_text(encoding="utf-8"))
-    original_run_case = frozen_retrieval_eval._run_case
+    original_as_dict = Hit.as_dict
 
-    def drift_tool_trust(case, memory_ids):
-        result = original_run_case(case, memory_ids)
-        if case["id"] == "tool_io_trust_metadata":
-            assert result["returned"] == ["tool_io_capture"]
-            result["returned_metadata"][0][field] = drifted_value
-        return result
+    def drift_tool_trust(self):
+        serialized = original_as_dict(self)
+        if serialized["trusted"] is False:
+            serialized = {
+                **serialized,
+                "trusted": True,
+                "trust_reason": "ordinary-memory",
+            }
+        return serialized
 
-    monkeypatch.setattr(frozen_retrieval_eval, "_run_case", drift_tool_trust)
+    monkeypatch.setattr(Hit, "as_dict", drift_tool_trust)
     actual = evaluate().as_dict()
 
     assert actual["cases"]["tool_io_trust_metadata"]["returned"] == [
         "tool_io_capture"
+    ]
+    assert actual["cases"]["tool_io_trust_metadata"]["returned_metadata"] == [
+        {
+            "id": "tool_io_capture",
+            "trusted": True,
+            "trust_reason": "ordinary-memory",
+        }
     ]
     with pytest.raises(AssertionError):
         _assert_matches_baseline(actual, baseline)
@@ -79,7 +84,7 @@ def test_porter_stemming_case_uses_a_morphological_query():
     case = next(case for case in corpus["cases"] if case["id"] == "porter_stemming")
 
     assert re.search(
-        rf"\\b{re.escape(case['query'])}\\b", record["content"], re.IGNORECASE
+        rf"\b{re.escape(case['query'])}\b", record["content"], re.IGNORECASE
     ) is None
     assert evaluate().as_dict()["cases"]["porter_stemming"]["returned"] == [
         "porter_stemming"
