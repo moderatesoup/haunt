@@ -16,7 +16,7 @@ except ImportError as exc:  # MCP 1.x has no MCPServer
 
 from haunt.paths import resolve_namespace
 from haunt.planner import planned_recall
-from haunt.store import Store, list_namespaces
+from haunt.store import Store, UnknownNamespaceError, list_namespaces, open_existing
 from haunt.temporal import TemporalParseError
 from haunt.util import clamp_limit
 
@@ -115,7 +115,7 @@ def memory_recall(
     ns = resolve_namespace(namespace)
     k = clamp_limit(k, default=8)
     try:
-        with Store(ns) as st:
+        with open_existing(ns) as st:
             hits = planned_recall(
                 query,
                 namespace=ns,
@@ -127,7 +127,7 @@ def memory_recall(
                 k=k,
                 store=st,
             )
-    except (TemporalParseError, ValueError) as exc:
+    except (TemporalParseError, UnknownNamespaceError, ValueError) as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns, "query": query})
     return _json({"namespace": ns, "query": query, "hits": [h.as_dict() for h in hits]})
 
@@ -144,11 +144,11 @@ def memory_timeline(
     ns = resolve_namespace(namespace)
     limit = clamp_limit(limit, default=50)
     try:
-        with Store(ns) as st:
+        with open_existing(ns) as st:
             rows = st.events(
                 session_id=session, since=since, until=until, clock=clock, limit=limit
             )
-    except ValueError as exc:
+    except (UnknownNamespaceError, ValueError) as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
     return _json({"namespace": ns, "events": rows})
 
@@ -160,12 +160,15 @@ def memory_health(namespace: Optional[str] = None) -> str:
 
     ns = resolve_namespace(namespace)
     es = embed_state()
-    with Store(ns) as st:
-        stats = st.stats()
-        vec_info: dict = {"ok": st.vec_ok()}
-        ver = st.vec_version()
-        if ver:
-            vec_info["version"] = ver
+    try:
+        with open_existing(ns) as st:
+            stats = st.stats()
+            vec_info: dict = {"ok": st.vec_ok()}
+            ver = st.vec_version()
+            if ver:
+                vec_info["version"] = ver
+    except UnknownNamespaceError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     return _json(
         {
             "namespace": ns,
@@ -195,8 +198,11 @@ def memory_session_end(
     session: Optional[str] = None,
 ) -> str:
     ns = resolve_namespace(namespace)
-    with Store(ns) as st:
-        result = st.end_session(session)
+    try:
+        with open_existing(ns) as st:
+            result = st.end_session(session)
+    except UnknownNamespaceError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     payload = {
         "ok": bool(result.get("ok")),
         "namespace": ns,
@@ -222,8 +228,11 @@ def memory_worldview(
     ns = resolve_namespace(namespace)
     facts_cap = clamp_limit(facts_cap, default=12)
     names_cap = clamp_limit(names_cap, default=12)
-    with Store(ns) as st:
-        wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
+    try:
+        with open_existing(ns) as st:
+            wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
+    except UnknownNamespaceError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     return _json(wv)
 
 
@@ -247,31 +256,34 @@ def memory_procedure(
     if action not in valid_actions:
         return _json({"ok": False, "error": f"unknown action '{action}', must be one of: {', '.join(valid_actions)}"})
     ns = resolve_namespace(namespace)
-    with Store(ns) as st:
-        if action == "write":
-            if not name:
-                return _json({"ok": False, "error": "name is required for write"})
-            if not body:
-                return _json({"ok": False, "error": "body is required for write"})
+    if action == "write":
+        if not name:
+            return _json({"ok": False, "error": "name is required for write"})
+        if not body:
+            return _json({"ok": False, "error": "body is required for write"})
+        with Store(ns) as st:
             r = st.procedure_write(name, body, trigger=trigger or "", origin=origin)
-            return _json({
-                "ok": True,
-                "action": "write",
-                "memory_id": r.memory_id,
-                "event_id": r.event_id,
-                "namespace": ns,
-                "name": name,
-            })
-        elif action == "get":
-            if not name:
-                return _json({"ok": False, "error": "name is required for get"})
-            proc = st.procedure_get(name)
-            if not proc:
-                return _json({"ok": False, "error": f"procedure '{name}' not found"})
-            return _json({"ok": True, "action": "get", "namespace": ns, "procedure": proc})
-        else:
+        return _json({
+            "ok": True,
+            "action": "write",
+            "memory_id": r.memory_id,
+            "event_id": r.event_id,
+            "namespace": ns,
+            "name": name,
+        })
+    try:
+        with open_existing(ns) as st:
+            if action == "get":
+                if not name:
+                    return _json({"ok": False, "error": "name is required for get"})
+                proc = st.procedure_get(name)
+                if not proc:
+                    return _json({"ok": False, "error": f"procedure '{name}' not found"})
+                return _json({"ok": True, "action": "get", "namespace": ns, "procedure": proc})
             procs = st.procedure_list()
             return _json({"ok": True, "action": "list", "namespace": ns, "procedures": procs})
+    except UnknownNamespaceError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
 
 
 @server.tool(
@@ -288,8 +300,11 @@ def memory_purge(
     namespace: Optional[str] = None,
 ) -> str:
     ns = resolve_namespace(namespace)
-    with Store(ns) as st:
-        result = st.purge(memory_id)
+    try:
+        with open_existing(ns) as st:
+            result = st.purge(memory_id)
+    except UnknownNamespaceError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     result["namespace"] = ns
     return _json(result)
 
@@ -307,8 +322,11 @@ def memory_contradict(
     origin: str = "mcp",
 ) -> str:
     ns = resolve_namespace(namespace)
-    with Store(ns) as st:
-        result = st.contradict(memory_id, replacement=replacement, origin=origin)
+    try:
+        with open_existing(ns) as st:
+            result = st.contradict(memory_id, replacement=replacement, origin=origin)
+    except UnknownNamespaceError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     result["namespace"] = ns
     return _json(result)
 

@@ -102,11 +102,13 @@ def test_health_mcp_includes_db_path_and_namespace(tmp_path, monkeypatch):
     from haunt import embed
     from haunt.mcp_server import memory_health
     from haunt.paths import ensure_layout
-    from haunt.store import init_registry
+    from haunt.store import Store, init_registry
 
     embed.reset()
     ensure_layout()
     init_registry()
+    with Store("mcp-health-test") as st:
+        st.observe("health path canary", origin="test")
 
     raw = memory_health(namespace="mcp-health-test")
     data = json.loads(raw)

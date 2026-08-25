@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Literal
 
 from haunt.recall import Hit, recall
-from haunt.store import Store
+from haunt.store import Store, open_existing
 from haunt.temporal import TemporalQuery, compile
 from haunt.util import clamp_k, iso_or_now, normalize_clock, utc_iso
 
@@ -180,7 +180,7 @@ def _hits_from_events(store: Store, events: list[dict], *, limit: int) -> list[H
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.event_id=? AND m.valid_to IS NULL
-            ORDER BY m.created_at DESC
+            ORDER BY m.created_at DESC, m.rowid DESC
             LIMIT 1
             """,
             (ev["id"],),
@@ -418,7 +418,7 @@ def planned_recall(
             confidence=tq.confidence,
         )
     own = store is None
-    store = store or Store(namespace or "default")
+    store = store or open_existing(namespace or "default")
     try:
         return execute(
             tq,
