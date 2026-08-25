@@ -186,7 +186,7 @@ def _hits_from_events(
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.event_id=? AND m.valid_to IS NULL
-            ORDER BY m.created_at DESC, m.rowid DESC
+            ORDER BY m.created_at DESC, m.rowid DESC, m.id ASC
             LIMIT 1
             """,
             (ev["id"],),
@@ -267,7 +267,13 @@ def run_timeline(
             if nxt <= offset:
                 break
             offset = nxt
-    hits = list(merged.values())[:limit]
+    # Preserve chronological order. Only exact values on the selected clock
+    # fall back to the stable memory ID; never sort timeline hits by ID alone.
+    hits = list(merged.values())
+    hits.sort(key=lambda hit: hit.memory_id)
+    time_attr = "ts" if _clocks(chosen)[0] == "storage_time" else "event_time"
+    hits.sort(key=lambda hit: getattr(hit, time_attr) or "", reverse=True)
+    hits = hits[:limit]
     for final_rank, hit in enumerate(hits, start=1):
         hit.final_rank = final_rank
     return hits
@@ -304,7 +310,7 @@ def run_recall(
             prev = merged.get(h.memory_id)
             if prev is None or h.score > prev.score:
                 merged[h.memory_id] = h
-    ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)
+    ranked = sorted(merged.values(), key=lambda h: (-h.score, h.memory_id))
     hits = ranked[:k]
     for final_rank, hit in enumerate(hits, start=1):
         hit.final_rank = final_rank
@@ -326,9 +332,10 @@ def run_union(
     """C: union of timeline(window, clock) and windowed recall."""
     k = clamp_k(k)
     by_id: dict[str, Hit] = {}
-    for h in run_timeline(
+    timeline = run_timeline(
         tq, store, session_id=session_id, limit=timeline_limit, clock=clock
-    ):
+    )
+    for h in timeline:
         by_id[h.memory_id] = h
     for h in run_recall(
         tq, store, as_of=as_of, tier=tier, k=k, clock=clock, namespace=namespace
@@ -336,8 +343,19 @@ def run_union(
         prev = by_id.get(h.memory_id)
         if prev is None or h.score > prev.score:
             by_id[h.memory_id] = h
-    ranked = sorted(by_id.values(), key=lambda h: h.score, reverse=True)
-    hits = ranked[:k]
+    ranked = sorted(
+        (hit for hit in by_id.values() if hit.vec_rank is not None or hit.fts_rank is not None),
+        key=lambda hit: (-hit.score, hit.memory_id),
+    )
+    # Unranked timeline rows remain in their already chronological order.
+    timeline_hits = [
+        hit
+        for hit in timeline
+        if by_id.get(hit.memory_id) is hit
+        and hit.vec_rank is None
+        and hit.fts_rank is None
+    ]
+    hits = (ranked + timeline_hits)[:k]
     for final_rank, hit in enumerate(hits, start=1):
         hit.final_rank = final_rank
     return hits

@@ -4251,9 +4251,9 @@ class Store:
             sql += f" AND {col}<=?"
             params.append(iso_or_now(until))
         if normalize_clock(clock) == "storage_time":
-            sql += " ORDER BY ts DESC, event_time DESC, rowid DESC LIMIT ? OFFSET ?"
+            sql += " ORDER BY ts DESC, id ASC LIMIT ? OFFSET ?"
         else:
-            sql += " ORDER BY event_time DESC, ts DESC, rowid DESC LIMIT ? OFFSET ?"
+            sql += " ORDER BY event_time DESC, id ASC LIMIT ? OFFSET ?"
         params.append(clamp_limit(limit, default=100))
         try:
             off = int(offset)

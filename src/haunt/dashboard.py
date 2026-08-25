@@ -937,7 +937,14 @@ async def api_recall_all(request: Request) -> JSONResponse:
         hit_map[key] = (h, ns_name)
         rrf[key] = h.score
 
-    ranked = sorted(rrf.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    ranked = sorted(
+        rrf.items(),
+        key=lambda item: (
+            -item[1],
+            hit_map[item[0]][1],
+            hit_map[item[0]][0].memory_id,
+        ),
+    )[:k]
     results = []
     for final_rank, (key, score) in enumerate(ranked, start=1):
         h, ns_name = hit_map[key]

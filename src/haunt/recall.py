@@ -245,7 +245,7 @@ def _fts_hits(
         JOIN events e ON e.id = m.event_id
         WHERE memories_fts MATCH ?
           AND {where}
-        ORDER BY f.rank
+        ORDER BY f.rank, f.id
         LIMIT ?
     """
     try:
@@ -277,7 +277,7 @@ def _vec_hits(
                 WHERE v.embedding MATCH ?
                   AND k = ?
                   AND {where}
-                ORDER BY v.distance
+                ORDER BY v.distance, v.id
             """
             try:
                 rows = conn.execute(sql, [blob, limit, *params]).fetchall()
@@ -299,7 +299,7 @@ def _vec_hits(
         if len(vec) != len(query_vec):
             continue
         scored.append((r["mid"], _l2(query_vec, vec)))
-    scored.sort(key=lambda x: x[1])
+    scored.sort(key=lambda x: (x[1], x[0]))
     return [
         (mid, i + 1, dist, "l2_distance")
         for i, (mid, dist) in enumerate(scored[:limit])
@@ -360,7 +360,7 @@ def recall(
             rrf[mid] = rrf.get(mid, 0.0) + 1.0 / (RRF_K + rank)
             fts_rank[mid] = (rank, raw)
 
-        ranked = sorted(rrf.items(), key=lambda kv: kv[1], reverse=True)[: int(k)]
+        ranked = sorted(rrf.items(), key=lambda kv: (-kv[1], kv[0]))[: int(k)]
         hits: list[Hit] = []
         for final_rank, (mid, score) in enumerate(ranked, start=1):
             row = store.conn.execute(

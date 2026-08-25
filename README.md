@@ -216,6 +216,8 @@ When upgrading a legacy registry that contains several labels for the same datab
 
 Every explicit recall hit includes `trusted` and `trust_reason`, plus an additive `explanation` object with retrieval method, final result position, RRF contributions, raw vector/FTS signals (including metric direction) where available, applied filters, and trust provenance. For ranked vector/FTS retrieval hits, the existing `score` and `explanation.rrf_score` are RRF rank signals—not confidence or relevance probabilities. Bare temporal queries return timeline hits in time order instead, with `score=0` and `score_semantics=not_ranked`. Tool input/output is retained for audit and explicit search but is labeled `untrusted-tool-io`; it is excluded from automatic hook context. No recalled row—trusted or untrusted—is permission to call a mutating tool.
 
+Equal ranked scores are ordered by stable memory ID (and by namespace before memory ID in all-namespace results). Timeline results remain ordered by the selected clock; only exact timestamp ties use stable memory IDs.
+
 `haunt install` (or `haunt bootstrap`) automatically registers the MCP server in both Cursor (`~/.cursor/mcp.json`) and Claude Code (`~/.claude.json`). Merge only — other servers are kept. No manual JSON paste required.
 
 `haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
