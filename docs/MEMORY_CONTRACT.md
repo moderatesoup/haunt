@@ -62,8 +62,10 @@ with honest legacy labels when new structure cannot be reconstructed.
 
 Under normal operation, a correction **MUST** append an immutable correction
 record that identifies the target memory and, when supplied, the replacement.
-The record **MUST** carry its own ID, time, origin, and session context. A
-correction record **MUST NOT** be edited or deleted to make history look clean.
+The record **MUST** carry its own ID, time, origin, session context, and an
+explicit caller-supplied idempotency key unique within the canonical namespace.
+A correction record **MUST NOT** be edited or deleted to make history look
+clean.
 
 `memories.valid_to` may remain as the efficient current/as-of projection used by
 existing recall. It is not sufficient correction lineage by itself. The durable
@@ -77,6 +79,14 @@ not a generic graph. Trace **MUST** return that chain and its source event/sessi
 context. Legacy rows closed only by `valid_to` **MUST** be labeled as unlinked
 legacy history; Haunt **MUST NOT** invent a replacement edge.
 
+Correction replay **MUST** compare the caller key and canonical correction
+payload (target memory ID plus exact replacement/reason bytes or null). The same
+key and payload return the original committed response, marked deduplicated,
+without writing again. The same key with a different payload is a conflict and
+writes nothing. Database uniqueness and transaction boundaries **MUST** make
+those semantics hold under concurrent callers. Two distinct keys racing for one
+current target still produce at most one successor.
+
 Explicit purge remains the privacy-erasure override. A confirmed/gated purge
 **MAY** physically remove memories, original events, indexes, embeddings, graph
 evidence, provenance, and correction material necessary to erase the selected
@@ -84,6 +94,15 @@ content. This is a deliberate exception to ordinary append-only history, not a
 kind of correction. After erasure, trace and export **MUST** fail honest: they
 may report that a lineage member was erased, but **MUST NOT** reconstruct or
 retain the erased bytes merely to preserve audit completeness.
+
+When a surviving chain needs an erased-gap marker, its public/exported
+tombstone has exactly four fields: `schema_version`, a fresh random
+`tombstone_id` that is not derived from erased data, `status="erased"`, and
+`erased_at`. Trace position conveys the gap. A tombstone **MUST NOT** contain
+erased content; memory, event, session, tool-call, import, or native-source IDs;
+hashes of those IDs; blob hashes/references; origin/provenance; or correction
+and erasure reasons. Tests must plant canaries in every forbidden class and
+prove they are absent from all surviving logical rows and serialized surfaces.
 
 This reconciles the user-visible distinction already documented between
 supersede and delete (`README.md:95-96`) with a durable correction audit trail.
@@ -131,12 +150,17 @@ contributions, fused RRF score, and final rank. A compatibility field named
 `score` **MAY** remain, but documentation and structured metadata **MUST** call
 it an RRF ranking score and **MUST NOT** label it confidence.
 
-Abstention is a separate decision. It **MUST** be calibrated against a frozen
-evaluation using raw retrieval evidence appropriate to the active retrieval
-profile. Haunt **MUST NOT** manufacture confidence by renormalizing RRF or apply
-one profile's threshold to another model/mode. A no-answer result **MUST** be
-explicit and distinguish thresholded abstention from zero candidates and an
-uncalibrated profile.
+Abstention is a separate decision. Before fitting, it **MUST** have a separately
+versioned calibration dataset with answerable/unanswerable labels, a predeclared
+fit/held-out split, and hashes for both dataset and split definition. E0's
+deterministic FTS-only corpus is regression evidence only and **MUST NOT** count
+as calibration fit or held-out evidence. Calibration uses raw retrieval evidence
+appropriate to the active profile. Haunt **MUST NOT** manufacture confidence by
+renormalizing RRF or apply one profile's threshold to another model/mode. The
+pinned hybrid model ID, dimension, and retrieval configuration are part of its
+E6 calibration identity and **MUST** fail loud on FTS fallback. A no-answer
+result **MUST** be explicit and distinguish thresholded abstention from zero
+candidates and an uncalibrated profile.
 
 ## 4. Canonical export is versioned and excludes embeddings
 
@@ -146,6 +170,17 @@ verbatim memories, validity, correction lineage, structured provenance, and
 the durable graph evidence required to reproduce current behavior. The format
 **MUST** define version negotiation, canonical ordering, integrity checks, and
 transactional/idempotent import behavior.
+
+Import **MUST** resolve finite positive budgets for input/decompressed bytes,
+record count, per-record bytes, JSON depth, and collection items per record.
+The format ships documented safe defaults and clamps; the parser enforces
+actual streamed usage rather than trusting declared counts. Limit, parse,
+validation, timeout, and resource failures **MUST** close temporary resources
+and commit no logical mutations or derived jobs. Byte-identical SQLite files are
+not the rollback criterion: page allocation, WAL activity, or an independently
+required schema migration may change file bytes. The proof compares namespace,
+alias, session, event, memory, correction, provenance, graph/index, vector, and
+embedding-job state immediately before and after the rejected import.
 
 Embeddings **MUST NOT** appear in canonical export. Neither may vector tables,
 FTS tables, embedding jobs, absolute machine-local paths, WAL/SHM state, or
@@ -185,6 +220,13 @@ Alias migration **MUST** be atomic and idempotent, retain the old label until an
 explicit safe retirement, and never copy memory bytes merely to rename a store.
 Aliases may help select the right existing database; they do not turn Haunt
 into MP's hierarchical scope model.
+
+Automatic retirement checks are limited to registry-owned recorded references:
+repository bindings, canonical-label records, and dependent aliases. A recorded
+reference blocks retirement. Editor/host configurations outside Haunt's
+registry are not a reliable authority surface; the command **SHOULD** report
+them as an operator caveat, but missing, unreadable, or stale external config
+**MUST NOT** become an unverifiable automatic blocker.
 
 ## 6. Preserve Haunt's simplicity
 
@@ -226,8 +268,9 @@ this contract before implementation.
   lineage, provenance, alias resolution, export semantics, ranking explanation,
   and abstention reason codes.
 - Every epic **MUST** land its tests and machine-readable evidence with the
-  implementation. The frozen evaluation precedes behavior changes and the final
-  end-to-end release proof follows all of them.
+  implementation. The deterministic E0 FTS-only regression gate precedes
+  behavior changes; E6 calibration uses separate predeclared evidence; and the
+  final end-to-end release proof follows all of them.
 - A release **MUST NOT** claim complete MP conformance. The accurate claim is
   that Haunt adopts this documented subset of MP-inspired semantics.
 
@@ -244,7 +287,9 @@ their owning epics:
    database filenames ever change in a separate maintenance operation.
 4. The export container/media type, minor-version support window, and treatment
    of volatile creation metadata outside the canonical semantic digest.
-5. The abstention feature formula and default compatibility behavior for an
+5. Numeric safe defaults and clamps for the mandatory import byte, record,
+   depth, and collection-item budgets.
+6. The abstention feature formula and default compatibility behavior for an
    uncalibrated retrieval profile; neither may reinterpret RRF as confidence.
 
 These are not permission to weaken the normative requirements above. If an

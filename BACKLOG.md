@@ -12,14 +12,20 @@ reader LLM or distillation pipeline (`README.md:3`, `README.md:239-243`).
 ## Status key
 
 - **Ready**: all dependencies are complete; implementation may start.
+- **In progress**: an implementation branch exists, but acceptance evidence has
+  not yet landed with this backlog.
 - **Blocked**: a listed dependency is incomplete.
 - **Done**: every acceptance criterion is met and the evidence is committed.
+
+The integration commit for an epic must change its status to **Done** and link
+the committed evidence. A downstream epic remains **Blocked** until that status
+change lands; work on a branch is not completion.
 
 ## Current baseline
 
 | Area | Existing behavior | Adoption gap |
 |---|---|---|
-| Evaluation | Temporal probes exist, but the optional LongMemEval script skips without an external file and its hit test accepts any non-empty result (`scripts/score_lme_temporal.py:74-154`). | A committed, immutable corpus and non-vacuous relevance/negative-query assertions. |
+| Evaluation | Temporal probes exist, but the optional LongMemEval script skips without an external file and its hit test accepts any non-empty result (`scripts/score_lme_temporal.py:74-154`). A deterministic FTS-only `K=3` regression gate with logical-ID normalization and corpus/config hashes is in flight on the E0 implementation branch. | Land the exact normalized result lock and its non-vacuous tests, then mark E0 done. Hybrid calibration belongs to E6. |
 | Correction | `Store.contradict()` updates `memories.valid_to` and may add an unlinked replacement (`src/haunt/store.py:1502-1565`); current recall hides closed rows (`src/haunt/recall.py:93-123`). | An append-only correction record and traversable old-to-new lineage. |
 | Provenance | Events carry session, time, role, tool fields, an `origin` string, and free-form `meta` (`src/haunt/store.py:131-164`, `src/haunt/store.py:569-659`). | A validated, structured source/import envelope and a trace surface. |
 | Namespace identity | Repository remotes derive collision-resistant names and legacy registrations are reused (`src/haunt/paths.py:56-117`, `src/haunt/paths.py:148-178`). | Explicit aliases, rename/move migration, collision handling, and retirement rules. |
@@ -37,47 +43,55 @@ keeps the final proof representative of the exact shipped sequence.
 
 ## E0 — Freeze the retrieval evaluation
 
-**Status:** Ready
+**Status:** In progress
 
 **Depends on:** none
 
-**Outcome:** A small, repository-owned evaluation is the fixed comparison point
-for every later epic.
+**Outcome:** A small, repository-owned, deterministic FTS-only gate is the fixed
+regression comparison for every later epic without requiring embeddings.
 
 **Acceptance criteria**
 
-- Commit a versioned evaluation manifest, deterministic ingest fixtures, query
-  cases, expected relevant memory IDs, and expected-unanswerable cases. Each
-  file has a SHA-256 recorded in the manifest.
-- Give every fixture a fixed memory/event identifier and UTC event, valid, and
-  storage time; the evaluator must not read wall-clock time.
+- Commit a versioned corpus and evaluation configuration. Record the SHA-256 of
+  the canonical corpus and the canonical configuration; individual fixture
+  files do not need separate manifest entries.
+- Give fixture memories stable logical IDs. Ingest them through normal Haunt
+  writes, capture the generated physical memory IDs, and map returned results
+  back to logical IDs before comparison. Physical IDs and storage timestamps
+  are intentionally generated and excluded from the result lock.
+- Fix only semantic timestamps needed by temporal cases. The evaluator must not
+  use wall-clock time to interpret a query or expected result.
 - Cover exact lexical lookup, paraphrase, temporal current/as-of behavior,
   superseded content, tool-I/O trust, namespace isolation, and out-of-corpus
   queries. Every category has at least one positive and one negative control.
-- Score relevance by expected IDs, not merely by non-empty output. Report at
-  least recall@1, recall@5, reciprocal rank, false-positive count on
-  unanswerable cases, and the count of evaluated cases.
-- Freeze an FTS-only profile that runs in normal CI. Freeze a hybrid profile
-  with its embedding model ID and dimension; its baseline artifact may run in
-  a dedicated release job, but it may not silently fall back to FTS-only.
-- Write baseline results as a committed machine-readable artifact containing
-  the manifest hash, Haunt revision, configuration, per-case result, and
-  aggregate metrics. Updating a fixture or expected answer requires an
-  explicit manifest version bump and a reviewed baseline diff.
+- Declare `K` in the configuration (`K=3` for the current gate). Score by
+  expected logical IDs, report Recall@K as Recall@3, and reject a result merely
+  because it is non-empty when its IDs or order are wrong.
+- Lock the exact ordered logical-ID result list for every query, including `[]`
+  for designated no-hit cases, plus aggregate Recall@3 and evaluated-case count.
+  The committed result lock records the corpus hash and configuration hash; it
+  does not depend on a Haunt revision or generated database metadata.
+- Run with `HAUNT_FTS_ONLY=1` in normal CI and assert that no vector model/stage
+  ran. Changing the corpus, configuration, or expected result requires a
+  reviewed version/hash and result-lock update.
 
 **Tests/evidence**
 
-- A test mutates one expected relevant ID and proves the evaluator fails.
-- A test removes all returned hits and proves the positive controls fail.
-- A test returns a hit for every query and proves the negative controls fail.
-- CI publishes the FTS-only report; release evidence publishes the pinned
-  hybrid report and verifies the declared model was actually loaded.
+- Two fresh-store runs generate different physical IDs but produce the same
+  exact ordered logical-ID results and Recall@3.
+- Mutating an expected logical ID/order, corpus hash, configuration hash, or
+  declared `K` makes the gate fail.
+- Removing all hits fails positive controls; returning a hit for every query
+  fails the exact `[]` locks.
+- CI runs and publishes the FTS-only gate with the resolved `K`, corpus hash,
+  configuration hash, exact per-query results, and aggregate Recall@3.
 
 **Non-goals**
 
 - Claiming benchmark leadership, vendoring a restricted third-party corpus, or
   using an LLM judge.
-- Tuning ranking or abstention in this epic.
+- Embeddings, hybrid evaluation, calibration, or tuning ranking/abstention.
+  Those belong to E6, so E0 never blocks E1 on model availability.
 
 ## E1 — Add append-only correction lineage and trace
 
@@ -93,8 +107,9 @@ that lineage.
 
 - Add an additive schema migration for a correction record with its own stable
   ID, target memory ID, optional replacement memory ID, timestamp, origin,
-  session ID, and optional reason. Normal correction code only inserts these
-  records; it never edits or deletes a correction record.
+  session ID, optional reason, and caller-supplied idempotency key. The key is
+  non-empty, bounded, and unique within the canonical namespace. Normal
+  correction code only inserts these records; it never edits or deletes one.
 - Make correction plus optional replacement atomic. A failed replacement write
   leaves no correction record and leaves the target current, preserving the
   atomicity guarantee already tested around `Store.contradict()`.
@@ -102,13 +117,24 @@ that lineage.
   the correction record the durable source of lineage. Existing pre-migration
   `valid_to` rows remain readable and are honestly labeled `legacy_unlinked`
   when no link can be recovered.
+- Define replay over the explicit idempotency key. The canonical payload is the
+  target memory ID plus exact replacement/reason bytes or null. Same namespace,
+  key, and payload returns the originally committed response with
+  `deduplicated=true` and writes nothing. Reusing the key with a different
+  canonical payload returns an idempotency conflict and writes nothing.
 - Prevent forks under normal operation: a current target may receive at most
-  one direct correction. Repeating the same request is idempotent; attempting a
-  different second correction fails without partial writes.
+  one direct correction. Two different keys racing to correct the same target
+  yield exactly one success and one already-superseded conflict.
 - Add a trace API used by CLI/MCP/dashboard detail that returns the ordered
   correction chain, source event/session identifiers, and an explicit status
   for a lineage member removed by privacy purge. Trace must never invent the
   erased bytes.
+- If purge leaves a gap needed to trace a surviving chain, replace the public
+  gap with an allowlisted tombstone containing only `schema_version`, a fresh
+  random `tombstone_id` not derived from erased data, `status="erased"`, and
+  `erased_at`. Its position in the trace conveys the gap. It contains no erased
+  content, memory/event/session/tool-call/import/native-source IDs, ID hashes,
+  blob hashes/references, origin/provenance, or correction/erasure reason.
 - Preserve historical recall: current recall returns only the chain tip, while
   an `as_of` before correction can return the prior memory.
 
@@ -117,9 +143,17 @@ that lineage.
 - Migration tests open a schema-v3 database, correct a legacy memory, restart,
   and recover the same lineage.
 - Positive tests cover correction with and without replacement, a three-link
-  chain, idempotent replay, concurrent attempts, and trace after restart.
+  chain, and trace after restart. Replay tests cover same-key/same-payload and
+  same-key/different-payload behavior before and after restart.
+- Concurrency tests cover same-key/same-payload callers, same-key/different-
+  payload callers, and different keys targeting one memory; each asserts exact
+  committed row counts and responses.
 - Failure-injection tests prove atomic rollback. A mutation test that removes
   the lineage insert must fail the trace assertion.
+- Erasure tests plant unique canaries in content, every source identifier, blob
+  hash, origin/provenance, and reasons; after purge, surviving database rows,
+  trace JSON, dashboard/MCP output, and export contain none of them. A response
+  schema test rejects any tombstone key outside the four-field allowlist.
 - Existing temporal and purge suites remain green.
 
 **Non-goals**
@@ -198,8 +232,11 @@ broadening access.
   the process's canonical namespace identity, not granted by possession of an
   alias string. Admin status and purge permission remain separate controls
   (`src/haunt/mcp_server.py:70-113`).
-- Support a documented alias-retirement check that refuses retirement while a
-  registered repository or installed host still resolves through that alias.
+- Support a documented alias-retirement check over registry-owned recorded
+  references only. It refuses retirement while a registry repository binding,
+  canonical-label record, or dependent alias still needs the candidate alias.
+  Host/editor configuration outside the registry is reported as an operator
+  caveat to inspect; it is not an unverifiable automatic blocker.
 - Prove that two clones of the same normalized remote resolve to one canonical
   namespace, while same-leaf repositories with different remotes remain
   distinct.
@@ -208,6 +245,9 @@ broadening access.
 
 - Fresh, upgraded, rename, move, remote URL form, truncation/hash, collision,
   retirement, typo-read, and concurrent-migration tests.
+- Retirement tests cover every registry-owned reference class and prove a
+  missing/unreadable external host configuration can only produce the caveat,
+  not a false registry reference or permanent refusal.
 - Security tests bind an ordinary MCP process to namespace A and prove that an
   alias for namespace B cannot be used to read or mutate B.
 - Filesystem evidence shows migration does not duplicate or rename the
@@ -248,6 +288,17 @@ and retain the canonical memory semantics and audit information.
   unsupported major version, malformed digest, alias collision, duplicate ID
   with different bytes, or invalid provenance before any destination mutation.
   Accept known older minor versions through explicit migrations.
+- Every import resolves finite positive budgets for input/decompressed bytes,
+  total records, bytes per record, JSON nesting depth, and collection items per
+  record. Safe defaults and clamps are committed with the format; CLI/API output
+  reports the resolved limits. Declared counts are preflight hints only—the
+  streaming parser enforces actual counts/bytes/depth and aborts on overrun.
+  Compressed input, if supported, is charged by decompressed bytes.
+- Limit, parse, validation, timeout, or resource-exhaustion failure rolls back
+  the transaction and closes any temporary resources. It may change SQLite
+  allocation/WAL bytes, but it commits no new or changed namespace, alias,
+  session, event, memory, correction, provenance, graph, FTS, vector, or
+  embedding-job rows.
 - After import into a fresh home, event/memory IDs, verbatim content, current
   and as-of recall membership, trace lineage, timestamps, trust labels,
   provenance, and namespace resolution match the source. Re-export has the same
@@ -257,11 +308,16 @@ and retain the canonical memory semantics and audit information.
 
 - Golden-bundle schema tests and a source -> export -> fresh import -> export
   comparison in FTS-only mode.
-- A pinned hybrid test proves excluded embeddings are regenerated and recall
-  works without requiring source-model compatibility.
-- Failure tests corrupt each record class and prove the destination remains
-  byte-for-byte unchanged. A purge test proves erased content is absent from
-  the bundle and cannot reappear after import.
+- A deterministic stub-embedding test proves excluded embeddings are queued or
+  rebuilt without requiring source-model compatibility. The pinned real hybrid
+  profile is exercised in E6.
+- Boundary tests cover each resolved input/record/byte/depth/item limit, false
+  declared counts, decompression expansion when applicable, timeout, and parser
+  cleanup. They assert no committed logical mutations or jobs; byte-identical
+  SQLite files are explicitly not the proof.
+- Failure tests corrupt each record class and assert the same logical rollback.
+  A purge test proves erased content is absent from the bundle and cannot
+  reappear after import.
 
 **Non-goals**
 
@@ -316,7 +372,7 @@ machine-readable retrieval evidence.
 
 **Status:** Blocked
 
-**Depends on:** E5 (and the unchanged E0 corpus)
+**Depends on:** E5
 
 **Outcome:** Recall can return an honest no-answer result when retrieval evidence
 does not support the query.
@@ -325,14 +381,22 @@ does not support the query.
 
 - Define an evidence-strength feature set from raw retrieval signals and query
   coverage; do not threshold the RRF rank score as though it were confidence.
-- Calibrate and version separate policies for the frozen FTS-only and pinned
-  hybrid profiles. Each artifact records manifest hash, feature definition,
-  model/configuration ID, threshold, fitting cases, held-out cases, and metrics.
-- Select thresholds using only the fitting split. On the frozen held-out split,
+- Before fitting, commit a separately versioned calibration dataset with
+  answerable/unanswerable labels and a predeclared immutable fit/held-out split.
+  Record the canonical dataset hash and split-definition hash. E0's corpus is a
+  regression lock only and must not count as fitting or held-out evidence.
+- Define the pinned hybrid profile here, including embedding model ID, dimension,
+  retrieval configuration, and fail-loud proof that it did not fall back to
+  FTS-only. Calibrate/version separate policies for the FTS-only and pinned
+  hybrid profiles.
+- Each calibration artifact records dataset/split hashes, feature definition,
+  profile/model ID, threshold, fit-case metrics, held-out metrics, and the exact
+  implementation/configuration versions needed to reproduce the features.
+- Select thresholds using only the predeclared fitting split. On the held-out split,
   abstain on 100% of designated unanswerable cases while retaining at least 95%
   of answerable cases whose relevant memory ranked in the pre-abstention top 5.
-  If the corpus is too small to support those gates, expand and re-freeze E0 in
-  a separately reviewed change before tuning.
+  If the calibration dataset is too small to support those gates, version and
+  review an expanded E6 dataset/split before fitting; do not repurpose E0.
 - Return an explicit structured result with `abstained`, a stable reason code,
   calibration ID, and the strongest observed evidence. An abstention returns no
   hits; an ordinary zero-candidate query remains distinguishable from a
@@ -346,17 +410,21 @@ does not support the query.
 
 **Tests/evidence**
 
-- Committed calibration and held-out reports, with a script that reproduces
-  their metrics from the frozen manifest.
+- Committed fit and held-out reports for FTS-only and the pinned hybrid profile,
+  with a script that reproduces them from the predeclared dataset/split hashes.
+- A test runs the pinned hybrid profile and asserts the exact model ID and
+  dimension before accepting its calibration result.
 - Boundary tests immediately above, at, and below every threshold; profile
   mismatch tests; and out-of-corpus adversarial queries.
-- A leakage test proves held-out labels are not read while fitting. A mutation
+- A leakage test proves held-out labels are not read while fitting, and a
+  separation test proves E0 cases/results are not calibration inputs. A mutation
   that uses `rrf_score` as the threshold must fail.
 
 **Non-goals**
 
 - Fact confidence, truth verification, source reputation, a reader LLM, or a
   universal threshold shared across retrieval modes/models.
+- Treating the E0 exact-result regression corpus as calibration evidence.
 - Guaranteeing that retained results are correct; abstention controls evidence
   sufficiency, not truth.
 
@@ -383,9 +451,10 @@ and is ready for a normal Haunt release.
 - Pass the full test suite on supported Python versions in FTS-only mode and a
   pinned hybrid release run that asserts the loaded model/dimension. No skipped
   or xfailed adoption test may be counted as evidence.
-- Publish the frozen-eval before/after comparison. Any regression or threshold
-  gate miss blocks release unless the frozen manifest and contract are changed
-  in an explicit reviewed decision.
+- Publish the E0 exact-result/Recall@3 before-and-after comparison and the E6
+  held-out calibration reports. Any regression or threshold gate miss blocks
+  release unless its separately versioned corpus/config or calibration
+  dataset/split and this contract change in an explicit review.
 - Update README, CLI/MCP help, dashboard copy, schema version notes, changelog,
   privacy/export warnings, and recovery guidance to match shipped behavior.
 - Audit the final diff and public surfaces against
@@ -395,8 +464,9 @@ and is ready for a normal Haunt release.
 **Tests/evidence**
 
 - CI logs and machine-readable end-to-end reports name the commit, Python
-  version, platform, retrieval profile, eval manifest hash, export format
-  version, schema version, and calibration ID.
+  version, platform, retrieval profile, E0 corpus/config hashes, E6 calibration
+  dataset/split hashes, export format version, schema version, and calibration
+  ID.
 - A clean install smoke test and an upgrade smoke test both execute public CLI
   and MCP surfaces, not private helper-only shortcuts.
 - Release notes link each epic to its tests and evidence artifact.
