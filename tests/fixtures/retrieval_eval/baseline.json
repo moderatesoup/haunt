@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
-  "dataset_sha256": "a305dbdb0811b3ae512d2c8916466a896d27bbb2bd976f38f44f7073678e5fdc",
-  "config_sha256": "5e1d2977da5a99cacdb5c693a73ee78f23d2ea9a35e8dcaf871428fda0175dab",
+  "schema_version": 2,
+  "dataset_sha256": "838e0efbb4bb63e6dc9b064b71a63307d1a942e14782c1d38f60ac4cc451ea09",
+  "config_sha256": "26eb082f224aa63b358e9ca5f29d75d88ce90d89fbf7b3ae8f37f22058f7f5b9",
   "cases": {
     "lexical_ranking": {
       "returned": [
@@ -23,6 +23,33 @@
       ],
       "first_relevant_rank": 1,
       "empty": false
+    },
+    "porter_stemming": {
+      "returned": [
+        "porter_stemming"
+      ],
+      "relevant": [
+        "porter_stemming"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "tool_io_trust_metadata": {
+      "returned": [
+        "tool_io_capture"
+      ],
+      "relevant": [
+        "tool_io_capture"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false,
+      "returned_metadata": [
+        {
+          "id": "tool_io_capture",
+          "trusted": false,
+          "trust_reason": "untrusted-tool-io"
+        }
+      ]
     },
     "current_supersession": {
       "returned": [
@@ -82,12 +109,12 @@
     }
   },
   "metrics": {
-    "cases": 8,
-    "positive_cases": 7,
+    "cases": 10,
+    "positive_cases": 9,
     "negative_cases": 1,
     "recall_at_3": 1.0,
     "mrr": 1.0,
-    "empty_result_rate": 0.125,
+    "empty_result_rate": 0.1,
     "false_negative_rate": 0.0,
     "false_positive_rate": 0.0
   }

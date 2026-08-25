@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
-from haunt.frozen_retrieval_eval import DEFAULT_BASELINE, evaluate
+import pytest
+
+from haunt import frozen_retrieval_eval
+from haunt.frozen_retrieval_eval import DEFAULT_BASELINE, evaluate, load_corpus
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
@@ -17,13 +21,18 @@ def _snapshot(root: Path) -> dict[str, bytes]:
     }
 
 
+def _assert_matches_baseline(actual: dict, baseline: dict) -> None:
+    """Keep all result fields, including locked trust metadata, exact."""
+    assert actual == baseline
+
+
 def test_frozen_retrieval_baseline():
     """Fail meaningful recall/planner regressions without any model dependency."""
     baseline = json.loads(DEFAULT_BASELINE.read_text(encoding="utf-8"))
     actual = evaluate().as_dict()
 
     # Exact ranked cases catch failures hidden by a superficially stable macro.
-    assert actual == baseline
+    _assert_matches_baseline(actual, baseline)
 
     # Floors document the intended quality bar as well as the historic lock.
     metrics = actual["metrics"]
@@ -33,7 +42,51 @@ def test_frozen_retrieval_baseline():
     assert metrics["false_positive_rate"] == 0.0
 
 
-def test_evaluate_preserves_caller_home_and_is_repeatable(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    [("trusted", True), ("trust_reason", "ordinary-memory")],
+)
+def test_frozen_retrieval_metadata_lock_rejects_trust_drift(
+    monkeypatch, field, drifted_value
+):
+    """A trust-label regression cannot hide behind unchanged logical IDs."""
+    baseline = json.loads(DEFAULT_BASELINE.read_text(encoding="utf-8"))
+    original_run_case = frozen_retrieval_eval._run_case
+
+    def drift_tool_trust(case, memory_ids):
+        result = original_run_case(case, memory_ids)
+        if case["id"] == "tool_io_trust_metadata":
+            assert result["returned"] == ["tool_io_capture"]
+            result["returned_metadata"][0][field] = drifted_value
+        return result
+
+    monkeypatch.setattr(frozen_retrieval_eval, "_run_case", drift_tool_trust)
+    actual = evaluate().as_dict()
+
+    assert actual["cases"]["tool_io_trust_metadata"]["returned"] == [
+        "tool_io_capture"
+    ]
+    with pytest.raises(AssertionError):
+        _assert_matches_baseline(actual, baseline)
+
+
+def test_porter_stemming_case_uses_a_morphological_query():
+    """The fixture queries a Porter variant absent from the indexed text."""
+    corpus = load_corpus()
+    record = next(
+        record for record in corpus["records"] if record["id"] == "porter_stemming"
+    )
+    case = next(case for case in corpus["cases"] if case["id"] == "porter_stemming")
+
+    assert re.search(
+        rf"\\b{re.escape(case['query'])}\\b", record["content"], re.IGNORECASE
+    ) is None
+    assert evaluate().as_dict()["cases"]["porter_stemming"]["returned"] == [
+        "porter_stemming"
+    ]
+
+
+def test_evaluate_preserves_caller_home(tmp_path, monkeypatch):
     """The public evaluator never mutates the caller's home or environment."""
     caller_home = tmp_path / "caller-home"
     monkeypatch.setenv("HAUNT_HOME", str(caller_home))
@@ -54,12 +107,15 @@ def test_evaluate_preserves_caller_home_and_is_repeatable(tmp_path, monkeypatch)
     # intentionally non-evaluation values exactly.
     monkeypatch.delenv("HAUNT_FTS_ONLY")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "caller-selected-model")
-    first = evaluate().as_dict()
-    second = evaluate().as_dict()
+    evaluate()
 
-    assert first == second
     assert os.environ["HAUNT_HOME"] == str(caller_home)
     assert "HAUNT_FTS_ONLY" not in os.environ
     assert os.environ["HAUNT_EMBED_MODEL"] == "caller-selected-model"
     assert _snapshot(caller_home) == before
     embed.reset()
+
+
+def test_two_evaluations_are_identical():
+    """Fresh temporary homes must produce an identical deterministic lock."""
+    assert evaluate().as_dict() == evaluate().as_dict()
