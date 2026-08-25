@@ -127,6 +127,10 @@ def test_end_session_open_session_succeeds(fts_env):
 def test_memory_session_end_nonexistent_is_not_ok(fts_env):
     """Published #22 falsifier: MCP must not return ok:true for a missing session."""
     from haunt.mcp_server import memory_session_end
+    from haunt.store import Store
+
+    with Store("default") as st:
+        st.ensure_session("placeholder-so-default-exists")
 
     missing = "nonexistent-session-xyz"
     data = json.loads(
@@ -169,6 +173,10 @@ def test_memory_session_end_already_ended_is_not_ok(fts_env):
 
 def test_memory_session_end_no_session_is_not_ok(fts_env):
     from haunt.mcp_server import memory_session_end
+    from haunt.store import Store
+
+    with Store("default") as st:
+        st.set_meta("bootstrapped", "1")
 
     data = json.loads(memory_session_end(namespace="default"))
     assert data["ok"] is False, (

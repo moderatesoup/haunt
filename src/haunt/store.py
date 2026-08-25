@@ -26,10 +26,41 @@ from haunt.paths import (
     safe_name,
     tighten_db_files,
 )
-from haunt.util import clamp_limit, clock_sql_column, dumps, iso_or_now, loads, new_id, normalize_clock, now_iso
+from haunt.util import (
+    clamp_limit,
+    clock_sql_column,
+    dumps,
+    iso_or_now,
+    loads,
+    new_id,
+    normalize_clock,
+    now_iso,
+    parse_iso,
+    utc_iso,
+)
 
 ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
+
+# 1: one-time normalize of offset/naive clocks to UTC microseconds.
+SCHEMA_VERSION = 1
+SCHEMA_VERSION_KEY = "schema_version"
+
+_CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("sessions", ("started_at", "ended_at")),
+    ("events", ("ts", "event_time")),
+    ("memories", ("valid_from", "valid_to", "created_at")),
+    ("entities", ("first_seen", "last_seen")),
+    ("relations", ("valid_from", "valid_to")),
+)
+
+
+class UnknownNamespaceError(ValueError):
+    """Raised when a read/mutation targets a namespace that does not exist."""
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(f"unknown namespace: {name}")
 
 
 def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
@@ -168,6 +199,79 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _normalize_clock_value(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if not text:
+        return text
+    try:
+        return utc_iso(parse_iso(text))
+    except (TypeError, ValueError):
+        return text
+
+
+def _normalize_stored_clocks(conn: sqlite3.Connection) -> int:
+    """Rewrite offset/naive timestamps to canonical UTC. Returns rows touched."""
+    changed = 0
+    for table, cols in _CLOCK_COLUMNS:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if not exists:
+            continue
+        rows = conn.execute(
+            f"SELECT rowid, {', '.join(cols)} FROM {table}"
+        ).fetchall()
+        for row in rows:
+            sets: list[str] = []
+            params: list[Any] = []
+            for col in cols:
+                old = row[col]
+                if old is None:
+                    continue
+                new = _normalize_clock_value(old)
+                if new != old:
+                    sets.append(f"{col}=?")
+                    params.append(new)
+            if sets:
+                params.append(row["rowid"])
+                conn.execute(
+                    f"UPDATE {table} SET {', '.join(sets)} WHERE rowid=?",
+                    params,
+                )
+                changed += 1
+    return changed
+
+
+def _schema_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (SCHEMA_VERSION_KEY,)
+    ).fetchone()
+    if not row:
+        return 0
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
+    """Create tables and run one-time migrations. Not invoked per query."""
+    _init_namespace_schema(conn)
+    current = _schema_version(conn)
+    if current >= SCHEMA_VERSION:
+        return
+    if current < 1:
+        _normalize_stored_clocks(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
+    )
+    conn.commit()
+
+
 def ensure_vec_table(conn: sqlite3.Connection, dim: int, *, commit: bool = True) -> bool:
     if dim <= 0 or not _vec_loaded(conn):
         return False
@@ -219,7 +323,7 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
         conn.close()
     ns = _connect(db)
     try:
-        _init_namespace_schema(ns)
+        _ensure_namespace_schema(ns)
         if repo:
             ns.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('repo_path', ?)",
@@ -302,7 +406,7 @@ class Store:
             register_namespace(self.name, repo_path)
         self.db_path = namespace_db_path(self.name)
         self.conn = _connect(self.db_path, create=create)
-        _init_namespace_schema(self.conn)
+        _ensure_namespace_schema(self.conn)
 
     def close(self) -> None:
         self.conn.close()
@@ -613,9 +717,9 @@ class Store:
             sql += f" AND {col}<=?"
             params.append(iso_or_now(until))
         if normalize_clock(clock) == "storage_time":
-            sql += " ORDER BY ts DESC, event_time DESC LIMIT ? OFFSET ?"
+            sql += " ORDER BY ts DESC, event_time DESC, rowid DESC LIMIT ? OFFSET ?"
         else:
-            sql += " ORDER BY event_time DESC, ts DESC LIMIT ? OFFSET ?"
+            sql += " ORDER BY event_time DESC, ts DESC, rowid DESC LIMIT ? OFFSET ?"
         params.append(clamp_limit(limit, default=100))
         try:
             off = int(offset)
@@ -635,7 +739,7 @@ class Store:
             )
         }
         last = self.conn.execute(
-            "SELECT ts, event_time FROM events ORDER BY ts DESC LIMIT 1"
+            "SELECT ts, event_time FROM events ORDER BY ts DESC, rowid DESC LIMIT 1"
         ).fetchone()
         db = Path(self.db_path)
         size = db.stat().st_size if db.exists() else 0
@@ -867,7 +971,7 @@ class Store:
             WHERE m.event_id IN (
                 SELECT id FROM events WHERE session_id = ?
             ) AND m.id != ?
-            ORDER BY m.created_at DESC
+            ORDER BY m.created_at DESC, m.rowid DESC
             LIMIT 20
             """,
             (d["session_id"], memory_id),
@@ -924,7 +1028,7 @@ class Store:
             params.append(iso_or_now(until))
 
         total = self.conn.execute(count_sql, params).fetchone()[0]
-        sql += " ORDER BY m.created_at DESC LIMIT ? OFFSET ?"
+        sql += " ORDER BY m.created_at DESC, m.rowid DESC LIMIT ? OFFSET ?"
         rows = self.conn.execute(sql, params + [limit, offset]).fetchall()
         return {
             "memories": [dict(r) for r in rows],
@@ -951,7 +1055,7 @@ class Store:
                 SELECT m.id, m.content, m.valid_from, m.created_at
                 FROM memories m
                 WHERE m.tier='semantic' AND m.valid_to IS NULL
-                ORDER BY m.created_at DESC
+                ORDER BY m.created_at DESC, m.rowid DESC
                 LIMIT ?
                 """,
                 (facts_cap,),
@@ -966,7 +1070,7 @@ class Store:
                 FROM memories m
                 JOIN events e ON e.id = m.event_id
                 WHERE m.tier='procedural' AND m.valid_to IS NULL AND e.meta LIKE '%"kind": "procedure"%'
-                ORDER BY m.created_at DESC
+                ORDER BY m.created_at DESC, m.rowid DESC
                 """,
             ).fetchall()
         ]
@@ -1032,7 +1136,7 @@ class Store:
               AND m.valid_to IS NULL
               AND json_extract(e.meta, '$.kind') = 'procedure'
               AND json_extract(e.meta, '$.name') = ?
-            ORDER BY m.created_at DESC
+            ORDER BY m.created_at DESC, m.rowid DESC
             LIMIT 1
             """,
             (name,),
@@ -1059,7 +1163,7 @@ class Store:
             WHERE m.tier='procedural'
               AND m.valid_to IS NULL
               AND e.meta LIKE '%"kind": "procedure"%'
-            ORDER BY m.created_at DESC
+            ORDER BY m.created_at DESC, m.rowid DESC
             """,
         ).fetchall()
         out: list[dict[str, Any]] = []
@@ -1145,6 +1249,17 @@ class Store:
         except Exception:
             self.conn.rollback()
             raise
+
+
+def open_existing(name: str, repo_path: str | None = None) -> Store:
+    """Open a registered namespace. Never creates a DB or registry row."""
+    name = safe_name(name)
+    if not namespace_exists(name):
+        raise UnknownNamespaceError(name)
+    try:
+        return Store(name, repo_path=repo_path, create=False)
+    except FileNotFoundError as exc:
+        raise UnknownNamespaceError(name) from exc
 
 
 def get_store(name: str | None = None, repo_path: str | None = None) -> Store:

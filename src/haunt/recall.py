@@ -16,7 +16,7 @@ import sqlite_vec
 
 from haunt.embed import available as embed_available
 from haunt.embed import embed_one
-from haunt.store import Store
+from haunt.store import Store, open_existing
 from haunt.util import clamp_k, clock_sql_column, iso_or_now, snippet
 
 # Match FTS5 unicode61 word characters (letters/digits) plus the same
@@ -204,7 +204,7 @@ def recall(
 ) -> list[Hit]:
     k = clamp_k(k)
     own = store is None
-    store = store or Store(namespace or "default")
+    store = store or open_existing(namespace or "default")
     try:
         store.ensure_current_embeddings()
         where, params = _filters(as_of, since, until, tier, clock)

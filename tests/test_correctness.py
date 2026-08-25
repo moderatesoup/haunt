@@ -14,7 +14,7 @@ from haunt.planner import execute, plan
 from haunt.recall import _fts_match_query, recall
 from haunt.store import Store
 from haunt.temporal import compile
-from haunt.util import clamp_k, format_iso, iso_or_now
+from haunt.util import clamp_k, format_iso, iso_or_now, now_iso, utc_iso
 
 NOW = datetime(2026, 8, 22, 15, 30, 0, tzinfo=timezone.utc)
 
@@ -87,15 +87,32 @@ def test_fts_query_tokenizes_unicode_like_index(fts_env):
         assert any(h.memory_id == jp.memory_id for h in jp_hits)
 
 
+def test_utc_iso_keeps_microseconds():
+    """#67: new clocks retain microseconds and stay UTC."""
+    with_us = datetime(2026, 8, 1, 12, 0, 0, 123456, tzinfo=timezone.utc)
+    whole = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+    assert utc_iso(with_us) == "2026-08-01T12:00:00.123456+00:00"
+    assert utc_iso(whole) == "2026-08-01T12:00:00.000000+00:00"
+    offset = datetime(2026, 8, 1, 10, 0, 0, 1, tzinfo=timezone.utc).astimezone(
+        timezone.utc
+    )
+    assert utc_iso(offset).endswith("+00:00")
+    stamped = now_iso()
+    assert stamped.endswith("+00:00")
+    parsed = datetime.fromisoformat(stamped)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset().total_seconds() == 0
+
+
 def test_offset_timestamps_sort_by_utc_not_text(fts_env):
     """Offsets that mis-order as text must store/order as UTC."""
     later_raw = "2026-08-01T10:00:00-08:00"  # 18:00 UTC
     earlier_raw = "2026-08-01T15:00:00+00:00"  # 15:00 UTC
     assert later_raw < earlier_raw, "precondition: text sort is wrong"
 
-    assert iso_or_now(later_raw) == "2026-08-01T18:00:00+00:00"
-    assert iso_or_now(earlier_raw) == "2026-08-01T15:00:00+00:00"
-    assert format_iso(later_raw) == "2026-08-01T18:00:00+00:00"
+    assert iso_or_now(later_raw) == "2026-08-01T18:00:00.000000+00:00"
+    assert iso_or_now(earlier_raw) == "2026-08-01T15:00:00.000000+00:00"
+    assert format_iso(later_raw) == "2026-08-01T18:00:00.000000+00:00"
 
     with Store("tzorder") as st:
         later = st.observe("later west-coast event", event_time=later_raw, origin="test")
@@ -105,8 +122,8 @@ def test_offset_timestamps_sort_by_utc_not_text(fts_env):
         assert ids[0] == later.event_id
         assert ids[1] == earlier.event_id
         by_id = {r["id"]: r for r in rows}
-        assert by_id[later.event_id]["event_time"] == "2026-08-01T18:00:00+00:00"
-        assert by_id[earlier.event_id]["event_time"] == "2026-08-01T15:00:00+00:00"
+        assert by_id[later.event_id]["event_time"] == "2026-08-01T18:00:00.000000+00:00"
+        assert by_id[earlier.event_id]["event_time"] == "2026-08-01T15:00:00.000000+00:00"
         assert by_id[later.event_id]["event_time"] > by_id[earlier.event_id]["event_time"]
 
 

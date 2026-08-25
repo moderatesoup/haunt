@@ -973,7 +973,7 @@ async def api_event_memories(request: Request) -> JSONResponse:
     event_id = request.path_params["event_id"]
     with Store(name, create=False) as st:
         rows = st.conn.execute(
-            "SELECT id FROM memories WHERE event_id=? ORDER BY created_at DESC",
+            "SELECT id FROM memories WHERE event_id=? ORDER BY created_at DESC, rowid DESC",
             (event_id,),
         ).fetchall()
     mids = [r["id"] for r in rows]

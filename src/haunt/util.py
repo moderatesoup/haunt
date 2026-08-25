@@ -30,10 +30,10 @@ def clamp_k(k: Any, *, default: int = 8) -> int:
 
 
 def utc_iso(dt: datetime) -> str:
-    """Canonical storage/order form: UTC with an explicit +00:00 offset."""
+    """Canonical storage/order form: UTC, microseconds, explicit +00:00."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def now_iso() -> str:

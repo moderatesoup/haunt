@@ -12,7 +12,7 @@ from haunt.bootstrap import bootstrap, format_report
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
-from haunt.store import Store, list_namespaces, register_namespace
+from haunt.store import Store, UnknownNamespaceError, list_namespaces, open_existing, register_namespace
 from haunt.temporal import TemporalParseError
 from haunt.util import clamp_limit, format_iso, snippet
 
@@ -24,6 +24,15 @@ app = typer.Typer(
 
 def _ns(name: Optional[str]) -> str:
     return resolve_namespace(name)
+
+
+def _existing(ns: str) -> Store:
+    """Open an existing namespace or exit 2. Never creates a DB."""
+    try:
+        return open_existing(ns)
+    except UnknownNamespaceError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
 
 
 @app.command("bootstrap")
@@ -119,7 +128,7 @@ def recall_cmd(
     """
     ns = _ns(namespace)
     try:
-        with Store(ns) as st:
+        with _existing(ns) as st:
             hits = planned_recall(
                 query,
                 namespace=ns,
@@ -163,7 +172,7 @@ def timeline_cmd(
     ns = _ns(namespace)
     limit = clamp_limit(limit, default=50)
     try:
-        with Store(ns) as st:
+        with _existing(ns) as st:
             rows = st.events(
                 session_id=session, since=since, until=until, clock=clock, limit=limit
             )
@@ -218,7 +227,7 @@ def health_cmd(
     if es.error:
         typer.echo(f"embed error   {es.error}")
     ns = _ns(namespace)
-    with Store(ns) as st:
+    with _existing(ns) as st:
         vec_ok = st.vec_ok()
         vec_ver = st.vec_version()
         typer.echo(
@@ -247,7 +256,7 @@ def graph_cmd(
 ) -> None:
     """Entities and typed relations (deterministic extract)."""
     ns = _ns(namespace)
-    with Store(ns) as st:
+    with _existing(ns) as st:
         if rebuild:
             report = st.rebuild_graph()
             typer.echo(
@@ -280,7 +289,7 @@ def worldview_cmd(
     ns = _ns(namespace)
     facts_cap = clamp_limit(facts_cap, default=12)
     names_cap = clamp_limit(names_cap, default=12)
-    with Store(ns) as st:
+    with _existing(ns) as st:
         wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
     if json_out:
         typer.echo(_json.dumps(wv, ensure_ascii=False, default=str, indent=2))
@@ -331,7 +340,7 @@ def procedure_get_cmd(
 ) -> None:
     """Retrieve a named procedure."""
     ns = _ns(namespace)
-    with Store(ns) as st:
+    with _existing(ns) as st:
         proc = st.procedure_get(name)
     if not proc:
         typer.echo(f"not found: {name}")
@@ -351,7 +360,7 @@ def procedure_list_cmd(
 ) -> None:
     """List all active procedures."""
     ns = _ns(namespace)
-    with Store(ns) as st:
+    with _existing(ns) as st:
         procs = st.procedure_list()
     if not procs:
         typer.echo("no procedures")
@@ -381,7 +390,7 @@ def delete_cmd(
         raise typer.Exit(2)
     ns = _ns(namespace)
     if event_id:
-        with Store(ns) as st:
+        with _existing(ns) as st:
             rows = st.conn.execute(
                 "SELECT id FROM memories WHERE event_id=?", (event_id,)
             ).fetchall()
@@ -401,13 +410,13 @@ def delete_cmd(
                     f"event={result.get('event_deleted')}"
                 )
         return
-    if not yes:
-        typer.confirm(
-            f"Permanently delete memory {memory_id}? This removes the memory, "
-            "FTS index, vector embedding, graph data, and orphaned events.",
-            abort=True,
-        )
-    with Store(ns) as st:
+    with _existing(ns) as st:
+        if not yes:
+            typer.confirm(
+                f"Permanently delete memory {memory_id}? This removes the memory, "
+                "FTS index, vector embedding, graph data, and orphaned events.",
+                abort=True,
+            )
         result = st.purge(memory_id)
     if not result.get("ok"):
         typer.echo(f"error: {result.get('error', 'unknown')}", err=True)
