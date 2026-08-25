@@ -82,11 +82,12 @@ def test_new_observe_timestamps_have_microseconds(fts_env):
         ).fetchone()
     for value in (row["ts"], row["event_time"], mem["created_at"]):
         assert value.endswith("+00:00")
-        dt = datetime.fromisoformat(value)
         assert "." in value
+        frac = value.split(".", 1)[1].split("+", 1)[0]
+        assert len(frac) == 6 and frac.isdigit()
+        dt = datetime.fromisoformat(value)
         assert dt.tzinfo is not None
         assert dt.utcoffset() == timezone.utc.utcoffset(dt)
-        assert dt.microsecond >= 0
 
 
 def test_legacy_offset_fixture_rewritten_once_and_ordered(fts_env):
@@ -169,6 +170,38 @@ def test_legacy_offset_fixture_rewritten_once_and_ordered(fts_env):
             ),
         )
         st.conn.execute(
+            """
+            INSERT INTO memories(
+                id, event_id, tier, content, embedding, valid_from, valid_to, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                "mem-later",
+                "evt-later",
+                "episodic",
+                "later offset event",
+                None,
+                later_raw,
+                None,
+                later_raw,
+            ),
+        )
+        st.conn.execute(
+            """
+            INSERT INTO entities(id, name, type, norm_name, first_seen, last_seen)
+            VALUES (?,?,?,?,?,?)
+            """,
+            ("ent-1", "LegacyEnt", "thing", "legacyent", later_raw, earlier_raw),
+        )
+        st.conn.execute(
+            """
+            INSERT INTO relations(
+                id, src_entity, rel, dst_entity, event_id, valid_from, valid_to, weight
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            ("rel-1", "ent-1", "mentions", "ent-1", "evt-later", later_raw, None, 1.0),
+        )
+        st.conn.execute(
             "DELETE FROM meta WHERE key=?",
             (SCHEMA_VERSION_KEY,),
         )
@@ -181,6 +214,20 @@ def test_legacy_offset_fixture_rewritten_once_and_ordered(fts_env):
         assert rows["evt-later"]["event_time"] == "2026-08-01T15:00:00.000000+00:00"
         assert rows["evt-earlier"]["event_time"] == "2026-08-01T14:00:00.000000+00:00"
         assert rows["evt-naive"]["event_time"] == "2026-08-01T16:00:00.000000+00:00"
+        mem = st.conn.execute(
+            "SELECT valid_from, created_at FROM memories WHERE id='mem-later'"
+        ).fetchone()
+        assert mem["valid_from"] == "2026-08-01T15:00:00.000000+00:00"
+        assert mem["created_at"] == "2026-08-01T15:00:00.000000+00:00"
+        ent = st.conn.execute(
+            "SELECT first_seen, last_seen FROM entities WHERE id='ent-1'"
+        ).fetchone()
+        assert ent["first_seen"] == "2026-08-01T15:00:00.000000+00:00"
+        assert ent["last_seen"] == "2026-08-01T14:00:00.000000+00:00"
+        rel = st.conn.execute(
+            "SELECT valid_from FROM relations WHERE id='rel-1'"
+        ).fetchone()
+        assert rel["valid_from"] == "2026-08-01T15:00:00.000000+00:00"
         ordered = [r["id"] for r in st.events(limit=10)]
         assert ordered[0] == "evt-naive"
         assert ordered[1] == "evt-later"
@@ -238,6 +285,8 @@ def test_schema_migrate_is_version_gated():
     assert "SCHEMA_VERSION" in src
     assert "_normalize_stored_clocks" in src
     assert "if current >= SCHEMA_VERSION" in src
+    tables = {t for t, _ in store_mod._CLOCK_COLUMNS}
+    assert tables == {"sessions", "events", "memories", "entities", "relations"}
 
 
 def test_procedure_get_same_second_returns_later_write(fts_env, monkeypatch):

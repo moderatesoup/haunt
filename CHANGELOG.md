@@ -4,7 +4,7 @@
 
 New timestamps keep microseconds (or finer) and stay UTC. Opening a namespace runs a schema-versioned one-time rewrite of offset/naive clocks; queries do not rewrite history. Newest-procedure / latest-row picks break ties with `rowid`, not second-resolution `created_at` alone. (#67)
 
-MCP and CLI reads/mutations use `open_existing`: unknown namespaces fail loud and do not create a `*.db`. Only `init`, first `observe`, procedure write, and bootstrap create. (#68)
+MCP and CLI reads/mutations use `open_existing`: unknown namespaces fail loud and do not create a `*.db`. MCP/CLI create paths remain `init`, first `observe`, procedure write, and bootstrap. Host hooks are unchanged (#48). (#68)
 
 Dashboard POST contradict rejects non-JSON (415), invalid/non-object JSON and non-string `replacement` (400) without setting `valid_to`. `Store.contradict` raises `ValueError` if `replacement` is not a string or null. `HAUNT_FTS_ONLY=1` / `HAUNT_EMBED_MODEL=off` bootstrap no longer fatals on a failed sqlite-vec probe; layout + default namespace still come up FTS-only, without downloading BGE-M3. Doctor treats sqlite-vec as optional in that mode. (#64)
 
