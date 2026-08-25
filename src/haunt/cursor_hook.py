@@ -6,6 +6,7 @@ See https://cursor.com/docs/hooks.md
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -156,6 +157,47 @@ def hook_session(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def hook_idempotency_key(
+    payload: dict[str, Any],
+    *,
+    origin: str,
+    event: str,
+    session_id: str | None,
+) -> str | None:
+    """Build a retry key only when the host supplied an event-specific ID."""
+    id_fields = (
+        "hook_event_id",
+        "event_id",
+        "generation_id",
+        "prompt_id",
+        "message_id",
+        "tool_use_id",
+        "tool_call_id",
+        "call_id",
+        "request_id",
+        "response_id",
+    )
+    identifiers = {
+        key: str(payload[key])
+        for key in id_fields
+        if payload.get(key) not in (None, "")
+    }
+    if not identifiers:
+        return None
+    material = json.dumps(
+        {
+            "origin": origin,
+            "event": event,
+            "session": session_id,
+            "ids": identifiers,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return f"hook:{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
+
+
 def _is_memory_tool(name: str) -> bool:
     n = (name or "").strip()
     if n.startswith("memory_"):
@@ -191,11 +233,19 @@ def format_timeline_block(rows: list[dict[str, Any]], namespace: str) -> str:
 
 
 def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
+    event = detect_event(payload)
+    session_id = hook_session(payload)
     store.observe(
         kwargs.pop("content", ""),
-        session_id=hook_session(payload),
+        session_id=session_id,
         origin=ORIGIN,
-        meta={"hook": detect_event(payload)},
+        meta={"hook": event},
+        idempotency_key=hook_idempotency_key(
+            payload,
+            origin=ORIGIN,
+            event=event,
+            session_id=session_id,
+        ),
         **kwargs,
     )
 

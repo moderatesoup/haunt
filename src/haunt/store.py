@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,14 +9,11 @@ from typing import Any, Iterator
 
 import sqlite_vec
 
-from haunt.embed import available as embed_available
-from haunt.embed import dimension as embed_dim
 from haunt.embed import embed_one
 from haunt.embed import embed_texts
 from haunt.embed import state as embed_state
 from haunt.paths import (
     ensure_layout,
-    infer_namespace,
     haunt_home,
     mkdir_private,
     namespace_db_path,
@@ -43,7 +39,8 @@ ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
 
 # 1: one-time normalize of offset/naive clocks to UTC microseconds.
-SCHEMA_VERSION = 1
+# 2: graph evidence tables + hook idempotency key.
+SCHEMA_VERSION = 2
 SCHEMA_VERSION_KEY = "schema_version"
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -139,6 +136,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE TABLE IF NOT EXISTS events (
             id TEXT PRIMARY KEY,
+            idempotency_key TEXT,
             session_id TEXT NOT NULL,
             ts TEXT NOT NULL,
             event_time TEXT NOT NULL,
@@ -181,6 +179,26 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             valid_to TEXT,
             weight REAL NOT NULL DEFAULT 1.0
         );
+        CREATE TABLE IF NOT EXISTS entity_mentions (
+            event_id TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (event_id, entity_id),
+            FOREIGN KEY (event_id) REFERENCES events(id),
+            FOREIGN KEY (entity_id) REFERENCES entities(id)
+        );
+        CREATE TABLE IF NOT EXISTS relation_evidence (
+            event_id TEXT NOT NULL,
+            src_entity TEXT NOT NULL,
+            rel TEXT NOT NULL,
+            dst_entity TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 1.0,
+            PRIMARY KEY (event_id, src_entity, rel, dst_entity),
+            FOREIGN KEY (event_id) REFERENCES events(id),
+            FOREIGN KEY (src_entity) REFERENCES entities(id),
+            FOREIGN KEY (dst_entity) REFERENCES entities(id)
+        );
         CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
         CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time);
         CREATE INDEX IF NOT EXISTS idx_events_tier ON events(tier);
@@ -189,6 +207,9 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name, type);
         CREATE INDEX IF NOT EXISTS idx_relations_src ON relations(src_entity);
         CREATE INDEX IF NOT EXISTS idx_relations_dst ON relations(dst_entity);
+        CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
+        CREATE INDEX IF NOT EXISTS idx_relation_evidence_src ON relation_evidence(src_entity);
+        CREATE INDEX IF NOT EXISTS idx_relation_evidence_dst ON relation_evidence(dst_entity);
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             id UNINDEXED,
             content,
@@ -265,6 +286,17 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
         return
     if current < 1:
         _normalize_stored_clocks(conn)
+    if current < 2:
+        event_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "idempotency_key" not in event_columns:
+            conn.execute("ALTER TABLE events ADD COLUMN idempotency_key TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency "
+            "ON events(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
         (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
@@ -397,6 +429,7 @@ class ObserveResult:
     tier: str
     entities: list[str] = field(default_factory=list)
     embedded: bool = False
+    deduplicated: bool = False
 
 
 class Store:
@@ -407,6 +440,7 @@ class Store:
         self.db_path = namespace_db_path(self.name)
         self.conn = _connect(self.db_path, create=create)
         _ensure_namespace_schema(self.conn)
+        self._ensure_graph_evidence()
 
     def close(self) -> None:
         self.conn.close()
@@ -416,6 +450,14 @@ class Store:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def _ensure_graph_evidence(self) -> None:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key='graph_evidence_version'"
+        ).fetchone()
+        if row and str(row["value"]) == "1":
+            return
+        self.rebuild_graph(touch=False)
 
     def vec_ok(self) -> bool:
         return _vec_loaded(self.conn)
@@ -521,89 +563,112 @@ class Store:
         meta: dict[str, Any] | None = None,
         valid_from: str | None = None,
         valid_to: str | None = None,
+        idempotency_key: str | None = None,
         commit: bool = True,
     ) -> ObserveResult:
         if role not in ROLES:
             raise ValueError(f"role must be one of {ROLES}")
         if tier not in TIERS:
             raise ValueError(f"tier must be one of {TIERS}")
+        text = verbatim_text(content, tool_name, tool_input, tool_output)
+        idem = (idempotency_key or "").strip() or None
+        if idem and len(idem) > 512:
+            raise ValueError("idempotency_key must be 512 characters or fewer")
+        if idem:
+            existing = self._observe_by_idempotency_key(idem, text)
+            if existing is not None:
+                return existing
         if commit:
             self.ensure_current_embeddings()
-        sid = self.ensure_session(session_id, source=origin, commit=commit)
-        et = iso_or_now(event_time)
-        ts = now_iso()
-        vf = iso_or_now(valid_from) if valid_from else et
-        vt = iso_or_now(valid_to) if valid_to else None
-        event_id = new_id()
-        memory_id = new_id()
-        text = verbatim_text(content, tool_name, tool_input, tool_output)
-        self.conn.execute(
-            """
-            INSERT INTO events(
-                id, session_id, ts, event_time, role, content,
-                tool_name, tool_input, tool_output, origin, tier, meta
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                event_id,
-                sid,
-                ts,
-                et,
-                role,
-                content or "",
-                tool_name,
-                tool_input,
-                tool_output,
-                origin,
-                tier,
-                dumps(meta or {}),
-            ),
-        )
-        blob = None
-        embedded = False
-        vec = embed_one(text) if text.strip() else None
-        if vec is not None:
-            blob = sqlite_vec.serialize_float32(vec)
-            ensure_vec_table(self.conn, len(vec), commit=commit)
-            es = embed_state()
+        try:
+            sid = self.ensure_session(session_id, source=origin, commit=False)
+            et = iso_or_now(event_time)
+            ts = now_iso()
+            vf = iso_or_now(valid_from) if valid_from else et
+            vt = iso_or_now(valid_to) if valid_to else None
+            event_id = new_id()
+            memory_id = new_id()
             self.conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                ("embed_model", es.model_id),
+                """
+                INSERT INTO events(
+                    id, idempotency_key, session_id, ts, event_time, role, content,
+                    tool_name, tool_input, tool_output, origin, tier, meta
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    event_id,
+                    idem,
+                    sid,
+                    ts,
+                    et,
+                    role,
+                    content or "",
+                    tool_name,
+                    tool_input,
+                    tool_output,
+                    origin,
+                    tier,
+                    dumps(meta or {}),
+                ),
             )
-            self.conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                ("embed_dim", str(len(vec))),
-            )
-        self.conn.execute(
-            """
-            INSERT INTO memories(
-                id, event_id, tier, content, embedding, valid_from, valid_to, created_at
-            ) VALUES (?,?,?,?,?,?,?,?)
-            """,
-            (memory_id, event_id, tier, text, blob, vf, vt, ts),
-        )
-        self.conn.execute(
-            "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
-            (memory_id, text),
-        )
-        if blob is not None and _vec_loaded(self.conn):
-            try:
+            blob = None
+            embedded = False
+            vec = embed_one(text) if text.strip() else None
+            if vec is not None:
+                blob = sqlite_vec.serialize_float32(vec)
+                ensure_vec_table(self.conn, len(vec), commit=False)
+                es = embed_state()
                 self.conn.execute(
-                    "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
-                    (memory_id, blob),
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    ("embed_model", es.model_id),
                 )
-                embedded = True
-            except sqlite3.Error:
-                pass
-        if commit:
-            self.conn.commit()
-        from haunt.graph import extract_and_store
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    ("embed_dim", str(len(vec))),
+                )
+            self.conn.execute(
+                """
+                INSERT INTO memories(
+                    id, event_id, tier, content, embedding, valid_from, valid_to, created_at
+                ) VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (memory_id, event_id, tier, text, blob, vf, vt, ts),
+            )
+            self.conn.execute(
+                "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
+                (memory_id, text),
+            )
+            if blob is not None and _vec_loaded(self.conn):
+                try:
+                    self.conn.execute(
+                        "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
+                        (memory_id, blob),
+                    )
+                    embedded = True
+                except sqlite3.Error:
+                    pass
+            from haunt.graph import extract_and_store
 
-        entity_names = extract_and_store(
-            self.conn, event_id, text, et, tool_name, commit=commit
-        )
+            entity_names = extract_and_store(
+                self.conn, event_id, text, et, tool_name, commit=False
+            )
+            if commit:
+                self.conn.commit()
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            if idem:
+                existing = self._observe_by_idempotency_key(idem, text)
+                if existing is not None:
+                    return existing
+            raise
+        except Exception:
+            self.conn.rollback()
+            raise
         if commit:
-            touch_namespace(self.name)
+            try:
+                touch_namespace(self.name)
+            except Exception:
+                pass
         return ObserveResult(
             event_id=event_id,
             memory_id=memory_id,
@@ -612,6 +677,51 @@ class Store:
             tier=tier,
             entities=entity_names,
             embedded=embedded,
+        )
+
+    def _observe_by_idempotency_key(
+        self,
+        key: str,
+        expected_text: str,
+    ) -> ObserveResult | None:
+        row = self.conn.execute(
+            """
+            SELECT e.id AS event_id, e.session_id, e.tier,
+                   m.id AS memory_id, m.content, m.embedding
+            FROM events e
+            JOIN memories m ON m.event_id=e.id
+            WHERE e.idempotency_key=?
+            ORDER BY m.rowid ASC
+            LIMIT 1
+            """,
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["content"] != expected_text:
+            raise ValueError("idempotency_key was reused with different content")
+        entities = [
+            str(r["name"])
+            for r in self.conn.execute(
+                """
+                SELECT e.name
+                FROM entity_mentions em
+                JOIN entities e ON e.id=em.entity_id
+                WHERE em.event_id=?
+                ORDER BY e.name
+                """,
+                (row["event_id"],),
+            ).fetchall()
+        ]
+        return ObserveResult(
+            event_id=row["event_id"],
+            memory_id=row["memory_id"],
+            session_id=row["session_id"],
+            namespace=self.name,
+            tier=row["tier"],
+            entities=entities,
+            embedded=row["embedding"] is not None,
+            deduplicated=True,
         )
 
 
@@ -802,8 +912,8 @@ class Store:
             "relations": [dict(r) for r in self.conn.execute("SELECT * FROM relations ORDER BY valid_from DESC LIMIT 400")],
         }
 
-    def rebuild_graph(self) -> dict[str, Any]:
-        """Wipe entities/relations and re-extract from stored events."""
+    def rebuild_graph(self, *, touch: bool = True) -> dict[str, Any]:
+        """Rebuild graph evidence and derived aggregates from stored events."""
         from haunt.graph import extract_and_store
 
         def count(table: str) -> int:
@@ -814,27 +924,47 @@ class Store:
         events_n = count("events")
         memories_n = count("memories")
 
-        self.conn.execute("DELETE FROM relations")
-        self.conn.execute("DELETE FROM entities")
-        self.conn.commit()
+        try:
+            self.conn.execute("DELETE FROM relation_evidence")
+            self.conn.execute("DELETE FROM entity_mentions")
+            self.conn.execute("DELETE FROM relations")
+            self.conn.execute("DELETE FROM entities")
 
-        rows = self.conn.execute(
-            """
-            SELECT id, content, tool_name, tool_input, tool_output, event_time
-            FROM events
-            ORDER BY event_time ASC, ts ASC
-            """
-        ).fetchall()
-        for r in rows:
-            text = verbatim_text(
-                r["content"] or "",
-                r["tool_name"],
-                r["tool_input"],
-                r["tool_output"],
+            rows = self.conn.execute(
+                """
+                SELECT id, content, tool_name, tool_input, tool_output, event_time
+                FROM events
+                ORDER BY event_time ASC, ts ASC, rowid ASC
+                """
+            ).fetchall()
+            for r in rows:
+                text = verbatim_text(
+                    r["content"] or "",
+                    r["tool_name"],
+                    r["tool_input"],
+                    r["tool_output"],
+                )
+                extract_and_store(
+                    self.conn,
+                    r["id"],
+                    text,
+                    r["event_time"],
+                    r["tool_name"],
+                    commit=False,
+                )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("graph_evidence_version", "1"),
             )
-            extract_and_store(
-                self.conn, r["id"], text, r["event_time"], r["tool_name"]
-            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        if touch:
+            try:
+                touch_namespace(self.name)
+            except Exception:
+                pass
 
         return {
             "events": events_n,
@@ -875,57 +1005,52 @@ class Store:
             "event_deleted": False,
         }
 
-        self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-
         try:
-            self.conn.execute(
-                "DELETE FROM memories_fts WHERE id=?", (memory_id,)
-            )
-            deleted["fts_deleted"] = True
-        except sqlite3.Error:
-            pass
+            self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
 
-        if _vec_loaded(self.conn):
             try:
-                has_vec = self.conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memories'"
-                ).fetchone()
-                if has_vec:
-                    self.conn.execute(
-                        "DELETE FROM vec_memories WHERE id=?", (memory_id,)
-                    )
-                    deleted["vec_deleted"] = True
+                self.conn.execute(
+                    "DELETE FROM memories_fts WHERE id=?", (memory_id,)
+                )
+                deleted["fts_deleted"] = True
             except sqlite3.Error:
                 pass
+            if _vec_loaded(self.conn):
+                try:
+                    has_vec = self.conn.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name='vec_memories'"
+                    ).fetchone()
+                    if has_vec:
+                        self.conn.execute(
+                            "DELETE FROM vec_memories WHERE id=?", (memory_id,)
+                        )
+                        deleted["vec_deleted"] = True
+                except sqlite3.Error:
+                    pass
 
-        rel_count = self.conn.execute(
-            "SELECT COUNT(*) FROM relations WHERE event_id=?", (event_id,)
-        ).fetchone()[0]
-        self.conn.execute("DELETE FROM relations WHERE event_id=?", (event_id,))
-        deleted["relations_deleted"] = rel_count
+            other_memories = self.conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
+            ).fetchone()[0]
+            if other_memories == 0:
+                from haunt.graph import remove_event_evidence
 
-        orphan_entities = self.conn.execute(
-            """
-            SELECT e.id FROM entities e
-            WHERE NOT EXISTS (
-                SELECT 1 FROM relations r
-                WHERE r.src_entity = e.id OR r.dst_entity = e.id
-            )
-            """
-        ).fetchall()
-        deleted["entities_deleted"] = len(orphan_entities)
-        for oe in orphan_entities:
-            self.conn.execute("DELETE FROM entities WHERE id=?", (oe["id"],))
+                rel_count, entity_count = remove_event_evidence(
+                    self.conn, event_id
+                )
+                deleted["relations_deleted"] = rel_count
+                deleted["entities_deleted"] = entity_count
+                self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+                deleted["event_deleted"] = True
 
-        other_memories = self.conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
-        ).fetchone()[0]
-        if other_memories == 0:
-            self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
-            deleted["event_deleted"] = True
-
-        self.conn.commit()
-        touch_namespace(self.name)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        try:
+            touch_namespace(self.name)
+        except Exception:
+            pass
         return deleted
 
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:

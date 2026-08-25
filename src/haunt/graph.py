@@ -250,8 +250,14 @@ def extract_and_store(
         if row:
             eid = row["id"]
             conn.execute(
-                "UPDATE entities SET last_seen=?, name=? WHERE id=?",
-                (event_time, e.name, eid),
+                """
+                UPDATE entities
+                SET first_seen=MIN(first_seen, ?),
+                    last_seen=MAX(last_seen, ?),
+                    name=?
+                WHERE id=?
+                """,
+                (event_time, event_time, e.name, eid),
             )
         else:
             eid = new_id()
@@ -267,6 +273,15 @@ def extract_and_store(
             seen_names.add(e.name)
             names.append(e.name)
 
+    for eid in ids.values():
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO entity_mentions(event_id, entity_id, observed_at)
+            VALUES (?,?,?)
+            """,
+            (event_id, eid, event_time),
+        )
+
     emitted: set[tuple[str, str, str]] = set()
 
     def rel(src: str, kind: str, dst: str, weight: float) -> None:
@@ -274,7 +289,9 @@ def extract_and_store(
         if key in emitted:
             return
         emitted.add(key)
-        _upsert_rel(conn, src, kind, dst, event_id, event_time, weight)
+        _add_relation_evidence(
+            conn, src, kind, dst, event_id, event_time, weight
+        )
 
     id_list = list(ids.values())
     for i, src in enumerate(id_list[:8]):
@@ -305,7 +322,7 @@ def extract_and_store(
     return names
 
 
-def _upsert_rel(
+def _add_relation_evidence(
     conn: sqlite3.Connection,
     src: str,
     rel: str,
@@ -314,25 +331,128 @@ def _upsert_rel(
     valid_from: str,
     weight: float,
 ) -> None:
-    row = conn.execute(
+    conn.execute(
         """
-        SELECT id, weight, event_id FROM relations
-        WHERE src_entity=? AND rel=? AND dst_entity=? AND valid_to IS NULL
+        INSERT OR IGNORE INTO relation_evidence(
+            event_id, src_entity, rel, dst_entity, observed_at, weight
+        ) VALUES (?,?,?,?,?,?)
+        """,
+        (event_id, src, rel, dst, valid_from, weight),
+    )
+    _refresh_relation(conn, src, rel, dst)
+
+
+def _refresh_relation(
+    conn: sqlite3.Connection,
+    src: str,
+    rel: str,
+    dst: str,
+) -> None:
+    aggregate = conn.execute(
+        """
+        SELECT SUM(weight) AS weight, MIN(observed_at) AS valid_from
+        FROM relation_evidence
+        WHERE src_entity=? AND rel=? AND dst_entity=?
         """,
         (src, rel, dst),
     ).fetchone()
-    if row:
-        if row["event_id"] == event_id:
-            return
+    rows = conn.execute(
+        """
+        SELECT id FROM relations
+        WHERE src_entity=? AND rel=? AND dst_entity=? AND valid_to IS NULL
+        ORDER BY rowid ASC
+        """,
+        (src, rel, dst),
+    ).fetchall()
+    if not aggregate or aggregate["weight"] is None:
+        for row in rows:
+            conn.execute("DELETE FROM relations WHERE id=?", (row["id"],))
+        return
+    latest = conn.execute(
+        """
+        SELECT event_id FROM relation_evidence
+        WHERE src_entity=? AND rel=? AND dst_entity=?
+        ORDER BY observed_at DESC, rowid DESC
+        LIMIT 1
+        """,
+        (src, rel, dst),
+    ).fetchone()
+    if rows:
+        keep = rows[0]["id"]
         conn.execute(
-            "UPDATE relations SET weight=?, event_id=? WHERE id=?",
-            (float(row["weight"]) + weight, event_id, row["id"]),
+            """
+            UPDATE relations
+            SET event_id=?, valid_from=?, valid_to=NULL, weight=?
+            WHERE id=?
+            """,
+            (
+                latest["event_id"],
+                aggregate["valid_from"],
+                float(aggregate["weight"]),
+                keep,
+            ),
         )
+        for duplicate in rows[1:]:
+            conn.execute("DELETE FROM relations WHERE id=?", (duplicate["id"],))
         return
     conn.execute(
         """
-        INSERT INTO relations(id, src_entity, rel, dst_entity, event_id, valid_from, valid_to, weight)
-        VALUES (?,?,?,?,?,?,?,?)
+        INSERT INTO relations(
+            id, src_entity, rel, dst_entity, event_id, valid_from, valid_to, weight
+        ) VALUES (?,?,?,?,?,?,?,?)
         """,
-        (new_id(), src, rel, dst, event_id, valid_from, None, weight),
+        (
+            new_id(),
+            src,
+            rel,
+            dst,
+            latest["event_id"],
+            aggregate["valid_from"],
+            None,
+            float(aggregate["weight"]),
+        ),
     )
+
+
+def remove_event_evidence(
+    conn: sqlite3.Connection,
+    event_id: str,
+) -> tuple[int, int]:
+    """Delete one event's evidence and refresh only affected aggregates."""
+    triples = conn.execute(
+        """
+        SELECT src_entity, rel, dst_entity
+        FROM relation_evidence
+        WHERE event_id=?
+        """,
+        (event_id,),
+    ).fetchall()
+    entity_rows = conn.execute(
+        "SELECT entity_id FROM entity_mentions WHERE event_id=?",
+        (event_id,),
+    ).fetchall()
+    conn.execute("DELETE FROM relation_evidence WHERE event_id=?", (event_id,))
+    for row in triples:
+        _refresh_relation(
+            conn, row["src_entity"], row["rel"], row["dst_entity"]
+        )
+    conn.execute("DELETE FROM entity_mentions WHERE event_id=?", (event_id,))
+    entities_deleted = 0
+    for row in entity_rows:
+        entity_id = row["entity_id"]
+        span = conn.execute(
+            """
+            SELECT MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen
+            FROM entity_mentions WHERE entity_id=?
+            """,
+            (entity_id,),
+        ).fetchone()
+        if not span or span["first_seen"] is None:
+            conn.execute("DELETE FROM entities WHERE id=?", (entity_id,))
+            entities_deleted += 1
+        else:
+            conn.execute(
+                "UPDATE entities SET first_seen=?, last_seen=? WHERE id=?",
+                (span["first_seen"], span["last_seen"], entity_id),
+            )
+    return len(triples), entities_deleted

@@ -72,6 +72,7 @@ def memory_observe(
     tool_input: Optional[str] = None,
     tool_output: Optional[str] = None,
     event_time: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
     origin: str = "mcp",
 ) -> str:
     ns = resolve_namespace(namespace)
@@ -85,6 +86,7 @@ def memory_observe(
             tool_input=tool_input,
             tool_output=tool_output,
             event_time=event_time,
+            idempotency_key=idempotency_key,
             origin=origin,
         )
     return _json(
@@ -97,6 +99,7 @@ def memory_observe(
             "tier": r.tier,
             "embedded": r.embedded,
             "entities": r.entities,
+            "deduplicated": r.deduplicated,
         }
     )
 
