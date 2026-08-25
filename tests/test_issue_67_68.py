@@ -36,6 +36,8 @@ def fts_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+    # These legacy cross-namespace MCP assertions exercise explicit admin mode.
+    monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
     from haunt import embed
     from haunt.paths import ensure_layout
     from haunt.store import init_registry

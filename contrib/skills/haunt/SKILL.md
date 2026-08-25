@@ -45,7 +45,7 @@ Supersede a wrong fact (`valid_to=now`). Does not delete. Optional `replacement`
 
 ### `memory_purge`
 `memory_id`
-Hard-delete the memory and its provenance. Data is gone. Use contradict to supersede.
+Hard-delete the memory and its provenance. Data is gone. MCP purge is disabled by default; use the confirmed CLI flow unless the operator explicitly enabled `HAUNT_MCP_ALLOW_PURGE=1`. Use contradict to supersede.
 
 ### `memory_timeline`
 optional `session`, `since`, `until`, `clock`, `limit`
@@ -60,7 +60,7 @@ optional `namespace`
 Counts, sqlite-vec, embed status.
 
 ### `memory_namespaces`
-No args. List namespaces.
+No args. List the process-bound namespace; all namespaces only in explicit admin mode.
 
 ## Observe skip list
 
@@ -71,7 +71,7 @@ No args. List namespaces.
 
 ## Namespace
 
-Inferred from git / `CURSOR_PROJECT_DIR` / `CLAUDE_PROJECT_DIR` / cwd. Do not invent. When building haunt itself, namespace is `haunt`.
+The MCP process is bound once from `HAUNT_NAMESPACE` or the full git remote identity (`host/owner/repo`). Do not invent or request a different namespace. Existing remote/path registrations may retain a legacy short name.
 
 ## No-hooks hosts (Grok Bot, Codex, …)
 

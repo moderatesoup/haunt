@@ -25,11 +25,11 @@ Default recall hides superseded rows unless you pass `as_of`.
 - `memory_worldview` if no worldview card is in context.
 - `memory_procedure` `action`=`write`/`get`/`list`. Write needs `name`, `body`.
 - `memory_contradict` `memory_id`, optional `replacement`. Supersedes. Does not delete.
-- `memory_purge` `memory_id`. Hard delete.
+- `memory_purge` `memory_id`. Hard delete; disabled unless the operator explicitly enabled MCP purge.
 - `memory_timeline` only with ISO `since`/`until` or `session`. No NL compile.
 - `memory_session_end` `session`. `ok: false` if nothing ended.
-- `memory_health` / `memory_namespaces` when you need counts or the namespace list.
+- `memory_health` / `memory_namespaces` when you need counts or the bound namespace.
 
 ## Namespace
 
-Inferred. Do not invent. When building haunt, namespace is `haunt`.
+The MCP process is bound once from `HAUNT_NAMESPACE` or full git remote identity. Do not invent or request another namespace.

@@ -153,7 +153,7 @@ Auto-store every prompt, reply, and tool call. Verbatim only — no LLM, no summ
 | `sessionStart` | session-open coordinate event + worldview card (`additional_context`); not a reliable recall path |
 | `sessionEnd` | close session; no summary |
 
-Cursor MCP is merged into `~/.cursor/mcp.json` (honors `CURSOR_HOME`) as an absolute `~/.haunt/bin/haunt-mcp` command.
+Cursor MCP is merged into `~/.cursor/mcp.json` (honors `CURSOR_HOME`) as an absolute `~/.haunt/bin/haunt-mcp` command. Each MCP process binds once to the inferred project namespace; ordinary tools cannot cross that binding.
 
 ### Claude Code hooks
 
@@ -194,6 +194,10 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 
 haunt is its own MCP server — it runs alongside any other servers you already have (IronRecall, etc.) without interfering.
 
+By default, one `haunt-mcp` process is bound immutably to one project namespace. New git-backed projects use the full remote identity (`host/owner/repo`), so same-leaf repositories do not collide. Existing namespaces registered to the same remote or repository path keep their current name. Passing another namespace to an ordinary tool is denied, and `memory_namespaces` returns only the bound namespace. `HAUNT_MCP_ADMIN=1` enables cross-namespace access for an intentionally admin-scoped process.
+
+`memory_purge` is marked destructive and is off for MCP by default. Use the confirmed `haunt delete` CLI flow, or explicitly launch a process with `HAUNT_MCP_ALLOW_PURGE=1`. Admin mode alone does not enable purge.
+
 `haunt install` (or `haunt bootstrap`) automatically registers the MCP server in both Cursor (`~/.cursor/mcp.json`) and Claude Code (`~/.claude.json`). Merge only — other servers are kept. No manual JSON paste required.
 
 `haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
@@ -207,7 +211,9 @@ Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `m
 | `HAUNT_HOME` | `~/.haunt` | data directory |
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
 | `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
-| `HAUNT_NAMESPACE` | inferred from git | override namespace |
+| `HAUNT_NAMESPACE` | inferred from full git remote | override and bind the project namespace |
+| `HAUNT_MCP_ADMIN` | unset | set to `1` only for an admin MCP process that may cross/list namespaces |
+| `HAUNT_MCP_ALLOW_PURGE` | unset | set to `1` to expose hard purge in that MCP process; off by default |
 | `HAUNT_MODEL_CACHE` | `$HAUNT_HOME/models` | model download directory |
 
 ## Layout
