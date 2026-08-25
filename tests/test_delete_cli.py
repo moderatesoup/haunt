@@ -15,7 +15,7 @@ def test_delete_event_id_without_positional_missing_event(haunt_env):
 
     Old required-argument behavior: Missing argument 'memory_id', exit=2.
     """
-    result = runner.invoke(app, ["delete", "--event-id", "fake-event-123", "--yes"])
+    result = runner.invoke(app, ["delete", "--event-id", "fake-event-123", "--yes", "-n", "default"])
     combined = f"{result.stdout}{result.stderr}{result.output}"
     assert "Missing argument" not in combined
     assert result.exit_code == 1
