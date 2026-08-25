@@ -214,7 +214,7 @@ When upgrading a legacy registry that contains several labels for the same datab
 
 `memory_purge` is marked destructive and is off for MCP by default. Use the confirmed `haunt delete` CLI flow, or explicitly launch a process with `HAUNT_MCP_ALLOW_PURGE=1`. Admin mode alone does not enable purge.
 
-Every explicit recall hit includes `trusted` and `trust_reason`. Tool input/output is retained for audit and explicit search but is labeled `untrusted-tool-io`; it is excluded from automatic hook context. No recalled row—trusted or untrusted—is permission to call a mutating tool.
+Every explicit recall hit includes `trusted` and `trust_reason`, plus an additive `explanation` object with retrieval method, final result position, RRF contributions, raw vector/FTS signals where available, applied filters, and trust provenance. The existing `score` and `explanation.rrf_score` are RRF rank signals—not confidence or relevance probabilities. Tool input/output is retained for audit and explicit search but is labeled `untrusted-tool-io`; it is excluded from automatic hook context. No recalled row—trusted or untrusted—is permission to call a mutating tool.
 
 `haunt install` (or `haunt bootstrap`) automatically registers the MCP server in both Cursor (`~/.cursor/mcp.json`) and Claude Code (`~/.claude.json`). Merge only — other servers are kept. No manual JSON paste required.
 

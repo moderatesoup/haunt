@@ -507,7 +507,7 @@ function eventsTable(rows){
 
 function hitsTable(hits){
   if(!hits.length){$("hits").innerHTML='<div class="empty">no hits</div>';return;}
-  $("hits").innerHTML=`<table><thead><tr><th>#</th><th>score</th><th>tier</th><th>origin</th>${ALL_NS?'<th>namespace</th>':''}<th>memory_id</th><th>snippet</th><th></th></tr></thead><tbody>`+
+  $("hits").innerHTML=`<table><thead><tr><th>#</th><th title="RRF rank signal; not confidence">rrf</th><th>tier</th><th>origin</th>${ALL_NS?'<th>namespace</th>':''}<th>memory_id</th><th>snippet</th><th></th></tr></thead><tbody>`+
     hits.map((h,i)=>`<tr class="clickable" onclick="openDetail('${esc(h.memory_id)}','${esc(h.namespace||NS)}')">
       <td>${i+1}</td><td>${(h.score||0).toFixed(4)}</td>
       <td class="${tierCls(h.tier)}">${h.tier}</td>
@@ -939,11 +939,12 @@ async def api_recall_all(request: Request) -> JSONResponse:
 
     ranked = sorted(rrf.items(), key=lambda kv: kv[1], reverse=True)[:k]
     results = []
-    for key, score in ranked:
+    for final_rank, (key, score) in enumerate(ranked, start=1):
         h, ns_name = hit_map[key]
         d = h.as_dict()
         d["namespace"] = ns_name
         d["score"] = round(score, 6)
+        d["explanation"]["final_rank"] = final_rank
         results.append(d)
 
     return JSONResponse({"query": q, "hits": results, "errors": errors})

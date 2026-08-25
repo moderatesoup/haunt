@@ -250,7 +250,7 @@ def format_recall_block(hits: list[Hit], namespace: str) -> str:
         return "\n".join(lines)
     for i, h in enumerate(safe_hits, 1):
         lines.append(
-            f"{i}  {h.score:.4f}  {h.tier}  {h.memory_id}  {snippet(h.content, 160)}"
+            f"{i}  rrf={h.score:.4f}  {h.tier}  {h.memory_id}  {snippet(h.content, 160)}"
         )
     return "\n".join(lines)
 

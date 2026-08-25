@@ -169,7 +169,7 @@ def recall_cmd(
     k: int = typer.Option(8, "--k"),
     json_out: bool = typer.Option(False, "--json", help="Output stable JSON"),
 ) -> None:
-    """Hybrid recall (vec + FTS5 + RRF). Prints score, tier, id, snippet.
+    """Hybrid recall (vec + FTS5 + RRF). Prints RRF rank signal, tier, id, snippet.
 
     Natural-language time phrases are compiled at query time. Non-temporal
     queries take the existing recall path unchanged.
@@ -217,7 +217,7 @@ def recall_cmd(
     if not hits:
         typer.echo("no hits")
         return
-    typer.echo(f"{'#':<3} {'score':<8} {'tier':<12} {'id':<36} snippet")
+    typer.echo(f"{'#':<3} {'rrf':<8} {'tier':<12} {'id':<36} snippet")
     for i, h in enumerate(hits, 1):
         tier_text = human_display(
             h.tier, limit=40, collapse_whitespace=True, sqlite_scalar=True

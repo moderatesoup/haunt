@@ -169,7 +169,13 @@ def _clocks(clock: str) -> tuple[str, ...]:
     return (c,)
 
 
-def _hits_from_events(store: Store, events: list[dict], *, limit: int) -> list[Hit]:
+def _hits_from_events(
+    store: Store,
+    events: list[dict],
+    *,
+    limit: int,
+    filter_context: dict[str, object],
+) -> list[Hit]:
     hits: list[Hit] = []
     seen: set[str] = set()
     for ev in events:
@@ -202,6 +208,7 @@ def _hits_from_events(store: Store, events: list[dict], *, limit: int) -> list[H
                 valid_to=row["valid_to"],
                 tool_name=row["tool_name"],
                 origin=row["origin"],
+                filter_context=filter_context,
             )
         )
         if len(hits) >= limit:
@@ -227,6 +234,16 @@ def run_timeline(
     chosen = clock or tq.clock
     merged: dict[str, Hit] = {}
     for clk in _clocks(chosen):
+        filter_context: dict[str, object] = {
+            "validity": "current",
+            "as_of": None,
+            "clock": clk,
+            "since": since,
+            "until": until,
+            "tier": None,
+            "include_untrusted": True,
+            "session_id": session_id,
+        }
         # Page through events. store.events clamps LIMIT to 100; doubling
         # fetch_n past that made len(rows) < fetch_n and starved refill.
         batch = max(int(limit), 1)
@@ -240,7 +257,9 @@ def run_timeline(
                 limit=batch,
                 offset=offset,
             )
-            for h in _hits_from_events(store, rows, limit=limit):
+            for h in _hits_from_events(
+                store, rows, limit=limit, filter_context=filter_context
+            ):
                 merged.setdefault(h.memory_id, h)
             if len(merged) >= limit or len(rows) < batch:
                 break
@@ -248,7 +267,10 @@ def run_timeline(
             if nxt <= offset:
                 break
             offset = nxt
-    return list(merged.values())[:limit]
+    hits = list(merged.values())[:limit]
+    for final_rank, hit in enumerate(hits, start=1):
+        hit.final_rank = final_rank
+    return hits
 
 
 def run_recall(
@@ -283,7 +305,10 @@ def run_recall(
             if prev is None or h.score > prev.score:
                 merged[h.memory_id] = h
     ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)
-    return ranked[:k]
+    hits = ranked[:k]
+    for final_rank, hit in enumerate(hits, start=1):
+        hit.final_rank = final_rank
+    return hits
 
 
 def run_union(
@@ -312,7 +337,10 @@ def run_union(
         if prev is None or h.score > prev.score:
             by_id[h.memory_id] = h
     ranked = sorted(by_id.values(), key=lambda h: h.score, reverse=True)
-    return ranked[:k]
+    hits = ranked[:k]
+    for final_rank, hit in enumerate(hits, start=1):
+        hit.final_rank = final_rank
+    return hits
 
 
 def execute(
