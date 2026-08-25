@@ -97,7 +97,7 @@ def test_health_mcp_includes_db_path_and_namespace(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+    monkeypatch.setenv("HAUNT_NAMESPACE", "mcp-health-test")
 
     from haunt import embed
     from haunt.mcp_server import memory_health
@@ -166,7 +166,7 @@ def test_memory_procedure_rejects_invalid_action(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+    monkeypatch.setenv("HAUNT_NAMESPACE", "proc-test")
 
     from haunt import embed
     from haunt.mcp_server import memory_procedure
@@ -255,7 +255,7 @@ def test_no_split_brain_health_matches_store(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+    monkeypatch.setenv("HAUNT_NAMESPACE", "split-brain-test")
 
     from haunt import embed
     from haunt.mcp_server import memory_health
@@ -292,7 +292,7 @@ def test_split_brain_impossible_with_sabotaged_load(tmp_path, monkeypatch):
     monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
-    monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+    monkeypatch.setenv("HAUNT_NAMESPACE", "sabotage-test")
 
     from haunt.bootstrap import probe_sqlite_vec
     from haunt import embed

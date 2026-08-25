@@ -37,7 +37,9 @@ Cursor hooks are **fail-open**: if a hook errors, it prints `{}` and exits 0. A 
 
 Each namespace is a **separate SQLite file** under `~/.haunt/namespaces/`. That is **storage isolation** (separate files, tables, connections, and queries) — **not authorization**. A `recall` in namespace A cannot return rows from namespace B's file.
 
-This is not a security kernel. The same local user can open every namespace file via MCP (`memory_recall` with any `namespace`) or the CLI (`haunt recall -n …`). haunt does not authenticate callers or enforce per-namespace access control.
+This is not a security kernel. An ordinary MCP process is blast-radius-limited to one immutable namespace, inferred from the full git remote identity (`host/owner/repo`) or set with `HAUNT_NAMESPACE`; cross-namespace requests are denied and namespace listing is filtered. An intentionally separate process launched with `HAUNT_MCP_ADMIN=1` may cross/list namespaces. MCP hard purge is disabled unless `HAUNT_MCP_ALLOW_PURGE=1` is also set.
+
+Those process capabilities are guardrails, not operating-system authorization. The same local user can still open every SQLite file directly or use the CLI (`haunt recall -n …`, confirmed `haunt delete`). A compromised same-user process can do the same. Do not present namespace binding as protection from the local account that owns `HAUNT_HOME`.
 
 ## Reporting a vulnerability
 

@@ -4,19 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from typing import Any, Optional
 
 try:
     from mcp.server import MCPServer
+    from mcp.types import ToolAnnotations
 except ImportError as exc:  # MCP 1.x has no MCPServer
     raise ImportError(
         "haunt requires mcp>=2 (MCPServer API). MCP 1.x cannot be used."
     ) from exc
 
-from haunt.paths import resolve_namespace
+from haunt.paths import haunt_home, infer_namespace, resolve_namespace, safe_name
 from haunt.planner import planned_recall
-from haunt.store import Store, UnknownNamespaceError, list_namespaces, open_existing
+from haunt.store import (
+    Store,
+    UnknownNamespaceError,
+    list_namespaces,
+    namespace_exists,
+    open_existing,
+)
 from haunt.temporal import TemporalParseError
 from haunt.util import clamp_limit
 
@@ -43,6 +52,73 @@ def _require_mcp_v2() -> None:
 
 _require_mcp_v2()
 
+
+class MCPAuthorityError(ValueError):
+    """Raised when an ordinary MCP process tries to cross its binding."""
+
+
+def _truthy(raw: str | None) -> bool:
+    return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class MCPAuthority:
+    bound_namespace: str
+    admin: bool = False
+    allow_purge: bool = False
+
+    @classmethod
+    def from_environment(cls) -> "MCPAuthority":
+        return cls(
+            bound_namespace=infer_namespace(),
+            admin=_truthy(os.environ.get("HAUNT_MCP_ADMIN")),
+            allow_purge=_truthy(os.environ.get("HAUNT_MCP_ALLOW_PURGE")),
+        )
+
+    def select(self, requested: str | None) -> str:
+        if self.admin:
+            return resolve_namespace(requested) if requested else self.bound_namespace
+        if requested is None:
+            return self.bound_namespace
+        selected = safe_name(requested)
+        if selected != self.bound_namespace:
+            raise MCPAuthorityError(
+                f"MCP process is bound to namespace {self.bound_namespace!r}; "
+                f"access to {selected!r} is denied"
+            )
+        return self.bound_namespace
+
+
+_MCP_AUTHORITY: MCPAuthority | None = None
+_MCP_AUTHORITY_HOME: str | None = None
+
+
+def _authority() -> MCPAuthority:
+    """Return the immutable process authority (home reset supports test isolation)."""
+    global _MCP_AUTHORITY, _MCP_AUTHORITY_HOME
+    home = str(haunt_home())
+    if _MCP_AUTHORITY is None or _MCP_AUTHORITY_HOME != home:
+        _MCP_AUTHORITY = MCPAuthority.from_environment()
+        _MCP_AUTHORITY_HOME = home
+    return _MCP_AUTHORITY
+
+
+def _mcp_namespace(requested: str | None) -> str:
+    return _authority().select(requested)
+
+
+def _authority_error(exc: MCPAuthorityError) -> str:
+    authority = _authority()
+    return _json(
+        {
+            "ok": False,
+            "error": str(exc),
+            "namespace": authority.bound_namespace,
+            "admin": authority.admin,
+        }
+    )
+
+
 server = MCPServer(
     name="haunt",
     version="0.2.0",
@@ -53,6 +129,9 @@ server = MCPServer(
         "double-store). Only call memory_observe when hooks are absent "
         "(e.g. Grok Bot). "
         "Call memory_recall to fetch prior context. Never summarize on write."
+        " This MCP process is bound to one namespace; a namespace argument cannot "
+        "cross that binding unless HAUNT_MCP_ADMIN=1 was set before launch. Hard "
+        "purge is disabled unless HAUNT_MCP_ALLOW_PURGE=1 was set before launch."
     ),
 )
 
@@ -75,7 +154,10 @@ def memory_observe(
     idempotency_key: Optional[str] = None,
     origin: str = "mcp",
 ) -> str:
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
     with Store(ns) as st:
         r = st.observe(
             text,
@@ -115,7 +197,10 @@ def memory_recall(
     tier: Optional[str] = None,
     k: int = 8,
 ) -> str:
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
     k = clamp_limit(k, default=8)
     try:
         with open_existing(ns) as st:
@@ -144,7 +229,10 @@ def memory_timeline(
     clock: Optional[str] = None,
     limit: int = 50,
 ) -> str:
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
     limit = clamp_limit(limit, default=50)
     try:
         with open_existing(ns) as st:
@@ -161,7 +249,10 @@ def memory_health(namespace: Optional[str] = None) -> str:
     from haunt.embed import state as embed_state
     from haunt.paths import haunt_home
 
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
     es = embed_state()
     try:
         with open_existing(ns) as st:
@@ -190,9 +281,19 @@ def memory_health(namespace: Optional[str] = None) -> str:
     )
 
 
-@server.tool(description="List all memory namespaces.")
+@server.tool(description="List the bound namespace (all namespaces in explicit admin mode).")
 def memory_namespaces() -> str:
-    return _json({"namespaces": list_namespaces()})
+    authority = _authority()
+    rows = list_namespaces(
+        only=None if authority.admin else authority.bound_namespace
+    )
+    return _json(
+        {
+            "namespaces": rows,
+            "bound_namespace": authority.bound_namespace,
+            "admin": authority.admin,
+        }
+    )
 
 
 @server.tool(description="Mark a session ended. No distillation — just close it.")
@@ -200,7 +301,10 @@ def memory_session_end(
     namespace: Optional[str] = None,
     session: Optional[str] = None,
 ) -> str:
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
     try:
         with open_existing(ns) as st:
             result = st.end_session(session)
@@ -228,7 +332,10 @@ def memory_worldview(
     facts_cap: int = 12,
     names_cap: int = 12,
 ) -> str:
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
     facts_cap = clamp_limit(facts_cap, default=12)
     names_cap = clamp_limit(names_cap, default=12)
     try:
@@ -258,7 +365,10 @@ def memory_procedure(
     valid_actions = ("write", "get", "list")
     if action not in valid_actions:
         return _json({"ok": False, "error": f"unknown action '{action}', must be one of: {', '.join(valid_actions)}"})
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
     if action == "write":
         if not name:
             return _json({"ok": False, "error": "name is required for write"})
@@ -296,13 +406,37 @@ def memory_procedure(
         "and the event itself if no other memories reference it. "
         "This is a hard purge — the data is gone, not just superseded. "
         "Use memory_contradict to supersede (set valid_to) without deleting."
-    )
+    ),
+    annotations=ToolAnnotations(
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 def memory_purge(
     memory_id: str,
     namespace: Optional[str] = None,
 ) -> str:
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
+    authority = _authority()
+    if not namespace_exists(ns):
+        return _json(
+            {"ok": False, "error": f"unknown namespace: {ns}", "namespace": ns}
+        )
+    if not authority.allow_purge:
+        return _json(
+            {
+                "ok": False,
+                "error": (
+                    "memory_purge is disabled for MCP; use the confirmed CLI "
+                    "delete flow or launch with HAUNT_MCP_ALLOW_PURGE=1"
+                ),
+                "namespace": ns,
+            }
+        )
     try:
         with open_existing(ns) as st:
             result = st.purge(memory_id)
@@ -324,7 +458,10 @@ def memory_contradict(
     namespace: Optional[str] = None,
     origin: str = "mcp",
 ) -> str:
-    ns = resolve_namespace(namespace)
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
     try:
         with open_existing(ns) as st:
             result = st.contradict(memory_id, replacement=replacement, origin=origin)

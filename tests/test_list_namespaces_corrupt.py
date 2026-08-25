@@ -124,7 +124,8 @@ def test_cli_namespaces_prints_error_not_zeros(haunt_env):
             assert not line.split()[1:2] == ["0"]
 
 
-def test_mcp_memory_namespaces_surfaces_error(haunt_env):
+def test_mcp_memory_namespaces_surfaces_error(haunt_env, monkeypatch):
+    monkeypatch.setenv("HAUNT_NAMESPACE", "mcp-corrupt")
     observe("mcp corrupt canary MCP-CORRUPT-18", namespace="mcp-corrupt", role="user")
     _corrupt_ns_db("mcp-corrupt")
     from haunt.mcp_server import memory_namespaces

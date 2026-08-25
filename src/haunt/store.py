@@ -1402,9 +1402,13 @@ def observe(
         return store.observe(content, **kwargs)
 
 
-def list_namespaces() -> list[dict[str, Any]]:
+def list_namespaces(*, only: str | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for row in list_namespace_rows():
+    rows = list_namespace_rows()
+    if only is not None:
+        selected = safe_name(only)
+        rows = [row for row in rows if row["name"] == selected]
+    for row in rows:
         db = Path(row["db_path"])
         extra: dict[str, Any] = {
             "db_size_bytes": db.stat().st_size if db.exists() else 0,
