@@ -12,11 +12,10 @@ from haunt.store import Store, observe
 @pytest.fixture
 def dash_client(haunt_env):
     """HTTPX test client for the dashboard app."""
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
 
     observe("dashboard test memory DASH-CANARY-42", namespace="default", role="user")
-    return TestClient(app)
+    return make_dash_client()
 
 
 def test_index_returns_html(dash_client):

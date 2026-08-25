@@ -10,7 +10,7 @@ import inspect
 from unittest.mock import patch
 
 import pytest
-from starlette.testclient import TestClient
+from tests.dashutil import make_dash_client
 
 
 @pytest.fixture
@@ -51,9 +51,7 @@ def _observe(content: str = "original fact stays current"):
 
 
 def _post(path: str, **kwargs):
-    from haunt.dashboard import app
-
-    return TestClient(app).post(path, **kwargs)
+    return make_dash_client().post(path, **kwargs)
 
 
 # ---------------------------------------------------------------------------

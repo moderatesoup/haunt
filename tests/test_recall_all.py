@@ -11,8 +11,7 @@ from haunt.store import Store, observe
 @pytest.fixture
 def multi_ns_client(haunt_env):
     """Set up two namespaces with distinct memories, return test client."""
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
 
     observe(
         "the quantum flux capacitor enables time travel",
@@ -42,7 +41,7 @@ def multi_ns_client(haunt_env):
         origin="cli",
         tier="semantic",
     )
-    return TestClient(app)
+    return make_dash_client()
 
 
 def test_all_ns_recall_returns_hits_from_both(multi_ns_client):
@@ -142,8 +141,7 @@ def test_all_ns_recall_surfaces_corrupt_namespace_errors(haunt_env):
     must include a non-empty errors list with namespace + error string.
     Deleting the errors field from the JSON fails this test.
     """
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
 
     canary = "CANARY-RECALL-ALL-55"
     observe(canary, namespace="goodns", role="user")
@@ -152,7 +150,7 @@ def test_all_ns_recall_surfaces_corrupt_namespace_errors(haunt_env):
     assert db.exists(), f"expected registered db at {db}"
     db.write_text("GARBAGE")
 
-    client = TestClient(app)
+    client = make_dash_client()
     r = client.get(f"/api/recall?q={canary}")
     assert r.status_code == 200
     data = r.json()

@@ -4,6 +4,18 @@
 
 haunt is **local-only**. All data (SQLite databases, embeddings, models) stays on your machine under `~/.haunt/` (or `$HAUNT_HOME`). haunt never phones home, never opens a port (except the optional local dashboard on 127.0.0.1), and never sends data to any remote service. The only network call is the one-time model download from Hugging Face during `haunt bootstrap`.
 
+## Dashboard bind, Host, Origin, and launch token
+
+`haunt dash` binds **127.0.0.1** by default. Loopback bind is not enough on its own:
+
+- Requests whose `Host` is not a trusted loopback name (`127.0.0.1`, `localhost`, `::1`) or the configured bind host are rejected (400). This blocks DNS rebinding.
+- Every `/api` route, including GET, requires the launch token (`X-Haunt-Token` header or `?token=`). Missing or wrong token is 401. The HTML index can still load locally; the API is gated.
+- Cookie-less mutation routes (`DELETE` memory, `POST` contradict) also validate `Origin` when present. Same-origin and missing-Origin local TestClient requests still work. Cross-origin form posts are rejected.
+- `haunt dash` mints a random launch token at start and prints it. `--allow-remote` without that token configured refuses to start (or every `/api` route returns 401).
+- **`--allow-remote` is unsafe without the token.** It exposes the local memory admin API on the network. Anyone who has the token can read and mutate every namespace. **Namespaces are still not authorization** — see below.
+
+Do not add Docker, Postgres, or HTTP team-tier auth. This is a local-first console.
+
 ## Secret redaction
 
 Cursor hook input and output are run through a best-effort denylist that redacts common secret patterns (API keys, bearer tokens, AWS access keys, GitHub PATs, JWTs, Slack tokens, etc.).

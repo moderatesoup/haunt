@@ -139,10 +139,9 @@ def test_mcp_memory_namespaces_surfaces_error(haunt_env):
 def test_dash_api_namespaces_surfaces_error(haunt_env):
     observe("dash corrupt canary DASH-CORRUPT-18", namespace="dash-corrupt", role="user")
     _corrupt_ns_db("dash-corrupt")
-    from starlette.testclient import TestClient
-    from haunt.dashboard import app
+    from tests.dashutil import make_dash_client
 
-    client = TestClient(app)
+    client = make_dash_client()
     r = client.get("/api/namespaces")
     assert r.status_code == 200
     row = next(n for n in r.json()["namespaces"] if n["name"] == "dash-corrupt")

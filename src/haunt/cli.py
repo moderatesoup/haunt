@@ -520,7 +520,10 @@ def dash_cmd(
     allow_remote: bool = typer.Option(
         False,
         "--allow-remote",
-        help="Allow binding beyond loopback (exposes local memories on the network).",
+        help=(
+            "Allow binding beyond loopback. Unsafe without the launch token: "
+            "exposes the memory API on the network. Namespaces are not authorization."
+        ),
     ),
 ) -> None:
     """Start the local memory console (127.0.0.1), or install a desktop shortcut."""
