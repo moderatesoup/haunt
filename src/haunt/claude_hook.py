@@ -23,6 +23,7 @@ from haunt.cursor_hook import (
     _redact_secrets,
     format_recall_block,
     format_worldview_card,
+    hook_idempotency_key,
 )
 from haunt.paths import infer_namespace, safe_name
 from haunt.recall import recall
@@ -76,11 +77,18 @@ def _hook_specific_output(event: str, additional_context: str) -> dict[str, Any]
 
 def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
     event = detect_event(payload)
+    session_id = _hook_session(payload)
     store.observe(
         kwargs.pop("content", ""),
-        session_id=_hook_session(payload),
+        session_id=session_id,
         origin=ORIGIN,
         meta={"hook": event},
+        idempotency_key=hook_idempotency_key(
+            payload,
+            origin=ORIGIN,
+            event=event,
+            session_id=session_id,
+        ),
         **kwargs,
     )
 
