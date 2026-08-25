@@ -559,6 +559,10 @@ async function openDetail(memId,ns){
     </tr>`).join("");
     html+="</tbody></table>";
   }
+  if(d.trace&&d.trace.members){
+    html+=`<h2 class="section" style="margin-top:12px;">correction lineage (${esc(d.trace.lineage_status||"")})</h2>`;
+    html+=`<div class="detail-content">${esc(JSON.stringify(d.trace,null,2))}</div>`;
+  }
   $("detailBody").innerHTML=html;
   dp.scrollIntoView({behavior:'smooth',block:'start'});
 }
@@ -697,8 +701,7 @@ async function doContradict(){
   if(!ns)return;
   closeContradictModal();
   const replacement=$("contradictReplacement").value.trim()||null;
-  const body={};
-  if(replacement)body.replacement=replacement;
+  const body={replacement,idempotency_key:crypto.randomUUID()};
   const r=await j(`/api/namespace/${encodeURIComponent(ns)}/memory/${encodeURIComponent(DETAIL_MID)}/contradict`,{
     method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)
   });
@@ -980,7 +983,7 @@ async def api_memory_detail(request: Request) -> JSONResponse:
     with Store(name, create=False) as st:
         detail = st.get_memory(memory_id)
     if not detail:
-        return JSONResponse({"error": f"memory {memory_id} not found"}, status_code=404)
+        return JSONResponse({"error": "memory not found"}, status_code=404)
     return JSONResponse(detail)
 
 
@@ -992,6 +995,8 @@ async def api_memory_delete(request: Request) -> JSONResponse:
     memory_id = request.path_params["memory_id"]
     with Store(name, create=False) as st:
         result = st.purge(memory_id)
+    result.pop("memory_id", None)
+    result.pop("event_id", None)
     status = 200 if result.get("ok") else 404
     return JSONResponse(result, status_code=status)
 
@@ -1084,19 +1089,42 @@ async def api_contradict(request: Request) -> JSONResponse:
             replacement = replacement.strip() or None
     else:
         replacement = None
+    reason = body.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return JSONResponse({"error": "reason must be a string or null"}, status_code=400)
+    idempotency_key = body.get("idempotency_key")
+    if idempotency_key is not None and not isinstance(idempotency_key, str):
+        return JSONResponse(
+            {"error": "idempotency_key must be a string or null"}, status_code=400
+        )
+    session_id = body.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        return JSONResponse({"error": "session_id must be a string or null"}, status_code=400)
 
     name = resolve_namespace(request.path_params["name"])
     missing = _missing_namespace(name)
     if missing:
         return missing
     memory_id = request.path_params["memory_id"]
-    with Store(name, create=False) as st:
-        result = st.contradict(memory_id, replacement=replacement, origin="dashboard")
+    try:
+        with Store(name, create=False) as st:
+            result = st.contradict(
+                memory_id,
+                replacement=replacement,
+                origin="dashboard",
+                session_id=session_id,
+                reason=reason,
+                idempotency_key=idempotency_key,
+            )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     result["namespace"] = name
     if result.get("ok"):
         status = 200
     elif "not found" in (result.get("error") or ""):
         status = 404
+    elif result.get("conflict") == "idempotency_key_reused":
+        status = 409
     else:
         status = 200
     return JSONResponse(result, status_code=status)

@@ -42,8 +42,12 @@ Call when no `[haunt worldview ns=…]` card is in context.
 Write only when the user wants a named how-to remembered. Do not auto-extract.
 
 ### `memory_contradict`
-`memory_id`, optional `replacement`
-Supersede a wrong fact (`valid_to=now`). Does not delete. Optional `replacement` is stored as semantic.
+`memory_id`, optional `replacement`, `reason`, `idempotency_key`
+Supersede a wrong fact (`valid_to=now`). Does not delete. Optional `replacement` is stored as semantic. Supply a stable caller idempotency key for safe retries.
+
+### `memory_trace`
+`memory_id`
+Return the ordered correction chain from any surviving member, including source context and opaque erased gaps.
 
 ### `memory_purge`
 `memory_id`

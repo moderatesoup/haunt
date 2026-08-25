@@ -457,6 +457,8 @@ def memory_purge(
             result = st.purge(memory_id)
     except UnknownNamespaceError as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
+    result.pop("memory_id", None)
+    result.pop("event_id", None)
     result["namespace"] = ns
     return _json(result)
 
@@ -472,6 +474,9 @@ def memory_contradict(
     replacement: Optional[str] = None,
     namespace: Optional[str] = None,
     origin: str = "mcp",
+    session_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> str:
     try:
         ns = _mcp_namespace(namespace)
@@ -479,10 +484,39 @@ def memory_contradict(
         return _authority_error(exc)
     try:
         with open_existing(ns) as st:
-            result = st.contradict(memory_id, replacement=replacement, origin=origin)
-    except UnknownNamespaceError as exc:
+            result = st.contradict(
+                memory_id,
+                replacement=replacement,
+                origin=origin,
+                session_id=session_id,
+                reason=reason,
+                idempotency_key=idempotency_key,
+            )
+    except (UnknownNamespaceError, ValueError) as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
     result["namespace"] = ns
+    return _json(result)
+
+
+@server.tool(
+    description=(
+        "Trace the ordered correction chain containing a surviving memory, "
+        "including source event/session context and privacy-erasure gaps."
+    )
+)
+def memory_trace(
+    memory_id: str,
+    namespace: Optional[str] = None,
+) -> str:
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
+    try:
+        with open_existing(ns) as st:
+            result = st.trace(memory_id)
+    except UnknownNamespaceError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     return _json(result)
 
 

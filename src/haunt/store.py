@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -41,7 +43,8 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 1: one-time normalize of offset/naive clocks to UTC microseconds.
 # 2: graph evidence tables + hook idempotency key.
 # 3: durable queue for hook-deferred embeddings.
-SCHEMA_VERSION = 3
+# 4: append-only correction lineage plus privacy-erasure tombstones.
+SCHEMA_VERSION = 4
 SCHEMA_VERSION_KEY = "schema_version"
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -51,6 +54,9 @@ _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("entities", ("first_seen", "last_seen")),
     ("relations", ("valid_from", "valid_to")),
 )
+
+CORRECTION_KEY_MAX = 512
+TOMBSTONE_SCHEMA_VERSION = 1
 
 
 class UnknownNamespaceError(ValueError):
@@ -314,6 +320,51 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
             WHERE embedding IS NULL AND TRIM(content) != ''
             """
         )
+    if current < 4:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS lineage_tombstones (
+                schema_version INTEGER NOT NULL,
+                tombstone_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK (status = 'erased'),
+                erased_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS corrections (
+                id TEXT PRIMARY KEY,
+                target_memory_id TEXT,
+                target_tombstone_id TEXT,
+                replacement_memory_id TEXT,
+                replacement_tombstone_id TEXT,
+                corrected_at TEXT NOT NULL,
+                origin TEXT,
+                session_id TEXT,
+                reason TEXT,
+                idempotency_key TEXT,
+                request_identity TEXT,
+                request_payload BLOB,
+                response_json TEXT,
+                CHECK ((target_memory_id IS NOT NULL) !=
+                       (target_tombstone_id IS NOT NULL)),
+                CHECK (replacement_memory_id IS NULL OR
+                       replacement_tombstone_id IS NULL)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_idempotency
+                ON corrections(idempotency_key)
+                WHERE idempotency_key IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_target_memory
+                ON corrections(target_memory_id)
+                WHERE target_memory_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_target_tombstone
+                ON corrections(target_tombstone_id)
+                WHERE target_tombstone_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_replacement_memory
+                ON corrections(replacement_memory_id)
+                WHERE replacement_memory_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_replacement_tombstone
+                ON corrections(replacement_tombstone_id)
+                WHERE replacement_tombstone_id IS NOT NULL;
+            """
+        )
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
         (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
@@ -435,6 +486,26 @@ def verbatim_text(
     if tool_output:
         parts.append(tool_output)
     return "\n".join(parts)
+
+
+def _correction_request_payload(
+    memory_id: str,
+    replacement: str | None,
+    reason: str | None,
+) -> bytes:
+    """Length-prefix exact UTF-8 request fields; null and empty stay distinct."""
+    parts: list[bytes] = []
+    for value in (memory_id, replacement, reason):
+        if value is None:
+            parts.append(b"\x00")
+            continue
+        raw = value.encode("utf-8")
+        parts.append(b"\x01" + struct.pack(">Q", len(raw)) + raw)
+    return b"".join(parts)
+
+
+def _correction_request_identity(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 @dataclass
@@ -1037,6 +1108,8 @@ class Store:
             "entities": count("entities"),
             "relations": count("relations"),
             "embedding_jobs": count("embedding_jobs"),
+            "corrections": count("corrections"),
+            "lineage_tombstones": count("lineage_tombstones"),
             "tiers": tiers,
             "last_write": last["ts"] if last else None,
             "last_event_time": last["event_time"] if last else None,
@@ -1178,10 +1251,15 @@ class Store:
         Returns a report of what was deleted.
         """
         row = self.conn.execute(
-            "SELECT id, event_id FROM memories WHERE id=?", (memory_id,)
+            """
+            SELECT m.id, m.event_id, e.session_id
+            FROM memories m JOIN events e ON e.id=m.event_id
+            WHERE m.id=?
+            """,
+            (memory_id,),
         ).fetchone()
         if not row:
-            return {"ok": False, "error": f"memory {memory_id} not found"}
+            return {"ok": False, "error": "memory not found"}
 
         event_id = row["event_id"]
         deleted: dict[str, Any] = {
@@ -1193,9 +1271,77 @@ class Store:
             "relations_deleted": 0,
             "entities_deleted": 0,
             "event_deleted": False,
+            "session_deleted": False,
         }
 
         try:
+            # Privacy erasure is the sole exception to correction immutability.
+            # Replace an erased chain member with a fresh opaque tombstone and
+            # scrub correction request/context fields that could retain it.
+            lineage_rows = self.conn.execute(
+                """
+                SELECT * FROM corrections
+                WHERE target_memory_id=? OR replacement_memory_id=?
+                """,
+                (memory_id, memory_id),
+            ).fetchall()
+            needs_tombstone = any(
+                r["replacement_memory_id"] is not None
+                or r["replacement_tombstone_id"] is not None
+                for r in lineage_rows
+                if r["target_memory_id"] == memory_id
+            ) or any(r["replacement_memory_id"] == memory_id for r in lineage_rows)
+            tombstone: dict[str, Any] | None = None
+            if needs_tombstone:
+                tombstone = {
+                    "schema_version": TOMBSTONE_SCHEMA_VERSION,
+                    "tombstone_id": new_id(),
+                    "status": "erased",
+                    "erased_at": now_iso(),
+                }
+                self.conn.execute(
+                    """
+                    INSERT INTO lineage_tombstones(
+                        schema_version, tombstone_id, status, erased_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    tuple(tombstone.values()),
+                )
+            for correction in lineage_rows:
+                if correction["target_memory_id"] == memory_id:
+                    has_successor = (
+                        correction["replacement_memory_id"] is not None
+                        or correction["replacement_tombstone_id"] is not None
+                    )
+                    if not has_successor:
+                        self.conn.execute(
+                            "DELETE FROM corrections WHERE id=?", (correction["id"],)
+                        )
+                        continue
+                    self.conn.execute(
+                        """
+                        UPDATE corrections
+                        SET target_memory_id=NULL, target_tombstone_id=?,
+                            origin=NULL, session_id=NULL, reason=NULL,
+                            idempotency_key=NULL, request_identity=NULL,
+                            request_payload=NULL, response_json=NULL
+                        WHERE id=?
+                        """,
+                        (tombstone["tombstone_id"], correction["id"]),
+                    )
+                if correction["replacement_memory_id"] == memory_id:
+                    self.conn.execute(
+                        """
+                        UPDATE corrections
+                        SET replacement_memory_id=NULL, replacement_tombstone_id=?,
+                            origin=NULL, session_id=NULL, reason=NULL,
+                            idempotency_key=NULL, request_identity=NULL,
+                            request_payload=NULL, response_json=NULL
+                        WHERE id=?
+                        """,
+                        (tombstone["tombstone_id"], correction["id"]),
+                    )
+
             self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
 
             try:
@@ -1233,6 +1379,28 @@ class Store:
                 self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
                 deleted["event_deleted"] = True
 
+                session_id = row["session_id"]
+                session_refs = self.conn.execute(
+                    """
+                    SELECT
+                      (SELECT COUNT(*) FROM events WHERE session_id=?) +
+                      (SELECT COUNT(*) FROM corrections WHERE session_id=?)
+                    """,
+                    (session_id, session_id),
+                ).fetchone()[0]
+                if session_refs == 0:
+                    self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                    self.conn.execute(
+                        "DELETE FROM meta WHERE key='current_session' AND value=?",
+                        (session_id,),
+                    )
+                    deleted["session_deleted"] = True
+
+            if tombstone is not None:
+                deleted["lineage_tombstone"] = tombstone
+
+            self._prune_erased_only_lineage()
+
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -1242,6 +1410,181 @@ class Store:
         except Exception:
             pass
         return deleted
+
+    def _prune_erased_only_lineage(self) -> None:
+        """During purge, discard components that no surviving memory can trace."""
+        rows = self.conn.execute(
+            """
+            SELECT id, target_memory_id, target_tombstone_id,
+                   replacement_memory_id, replacement_tombstone_id
+            FROM corrections
+            """
+        ).fetchall()
+
+        def nodes(row: sqlite3.Row) -> list[tuple[str, str]]:
+            found: list[tuple[str, str]] = []
+            for prefix in ("target", "replacement"):
+                if row[f"{prefix}_memory_id"] is not None:
+                    found.append(("memory", str(row[f"{prefix}_memory_id"])))
+                elif row[f"{prefix}_tombstone_id"] is not None:
+                    found.append(("tombstone", str(row[f"{prefix}_tombstone_id"])))
+            return found
+
+        by_node: dict[tuple[str, str], set[str]] = {}
+        row_nodes: dict[str, list[tuple[str, str]]] = {}
+        for row in rows:
+            correction_nodes = nodes(row)
+            row_nodes[str(row["id"])] = correction_nodes
+            for item in correction_nodes:
+                by_node.setdefault(item, set()).add(str(row["id"]))
+
+        pending = set(row_nodes)
+        while pending:
+            seed = pending.pop()
+            component = {seed}
+            frontier = [seed]
+            component_nodes: set[tuple[str, str]] = set()
+            while frontier:
+                correction_id = frontier.pop()
+                for item in row_nodes[correction_id]:
+                    component_nodes.add(item)
+                    for neighbor in by_node[item]:
+                        if neighbor in pending:
+                            pending.remove(neighbor)
+                            component.add(neighbor)
+                            frontier.append(neighbor)
+            if any(kind == "memory" for kind, _ in component_nodes):
+                continue
+            self.conn.executemany(
+                "DELETE FROM corrections WHERE id=?", [(item,) for item in component]
+            )
+
+        self.conn.execute(
+            """
+            DELETE FROM lineage_tombstones
+            WHERE tombstone_id NOT IN (
+                SELECT target_tombstone_id FROM corrections
+                WHERE target_tombstone_id IS NOT NULL
+                UNION
+                SELECT replacement_tombstone_id FROM corrections
+                WHERE replacement_tombstone_id IS NOT NULL
+            )
+            """
+        )
+
+    def trace(self, memory_id: str) -> dict[str, Any]:
+        """Return the ordered correction chain containing a surviving memory.
+
+        Correction records are append-only during ordinary operation. Purge may
+        scrub/delete adjacent records and substitute allowlisted tombstones.
+        """
+        requested = self.conn.execute(
+            "SELECT id, valid_to FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if requested is None:
+            return {"ok": False, "error": "memory not found"}
+
+        correction_rows = self.conn.execute(
+            "SELECT * FROM corrections ORDER BY corrected_at, rowid"
+        ).fetchall()
+
+        def node(row: sqlite3.Row, prefix: str) -> tuple[str, str] | None:
+            memory = row[f"{prefix}_memory_id"]
+            if memory is not None:
+                return ("memory", str(memory))
+            tombstone = row[f"{prefix}_tombstone_id"]
+            if tombstone is not None:
+                return ("tombstone", str(tombstone))
+            return None
+
+        incoming: dict[tuple[str, str], sqlite3.Row] = {}
+        outgoing: dict[tuple[str, str], sqlite3.Row] = {}
+        for correction in correction_rows:
+            target = node(correction, "target")
+            replacement = node(correction, "replacement")
+            if target is not None:
+                outgoing[target] = correction
+            if replacement is not None:
+                incoming[replacement] = correction
+
+        start = ("memory", memory_id)
+        seen: set[tuple[str, str]] = set()
+        while start in incoming and start not in seen:
+            seen.add(start)
+            predecessor = node(incoming[start], "target")
+            if predecessor is None:
+                break
+            start = predecessor
+
+        members: list[dict[str, Any]] = []
+        corrections: list[dict[str, Any]] = []
+        current = start
+        seen.clear()
+        while current not in seen:
+            seen.add(current)
+            if current[0] == "tombstone":
+                tomb = self.conn.execute(
+                    """
+                    SELECT schema_version, tombstone_id, status, erased_at
+                    FROM lineage_tombstones WHERE tombstone_id=?
+                    """,
+                    (current[1],),
+                ).fetchone()
+                if tomb is None:
+                    break
+                members.append(dict(tomb))
+            else:
+                memory = self.conn.execute(
+                    """
+                    SELECT m.id AS memory_id, m.event_id, m.content, m.tier,
+                           m.valid_from, m.valid_to, m.created_at,
+                           e.session_id, e.event_time, e.ts, e.role, e.origin
+                    FROM memories m JOIN events e ON e.id=m.event_id
+                    WHERE m.id=?
+                    """,
+                    (current[1],),
+                ).fetchone()
+                if memory is None:
+                    break
+                member = dict(memory)
+                if current in outgoing:
+                    member["status"] = "superseded"
+                elif member["valid_to"] is not None:
+                    member["status"] = "legacy_unlinked"
+                else:
+                    member["status"] = "current"
+                members.append(member)
+
+            correction = outgoing.get(current)
+            if correction is None:
+                break
+            corrections.append(
+                {
+                    "correction_id": correction["id"],
+                    "corrected_at": correction["corrected_at"],
+                    "origin": correction["origin"],
+                    "session_id": correction["session_id"],
+                    "reason": correction["reason"],
+                }
+            )
+            successor = node(correction, "replacement")
+            if successor is None:
+                break
+            current = successor
+
+        linked = bool(corrections or incoming.get(("memory", memory_id)))
+        lineage_status = "linked" if linked else (
+            "legacy_unlinked" if requested["valid_to"] is not None else "standalone"
+        )
+        return {
+            "ok": True,
+            "schema_version": 1,
+            "namespace": self.name,
+            "requested_memory_id": memory_id,
+            "lineage_status": lineage_status,
+            "members": members,
+            "corrections": corrections,
+        }
 
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         """Retrieve full provenance detail for a single memory."""
@@ -1292,6 +1635,7 @@ class Store:
             (d["session_id"], memory_id),
         ).fetchall()
         d["related_memories"] = [dict(r) for r in related]
+        d["trace"] = self.trace(memory_id)
 
         return d
 
@@ -1499,6 +1843,25 @@ class Store:
     # contradict: supersede a memory
     # ------------------------------------------------------------------
 
+    def _correction_replay(
+        self, key: str, payload: bytes
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT request_payload, response_json FROM corrections WHERE idempotency_key=?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["request_payload"] != payload:
+            return {
+                "ok": False,
+                "conflict": "idempotency_key_reused",
+                "error": "idempotency_key was reused with a different correction payload",
+            }
+        original = loads(row["response_json"], default={})
+        original["deduplicated"] = True
+        return original
+
     def contradict(
         self,
         memory_id: str,
@@ -1507,29 +1870,63 @@ class Store:
         namespace: str | None = None,
         origin: str = "cli",
         session_id: str | None = None,
+        reason: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Mark memory_id superseded (set valid_to=now). Optionally store replacement as semantic."""
+        """Append a correction and update its current/as-of projection atomically."""
         if replacement is not None and not isinstance(replacement, str):
             raise ValueError("replacement must be a string or null")
-        ts = now_iso()
-        row = self.conn.execute(
-            "SELECT id, valid_to FROM memories WHERE id=?", (memory_id,)
-        ).fetchone()
-        if not row:
-            return {"ok": False, "error": f"memory {memory_id} not found"}
-        if row["valid_to"] is not None:
-            return {
-                "ok": False,
-                "error": f"memory {memory_id} already superseded",
-                "valid_to": row["valid_to"],
-            }
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("reason must be a string or null")
+        if not isinstance(origin, str) or not origin.strip():
+            raise ValueError("origin must be a non-empty string")
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            raise ValueError("idempotency_key must be a string")
+        key = new_id() if idempotency_key is None else idempotency_key
+        if not key or not key.strip():
+            raise ValueError("idempotency_key must be non-empty")
+        if len(key) > CORRECTION_KEY_MAX:
+            raise ValueError(
+                f"idempotency_key must be {CORRECTION_KEY_MAX} characters or fewer"
+            )
 
-        replacement_text = (replacement or "").strip() or None
+        # Empty replacement has historically meant "supersede without replacing".
+        # All other bytes, including surrounding whitespace, remain verbatim.
+        replacement_text = None if replacement == "" else replacement
+        payload = _correction_request_payload(memory_id, replacement_text, reason)
+        request_identity = _correction_request_identity(payload)
+        replay_result = self._correction_replay(key, payload)
+        if replay_result is not None:
+            return replay_result
         if replacement_text is not None:
             self.ensure_current_embeddings()
-            self.ensure_session(session_id, source=origin)
+            self.process_embedding_jobs(limit=32)
 
         try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            replay_result = self._correction_replay(key, payload)
+            if replay_result is not None:
+                self.conn.rollback()
+                return replay_result
+
+            row = self.conn.execute(
+                "SELECT id, valid_to FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+            if not row:
+                self.conn.rollback()
+                return {"ok": False, "error": f"memory {memory_id} not found"}
+            if row["valid_to"] is not None:
+                self.conn.rollback()
+                return {
+                    "ok": False,
+                    "conflict": "already_superseded",
+                    "error": f"memory {memory_id} already superseded",
+                    "valid_to": row["valid_to"],
+                }
+
+            ts = now_iso()
+            correction_id = new_id()
+            sid = self.ensure_session(session_id, source=origin, commit=False)
             cur = self.conn.execute(
                 "UPDATE memories SET valid_to=? WHERE id=? AND valid_to IS NULL",
                 (ts, memory_id),
@@ -1541,27 +1938,61 @@ class Store:
                 ).fetchone()
                 return {
                     "ok": False,
+                    "conflict": "already_superseded",
                     "error": f"memory {memory_id} already superseded",
                     "valid_to": None if again is None else again["valid_to"],
                 }
             result: dict[str, Any] = {
                 "ok": True,
+                "correction_id": correction_id,
                 "superseded": memory_id,
                 "valid_to": ts,
+                "idempotency_key": key,
+                "request_identity": request_identity,
+                "deduplicated": False,
             }
-            if replacement_text:
+            replacement_memory_id: str | None = None
+            if replacement_text is not None:
                 r = self.observe(
                     replacement_text,
                     role="system",
                     tier="semantic",
-                    session_id=session_id,
+                    session_id=sid,
+                    event_time=ts,
+                    valid_from=ts,
                     origin=origin,
                     commit=False,
                 )
+                replacement_memory_id = r.memory_id
                 result["replacement_memory_id"] = r.memory_id
                 result["replacement_event_id"] = r.event_id
+            self.conn.execute(
+                """
+                INSERT INTO corrections(
+                    id, target_memory_id, replacement_memory_id, corrected_at,
+                    origin, session_id, reason, idempotency_key,
+                    request_identity, request_payload, response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    correction_id,
+                    memory_id,
+                    replacement_memory_id,
+                    ts,
+                    origin,
+                    sid,
+                    reason,
+                    key,
+                    request_identity,
+                    payload,
+                    dumps(result),
+                ),
+            )
             self.conn.commit()
-            touch_namespace(self.name)
+            try:
+                touch_namespace(self.name)
+            except Exception:
+                pass
             return result
         except Exception:
             self.conn.rollback()
