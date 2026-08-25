@@ -169,7 +169,7 @@ def recall_cmd(
     k: int = typer.Option(8, "--k"),
     json_out: bool = typer.Option(False, "--json", help="Output stable JSON"),
 ) -> None:
-    """Hybrid recall (vec + FTS5 + RRF). Prints RRF rank signal, tier, id, snippet.
+    """Recall memories. Ranked hits show an RRF signal; timeline hits show time order.
 
     Natural-language time phrases are compiled at query time. Non-temporal
     queries take the existing recall path unchanged.
@@ -217,7 +217,7 @@ def recall_cmd(
     if not hits:
         typer.echo("no hits")
         return
-    typer.echo(f"{'#':<3} {'rrf':<8} {'tier':<12} {'id':<36} snippet")
+    typer.echo(f"{'#':<3} {'signal':<12} {'tier':<12} {'id':<36} snippet")
     for i, h in enumerate(hits, 1):
         tier_text = human_display(
             h.tier, limit=40, collapse_whitespace=True, sqlite_scalar=True
@@ -225,8 +225,13 @@ def recall_cmd(
         memory_id = human_display(
             h.memory_id, limit=64, collapse_whitespace=True, sqlite_scalar=True
         )
+        signal = (
+            f"rrf={h.score:.4f}"
+            if h.vec_rank is not None or h.fts_rank is not None
+            else "time-order"
+        )
         typer.echo(
-            f"{i:<3} {h.score:<8.4f} {tier_text:<12} {memory_id:<36} "
+            f"{i:<3} {signal:<12} {tier_text:<12} {memory_id:<36} "
             f"{snippet(h.content, 140)}"
         )
 

@@ -46,6 +46,7 @@ class Hit:
     vec_rank: int | None = None
     fts_rank: int | None = None
     vec_distance: float | None = None
+    vec_metric: str | None = None
     fts_rank_raw: float | None = None
     filter_context: dict[str, Any] | None = None
     final_rank: int | None = None
@@ -67,12 +68,22 @@ class Hit:
         produced; it deliberately does not present retrieval as confidence.
         """
         vector = (
-            {"rank": self.vec_rank, "distance": self.vec_distance}
+            {
+                "rank": self.vec_rank,
+                "distance": self.vec_distance,
+                "metric": self.vec_metric,
+                "lower_is_better": True,
+            }
             if self.vec_rank is not None
             else None
         )
         fts = (
-            {"rank": self.fts_rank, "raw_score": self.fts_rank_raw}
+            {
+                "rank": self.fts_rank,
+                "raw_score": self.fts_rank_raw,
+                "metric": "fts5_bm25",
+                "lower_is_better": True,
+            }
             if self.fts_rank is not None
             else None
         )
@@ -83,7 +94,7 @@ class Hit:
                     {
                         "source": source,
                         "rank": rank,
-                        "value": round(1.0 / (RRF_K + rank), 6),
+                        "value": 1.0 / (RRF_K + rank),
                     }
                 )
         is_rrf = bool(contributions)
@@ -98,7 +109,12 @@ class Hit:
                 "rrf_rank_signal_not_confidence" if is_rrf else "not_ranked"
             ),
             "final_rank": self.final_rank,
-            "rrf_score": round(self.score, 6) if is_rrf else None,
+            # Keep the unrounded contributions and their sum together so a
+            # consumer can reproduce this serialized score without a rounding
+            # discrepancy. The legacy top-level ``score`` remains rounded.
+            "rrf_score": (
+                sum(item["value"] for item in contributions) if is_rrf else None
+            ),
             "rrf_k": RRF_K if is_rrf else None,
             "rrf_contributions": contributions,
             "vector": vector,
@@ -245,7 +261,7 @@ def _vec_hits(
     where: str,
     params: list[Any],
     limit: int,
-) -> list[tuple[str, int, float]]:
+) -> list[tuple[str, int, float, str]]:
     blob = sqlite_vec.serialize_float32(query_vec)
     conn = store.conn
     if store.vec_ok():
@@ -265,7 +281,10 @@ def _vec_hits(
             """
             try:
                 rows = conn.execute(sql, [blob, limit, *params]).fetchall()
-                return [(r["mid"], i + 1, float(r["dist"])) for i, r in enumerate(rows)]
+                return [
+                    (r["mid"], i + 1, float(r["dist"]), "cosine_distance")
+                    for i, r in enumerate(rows)
+                ]
             except sqlite3.Error:
                 pass
     sql = f"""
@@ -281,7 +300,10 @@ def _vec_hits(
             continue
         scored.append((r["mid"], _l2(query_vec, vec)))
     scored.sort(key=lambda x: x[1])
-    return [(mid, i + 1, dist) for i, (mid, dist) in enumerate(scored[:limit])]
+    return [
+        (mid, i + 1, dist, "l2_distance")
+        for i, (mid, dist) in enumerate(scored[:limit])
+    ]
 
 
 def recall(
@@ -322,18 +344,18 @@ def recall(
             include_untrusted=include_untrusted,
         )
         fts = _fts_hits(store.conn, query, where, params, CANDIDATES)
-        vec: list[tuple[str, int, float]] = []
+        vec: list[tuple[str, int, float, str]] = []
         if use_vectors and embed_available():
             qv = embed_one(query)
             if qv:
                 vec = _vec_hits(store, qv, where, params, CANDIDATES)
 
         rrf: dict[str, float] = {}
-        vec_rank: dict[str, tuple[int, float]] = {}
+        vec_rank: dict[str, tuple[int, float, str]] = {}
         fts_rank: dict[str, tuple[int, float]] = {}
-        for mid, rank, raw in vec:
+        for mid, rank, raw, metric in vec:
             rrf[mid] = rrf.get(mid, 0.0) + 1.0 / (RRF_K + rank)
-            vec_rank[mid] = (rank, raw)
+            vec_rank[mid] = (rank, raw, metric)
         for mid, rank, raw in fts:
             rrf[mid] = rrf.get(mid, 0.0) + 1.0 / (RRF_K + rank)
             fts_rank[mid] = (rank, raw)
@@ -372,6 +394,7 @@ def recall(
                     vec_rank=vr[0] if vr else None,
                     fts_rank=fr[0] if fr else None,
                     vec_distance=vr[1] if vr else None,
+                    vec_metric=vr[2] if vr else None,
                     fts_rank_raw=fr[1] if fr else None,
                     filter_context=filter_context,
                     final_rank=final_rank,
