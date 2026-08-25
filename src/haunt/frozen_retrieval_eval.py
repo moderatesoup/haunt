@@ -24,7 +24,7 @@ from haunt.planner import planned_recall
 from haunt.recall import recall
 from haunt.store import Store
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 K = 3
 _ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CORPUS = _ROOT / "tests" / "fixtures" / "retrieval_eval" / "corpus.json"
@@ -117,6 +117,9 @@ def _seed(corpus: dict[str, Any]) -> dict[str, str]:
                 record["content"],
                 role=record.get("role", "user"),
                 tier=record.get("tier", "episodic"),
+                tool_name=record.get("tool_name"),
+                tool_input=record.get("tool_input"),
+                tool_output=record.get("tool_output"),
                 origin="frozen-retrieval-eval",
                 event_time=record["event_time"],
                 valid_from=record.get("valid_from", record["event_time"]),
@@ -157,12 +160,26 @@ def _run_case(
         (i for i, value in enumerate(returned, start=1) if value in expected_set),
         None,
     )
-    return {
+    result = {
         "returned": returned,
         "relevant": expected,
         "first_relevant_rank": rank,
         "empty": not returned,
     }
+    if case.get("lock_returned_metadata"):
+        # Keep the public lock portable: fixture IDs, rather than generated
+        # Store IDs, identify the returned records. Read trust labels from the
+        # public serialization path, but allowlist this projection so additive
+        # Hit.as_dict() fields do not change the frozen artifact's contract.
+        result["returned_metadata"] = [
+            {
+                "id": by_memory_id[serialized["memory_id"]],
+                "trusted": serialized["trusted"],
+                "trust_reason": serialized["trust_reason"],
+            }
+            for serialized in (hit.as_dict() for hit in hits)
+        ]
+    return result
 
 
 def _metrics(cases: dict[str, dict[str, Any]]) -> dict[str, float | int]:

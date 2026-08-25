@@ -26,7 +26,7 @@ not completion.
 
 | Area | Existing behavior | Adoption gap |
 |---|---|---|
-| Evaluation | The optional LongMemEval temporal probe remains external-data-only (`scripts/score_lme_temporal.py:74-154`). The repository now also has a deterministic FTS-only `K=3` regression gate with logical-ID normalization, corpus/config hashes, exact ordered results, and non-vacuous positive/negative assertions (`src/haunt/frozen_retrieval_eval.py`; `tests/test_frozen_retrieval_eval.py`). | Add and lock the remaining stemming/morphology and tool-I/O trust controls, then mark E0 done. Hybrid calibration belongs to E6. |
+| Evaluation | The optional LongMemEval temporal probe remains external-data-only (`scripts/score_lme_temporal.py:74-154`). E0 now provides a deterministic FTS-only `K=3` regression gate with logical-ID normalization, corpus/config hashes, exact ordered results, Porter morphology, serialized tool-I/O trust metadata, and non-vacuous positive/negative assertions (`src/haunt/frozen_retrieval_eval.py`; `tests/test_frozen_retrieval_eval.py`). | E0 is complete. Pinned hybrid evaluation and calibration remain E6 work. |
 | Correction | `Store.contradict()` updates `memories.valid_to` and may add an unlinked replacement (`src/haunt/store.py:1502-1565`); current recall hides closed rows (`src/haunt/recall.py:93-123`). | An append-only correction record and traversable old-to-new lineage. |
 | Provenance | Events carry session, time, role, tool fields, an `origin` string, and free-form `meta` (`src/haunt/store.py:131-164`, `src/haunt/store.py:569-659`). | A validated, structured source/import envelope and a trace surface. |
 | Namespace identity | Repository remotes derive collision-resistant names and legacy registrations are reused (`src/haunt/paths.py:56-117`, `src/haunt/paths.py:148-178`). | Explicit aliases, rename/move migration, collision handling, and retirement rules. |
@@ -56,7 +56,7 @@ schemas it must round-trip. E7 joins the portability and retrieval branches.
 
 ## E0 — Freeze the retrieval evaluation
 
-**Status:** In progress
+**Status:** Done
 
 **Depends on:** none
 
@@ -103,6 +103,16 @@ regression comparison for every later epic without requiring embeddings.
 - The gate runs under the existing `HAUNT_FTS_ONLY=1` pytest CI path. The
   committed baseline and failing assertion output are the evidence; E0 does not
   require CI artifact upload/publication unless the workflow later adds it.
+
+**Completion evidence**
+
+- `tests/fixtures/retrieval_eval/corpus.json` and `baseline.json` are schema v2
+  and lock ten cases: nine positive and one designated no-hit query.
+- The locked metrics are Recall@3 `1.0`, MRR `1.0`, false-negative rate `0.0`,
+  and negative-query false-positive rate `0.0`.
+- `tests/test_frozen_retrieval_eval.py` proves exact full-baseline equality,
+  repeated-run determinism, caller-home isolation, Porter morphology, and that
+  a public `Hit.as_dict()` trust-label regression fails the gate.
 
 **Non-goals**
 
