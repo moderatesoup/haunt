@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "dataset_sha256": "a305dbdb0811b3ae512d2c8916466a896d27bbb2bd976f38f44f7073678e5fdc",
+  "config_sha256": "5e1d2977da5a99cacdb5c693a73ee78f23d2ea9a35e8dcaf871428fda0175dab",
+  "cases": {
+    "lexical_ranking": {
+      "returned": [
+        "lexical_primary",
+        "lexical_distractor"
+      ],
+      "relevant": [
+        "lexical_primary"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "unicode_fts": {
+      "returned": [
+        "unicode_fts"
+      ],
+      "relevant": [
+        "unicode_fts"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "current_supersession": {
+      "returned": [
+        "current_access_code"
+      ],
+      "relevant": [
+        "current_access_code"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "as_of_before_supersession": {
+      "returned": [
+        "superseded_access_code"
+      ],
+      "relevant": [
+        "superseded_access_code"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "planned_temporal_window": {
+      "returned": [
+        "may_archive"
+      ],
+      "relevant": [
+        "may_archive"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "procedure_tier": {
+      "returned": [
+        "vault_handoff_procedure"
+      ],
+      "relevant": [
+        "vault_handoff_procedure"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "namespace_isolation": {
+      "returned": [
+        "main_isolation_beacon"
+      ],
+      "relevant": [
+        "main_isolation_beacon"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "negative_ood": {
+      "returned": [],
+      "relevant": [],
+      "first_relevant_rank": null,
+      "empty": true
+    }
+  },
+  "metrics": {
+    "cases": 8,
+    "positive_cases": 7,
+    "negative_cases": 1,
+    "recall_at_3": 1.0,
+    "mrr": 1.0,
+    "empty_result_rate": 0.125,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0
+  }
+}

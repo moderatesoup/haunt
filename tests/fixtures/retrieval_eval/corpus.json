@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "id": "lexical_primary",
+      "namespace": "frozen-main",
+      "content": "The marigold vector ledger requires a signed amber receipt.",
+      "event_time": "2024-01-10T09:00:00+00:00"
+    },
+    {
+      "id": "lexical_distractor",
+      "namespace": "frozen-main",
+      "content": "The ledger has ordinary receipts and a blue filing label.",
+      "event_time": "2024-01-11T09:00:00+00:00"
+    },
+    {
+      "id": "unicode_fts",
+      "namespace": "frozen-main",
+      "content": "Le café de 東京 conserve le résumé de la réunion.",
+      "event_time": "2024-01-12T09:00:00+00:00"
+    },
+    {
+      "id": "superseded_access_code",
+      "namespace": "frozen-main",
+      "content": "Snowcap access code is cedar-17.",
+      "event_time": "2024-02-01T09:00:00+00:00",
+      "valid_from": "2024-02-01T09:00:00+00:00"
+    },
+    {
+      "id": "current_access_code",
+      "namespace": "frozen-main",
+      "content": "Snowcap access code is juniper-42.",
+      "supersedes": "superseded_access_code",
+      "superseded_at": "2024-03-01T09:00:00+00:00"
+    },
+    {
+      "id": "may_archive",
+      "namespace": "frozen-main",
+      "content": "Aurora archive was sealed with heliotrope wax.",
+      "event_time": "2024-05-14T12:00:00+00:00"
+    },
+    {
+      "id": "june_archive",
+      "namespace": "frozen-main",
+      "content": "Aurora archive inventory was reviewed in June.",
+      "event_time": "2024-06-14T12:00:00+00:00"
+    },
+    {
+      "id": "vault_handoff_procedure",
+      "namespace": "frozen-main",
+      "tier": "procedural",
+      "role": "system",
+      "meta": {"kind": "procedure", "name": "vault handoff", "trigger": "release"},
+      "content": "Release vault handoff: verify the wax seal, then transfer the keycard.",
+      "event_time": "2024-07-01T12:00:00+00:00"
+    },
+    {
+      "id": "main_isolation_beacon",
+      "namespace": "frozen-main",
+      "content": "Main namespace isolation beacon is cobalt-31.",
+      "event_time": "2024-07-02T12:00:00+00:00"
+    },
+    {
+      "id": "other_isolation_beacon",
+      "namespace": "frozen-other",
+      "content": "Other namespace isolation beacon is cobalt-99.",
+      "event_time": "2024-07-02T12:00:00+00:00"
+    }
+  ],
+  "cases": [
+    {
+      "id": "lexical_ranking",
+      "namespace": "frozen-main",
+      "query": "marigold vector ledger amber",
+      "relevant": ["lexical_primary"]
+    },
+    {
+      "id": "unicode_fts",
+      "namespace": "frozen-main",
+      "query": "東京 café résumé",
+      "relevant": ["unicode_fts"]
+    },
+    {
+      "id": "current_supersession",
+      "namespace": "frozen-main",
+      "query": "snowcap access code",
+      "relevant": ["current_access_code"]
+    },
+    {
+      "id": "as_of_before_supersession",
+      "namespace": "frozen-main",
+      "query": "snowcap access code",
+      "options": {"as_of": "2024-02-15T09:00:00+00:00"},
+      "relevant": ["superseded_access_code"]
+    },
+    {
+      "id": "planned_temporal_window",
+      "entrypoint": "planned_recall",
+      "namespace": "frozen-main",
+      "query": "aurora archive in May 2024",
+      "now": "2026-08-22T15:30:00+00:00",
+      "relevant": ["may_archive"]
+    },
+    {
+      "id": "procedure_tier",
+      "namespace": "frozen-main",
+      "query": "release vault handoff",
+      "options": {"tier": "procedural"},
+      "relevant": ["vault_handoff_procedure"]
+    },
+    {
+      "id": "namespace_isolation",
+      "namespace": "frozen-main",
+      "query": "isolation beacon cobalt",
+      "relevant": ["main_isolation_beacon"]
+    },
+    {
+      "id": "negative_ood",
+      "namespace": "frozen-main",
+      "query": "unmatched zephyr quasar 918",
+      "relevant": []
+    }
+  ]
+}
