@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,7 @@ HOOK_EVENTS = (
     "sessionEnd",
 )
 STORE_THOUGHTS_ENV = ("HAUNT_STORE_THOUGHTS",)
+TOOL_IO_MAX_CHARS_DEFAULT = 12_000
 
 
 def _as_text(value: Any) -> str:
@@ -206,12 +208,47 @@ def _is_memory_tool(name: str) -> bool:
     return leaf.startswith("memory_")
 
 
+def _tool_excluded(name: str) -> bool:
+    """Match comma-separated, case-insensitive tool globs from the environment."""
+    raw = os.environ.get("HAUNT_EXCLUDE_TOOLS") or ""
+    patterns = [part.strip().casefold() for part in raw.split(",") if part.strip()]
+    candidate = (name or "").strip().casefold()
+    return any(fnmatchcase(candidate, pattern) for pattern in patterns)
+
+
+def _tool_io_cap() -> int:
+    raw = (os.environ.get("HAUNT_TOOL_IO_MAX_CHARS") or "").strip()
+    try:
+        value = int(raw) if raw else TOOL_IO_MAX_CHARS_DEFAULT
+    except ValueError:
+        value = TOOL_IO_MAX_CHARS_DEFAULT
+    return max(256, min(value, 100_000))
+
+
+def _cap_tool_io(text: str) -> str:
+    cap = _tool_io_cap()
+    if len(text) <= cap:
+        return text
+    omitted = len(text) - cap
+    return f"{text[:cap]}\n… [truncated by haunt: {omitted} chars omitted]"
+
+
+def _prepare_tool_io(tool_input: str, tool_output: str) -> tuple[str, str]:
+    return (
+        _redact_secrets(_cap_tool_io(tool_input)),
+        _redact_secrets(_cap_tool_io(tool_output)),
+    )
+
+
 def format_recall_block(hits: list[Hit], namespace: str) -> str:
     lines = [f"[haunt ns={namespace}]"]
-    if not hits:
+    # Defense in depth: automatic hook context must never render raw tool I/O,
+    # even if a future caller forgets recall(include_untrusted=False).
+    safe_hits = [hit for hit in hits if hit.trusted]
+    if not safe_hits:
         lines.append("(no memories)")
         return "\n".join(lines)
-    for i, h in enumerate(hits, 1):
+    for i, h in enumerate(safe_hits, 1):
         lines.append(
             f"{i}  {h.score:.4f}  {h.tier}  {h.memory_id}  {snippet(h.content, 160)}"
         )
@@ -246,6 +283,7 @@ def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
             event=event,
             session_id=session_id,
         ),
+        defer_embedding=True,
         **kwargs,
     )
 
@@ -256,7 +294,14 @@ def _handle_before_submit(store: Store, payload: dict[str, Any], ns: str) -> dic
     hits: list[Hit] = []
     if prompt.strip():
         try:
-            hits = recall(prompt, namespace=ns, k=8, store=store)
+            hits = recall(
+                prompt,
+                namespace=ns,
+                k=8,
+                store=store,
+                include_untrusted=False,
+                use_vectors=False,
+            )
         except Exception:
             hits = []
         _observe(store, payload, content=prompt, role="user", tier="episodic")
@@ -288,8 +333,12 @@ def _handle_after_thought(store: Store, payload: dict[str, Any]) -> dict[str, An
 
 def _handle_post_tool(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
     name = _as_text(payload.get("tool_name")) or "tool"
-    if _is_memory_tool(name):
+    if _is_memory_tool(name) or _tool_excluded(name):
         return {}
+    tool_input, tool_output = _prepare_tool_io(
+        _as_text(payload.get("tool_input")),
+        _as_text(payload.get("tool_output")),
+    )
     # Generic tool I/O is episodic, not a named how-to (meta.kind=procedure).
     _observe(
         store,
@@ -298,13 +347,19 @@ def _handle_post_tool(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         role="tool",
         tier="episodic",
         tool_name=name,
-        tool_input=_redact_secrets(_as_text(payload.get("tool_input"))),
-        tool_output=_redact_secrets(_as_text(payload.get("tool_output"))),
+        tool_input=tool_input,
+        tool_output=tool_output,
     )
     return {}
 
 
 def _handle_after_shell(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
+    if _tool_excluded("Shell"):
+        return {}
+    tool_input, tool_output = _prepare_tool_io(
+        _as_text(payload.get("command")),
+        _as_text(payload.get("output")),
+    )
     _observe(
         store,
         payload,
@@ -312,16 +367,20 @@ def _handle_after_shell(store: Store, payload: dict[str, Any]) -> dict[str, Any]
         role="tool",
         tier="episodic",
         tool_name="Shell",
-        tool_input=_redact_secrets(_as_text(payload.get("command"))),
-        tool_output=_redact_secrets(_as_text(payload.get("output"))),
+        tool_input=tool_input,
+        tool_output=tool_output,
     )
     return {}
 
 
 def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
     name = _as_text(payload.get("tool_name"))
-    if _is_memory_tool(name):
+    if _is_memory_tool(name) or _tool_excluded(name or "mcp"):
         return {}
+    tool_input, tool_output = _prepare_tool_io(
+        _as_text(payload.get("tool_input")),
+        _as_text(payload.get("result_json")),
+    )
     _observe(
         store,
         payload,
@@ -329,8 +388,8 @@ def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         role="tool",
         tier="episodic",
         tool_name=name or "mcp",
-        tool_input=_redact_secrets(_as_text(payload.get("tool_input"))),
-        tool_output=_redact_secrets(_as_text(payload.get("result_json"))),
+        tool_input=tool_input,
+        tool_output=tool_output,
     )
     return {}
 

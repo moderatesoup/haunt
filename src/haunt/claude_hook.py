@@ -20,7 +20,8 @@ from typing import Any
 from haunt.cursor_hook import (
     _as_text,
     _is_memory_tool,
-    _redact_secrets,
+    _prepare_tool_io,
+    _tool_excluded,
     format_recall_block,
     format_worldview_card,
     hook_idempotency_key,
@@ -89,6 +90,7 @@ def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
             event=event,
             session_id=session_id,
         ),
+        defer_embedding=True,
         **kwargs,
     )
 
@@ -101,7 +103,14 @@ def _handle_user_prompt_submit(
     hits = []
     if prompt.strip():
         try:
-            hits = recall(prompt, namespace=ns, k=8, store=store)
+            hits = recall(
+                prompt,
+                namespace=ns,
+                k=8,
+                store=store,
+                include_untrusted=False,
+                use_vectors=False,
+            )
         except Exception:
             hits = []
         _observe(store, payload, content=prompt, role="user", tier="episodic")
@@ -161,8 +170,12 @@ def _tool_output_text(payload: dict[str, Any]) -> str:
 def _handle_post_tool_use(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
     """PostToolUse / PostToolUseFailure: log tool I/O as episodic, skip memory_*."""
     name = _as_text(payload.get("tool_name")) or "tool"
-    if _is_memory_tool(name):
+    if _is_memory_tool(name) or _tool_excluded(name):
         return {}
+    tool_input, tool_output = _prepare_tool_io(
+        _as_text(payload.get("tool_input")),
+        _tool_output_text(payload),
+    )
     _observe(
         store,
         payload,
@@ -170,8 +183,8 @@ def _handle_post_tool_use(store: Store, payload: dict[str, Any]) -> dict[str, An
         role="tool",
         tier="episodic",
         tool_name=name,
-        tool_input=_redact_secrets(_as_text(payload.get("tool_input"))),
-        tool_output=_redact_secrets(_tool_output_text(payload)),
+        tool_input=tool_input,
+        tool_output=tool_output,
     )
     return {}
 

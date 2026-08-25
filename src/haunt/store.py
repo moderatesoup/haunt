@@ -40,7 +40,8 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 
 # 1: one-time normalize of offset/naive clocks to UTC microseconds.
 # 2: graph evidence tables + hook idempotency key.
-SCHEMA_VERSION = 2
+# 3: durable queue for hook-deferred embeddings.
+SCHEMA_VERSION = 3
 SCHEMA_VERSION_KEY = "schema_version"
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -199,6 +200,13 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (src_entity) REFERENCES entities(id),
             FOREIGN KEY (dst_entity) REFERENCES entities(id)
         );
+        CREATE TABLE IF NOT EXISTS embedding_jobs (
+            memory_id TEXT PRIMARY KEY,
+            queued_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+        );
         CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
         CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time);
         CREATE INDEX IF NOT EXISTS idx_events_tier ON events(tier);
@@ -210,6 +218,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
         CREATE INDEX IF NOT EXISTS idx_relation_evidence_src ON relation_evidence(src_entity);
         CREATE INDEX IF NOT EXISTS idx_relation_evidence_dst ON relation_evidence(dst_entity);
+        CREATE INDEX IF NOT EXISTS idx_embedding_jobs_queued ON embedding_jobs(queued_at);
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             id UNINDEXED,
             content,
@@ -296,6 +305,14 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency "
             "ON events(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+    if current < 3:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
+            SELECT id, created_at FROM memories
+            WHERE embedding IS NULL AND TRIM(content) != ''
+            """
         )
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
@@ -429,6 +446,7 @@ class ObserveResult:
     tier: str
     entities: list[str] = field(default_factory=list)
     embedded: bool = False
+    embedding_queued: bool = False
     deduplicated: bool = False
 
 
@@ -564,6 +582,7 @@ class Store:
         valid_from: str | None = None,
         valid_to: str | None = None,
         idempotency_key: str | None = None,
+        defer_embedding: bool = False,
         commit: bool = True,
     ) -> ObserveResult:
         if role not in ROLES:
@@ -578,8 +597,9 @@ class Store:
             existing = self._observe_by_idempotency_key(idem, text)
             if existing is not None:
                 return existing
-        if commit:
+        if commit and not defer_embedding:
             self.ensure_current_embeddings()
+            self.process_embedding_jobs(limit=32)
         try:
             sid = self.ensure_session(session_id, source=origin, commit=False)
             et = iso_or_now(event_time)
@@ -613,7 +633,11 @@ class Store:
             )
             blob = None
             embedded = False
-            vec = embed_one(text) if text.strip() else None
+            vec = (
+                None
+                if defer_embedding
+                else (embed_one(text) if text.strip() else None)
+            )
             if vec is not None:
                 blob = sqlite_vec.serialize_float32(vec)
                 ensure_vec_table(self.conn, len(vec), commit=False)
@@ -638,6 +662,15 @@ class Store:
                 "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
                 (memory_id, text),
             )
+            embedding_queued = bool(blob is None and text.strip())
+            if embedding_queued:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
+                    VALUES (?, ?)
+                    """,
+                    (memory_id, ts),
+                )
             if blob is not None and _vec_loaded(self.conn):
                 try:
                     self.conn.execute(
@@ -677,6 +710,7 @@ class Store:
             tier=tier,
             entities=entity_names,
             embedded=embedded,
+            embedding_queued=embedding_queued,
         )
 
     def _observe_by_idempotency_key(
@@ -721,8 +755,135 @@ class Store:
             tier=row["tier"],
             entities=entities,
             embedded=row["embedding"] is not None,
+            embedding_queued=self.conn.execute(
+                "SELECT 1 FROM embedding_jobs WHERE memory_id=?",
+                (row["memory_id"],),
+            ).fetchone()
+            is not None,
             deduplicated=True,
         )
+
+
+    def process_embedding_jobs(self, *, limit: int = 64) -> dict[str, Any]:
+        """Embed queued hook writes in a persistent, model-owning process."""
+        cap = clamp_limit(limit, default=64)
+        queued = self.conn.execute(
+            """
+            SELECT j.memory_id, m.content
+            FROM embedding_jobs j
+            JOIN memories m ON m.id=j.memory_id
+            ORDER BY j.queued_at ASC, j.rowid ASC
+            LIMIT ?
+            """,
+            (cap,),
+        ).fetchall()
+        if not queued:
+            return {"queued": 0, "processed": 0, "failed": 0}
+        es = embed_state()
+        if not es.available:
+            return {
+                "queued": len(queued),
+                "processed": 0,
+                "failed": 0,
+                "available": False,
+            }
+        try:
+            vectors = embed_texts(
+                [row["content"] if row["content"] else " " for row in queued]
+            )
+        except Exception as exc:
+            message = str(exc)[:1000]
+            self.conn.executemany(
+                """
+                UPDATE embedding_jobs
+                SET attempts=attempts+1, last_error=? WHERE memory_id=?
+                """,
+                [(message, row["memory_id"]) for row in queued],
+            )
+            self.conn.commit()
+            return {
+                "queued": len(queued),
+                "processed": 0,
+                "failed": len(queued),
+                "error": message,
+            }
+        if not vectors:
+            message = "embedding backend returned no vectors"
+            self.conn.executemany(
+                """
+                UPDATE embedding_jobs
+                SET attempts=attempts+1, last_error=? WHERE memory_id=?
+                """,
+                [(message, row["memory_id"]) for row in queued],
+            )
+            self.conn.commit()
+            return {
+                "queued": len(queued),
+                "processed": 0,
+                "failed": len(queued),
+                "error": message,
+            }
+
+        ensure_vec_table(self.conn, es.dim, commit=False)
+        processed = 0
+        failed = 0
+        for row, vec in zip(queued, vectors):
+            memory_id = row["memory_id"]
+            try:
+                if len(vec) != es.dim:
+                    raise ValueError(
+                        f"embedding backend returned dimension {len(vec)}; "
+                        f"expected {es.dim}"
+                    )
+                blob = sqlite_vec.serialize_float32(vec)
+                self.conn.execute(
+                    "UPDATE memories SET embedding=? WHERE id=?",
+                    (blob, memory_id),
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?, ?)",
+                    (memory_id, blob),
+                )
+                self.conn.execute(
+                    "DELETE FROM embedding_jobs WHERE memory_id=?",
+                    (memory_id,),
+                )
+                processed += 1
+            except (sqlite3.Error, TypeError, ValueError) as exc:
+                self.conn.execute(
+                    """
+                    UPDATE embedding_jobs
+                    SET attempts=attempts+1, last_error=? WHERE memory_id=?
+                    """,
+                    (str(exc)[:1000], memory_id),
+                )
+                failed += 1
+        if len(vectors) < len(queued):
+            missing = queued[len(vectors) :]
+            message = "embedding backend returned fewer vectors than inputs"
+            self.conn.executemany(
+                """
+                UPDATE embedding_jobs
+                SET attempts=attempts+1, last_error=? WHERE memory_id=?
+                """,
+                [(message, row["memory_id"]) for row in missing],
+            )
+            failed += len(missing)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_model', ?)",
+            (es.model_id,),
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_dim', ?)",
+            (str(es.dim),),
+        )
+        self.conn.commit()
+        return {
+            "queued": len(queued),
+            "processed": processed,
+            "failed": failed,
+            "available": True,
+        }
 
 
     def embeddings_stale(self) -> bool:
@@ -756,6 +917,12 @@ class Store:
         self.conn.execute("DROP TABLE IF EXISTS vec_memories")
         if not es.available:
             self.conn.execute("UPDATE memories SET embedding=NULL")
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
+                SELECT id, created_at FROM memories WHERE TRIM(content) != ''
+                """
+            )
             self.conn.commit()
             return {
                 "updated": 0,
@@ -783,6 +950,10 @@ class Store:
                         self.conn.execute(
                             "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
                             (mid, blob),
+                        )
+                        self.conn.execute(
+                            "DELETE FROM embedding_jobs WHERE memory_id=?",
+                            (mid,),
                         )
                         updated += 1
                     except sqlite3.Error:
@@ -865,19 +1036,38 @@ class Store:
             "sessions": count("sessions"),
             "entities": count("entities"),
             "relations": count("relations"),
+            "embedding_jobs": count("embedding_jobs"),
             "tiers": tiers,
             "last_write": last["ts"] if last else None,
             "last_event_time": last["event_time"] if last else None,
             "wal": True,
         }
 
-    def top_entities(self, limit: int = 15) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+    def top_entities(
+        self,
+        limit: int = 15,
+        *,
+        trusted_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        trusted_clause = ""
+        if trusted_only:
+            trusted_clause = """
+            WHERE EXISTS (
+                SELECT 1
+                FROM entity_mentions em
+                JOIN events ev ON ev.id=em.event_id
+                WHERE em.entity_id=e.id
+                  AND ev.role != 'tool'
+                  AND ev.tool_name IS NULL
+            )
             """
+        rows = self.conn.execute(
+            f"""
             SELECT e.id, e.name, e.type, e.norm_name, e.first_seen, e.last_seen,
                    (SELECT COUNT(*) FROM relations r
                     WHERE r.src_entity=e.id OR r.dst_entity=e.id) AS rels
             FROM entities e
+            {trusted_clause}
             ORDER BY e.last_seen DESC
             LIMIT ?
             """,
@@ -1179,7 +1369,9 @@ class Store:
                 """
                 SELECT m.id, m.content, m.valid_from, m.created_at
                 FROM memories m
+                JOIN events e ON e.id=m.event_id
                 WHERE m.tier='semantic' AND m.valid_to IS NULL
+                  AND e.role != 'tool' AND e.tool_name IS NULL
                 ORDER BY m.created_at DESC, m.rowid DESC
                 LIMIT ?
                 """,
@@ -1208,7 +1400,7 @@ class Store:
                 "trigger": emeta.get("trigger", ""),
             })
 
-        names = self.top_entities(limit=names_cap)
+        names = self.top_entities(limit=names_cap, trusted_only=True)
         name_list = [{"name": n["name"], "type": n["type"], "mentions": n["rels"]} for n in names]
 
         stats = self.stats()

@@ -407,6 +407,32 @@ def test_wrapper_backtick_haunt_home_does_not_execute(tmp_path, monkeypatch):
     assert not marker.exists()
 
 
+def test_wrapper_crafted_python_path_does_not_execute(tmp_path, monkeypatch):
+    """Double quotes do not neutralize command substitution in executable paths."""
+    import haunt.bootstrap as bootstrap_mod
+    from haunt.paths import ensure_layout
+
+    marker = tmp_path / "pwned-from-python-path"
+    crafted_python = f"{tmp_path}/venv$(touch {marker})/python"
+    monkeypatch.setattr(bootstrap_mod.sys, "executable", crafted_python)
+    monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    ensure_layout()
+    dest = bootstrap_mod.write_hook_launcher()
+    body = dest.read_text(encoding="utf-8")
+    assert "$(touch" in body
+
+    subprocess.run(
+        ["/bin/sh", str(dest)],
+        input=b"",
+        capture_output=True,
+        timeout=15,
+    )
+    assert not marker.exists(), (
+        f"wrapper executed crafted Python path; marker at {marker}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 6. Cheap clamps
 # ---------------------------------------------------------------------------
