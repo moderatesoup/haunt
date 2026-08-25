@@ -1,6 +1,6 @@
 # Memory adoption backlog
 
-This is the dependency-ordered delivery plan for adopting the useful parts of
+This is the dependency graph for adopting the useful parts of
 Memory Protocol (MP) in Haunt. The normative product decisions are in
 [`docs/MEMORY_CONTRACT.md`](docs/MEMORY_CONTRACT.md). An epic is not complete
 until its acceptance criteria and named evidence are committed together.
@@ -11,15 +11,16 @@ reader LLM or distillation pipeline (`README.md:3`, `README.md:239-243`).
 
 ## Status key
 
-- **Ready**: all dependencies are complete; implementation may start.
+- **Ready**: all dependencies are complete and no implementation is active.
 - **In progress**: an implementation branch exists, but acceptance evidence has
-  not yet landed with this backlog.
-- **Blocked**: a listed dependency is incomplete.
+  not yet landed with this backlog; dependencies may still be pending.
+- **Blocked**: no active deliverable can close while a dependency is incomplete.
 - **Done**: every acceptance criterion is met and the evidence is committed.
 
 The integration commit for an epic must change its status to **Done** and link
-the committed evidence. A downstream epic remains **Blocked** until that status
-change lands; work on a branch is not completion.
+the committed evidence. Parallel branches may be **In progress**, but an epic
+cannot become **Done** until every dependency is **Done**; branch work alone is
+not completion.
 
 ## Current baseline
 
@@ -33,13 +34,25 @@ change lands; work on a branch is not completion.
 | Retrieval | Recall fuses vector and FTS ranks with RRF and retains component ranks internally (`src/haunt/recall.py:31-78`, `src/haunt/recall.py:243-288`). | A stable explanation contract and a calibrated ability to return no answer. |
 | Erasure | Purge physically deletes memory, indexes, graph evidence, and orphan events (`src/haunt/store.py:1169-1244`) and is explicitly gated over MCP (`src/haunt/mcp_server.py:417-461`). | Preserve this privacy override while correction becomes append-only. |
 
-## Dependency chain
+## Dependency graph
 
-`E0 -> E1 -> E2 -> E3 -> E4 -> E5 -> E6 -> E7`
+| Epic | Direct dependencies |
+|---|---|
+| E0 — frozen FTS-only regression | none |
+| E1 — correction lineage | E0 |
+| E2 — structured provenance | E1 |
+| E3 — namespace aliases | E0 |
+| E4 — export/import | E1, E2, E3 |
+| E5 — ranking explanations | E0 |
+| E6 — calibrated abstention | E0, E5 |
+| E7 — end-to-end release proof | E4, E6 |
 
-The chain is intentionally strict. It prevents schema, migration, portability,
-and ranking changes from landing without a frozen behavioral baseline, and it
-keeps the final proof representative of the exact shipped sequence.
+After E0, correction, aliasing, and ranking explanations can proceed in
+parallel. E3 does not depend on correction/provenance because it changes the
+registry identity layer, not namespace memory rows. E5 explains retrieval data
+that already exists; E2 references enrich it later but do not block the v1
+explanation shape. E4 waits for the durable correction, provenance, and alias
+schemas it must round-trip. E7 joins the portability and retrieval branches.
 
 ## E0 — Freeze the retrieval evaluation
 
@@ -61,9 +74,13 @@ regression comparison for every later epic without requiring embeddings.
   are intentionally generated and excluded from the result lock.
 - Fix only semantic timestamps needed by temporal cases. The evaluator must not
   use wall-clock time to interpret a query or expected result.
-- Cover exact lexical lookup, paraphrase, temporal current/as-of behavior,
-  superseded content, tool-I/O trust, namespace isolation, and out-of-corpus
-  queries. Every category has at least one positive and one negative control.
+- Cover exact lexical lookup, Unicode tokenization, stemming/morphology,
+  temporal current/as-of behavior, superseded content, namespace isolation, and
+  designated out-of-corpus/no-hit queries. True semantic paraphrase coverage
+  belongs to E6's pinned hybrid profile, not this FTS-only gate.
+- Add at least one tool-I/O query whose exact logical result and
+  `trusted=false` / `trust_reason="untrusted-tool-io"` metadata are locked. This
+  valuable case is explicit remaining E0 acceptance until it lands.
 - Declare `K` in the configuration (`K=3` for the current gate). Score by
   expected logical IDs, report Recall@K as Recall@3, and reject a result merely
   because it is non-empty when its IDs or order are wrong.
@@ -78,13 +95,14 @@ regression comparison for every later epic without requiring embeddings.
 **Tests/evidence**
 
 - Two fresh-store runs generate different physical IDs but produce the same
-  exact ordered logical-ID results and Recall@3.
-- Mutating an expected logical ID/order, corpus hash, configuration hash, or
-  declared `K` makes the gate fail.
-- Removing all hits fails positive controls; returning a hit for every query
-  fails the exact `[]` locks.
-- CI runs and publishes the FTS-only gate with the resolved `K`, corpus hash,
-  configuration hash, exact per-query results, and aggregate Recall@3.
+  exact ordered logical-ID results, metadata locks, and Recall@3.
+- Full baseline equality over resolved `K`, corpus/config hashes, per-query
+  logical results/metadata, and Recall@3 fails on any drift. Fixtures require a
+  non-empty positive expectation and at least one exact `[]` no-hit expectation
+  so the equality check cannot pass vacuously.
+- The gate runs under the existing `HAUNT_FTS_ONLY=1` pytest CI path. The
+  committed baseline and failing assertion output are the evidence; E0 does not
+  require CI artifact upload/publication unless the workflow later adds it.
 
 **Non-goals**
 
@@ -212,7 +230,7 @@ that source metadata measures truth.
 
 **Status:** Blocked
 
-**Depends on:** E2
+**Depends on:** E0
 
 **Outcome:** A repository move, remote normalization change, or deliberate
 namespace rename can retain one memory identity without copying data or
@@ -263,7 +281,7 @@ broadening access.
 
 **Status:** Blocked
 
-**Depends on:** E3
+**Depends on:** E1, E2, E3
 
 **Outcome:** A user can export one namespace, import it into a fresh Haunt home,
 and retain the canonical memory semantics and audit information.
@@ -328,9 +346,9 @@ and retain the canonical memory semantics and audit information.
 
 ## E5 — Explain ranking without calling it confidence
 
-**Status:** Blocked
+**Status:** In progress
 
-**Depends on:** E4
+**Depends on:** E0
 
 **Outcome:** Every hit explains why it ranked where it did using stable,
 machine-readable retrieval evidence.
@@ -348,8 +366,11 @@ machine-readable retrieval evidence.
   marked not run rather than assigned zero evidence.
 - Make ties deterministic with a documented stable tiebreaker. Turning
   explanations on or off must not change candidate selection or ordering.
-- Include trust labels and correction/provenance identifiers by reference,
-  without treating trusted text as authorization to mutate tools.
+- Include trust labels. When E2's correction/provenance references exist, add
+  them without changing ranking semantics; before E2 lands, mark those optional
+  references unavailable/legacy rather than inventing them. E2 is an enrichment
+  dependency, not a blocker for the v1 explanation object. Trusted text never
+  authorizes a tool mutation.
 - Expose the same explanation semantics through Python, CLI JSON, MCP, and
   dashboard APIs; human rendering may be implementation-specific.
 
@@ -361,6 +382,8 @@ machine-readable retrieval evidence.
   cases. A mutation that labels RRF as confidence must fail a contract test.
 - The frozen E0 metrics and hit order remain unchanged except for an explicitly
   reviewed deterministic-tie correction.
+- Once E2 lands, integration tests assert its correction/provenance references
+  appear in explanations without changing scores or order.
 
 **Non-goals**
 
@@ -372,7 +395,7 @@ machine-readable retrieval evidence.
 
 **Status:** Blocked
 
-**Depends on:** E5
+**Depends on:** E0, E5
 
 **Outcome:** Recall can return an honest no-answer result when retrieval evidence
 does not support the query.
@@ -389,6 +412,9 @@ does not support the query.
   retrieval configuration, and fail-loud proof that it did not fall back to
   FTS-only. Calibrate/version separate policies for the FTS-only and pinned
   hybrid profiles.
+- Include held-out hybrid answerable cases that are true semantic paraphrases
+  with no required lexical/stemming overlap. Lock expected logical IDs and
+  report pre-abstention Recall@5 separately from abstention metrics.
 - Each calibration artifact records dataset/split hashes, feature definition,
   profile/model ID, threshold, fit-case metrics, held-out metrics, and the exact
   implementation/configuration versions needed to reproduce the features.
@@ -432,7 +458,7 @@ does not support the query.
 
 **Status:** Blocked
 
-**Depends on:** E6
+**Depends on:** E4, E6
 
 **Outcome:** The complete adoption slice is proven on fresh and upgraded stores
 and is ready for a normal Haunt release.

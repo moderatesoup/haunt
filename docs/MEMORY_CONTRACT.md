@@ -268,9 +268,10 @@ this contract before implementation.
   lineage, provenance, alias resolution, export semantics, ranking explanation,
   and abstention reason codes.
 - Every epic **MUST** land its tests and machine-readable evidence with the
-  implementation. The deterministic E0 FTS-only regression gate precedes
-  behavior changes; E6 calibration uses separate predeclared evidence; and the
-  final end-to-end release proof follows all of them.
+  implementation. E0 gates integration of E1, E3, and E5, which may be developed
+  in parallel. E4 waits for E1/E2/E3 durable schemas; E6 waits for E0/E5 and uses
+  separate predeclared calibration evidence; E7 waits for E4/E6. An epic can be
+  in progress before a dependency lands but cannot be marked done first.
 - A release **MUST NOT** claim complete MP conformance. The accurate claim is
   that Haunt adopts this documented subset of MP-inspired semantics.
 
