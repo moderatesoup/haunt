@@ -8,7 +8,7 @@ import json
 import secrets
 import sys
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -24,7 +24,7 @@ from haunt.util import clamp_limit
 
 TOKEN_HEADER = "X-Haunt-Token"
 TOKEN_QUERY = "token"
-_HTML_TOKEN_PLACEHOLDER = "__HAUNT_LAUNCH_TOKEN__"
+_HTML_TOKEN_PLACEHOLDER = "__HAUNT_LAUNCH_TOKEN_JSON__"
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 
 _dash_token: str | None = None
@@ -339,7 +339,7 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
 
 <script>
 const $=id=>document.getElementById(id);
-const HAUNT_TOKEN="__HAUNT_LAUNCH_TOKEN__";
+const HAUNT_TOKEN=__HAUNT_LAUNCH_TOKEN_JSON__;
 let NS=null, DETAIL_MID=null, DETAIL_NS=null, BROWSE_PAGE=0, ALL_NS=false;
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -834,7 +834,13 @@ def _health_from_store(st: Store) -> dict[str, Any]:
 
 async def index(_request: Request) -> HTMLResponse:
     token = (_dash_token or "") if embed_launch_token_in_html() else ""
-    return HTMLResponse(HTML.replace(_HTML_TOKEN_PLACEHOLDER, token))
+    token_json = (
+        json.dumps(token)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    return HTMLResponse(HTML.replace(_HTML_TOKEN_PLACEHOLDER, token_json))
 
 
 async def api_namespaces(_request: Request) -> JSONResponse:
@@ -1172,6 +1178,16 @@ def host_name_is_trusted(name: str) -> bool:
     if n in _LOOPBACK_NAMES or is_loopback_host(n):
         return True
     bind = normalize_host_header(_dash_bind_host)
+    try:
+        bind_ip = ipaddress.ip_address(bind)
+    except ValueError:
+        bind_ip = None
+    if bind_ip is not None and bind_ip.is_unspecified:
+        try:
+            ipaddress.ip_address(n)
+            return True
+        except ValueError:
+            return False
     return bool(bind) and n == bind
 
 
@@ -1179,14 +1195,28 @@ def request_host_is_trusted(host_header: str) -> bool:
     return host_name_is_trusted(normalize_host_header(host_header))
 
 
-def request_origin_is_trusted(origin: str) -> bool:
+def _effective_port(scheme: str, port: int | None) -> int | None:
+    if port is not None:
+        return port
+    return {"http": 80, "https": 443}.get(scheme)
+
+
+def request_origin_is_trusted(origin: str, request: Request) -> bool:
     parsed = urlparse(origin)
     if parsed.scheme not in {"http", "https"}:
         return False
     host = parsed.hostname
     if not host:
         return False
-    return host_name_is_trusted(host.lower())
+    request_host = request.url.hostname
+    if not request_host or not host_name_is_trusted(host.lower()):
+        return False
+    return (
+        parsed.scheme == request.url.scheme
+        and host.lower() == request_host.lower()
+        and _effective_port(parsed.scheme, parsed.port)
+        == _effective_port(request.url.scheme, request.url.port)
+    )
 
 
 def _tokens_match(provided: str, expected: str) -> bool:
@@ -1221,7 +1251,7 @@ def guard_dashboard_request(request: Request) -> JSONResponse | None:
 
     if request.method in {"POST", "DELETE", "PUT", "PATCH"}:
         origin = request.headers.get("origin")
-        if origin and not request_origin_is_trusted(origin):
+        if origin and not request_origin_is_trusted(origin, request):
             return JSONResponse({"error": "untrusted origin"}, status_code=403)
     return None
 
@@ -1315,7 +1345,7 @@ def run_dashboard(
 
     url = f"http://{host}:{port}"
     open_url = (
-        f"{url}/?token={launch_token}"
+        f"{url}/?{urlencode({TOKEN_QUERY: launch_token})}"
         if launch_token and embed_launch_token_in_html()
         else url
     )

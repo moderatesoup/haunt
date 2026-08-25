@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,25 @@ def test_index_injects_launch_token_into_html(auth_env):
     assert TEST_DASH_TOKEN in r.text
     assert "X-Haunt-Token" in r.text
     assert "__HAUNT_LAUNCH_TOKEN__" not in r.text
+
+
+def test_index_json_escapes_caller_supplied_token(auth_env):
+    """A programmatic token must stay data inside the inline script."""
+    from haunt.dashboard import configure_dashboard_security
+
+    token = '";globalThis.HAUNT_PWNED=1;//</script><script>alert(1)</script>'
+    configure_dashboard_security(token=token, bind_host="127.0.0.1")
+    page = make_dash_client(token=None).get("/")
+    assert page.status_code == 200
+    assert f'const HAUNT_TOKEN="{token}";' not in page.text
+    expected = (
+        json.dumps(token)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    assert f"const HAUNT_TOKEN={expected};" in page.text
+    assert "</script><script>alert(1)</script>" not in page.text
 
 
 def test_host_evil_example_is_rejected_and_does_not_delete(auth_env):
@@ -195,6 +215,24 @@ def test_same_origin_origin_header_still_contradicts(auth_env):
     assert _memory_row(r.memory_id)["valid_to"] is not None
 
 
+@pytest.mark.parametrize(
+    "origin",
+    ["http://127.0.0.1:9999", "https://127.0.0.1"],
+)
+def test_wrong_port_or_scheme_is_not_same_origin(auth_env, origin):
+    r = _observe("WRONG-ORIGIN-PORT-CANARY must stay current")
+    client = make_dash_client()
+    resp = client.post(
+        f"/api/namespace/default/memory/{r.memory_id}/contradict",
+        json={"replacement": "forged"},
+        headers={"Origin": origin},
+    )
+    assert resp.status_code == 403
+    row = _memory_row(r.memory_id)
+    assert row is not None
+    assert row["valid_to"] is None
+
+
 def test_missing_origin_from_local_testclient_still_deletes(auth_env):
     r = _observe("MISSING-ORIGIN-DELETE-CANARY")
     client = make_dash_client()
@@ -251,8 +289,8 @@ def test_allow_remote_does_not_embed_token_in_html(auth_env, capsys, monkeypatch
 
     r = _observe("ALLOW-REMOTE-HTML-LEAK-CANARY must stay")
 
-    # Trusted Host toward a 0.0.0.0 bind: 127.0.0.1 and the bind IP itself.
-    for host in ("127.0.0.1", "0.0.0.0"):
+    # A wildcard bind accepts concrete IP Hosts, but never arbitrary DNS names.
+    for host in ("127.0.0.1", "0.0.0.0", "192.0.2.10"):
         page = make_dash_client(token=None, host=host).get("/")
         assert page.status_code == 200, host
         assert secret not in page.text, f"token_in_html=True host={host}"
@@ -269,6 +307,8 @@ def test_allow_remote_does_not_embed_token_in_html(auth_env, capsys, monkeypatch
 
         authed = make_dash_client(token=secret, host=host)
         assert authed.get("/api/namespaces").status_code == 200
+
+    assert make_dash_client(token=secret, host="evil.example").get("/").status_code == 400
 
 
 def test_allow_remote_without_token_refuses_to_start(monkeypatch):

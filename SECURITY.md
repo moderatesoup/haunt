@@ -8,7 +8,7 @@ haunt is **local-only**. All data (SQLite databases, embeddings, models) stays o
 
 `haunt dash` binds **127.0.0.1** by default. Loopback bind is not enough on its own:
 
-- Requests whose `Host` is not a trusted loopback name (`127.0.0.1`, `localhost`, `::1`) or the configured bind host are rejected (400). This blocks DNS rebinding.
+- Requests whose `Host` is not a trusted loopback name (`127.0.0.1`, `localhost`, `::1`), the configured bind host, or a literal IP reached through an explicit wildcard bind are rejected (400). Arbitrary DNS names remain rejected, which blocks DNS rebinding while keeping `0.0.0.0 --allow-remote` usable from a LAN IP.
 - Every `/api` route, including GET, requires the launch token (`X-Haunt-Token` header or `?token=`). Missing or wrong token is 401. The HTML index can still load without the token; the API is gated.
 - Loopback bind (default 127.0.0.1) injects the token into the console HTML so the local UI works. **`--allow-remote` / a non-loopback bind does not embed the token in HTML.** GET `/` with a trusted Host is not enough to obtain `X-Haunt-Token`. The token is printed only on `haunt dash` stdout for the operator who launched it.
 - Cookie-less mutation routes (`DELETE` memory, `POST` contradict) also validate `Origin` when present. Same-origin and missing-Origin local TestClient requests still work. Cross-origin form posts are rejected.

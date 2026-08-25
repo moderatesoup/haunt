@@ -17,4 +17,4 @@ def make_dash_client(
     from haunt.dashboard import app as dash_app
 
     headers = {"X-Haunt-Token": token} if token else {}
-    return TestClient(app or dash_app, base_url=f"http://{host}", headers=headers)
+    return TestClient(app or dash_app, base_url=f"http://{host}:7340", headers=headers)
