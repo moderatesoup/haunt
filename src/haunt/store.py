@@ -3899,6 +3899,23 @@ class Store:
         return store
 
     def _initialize_identity(self, identity: dict[str, Any]) -> None:
+        """Open and finish writer initialization in one sidecar lifecycle.
+
+        The mapped open already serializes its configure step, but schema
+        upgrades and first graph-evidence construction also write WAL state.
+        Keeping that work under the same lock prevents a sibling first opener
+        from committing or closing through a graph rebuild concurrently.
+        """
+        with _sqlite_configuration_lock():
+            self._initialize_identity_with_configuration_lock(identity)
+
+    def _initialize_identity_with_configuration_lock(
+        self, identity: dict[str, Any]
+    ) -> None:
+        if not _sqlite_configuration_lock_held():
+            raise NamespacePathError(
+                "writer initialization requires the serialized sidecar lock"
+            )
         self.namespace_id = str(identity["namespace_id"])
         self.name = str(identity["canonical_label"])
         self.db_path = Path(str(identity["db_path"]))
@@ -3933,12 +3950,17 @@ class Store:
         self.close()
 
     def _ensure_graph_evidence(self) -> None:
-        row = self.conn.execute(
-            "SELECT value FROM meta WHERE key='graph_evidence_version'"
-        ).fetchone()
-        if row and str(row["value"]) == "1":
-            return
-        self.rebuild_graph(touch=False)
+        # Two creators can both observe the absent marker immediately after a
+        # fresh namespace is published.  Re-read it while holding the same
+        # writer lifecycle lock used for WAL configuration and close, so only
+        # one automatic rebuild can reach its commit.
+        with _sqlite_configuration_lock():
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key='graph_evidence_version'"
+            ).fetchone()
+            if row and str(row["value"]) == "1":
+                return
+            self._rebuild_graph_with_configuration_lock(touch=False)
 
     def vec_ok(self) -> bool:
         return _vec_loaded(self.conn)
@@ -4649,6 +4671,17 @@ class Store:
 
     def rebuild_graph(self, *, touch: bool = True) -> dict[str, Any]:
         """Rebuild graph evidence and derived aggregates from stored events."""
+        with _sqlite_configuration_lock():
+            return self._rebuild_graph_with_configuration_lock(touch=touch)
+
+    def _rebuild_graph_with_configuration_lock(
+        self, *, touch: bool
+    ) -> dict[str, Any]:
+        """Run one graph-rebuild transaction under the writer lifecycle lock."""
+        if not _sqlite_configuration_lock_held():
+            raise NamespacePathError(
+                "graph rebuild requires the serialized sidecar lock"
+            )
         from haunt.graph import extract_and_store
 
         def count(table: str) -> int:

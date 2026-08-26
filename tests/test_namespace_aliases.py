@@ -1524,6 +1524,66 @@ def test_configured_writer_close_retries_the_configuration_lock_after_failure(
     assert acquired == 1
 
 
+def test_store_initialization_serializes_schema_and_graph_evidence(
+    alias_home, monkeypatch,
+):
+    """A first writer keeps every schema/graph WAL write in one lifecycle."""
+    import haunt.store as store_mod
+
+    original_schema = store_mod._ensure_namespace_schema
+    original_graph = Store._ensure_graph_evidence
+    observed: list[str] = []
+
+    def checked_schema(conn):
+        assert store_mod._sqlite_configuration_lock_held()
+        observed.append("schema")
+        return original_schema(conn)
+
+    def checked_graph(self):
+        assert store_mod._sqlite_configuration_lock_held()
+        observed.append("graph")
+        return original_graph(self)
+
+    monkeypatch.setattr(store_mod, "_ensure_namespace_schema", checked_schema)
+    monkeypatch.setattr(Store, "_ensure_graph_evidence", checked_graph)
+    with Store("initialization-lifecycle-lock"):
+        pass
+    assert observed == ["schema", "graph"]
+
+
+def test_graph_rebuild_and_automatic_evidence_share_configuration_lock(
+    alias_home, monkeypatch,
+):
+    """Automatic and explicit rebuild commits use the same sidecar lock."""
+    import haunt.store as store_mod
+
+    with Store("graph-rebuild-lifecycle-lock") as store:
+        calls: list[bool] = []
+
+        def checked_rebuild(self, *, touch):
+            assert store_mod._sqlite_configuration_lock_held()
+            calls.append(touch)
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("graph_evidence_version", "1"),
+            )
+            self.conn.commit()
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            Store, "_rebuild_graph_with_configuration_lock", checked_rebuild
+        )
+        store.conn.execute(
+            "DELETE FROM meta WHERE key='graph_evidence_version'"
+        )
+        store.conn.commit()
+        store._ensure_graph_evidence()
+        store._ensure_graph_evidence()
+        assert calls == [False]
+        assert store.rebuild_graph() == {"ok": True}
+        assert calls == [False, True]
+
+
 def test_repeated_cross_process_fresh_store_creation_resolves_registered_identity(
     tmp_path, monkeypatch,
 ):
@@ -1541,6 +1601,9 @@ def test_repeated_cross_process_fresh_store_creation_resolves_registered_identit
         if not existing_pythonpath
         else os.pathsep.join((source_root, existing_pythonpath))
     )
+    # Enable fatal-signal tracebacks before the child imports Haunt. This makes
+    # an SQLite SIGBUS/SIGSEGV failure actionable rather than an empty return.
+    env["PYTHONFAULTHANDLER"] = "1"
     # This test targets concurrent fresh *namespace* creation. Establish the
     # registry in a separate interpreter so the pytest process does not retain
     # an SQLite VFS handle while the fresh children test their own lifecycle.
@@ -1563,10 +1626,16 @@ def test_repeated_cross_process_fresh_store_creation_resolves_registered_identit
             sys.executable,
             "-c",
             (
-                "import faulthandler; faulthandler.dump_traceback_later(8); "
+                "import faulthandler, sys; "
+                "faulthandler.enable(all_threads=True); "
+                "faulthandler.dump_traceback_later(8, repeat=True); "
+                "print('phase:before-import', file=sys.stderr, flush=True); "
                 "from haunt.store import Store; "
+                "print('phase:before-store', file=sys.stderr, flush=True); "
                 f"store=Store({label!r}); "
-                "print(store.namespace_id); store.close(); "
+                "print('phase:after-store', file=sys.stderr, flush=True); "
+                "print(store.namespace_id, flush=True); store.close(); "
+                "print('phase:after-close', file=sys.stderr, flush=True); "
                 "faulthandler.cancel_dump_traceback_later()"
             ),
         ]
@@ -1586,8 +1655,31 @@ def test_repeated_cross_process_fresh_store_creation_resolves_registered_identit
                 if process.poll() is None:
                     process.terminate()
             outputs = [process.communicate(timeout=5) for process in processes]
-            pytest.fail(f"fresh Store subprocess timed out: {outputs!r}")
-        assert all(process.returncode == 0 for process in processes), outputs
+            diagnostics = [
+                (
+                    process.pid,
+                    process.returncode,
+                    stdout.decode(errors="replace"),
+                    stderr.decode(errors="replace"),
+                )
+                for process, (stdout, stderr) in zip(processes, outputs)
+            ]
+            pytest.fail(
+                f"fresh Store subprocess timed out in round {round_number}: "
+                f"{diagnostics!r}"
+            )
+        diagnostics = [
+            (
+                process.pid,
+                process.returncode,
+                stdout.decode(errors="replace"),
+                stderr.decode(errors="replace"),
+            )
+            for process, (stdout, stderr) in zip(processes, outputs)
+        ]
+        assert all(process.returncode == 0 for process in processes), (
+            f"fresh Store subprocess failed in round {round_number}: {diagnostics!r}"
+        )
         identities = {stdout.decode().strip() for stdout, _stderr in outputs}
         assert len(identities) == 1
 
