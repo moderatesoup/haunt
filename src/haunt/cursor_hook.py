@@ -62,6 +62,15 @@ HOOK_EVENTS = (
 )
 STORE_THOUGHTS_ENV = ("HAUNT_STORE_THOUGHTS",)
 TOOL_IO_MAX_CHARS_DEFAULT = 12_000
+# C11: format_recall_block() renders the [haunt ns=...] block both hosts
+# inject as automatic per-prompt additional_context. Each line is already
+# a single ~160-char snippet, but the block as a whole had no ceiling on
+# how many such lines it could emit. Both current callers pass a fixed
+# k=8, so this budget is a no-op for them today (8 lines is nowhere near
+# 4,000 chars); it exists so format_recall_block stays safe as a general
+# function, since this block runs on every prompt submission -- far more
+# often than an explicit memory_recall call -- so it should stay lean.
+RECALL_BLOCK_MAX_CHARS_DEFAULT = 4_000
 
 
 def _as_text(value: Any) -> str:
@@ -287,19 +296,157 @@ def _prepare_tool_io(tool_input: str, tool_output: str) -> tuple[str, str]:
     )
 
 
+def _recall_block_cap() -> int:
+    """HAUNT_RECALL_BLOCK_MAX_CHARS, clamped. Same parse/fallback/clamp
+    idiom as HAUNT_TOOL_IO_MAX_CHARS just above (_tool_io_cap): parse, fall
+    back to the default on anything unparsable, then clamp so a bad env
+    value can't disable the budget or set it below what one header plus
+    one hit line needs (each line is already bounded to roughly 200 chars
+    by the fixed 160-char snippet() call below, so 500 always leaves room
+    for at least one full line and the dropped-count marker).
+    """
+    raw = (os.environ.get("HAUNT_RECALL_BLOCK_MAX_CHARS") or "").strip()
+    try:
+        value = int(raw) if raw else RECALL_BLOCK_MAX_CHARS_DEFAULT
+    except ValueError:
+        value = RECALL_BLOCK_MAX_CHARS_DEFAULT
+    return max(500, min(value, 100_000))
+
+
+def _drop_marker(dropped: int, cap: int) -> str:
+    return f"… [truncated by haunt: {dropped} more hit(s) omitted, block budget {cap} chars]"
+
+
+def _truncate_header(header: str, cap: int, reason: str) -> str:
+    """Last-resort path: `header` cannot coexist with anything else --
+    not a body line, not a drop marker -- within `cap` chars. Truncates
+    the header text itself with its own inline marker, guaranteed <= cap
+    BY CONSTRUCTION: plain Python string slicing costs exactly one char
+    per char kept, unlike JSON serialization (see _truncate_hit_content
+    in mcp_server.py for the escape-expansion trap that bites when that
+    assumption is false there), so no measure-after-the-fact check is
+    needed here -- the arithmetic below is exact, not an estimate.
+
+    Both real call sites (cursor_hook, claude_hook) clamp namespace to 80
+    chars via safe_name(), so `len(header) > cap` cannot happen with the
+    default 4,000-char block cap or any HAUNT_RECALL_BLOCK_MAX_CHARS an
+    operator would plausibly set (floor 500). This function exists so
+    format_recall_block honestly handles the degenerate case anyway,
+    instead of falling through to an unconditional block[:cap] slice --
+    which can land anywhere, including through the header, eating
+    whatever marker would have reported the omission along with it and
+    leaving zero indication anything was cut. That silent failure is
+    exactly what every call site of this helper replaces.
+    """
+    marker = f"… [truncated by haunt: {reason}, block budget {cap} chars]"
+    sep = "\n"
+    if len(marker) + len(sep) >= cap:
+        # cap floor is 500 (_recall_block_cap) and marker is a short
+        # fixed-ish string, so unreachable in practice -- still never
+        # return something longer than cap regardless.
+        return marker[:cap]
+    keep = cap - len(marker) - len(sep)
+    return f"{header[:keep]}{sep}{marker}"
+
+
 def format_recall_block(hits: list[Hit], namespace: str) -> str:
-    lines = [f"[haunt ns={namespace}]"]
+    cap = _recall_block_cap()
+    header = f"[haunt ns={namespace}]"
+
+    # Degenerate configuration: the header alone (namespace far longer
+    # than the configured cap) cannot coexist with anything else at all
+    # -- not "(no memories)", not a single hit line, not the marker that
+    # would normally report an omission. Handled explicitly, before
+    # anything else, rather than falling into the packing logic below and
+    # its blind block[:cap] backstop -- the shape that used to slice
+    # straight through the header and eat the marker along with it,
+    # dropping a real hit with zero indication anything was omitted.
+    if len(header) > cap:
+        return _truncate_header(header, cap, "namespace exceeds cap")
+
     # Defense in depth: automatic hook context must never render raw tool I/O,
     # even if a future caller forgets recall(include_untrusted=False).
     safe_hits = [hit for hit in hits if hit.trusted]
     if not safe_hits:
-        lines.append("(no memories)")
-        return "\n".join(lines)
-    for i, h in enumerate(safe_hits, 1):
-        lines.append(
-            f"{i}  rrf={h.score:.4f}  {h.tier}  {h.memory_id}  {snippet(h.content, 160)}"
-        )
-    return "\n".join(lines)
+        block = f"{header}\n(no memories)"
+        if len(block) <= cap:
+            return block
+        # header alone fit (just checked above) but cap sits between
+        # len(header) and len(header) + len("\n(no memories)") -- still
+        # must never silently exceed cap. No hit was actually omitted
+        # (there are none), but the namespace text itself has to be cut
+        # to say so honestly rather than exceeding cap silently.
+        return _truncate_header(header, cap, "no room for body")
+
+    hit_lines = [
+        f"{i}  rrf={h.score:.4f}  {h.tier}  {h.memory_id}  {snippet(h.content, 160)}"
+        for i, h in enumerate(safe_hits, 1)
+    ]
+    total = len(header) + sum(len(line) + 1 for line in hit_lines)
+    if total <= cap:
+        # Common case (both hosts call recall() with a fixed k=8 today):
+        # byte-for-byte the same block this function has always produced.
+        return "\n".join([header, *hit_lines])
+    # Over budget: this block is injected on every prompt submission, so
+    # prefer fewer complete lines over a block mangled all the way through
+    # -- keep whole lines in their existing rank order until the next one
+    # would overflow, then say plainly how many were left out rather than
+    # silently cutting the block short (mirrors _cap_tool_io's explicit
+    # marker convention). Ordering/ranking is untouched: this only ever
+    # drops a suffix of the already-ranked line list, never reorders it.
+    #
+    # The drop-count marker line is itself appended to this same block, so
+    # its own cost has to be reserved *inside* the packing loop below, not
+    # added after -- otherwise the marker that reports the overage can
+    # itself push the block over `cap` (the bug this fixes: a cap=600
+    # block came back 644 chars, the marker line pushing it 44 over).
+    # Reserve the worst case: the marker text grows only with `dropped`'s
+    # digit count, and `dropped` can be at most len(hit_lines) (if zero
+    # lines end up kept) -- so sizing the reservation off len(hit_lines)
+    # is always >= the real marker's eventual size, never less, regardless
+    # of how many lines actually get kept below.
+    marker_reserve = len(_drop_marker(len(hit_lines), cap)) + 1
+    available = cap - len(header) - marker_reserve
+    if available < 0:
+        # header fits alone (checked above) but not alongside even a
+        # zero-hit-lines marker -- the same degenerate shape as the
+        # header-only check above, just only visible once a marker is
+        # actually needed. Handle it the same explicit, marker-safe way
+        # rather than let the packing loop's "keep nothing" result reach
+        # a blind slice.
+        return _truncate_header(header, cap, "no room for any hits")
+
+    used = 0
+    kept = 0
+    for line in hit_lines:
+        cost = len(line) + 1
+        if used + cost > available:
+            break
+        used += cost
+        kept += 1
+    lines = [header, *hit_lines[:kept]]
+    dropped = len(hit_lines) - kept
+    if dropped:
+        lines.append(_drop_marker(dropped, cap))
+    block = "\n".join(lines)
+    # Provably <= cap given `available >= 0` above: `used` never exceeds
+    # `available` (the loop breaks before adding a line that would push
+    # it over), and the real marker for the actual `dropped` count is
+    # never longer than the worst-case `marker_reserve` already reserved
+    # for it (dropped <= len(hit_lines), and the marker's length tracks
+    # only `dropped`'s digit count, which only shrinks as `dropped`
+    # shrinks) -- so len(header) + used + 1 + len(real marker) <= cap
+    # always holds by construction. Still verified by measurement, not
+    # trusted on arithmetic alone: if this is ever wrong (e.g. a future
+    # edit to the reservation math above), the fallback is the same
+    # explicit, marker-preserving truncation used for the degenerate
+    # cases above -- never a blind block[:cap] slice through arbitrary
+    # content, which is exactly how this bug slipped through before: it
+    # can land anywhere, including through the header, eating the marker
+    # along with it and leaving zero indication anything was omitted.
+    if len(block) <= cap:
+        return block
+    return _truncate_header(header, cap, "no room for any hits")
 
 
 def format_timeline_block(rows: list[dict[str, Any]], namespace: str) -> str:
