@@ -129,7 +129,11 @@ class MCPAuthority:
         return str(identity["canonical_label"]) if identity else self.bound_namespace
 
     def pin_namespace(self, namespace: str) -> str:
-        identity = resolve_namespace_identity(namespace)
+        identity = None
+        for _attempt in range(8):
+            identity = resolve_namespace_identity(namespace)
+            if identity is not None:
+                break
         if not identity:
             raise MCPAuthorityError(f"unknown namespace after creation: {namespace}")
         if self.admin:

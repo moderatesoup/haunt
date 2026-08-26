@@ -20,11 +20,15 @@ from typer.testing import CliRunner
 from haunt.cli import app
 from haunt.paths import (
     NamespacePathError,
+    SQLitePrimaryGuard,
+    SQLiteSidecarGuard,
     infer_namespace,
     namespace_db_path,
     registry_path,
     repository_identity,
     resolve_namespace,
+    sqlite_storage_snapshot,
+    tighten_db_files,
 )
 from haunt.store import (
     AliasRetirementError,
@@ -1415,6 +1419,43 @@ def test_plan_drift_and_backup_failure_do_not_change_namespace(alias_home, monke
     assert resolve_namespace_identity("drift-new") is None
 
 
+def test_backup_root_symlink_is_rejected_without_touching_external_directory(
+    alias_home, tmp_path
+):
+    register_namespace("backup-root-old")
+    plan = change_namespace_label("backup-root-old", "backup-root-new")
+    external = tmp_path / "external-backup-victim"
+    external.mkdir(mode=0o755)
+    external.chmod(0o755)
+    victim = external / "keep.txt"
+    victim.write_bytes(b"external-backup-victim")
+    victim.chmod(0o644)
+    (alias_home / "backups").symlink_to(external, target_is_directory=True)
+    before = (
+        victim.read_bytes(),
+        stat.S_IMODE(victim.stat().st_mode),
+        stat.S_IMODE(external.stat().st_mode),
+        tuple(sorted(path.name for path in external.iterdir())),
+    )
+
+    with pytest.raises(NamespaceMigrationError, match="backup directory is unsafe"):
+        change_namespace_label(
+            "backup-root-old", "backup-root-new", apply=True,
+            plan_digest=plan["plan_digest"],
+        )
+
+    after = (
+        victim.read_bytes(),
+        stat.S_IMODE(victim.stat().st_mode),
+        stat.S_IMODE(external.stat().st_mode),
+        tuple(sorted(path.name for path in external.iterdir())),
+    )
+    assert after == before
+    assert resolve_namespace_identity("backup-root-old")["canonical_label"] == (
+        "backup-root-old"
+    )
+
+
 def test_digest_gated_undo_restores_exact_state_and_keeps_history(alias_home):
     register_namespace("undo-old", "https://github.com/acme/undo.git")
     plan = change_namespace_label(
@@ -1503,3 +1544,281 @@ def test_cli_and_mcp_admin_share_digest_gated_workflow(alias_home, monkeypatch):
         )
     )
     assert undone["applied"] is True
+
+
+def _exact_home_snapshot(home: Path) -> dict[str, tuple[bytes, int, int, int]]:
+    return {
+        str(path.relative_to(home)): (
+            path.read_bytes(), stat.S_IMODE(path.stat().st_mode),
+            int(path.stat().st_dev), int(path.stat().st_ino),
+        )
+        for path in sorted(home.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _registry_logical_snapshot() -> tuple:
+    conn = sqlite3.connect(
+        f"{registry_path().as_uri()}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        schema = conn.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()
+        rows = tuple(
+            (table, tuple(conn.execute(f"SELECT * FROM {table}").fetchall()))
+            for table in tables
+        )
+        return (
+            tuple(schema), rows,
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            conn.execute("PRAGMA data_version").fetchone()[0],
+        )
+    finally:
+        conn.close()
+
+
+def _remove_quiescent_registry_sidecars() -> None:
+    conn = sqlite3.connect(registry_path())
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(str(registry_path()) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+def test_current_registry_dry_runs_are_exactly_zero_write_without_sidecars(
+    alias_home, monkeypatch
+):
+    register_namespace("zero-old")
+    _remove_quiescent_registry_sidecars()
+    before_files = _exact_home_snapshot(alias_home)
+    before_logical = _registry_logical_snapshot()
+    observer = sqlite3.connect(
+        f"{registry_path().as_uri()}?mode=ro&immutable=1", uri=True
+    )
+    before_data_version = observer.execute("PRAGMA data_version").fetchone()[0]
+
+    try:
+        direct = change_namespace_label("zero-old", "zero-new")
+        assert direct["plan_digest"]
+        assert _exact_home_snapshot(alias_home) == before_files
+        assert _registry_logical_snapshot() == before_logical
+        assert observer.execute("PRAGMA data_version").fetchone()[0] == (
+            before_data_version
+        )
+
+        cli = CliRunner().invoke(
+            app, ["namespace", "migrate", "zero-old", "zero-new"]
+        )
+        assert cli.exit_code == 0, cli.output
+        assert json.loads(cli.output)["plan_digest"] == direct["plan_digest"]
+        assert _exact_home_snapshot(alias_home) == before_files
+        assert _registry_logical_snapshot() == before_logical
+        assert observer.execute("PRAGMA data_version").fetchone()[0] == (
+            before_data_version
+        )
+
+        monkeypatch.setenv("HAUNT_NAMESPACE", "zero-old")
+        monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
+        import haunt.mcp_server as mcp
+
+        mcp._MCP_AUTHORITY = None
+        mcp._MCP_AUTHORITY_HOME = None
+        mcp_plan = json.loads(mcp.memory_namespace_migrate("zero-old", "zero-new"))
+        assert mcp_plan["plan_digest"] == direct["plan_digest"]
+        assert _exact_home_snapshot(alias_home) == before_files
+        assert _registry_logical_snapshot() == before_logical
+        assert observer.execute("PRAGMA data_version").fetchone()[0] == (
+            before_data_version
+        )
+        assert not Path(str(registry_path()) + "-wal").exists()
+        assert not Path(str(registry_path()) + "-shm").exists()
+    finally:
+        observer.close()
+
+
+def test_live_wal_dry_run_sees_commit_without_touching_registry_files(
+    alias_home, monkeypatch
+):
+    register_namespace("wal-plan-main")
+    identity = resolve_namespace_identity("wal-plan-main")
+    writer = sqlite3.connect(registry_path())
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute(
+        """INSERT INTO namespace_aliases(
+               normalized_label,label,namespace_id,is_canonical,created_at
+           ) VALUES (?,?,?,?,?)""",
+        ("wal-plan-alias", "wal-plan-alias", identity["namespace_id"], 0, "t"),
+    )
+    writer.commit()
+    try:
+        before = _exact_home_snapshot(alias_home)
+        plan = change_namespace_label("wal-plan-alias", "wal-plan-new")
+        assert plan["namespace_id"] == identity["namespace_id"]
+        assert _exact_home_snapshot(alias_home) == before
+        cli = CliRunner().invoke(
+            app, ["namespace", "migrate", "wal-plan-alias", "wal-plan-new"]
+        )
+        assert cli.exit_code == 0, cli.output
+        assert json.loads(cli.output)["plan_digest"] == plan["plan_digest"]
+        assert _exact_home_snapshot(alias_home) == before
+
+        monkeypatch.setenv("HAUNT_NAMESPACE", "wal-plan-alias")
+        monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
+        import haunt.mcp_server as mcp
+
+        mcp._MCP_AUTHORITY = None
+        mcp._MCP_AUTHORITY_HOME = None
+        mcp_plan = json.loads(
+            mcp.memory_namespace_migrate("wal-plan-alias", "wal-plan-new")
+        )
+        assert mcp_plan["plan_digest"] == plan["plan_digest"]
+        assert _exact_home_snapshot(alias_home) == before
+        journal = Path(str(registry_path()) + "-journal")
+        assert not journal.exists() or journal.stat().st_size == 0
+    finally:
+        writer.close()
+
+
+def test_incomplete_live_wal_dry_run_fails_without_touching_registry_files(
+    alias_home,
+):
+    register_namespace("incomplete-wal-old")
+    _remove_quiescent_registry_sidecars()
+    Path(str(registry_path()) + "-wal").write_bytes(b"incomplete-live-wal")
+    before = _exact_home_snapshot(alias_home)
+
+    with pytest.raises(NamespacePathError, match="incomplete WAL state"):
+        change_namespace_label("incomplete-wal-old", "incomplete-wal-new")
+
+    assert _exact_home_snapshot(alias_home) == before
+    assert not Path(str(registry_path()) + "-shm").exists()
+
+
+def test_unreadable_complete_wal_dry_run_fails_without_touching_registry_files(
+    alias_home,
+):
+    register_namespace("unreadable-wal-old")
+    _remove_quiescent_registry_sidecars()
+    Path(str(registry_path()) + "-wal").write_bytes(b"not-a-valid-wal" * 8)
+    Path(str(registry_path()) + "-shm").write_bytes(bytes(32 * 1024))
+    before = _exact_home_snapshot(alias_home)
+
+    with pytest.raises(NamespacePathError, match="cannot materialize"):
+        change_namespace_label("unreadable-wal-old", "unreadable-wal-new")
+
+    assert _exact_home_snapshot(alias_home) == before
+
+
+def test_fresh_idempotent_rename_is_no_write_and_remains_undoable(alias_home):
+    register_namespace("fresh-replay-old")
+    first_plan = change_namespace_label("fresh-replay-old", "fresh-replay-new")
+    applied = change_namespace_label(
+        "fresh-replay-old", "fresh-replay-new", apply=True,
+        plan_digest=first_plan["plan_digest"],
+    )
+    _remove_quiescent_registry_sidecars()
+    before_fresh_plan = _exact_home_snapshot(alias_home)
+    before_fresh_logical = _registry_logical_snapshot()
+    fresh_plan = change_namespace_label("fresh-replay-old", "fresh-replay-new")
+    assert fresh_plan["idempotent"] is True
+    assert _exact_home_snapshot(alias_home) == before_fresh_plan
+    assert _registry_logical_snapshot() == before_fresh_logical
+    before = _exact_home_snapshot(alias_home)
+    replay = change_namespace_label(
+        "fresh-replay-old", "fresh-replay-new", apply=True,
+        plan_digest=fresh_plan["plan_digest"],
+    )
+    assert replay["idempotent"] is True
+    assert _exact_home_snapshot(alias_home) == before
+    conn = sqlite3.connect(registry_path())
+    assert conn.execute(
+        "SELECT name FROM namespaces"
+    ).fetchall() == [("fresh-replay-new",)]
+    conn.close()
+    undo_plan = undo_namespace_migration(applied["migration_id"])
+    undo_namespace_migration(
+        applied["migration_id"], apply=True,
+        plan_digest=undo_plan["plan_digest"],
+    )
+    assert resolve_namespace_identity("fresh-replay-old")["canonical_label"] == (
+        "fresh-replay-old"
+    )
+
+
+def test_apply_replay_refuses_retirement_drift_without_writes(alias_home):
+    register_namespace("apply-drift-old")
+    plan = change_namespace_label("apply-drift-old", "apply-drift-new")
+    change_namespace_label(
+        "apply-drift-old", "apply-drift-new", apply=True,
+        plan_digest=plan["plan_digest"],
+    )
+    retire_namespace_alias("apply-drift-old", apply=True)
+    before = _exact_home_snapshot(alias_home)
+    with pytest.raises(NamespaceMigrationError, match="replay conflicts"):
+        change_namespace_label(
+            "apply-drift-old", "apply-drift-new", apply=True,
+            plan_digest=plan["plan_digest"],
+        )
+    assert _exact_home_snapshot(alias_home) == before
+
+
+def test_undo_replay_refuses_later_migration_drift_without_writes(alias_home):
+    register_namespace("undo-drift-old")
+    applied = _apply_change("undo-drift-old", "undo-drift-new")
+    undo_plan = undo_namespace_migration(applied["migration_id"])
+    undo_namespace_migration(
+        applied["migration_id"], apply=True,
+        plan_digest=undo_plan["plan_digest"],
+    )
+    _apply_change("undo-drift-old", "undo-drift-later", action="alias")
+    before = _exact_home_snapshot(alias_home)
+    with pytest.raises(NamespaceMigrationError, match="undo replay conflicts"):
+        undo_namespace_migration(
+            applied["migration_id"], apply=True,
+            plan_digest=undo_plan["plan_digest"],
+        )
+    assert _exact_home_snapshot(alias_home) == before
+
+
+def test_malformed_bracketed_non_ip_host_is_rejected_uniformly():
+    assert repository_identity("ssh://git@[not-ipv6]:2222/acme/api.git") is None
+    assert repository_identity("https://[127.0.0.1]/acme/api.git") is None
+
+
+@pytest.mark.parametrize("entry", ["primary", "sidecar", "tighten", "snapshot", "lock", "backup"])
+def test_missing_o_nofollow_fails_closed_at_every_safe_open(
+    alias_home, monkeypatch, entry
+):
+    register_namespace("nofollow-old")
+    plan = change_namespace_label("nofollow-old", "nofollow-new")
+    import haunt.store as store_module
+
+    monkeypatch.delattr(os, "O_NOFOLLOW")
+    action = {
+        "primary": lambda: SQLitePrimaryGuard.acquire(
+            registry_path(), create_missing=False
+        ),
+        "sidecar": lambda: SQLiteSidecarGuard.acquire(
+            registry_path(), claim_missing=False
+        ),
+        "tighten": lambda: tighten_db_files(registry_path()),
+        "snapshot": lambda: sqlite_storage_snapshot(registry_path()),
+        "lock": lambda: change_namespace_label(
+            "nofollow-old", "nofollow-new", apply=True,
+            plan_digest=plan["plan_digest"],
+        ),
+        "backup": lambda: store_module._backup_registry(purpose="test"),
+    }[entry]
+    with pytest.raises(NamespacePathError, match="O_NOFOLLOW is required"):
+        action()

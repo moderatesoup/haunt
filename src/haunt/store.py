@@ -30,17 +30,23 @@ from haunt.paths import (
     _git_repo_context,
     ensure_layout,
     haunt_home,
+    materialize_sqlite_shadow,
     mkdir_private,
     NamespacePathError,
     namespaces_dir,
     normalize_namespace_label,
     registry_path,
+    required_o_nofollow,
+    readonly_sqlite_mode,
     repository_identity,
     resolve_namespace,
     safe_name,
     SQLITE_OPEN_LOCK,
     SQLitePrimaryGuard,
     SQLiteSidecarGuard,
+    SQLiteStorageSnapshot,
+    sqlite_storage_snapshot,
+    temporary_sqlite_shadow,
     tighten_db_files,
     validate_namespace_db_paths,
     validate_namespace_root,
@@ -93,16 +99,12 @@ def _namespace_migration_lock() -> Iterator[None]:
         root = haunt_home()
         mkdir_private(root)
         lock_path = root / ".namespace-migration.lock"
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if not nofollow:
-            raise NamespaceMigrationError(
-                "O_NOFOLLOW is required for the namespace migration lock"
-            )
-        fd = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | nofollow | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
+        nofollow = required_o_nofollow()
+        flags = os.O_RDWR | nofollow | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            fd = os.open(lock_path, flags)
         try:
             held = os.fstat(fd)
             current = lock_path.lstat()
@@ -112,11 +114,11 @@ def _namespace_migration_lock() -> Iterator[None]:
                 or stat.S_ISLNK(current.st_mode)
                 or int(held.st_nlink) != 1
                 or int(current.st_nlink) != 1
+                or stat.S_IMODE(held.st_mode) != 0o600
                 or (int(held.st_dev), int(held.st_ino))
                 != (int(current.st_dev), int(current.st_ino))
             ):
                 raise NamespaceMigrationError("namespace migration lock is unsafe")
-            os.fchmod(fd, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
             current = lock_path.lstat()
             if (int(current.st_dev), int(current.st_ino)) != (
@@ -216,6 +218,8 @@ class _SidecarGuardedConnection(sqlite3.Connection):
     _primary_guard: SQLitePrimaryGuard | None = None
     _clean_unused_sidecar_claims = True
     _clean_primary_claim = True
+    _zero_write_snapshot: tuple[Path, SQLiteStorageSnapshot] | None = None
+    _temporary_read_dir: Any = None
 
     def set_sidecar_guard(
         self, guard: SQLiteSidecarGuard, *, clean_unused_claims: bool
@@ -226,6 +230,64 @@ class _SidecarGuardedConnection(sqlite3.Connection):
     def set_primary_guard(self, guard: SQLitePrimaryGuard) -> None:
         self._primary_guard = guard
 
+    def set_zero_write_snapshot(
+        self, path: Path, snapshot: SQLiteStorageSnapshot
+    ) -> None:
+        self._zero_write_snapshot = (path, snapshot)
+
+    def set_temporary_read_dir(self, temporary: Any) -> None:
+        self._temporary_read_dir = temporary
+
+    def verify_storage_guards(self) -> None:
+        if self._primary_guard is None or self._sidecar_guard is None:
+            raise NamespacePathError("SQLite connection has no held storage guards")
+        self._primary_guard.verify()
+        self._sidecar_guard.verify()
+
+    def copy_primary_to_fd(self, destination_fd: int) -> None:
+        """Copy this immutable, materialized main file to an already-held FD."""
+        self.verify_storage_guards()
+        assert self._primary_guard is not None
+        nofollow = required_o_nofollow()
+        source_fd = os.open(
+            self._primary_guard.path,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            source_info = os.fstat(source_fd)
+            if (
+                not stat.S_ISREG(source_info.st_mode)
+                or int(source_info.st_nlink) != 1
+                or (int(source_info.st_dev), int(source_info.st_ino))
+                != self._primary_guard.identity
+            ):
+                raise NamespacePathError(
+                    "SQLite source changed while creating registry backup"
+                )
+            os.lseek(destination_fd, 0, os.SEEK_SET)
+            os.ftruncate(destination_fd, 0)
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    view = view[written:]
+            os.fsync(destination_fd)
+            source_after = os.fstat(source_fd)
+            if (
+                (int(source_after.st_dev), int(source_after.st_ino))
+                != self._primary_guard.identity
+                or int(source_after.st_nlink) != 1
+            ):
+                raise NamespacePathError(
+                    "SQLite source changed while creating registry backup"
+                )
+            self.verify_storage_guards()
+        finally:
+            os.close(source_fd)
+
     def preserve_sidecar_claims(self) -> None:
         self._clean_unused_sidecar_claims = False
         self._clean_primary_claim = False
@@ -233,11 +295,22 @@ class _SidecarGuardedConnection(sqlite3.Connection):
     def close(self) -> None:
         guard = self._sidecar_guard
         primary = self._primary_guard
+        zero_write = self._zero_write_snapshot
+        temporary = self._temporary_read_dir
         self._sidecar_guard = None
         self._primary_guard = None
+        self._zero_write_snapshot = None
+        self._temporary_read_dir = None
         with _NAMESPACE_DB_HANDLE_LOCK:
+            close_error: Exception | None = None
             try:
                 super().close()
+                if zero_write is not None:
+                    path, before = zero_write
+                    if sqlite_storage_snapshot(path) != before:
+                        close_error = NamespacePathError(
+                            f"SQLite zero-write read observed storage drift: {path}"
+                        )
             finally:
                 if guard is not None:
                     guard.close(
@@ -245,6 +318,10 @@ class _SidecarGuardedConnection(sqlite3.Connection):
                     )
                 if primary is not None:
                     primary.close(clean_claim=self._clean_primary_claim)
+                if temporary is not None:
+                    temporary.cleanup()
+            if close_error is not None:
+                raise close_error
 
 
 def _raw_connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
@@ -273,7 +350,11 @@ def _sqlite_sidecar_pragma_hook(_path: Path) -> None:
 
 
 def _open_readonly_connection(
-    path: Path, *, immutable: bool = False, claim_missing: bool = True
+    path: Path,
+    *,
+    immutable: bool = False,
+    claim_missing: bool = True,
+    zero_write_snapshot: SQLiteStorageSnapshot | None = None,
 ) -> sqlite3.Connection:
     with _NAMESPACE_DB_HANDLE_LOCK:
         primary = SQLitePrimaryGuard.acquire(path, create_missing=False)
@@ -299,6 +380,8 @@ def _open_readonly_connection(
             assert isinstance(conn, _SidecarGuardedConnection)
             conn.set_primary_guard(primary)
             conn.set_sidecar_guard(sidecars, clean_unused_claims=True)
+            if zero_write_snapshot is not None:
+                conn.set_zero_write_snapshot(path, zero_write_snapshot)
             conn.row_factory = sqlite3.Row
             _verify_new_sqlite_fd(
                 before, primary.identity, allow_verified_vfs_reuse=True,
@@ -1439,11 +1522,20 @@ def _identity_row(conn: sqlite3.Connection, label: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def resolve_namespace_identity(name: str) -> dict[str, Any] | None:
-    """Resolve a label to its canonical identity without creating a namespace."""
-    conn = _registry()
+def _resolve_namespace_identity_once(name: str) -> dict[str, Any] | None:
+    try:
+        conn = _readonly_registry()
+    except FileNotFoundError:
+        return None
     result: dict[str, Any] | None = None
     try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        validate_registry_db_sources(conn, tables)
         row = _identity_row(conn, name)
         if not row:
             result = None
@@ -1455,16 +1547,57 @@ def resolve_namespace_identity(name: str) -> dict[str, Any] | None:
                 (row["namespace_id"],),
             ).fetchall()
             result = {**dict(row), "aliases": [dict(alias) for alias in aliases]}
+    except sqlite3.Error as exc:
+        raise NamespacePathError(f"cannot read namespace registry: {exc}") from exc
     finally:
         conn.close()
     return result
 
 
-def resolve_namespace_id(namespace_id: str) -> dict[str, Any] | None:
-    """Resolve a stable namespace ID to its current canonical record."""
-    conn = _registry()
+_CONCURRENT_REGISTRY_CHANGE_MARKERS = (
+    "storage drift",
+    "registry changed repeatedly",
+    "incomplete WAL state",
+    "changed while copying read snapshot",
+    "changed while snapshotting",
+    "sidecar appeared during safe open",
+    "sidecar disappeared during safe open",
+    "sidecar changed while opening",
+    "sidecar physical identity changed while opening",
+    "sidecar physical identity changed:",
+)
+
+
+def _is_concurrent_registry_change(exc: NamespacePathError) -> bool:
+    message = str(exc)
+    return any(marker in message for marker in _CONCURRENT_REGISTRY_CHANGE_MARKERS)
+
+
+def resolve_namespace_identity(name: str) -> dict[str, Any] | None:
+    """Resolve a label without writes, retrying a concurrently changing registry."""
+    for attempt in range(32):
+        try:
+            return _resolve_namespace_identity_once(name)
+        except NamespacePathError as exc:
+            if not _is_concurrent_registry_change(exc) or attempt == 31:
+                raise
+    return None
+
+
+def _resolve_namespace_id_once(namespace_id: str) -> dict[str, Any] | None:
+    try:
+        conn = _readonly_registry()
+    except FileNotFoundError:
+        return None
     result: dict[str, Any] | None = None
     try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        validate_registry_db_sources(conn, tables)
         row = conn.execute(
             "SELECT * FROM namespace_identities WHERE namespace_id=?",
             (namespace_id,),
@@ -1479,9 +1612,22 @@ def resolve_namespace_id(namespace_id: str) -> dict[str, Any] | None:
                 (namespace_id,),
             ).fetchall()
             result = {**dict(row), "aliases": [dict(alias) for alias in aliases]}
+    except sqlite3.Error as exc:
+        raise NamespacePathError(f"cannot read namespace registry: {exc}") from exc
     finally:
         conn.close()
     return result
+
+
+def resolve_namespace_id(namespace_id: str) -> dict[str, Any] | None:
+    """Resolve a stable ID without writes, retrying concurrent registry drift."""
+    for attempt in range(32):
+        try:
+            return _resolve_namespace_id_once(namespace_id)
+        except NamespacePathError as exc:
+            if not _is_concurrent_registry_change(exc) or attempt == 31:
+                raise
+    return None
 
 
 def _bind_repository(
@@ -1578,10 +1724,11 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
             db = Path(str(row["db_path"]))
             namespace_id = str(row["namespace_id"])
             canonical = str(row["canonical_label"])
-            conn.execute(
-                "UPDATE namespace_identities SET updated_at=? WHERE namespace_id=?",
-                (now, namespace_id),
-            )
+            if repo_identity or repo:
+                conn.execute(
+                    "UPDATE namespace_identities SET updated_at=? WHERE namespace_id=?",
+                    (now, namespace_id),
+                )
         else:
             db = namespaces_dir() / f"{label}.db"
             path_owner = conn.execute(
@@ -1669,7 +1816,6 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
         else:
             with _NAMESPACE_DB_HANDLE_LOCK:
                 ns.close()
-    resolve_namespace_identity(label)
     return db
 
 
@@ -1826,7 +1972,50 @@ def _readonly_registry() -> sqlite3.Connection:
     path = registry_path()
     if not path.is_file():
         raise FileNotFoundError(path)
-    return _open_readonly_connection(path, claim_missing=False)
+    for _attempt in range(3):
+        primary = SQLitePrimaryGuard.acquire(path, create_missing=False)
+        try:
+            sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=False)
+        except Exception:
+            primary.close()
+            raise
+        try:
+            immutable, snapshot = readonly_sqlite_mode(path)
+            primary.verify()
+            sidecars.verify()
+            if immutable:
+                primary.close()
+                sidecars.close(clean_unused_claims=False)
+                return _open_readonly_connection(
+                    path,
+                    immutable=True,
+                    claim_missing=False,
+                    zero_write_snapshot=snapshot,
+                )
+            temporary, shadow = temporary_sqlite_shadow(path, snapshot)
+            try:
+                primary.verify()
+                sidecars.verify()
+                if sqlite_storage_snapshot(path) != snapshot:
+                    temporary.cleanup()
+                    continue
+                materialize_sqlite_shadow(shadow)
+                conn = _open_readonly_connection(
+                    shadow, immutable=True, claim_missing=False
+                )
+                assert isinstance(conn, _SidecarGuardedConnection)
+                conn.set_zero_write_snapshot(path, snapshot)
+                conn.set_temporary_read_dir(temporary)
+                return conn
+            except Exception:
+                temporary.cleanup()
+                raise
+        finally:
+            sidecars.close(clean_unused_claims=False)
+            primary.close()
+    raise NamespacePathError(
+        "registry changed repeatedly while creating a zero-write read snapshot"
+    )
 
 
 def _canonical_json(value: Any) -> str:
@@ -1921,54 +2110,111 @@ def _namespace_state(conn: sqlite3.Connection, namespace_id: str) -> dict[str, A
     }
 
 
+def _private_backup_root() -> tuple[Path, int]:
+    """Atomically create/hold the private direct-child registry backup directory."""
+    nofollow = required_o_nofollow()
+    home = haunt_home()
+    backup_root = home / "backups"
+    for _attempt in range(3):
+        try:
+            info = backup_root.lstat()
+        except FileNotFoundError:
+            try:
+                backup_root.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            info = backup_root.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise NamespaceMigrationError("registry backup directory is unsafe")
+        try:
+            fd = os.open(
+                backup_root,
+                os.O_RDONLY
+                | nofollow
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as exc:
+            raise NamespaceMigrationError(
+                "registry backup directory cannot be opened safely"
+            ) from exc
+        held = os.fstat(fd)
+        current = backup_root.lstat()
+        if (
+            not stat.S_ISDIR(held.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (int(held.st_dev), int(held.st_ino))
+            != (int(current.st_dev), int(current.st_ino))
+        ):
+            os.close(fd)
+            raise NamespaceMigrationError("registry backup directory changed")
+        os.fchmod(fd, 0o700)
+        current = backup_root.lstat()
+        if (
+            stat.S_IMODE(os.fstat(fd).st_mode) != 0o700
+            or (int(current.st_dev), int(current.st_ino))
+            != (int(held.st_dev), int(held.st_ino))
+        ):
+            os.close(fd)
+            raise NamespaceMigrationError("registry backup directory changed")
+        return backup_root, fd
+    raise NamespaceMigrationError("registry backup directory changed repeatedly")
+
+
 def _backup_registry(*, purpose: str) -> dict[str, str]:
     """Create and verify a consistent private backup of registry.db only."""
-    source_path = registry_path()
-    backup_root = haunt_home() / "backups"
-    mkdir_private(backup_root)
-    root_info = backup_root.lstat()
-    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-        raise NamespaceMigrationError("registry backup directory is unsafe")
-    fd, raw_temp = tempfile.mkstemp(prefix=".registry-backup-", suffix=".db", dir=backup_root)
+    backup_root, backup_root_fd = _private_backup_root()
+    try:
+        fd, raw_temp = tempfile.mkstemp(
+            prefix=".registry-backup-", suffix=".db", dir=backup_root
+        )
+    except Exception:
+        os.close(backup_root_fd)
+        raise
     temp = Path(raw_temp)
     os.fchmod(fd, 0o600)
-    os.close(fd)
     final = backup_root / f"registry-{purpose}-{new_id()}.db"
     source: sqlite3.Connection | None = None
-    destination: sqlite3.Connection | None = None
     try:
-        source = _open_readonly_connection(source_path, claim_missing=False)
-        destination = sqlite3.connect(str(temp))
-        destination.execute("PRAGMA journal_mode=OFF")
-        source.backup(destination)
-        integrity_row = destination.execute("PRAGMA integrity_check").fetchone()
-        integrity = str(integrity_row[0]) if integrity_row else "missing"
-        if integrity != "ok":
-            raise NamespaceMigrationError(
-                f"registry backup failed integrity_check: {integrity}"
-            )
-        destination.close()
-        destination = None
+        source = _readonly_registry()
+        assert isinstance(source, _SidecarGuardedConnection)
+        source.copy_primary_to_fd(fd)
         source.close()
         source = None
+        held = os.fstat(fd)
         info = temp.lstat()
         if (
-            stat.S_ISLNK(info.st_mode)
+            not stat.S_ISREG(held.st_mode)
+            or stat.S_ISLNK(info.st_mode)
             or not stat.S_ISREG(info.st_mode)
+            or int(held.st_nlink) != 1
             or int(info.st_nlink) != 1
+            or (int(held.st_dev), int(held.st_ino))
+            != (int(info.st_dev), int(info.st_ino))
         ):
             raise NamespaceMigrationError("registry backup is not a private regular file")
-        temp.chmod(0o600)
+        if (
+            stat.S_IMODE(held.st_mode) != 0o600
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise NamespaceMigrationError("registry backup mode changed during creation")
+        os.close(fd)
+        fd = -1
         os.link(temp, final, follow_symlinks=False)
         temp.unlink()
-        digest = hashlib.sha256(final.read_bytes()).hexdigest()
+        final_state = sqlite_storage_snapshot(final)[str(final)]
+        if final_state is None:
+            raise NamespaceMigrationError("registry backup disappeared")
+        digest = final_state[-1]
         verify = _open_readonly_connection(final, immutable=True, claim_missing=False)
         try:
             verified_row = verify.execute("PRAGMA integrity_check").fetchone()
             verified = str(verified_row[0]) if verified_row else "missing"
         finally:
             verify.close()
-        if verified != "ok" or hashlib.sha256(final.read_bytes()).hexdigest() != digest:
+        verified_state = sqlite_storage_snapshot(final)[str(final)]
+        if verified != "ok" or verified_state is None or verified_state[-1] != digest:
             raise NamespaceMigrationError("registry backup verification failed")
         return {
             "path": str(final),
@@ -1983,10 +2229,11 @@ def _backup_registry(*, purpose: str) -> dict[str, str]:
                 pass
         raise
     finally:
-        if destination is not None:
-            destination.close()
+        if fd >= 0:
+            os.close(fd)
         if source is not None:
             source.close()
+        os.close(backup_root_fd)
 
 
 def _legacy_namespace_change_source(
@@ -2245,7 +2492,9 @@ def _plan_namespace_label_read_only(
             ),
         )
     except sqlite3.Error as exc:
-        raise UnknownNamespaceError(old_display) from exc
+        raise NamespaceMigrationError(
+            f"cannot read namespace registry safely: {exc}"
+        ) from exc
     finally:
         conn.close()
 
@@ -2272,6 +2521,42 @@ def _change_namespace_label(
     old_norm = normalize_namespace_label(old_display)
     new_norm = normalize_namespace_label(new_display)
     repo_identity, repo = _repository_context(repository)
+
+    def replay_result(
+        conn: sqlite3.Connection, replay: sqlite3.Row, supplied_digest: str
+    ) -> dict[str, Any]:
+        if not replay["after_state"]:
+            raise NamespaceMigrationError(
+                "migration has no recorded target state for safe idempotent replay"
+            )
+        current = _namespace_state(conn, str(replay["namespace_id"]))
+        expected = json.loads(str(replay["after_state"]))
+        if current != expected:
+            raise NamespaceMigrationError(
+                "migration replay conflicts with current alias, canonical, legacy, "
+                "or repository-binding state"
+            )
+        return {
+            "action": str(replay["action"]),
+            "mode": "apply",
+            "namespace_id": str(replay["namespace_id"]),
+            "migration_id": str(replay["migration_id"]),
+            "canonical_after": current["identity"]["canonical_label"],
+            "old_label": str(replay["old_label"]),
+            "new_label": str(replay["new_label"]),
+            "db_path": current["identity"]["db_path"],
+            "database_operation": "none",
+            "plan_digest": supplied_digest,
+            "recorded_plan_digest": replay["plan_digest"],
+            "backup": {
+                "path": replay["backup_path"],
+                "sha256": replay["backup_sha256"],
+                "integrity": replay["backup_integrity"],
+            },
+            "applied": True,
+            "idempotent": True,
+        }
+
     if apply and plan_digest and registry_path().is_file():
         replay_conn = _readonly_registry()
         try:
@@ -2295,25 +2580,7 @@ def _change_namespace_label(
                     explicit_repo is None
                     or explicit_repo == replay["repository_identity"]
                 ):
-                    return {
-                        "action": str(replay["action"]),
-                        "mode": "apply",
-                        "namespace_id": str(replay["namespace_id"]),
-                        "migration_id": str(replay["migration_id"]),
-                        "canonical_after": str(replay["canonical_label"]),
-                        "old_label": str(replay["old_label"]),
-                        "new_label": str(replay["new_label"]),
-                        "db_path": str(replay["db_path"]),
-                        "database_operation": "none",
-                        "plan_digest": plan_digest,
-                        "backup": {
-                            "path": replay["backup_path"],
-                            "sha256": replay["backup_sha256"],
-                            "integrity": replay["backup_integrity"],
-                        },
-                        "applied": True,
-                        "idempotent": True,
-                    }
+                    return replay_result(replay_conn, replay, plan_digest)
         finally:
             replay_conn.close()
     plan = _plan_namespace_label_read_only(
@@ -2335,6 +2602,22 @@ def _change_namespace_label(
         raise NamespaceMigrationError(
             "migration plan digest does not match the current registry state and operation"
         )
+    if plan["namespace_id"] is not None:
+        replay_conn = _readonly_registry()
+        try:
+            replay = replay_conn.execute(
+                """SELECT * FROM namespace_migrations
+                   WHERE namespace_id=? AND action=? AND old_label_norm=?
+                     AND new_label_norm=? AND repository_key=?""",
+                (
+                    plan["namespace_id"], action, old_norm, new_norm,
+                    plan["repository_identity"] or "",
+                ),
+            ).fetchone()
+            if replay is not None:
+                return replay_result(replay_conn, replay, plan_digest)
+        finally:
+            replay_conn.close()
     backup = _backup_registry(purpose="apply")
     now = now_iso()
     conn = _registry()
@@ -2660,6 +2943,38 @@ def _undo_namespace_migration(
     migration_id = migration_id.strip()
     if not migration_id:
         raise NamespaceMigrationError("migration_id is required")
+
+    def replay_result(
+        conn: sqlite3.Connection, replay: sqlite3.Row, supplied_digest: str
+    ) -> dict[str, Any]:
+        if not replay["before_state"]:
+            raise NamespaceMigrationError(
+                "migration has no recorded source state for safe undo replay"
+            )
+        current = _namespace_state(conn, str(replay["namespace_id"]))
+        expected = json.loads(str(replay["before_state"]))
+        if current != expected:
+            raise NamespaceMigrationError(
+                "undo replay conflicts with current alias, canonical, legacy, "
+                "or repository-binding state"
+            )
+        return {
+            "action": "undo",
+            "mode": "apply",
+            "migration_id": migration_id,
+            "namespace_id": str(replay["namespace_id"]),
+            "applied": True,
+            "idempotent": True,
+            "database_operation": "none",
+            "plan_digest": supplied_digest,
+            "recorded_plan_digest": replay["undo_plan_digest"],
+            "backup": {
+                "path": replay["undo_backup_path"],
+                "sha256": replay["undo_backup_sha256"],
+                "integrity": replay["undo_backup_integrity"],
+            },
+        }
+
     if apply and plan_digest:
         conn = _readonly_registry()
         try:
@@ -2672,21 +2987,7 @@ def _undo_namespace_migration(
                 and replay["undone_at"] is not None
                 and replay["undo_plan_digest"] == plan_digest
             ):
-                return {
-                    "action": "undo",
-                    "mode": "apply",
-                    "migration_id": migration_id,
-                    "namespace_id": str(replay["namespace_id"]),
-                    "applied": True,
-                    "idempotent": True,
-                    "database_operation": "none",
-                    "plan_digest": plan_digest,
-                    "backup": {
-                        "path": replay["undo_backup_path"],
-                        "sha256": replay["undo_backup_sha256"],
-                        "integrity": replay["undo_backup_integrity"],
-                    },
-                }
+                return replay_result(conn, replay, plan_digest)
         finally:
             conn.close()
     plan = _plan_namespace_undo_read_only(migration_id)
@@ -2700,6 +3001,20 @@ def _undo_namespace_migration(
         raise NamespaceMigrationError(
             "undo plan digest does not match the current registry state"
         )
+    if plan["idempotent"]:
+        conn = _readonly_registry()
+        try:
+            replay = conn.execute(
+                "SELECT * FROM namespace_migrations WHERE migration_id=?",
+                (migration_id,),
+            ).fetchone()
+            if replay is None or replay["undone_at"] is None:
+                raise NamespaceMigrationError(
+                    "undo replay state changed after planning"
+                )
+            return replay_result(conn, replay, plan_digest)
+        finally:
+            conn.close()
     backup = _backup_registry(purpose="undo")
     conn = _registry()
     try:
@@ -2975,7 +3290,12 @@ class Store:
         requested = safe_name(name)
         if create:
             register_namespace(requested, repo_path)
-        identity = resolve_namespace_identity(requested)
+        identity = None
+        attempts = 8 if create else 1
+        for _attempt in range(attempts):
+            identity = resolve_namespace_identity(requested)
+            if identity is not None:
+                break
         if not identity:
             raise UnknownNamespaceError(requested)
         self.namespace_id = str(identity["namespace_id"])

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import re
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass
 from hashlib import sha256
@@ -32,6 +34,14 @@ _NAMESPACE_ALIAS_CACHE_LOCK = threading.Lock()
 
 class NamespacePathError(ValueError):
     """Raised when namespace storage could redirect outside its physical identity."""
+
+
+def required_o_nofollow() -> int:
+    """Return the mandatory no-follow flag or fail closed on this platform."""
+    value = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(value, int) or value <= 0:
+        raise NamespacePathError("O_NOFOLLOW is required for safe filesystem opens")
+    return value
 
 
 @dataclass
@@ -68,9 +78,7 @@ class SQLitePrimaryGuard:
                 "SQLite database directory must be a real non-symlink directory: "
                 f"{path.parent}"
             )
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if not nofollow:
-            raise NamespacePathError("O_NOFOLLOW is required for safe SQLite opens")
+        nofollow = required_o_nofollow()
         cloexec = getattr(os, "O_CLOEXEC", 0)
         for _attempt in range(3):
             claimed = False
@@ -272,7 +280,7 @@ class SQLiteSidecarGuard:
 
     @staticmethod
     def _acquire_one(path: Path, *, claim_missing: bool) -> _SQLiteSidecarEntry:
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        nofollow = required_o_nofollow()
         cloexec = getattr(os, "O_CLOEXEC", 0)
         nonblock = getattr(os, "O_NONBLOCK", 0)
         for _attempt in range(3):
@@ -304,12 +312,20 @@ class SQLiteSidecarGuard:
                 raise NamespacePathError(
                     f"SQLite sidecar must be a regular non-symlink file: {path}"
                 )
-            if int(before.st_nlink) != 1:
+            if int(before.st_nlink) > 1:
                 raise NamespacePathError(
                     f"SQLite sidecar must have exactly one filesystem link: {path}"
                 )
+            if int(before.st_nlink) != 1:
+                raise NamespacePathError(
+                    f"SQLite sidecar changed while opening: {path}"
+                )
             try:
                 fd = os.open(path, os.O_RDONLY | nofollow | cloexec | nonblock)
+            except FileNotFoundError as exc:
+                raise NamespacePathError(
+                    f"SQLite sidecar changed while opening: {path}"
+                ) from exc
             except OSError as exc:
                 raise NamespacePathError(
                     f"cannot safely open SQLite sidecar: {path}"
@@ -318,7 +334,15 @@ class SQLiteSidecarGuard:
             identity = (int(info.st_dev), int(info.st_ino))
             if (
                 not stat.S_ISREG(info.st_mode)
-                or int(info.st_nlink) != 1
+                or int(info.st_nlink) > 1
+            ):
+                os.close(fd)
+                raise NamespacePathError(
+                    "SQLite sidecar physical identity changed unsafely while opening: "
+                    f"{path}"
+                )
+            if (
+                int(info.st_nlink) != 1
                 or identity != (int(before.st_dev), int(before.st_ino))
             ):
                 os.close(fd)
@@ -358,8 +382,15 @@ class SQLiteSidecarGuard:
                 not stat.S_ISREG(info.st_mode)
                 or not stat.S_ISREG(current.st_mode)
                 or stat.S_ISLNK(current.st_mode)
-                or int(info.st_nlink) != 1
-                or int(current.st_nlink) != 1
+                or int(info.st_nlink) > 1
+                or int(current.st_nlink) > 1
+            ):
+                raise NamespacePathError(
+                    "SQLite sidecar physical identity changed unsafely during open: "
+                    f"{entry.path}"
+                )
+            if (
+                int(info.st_nlink) != 1
                 or held != entry.identity
                 or current_identity != entry.identity
             ):
@@ -433,6 +464,222 @@ def validate_sqlite_sidecars(
             return {path: identity for path, identity in existing.items() if identity}
         finally:
             guard.close(clean_unused_claims=False)
+
+
+_SQLiteFileState = tuple[int, int, int, int, int, str]
+SQLiteStorageSnapshot = dict[str, _SQLiteFileState | None]
+
+
+def sqlite_storage_snapshot(db_path: Path) -> SQLiteStorageSnapshot:
+    """Hash SQLite main/sidecar state through no-follow descriptors."""
+    snapshot: SQLiteStorageSnapshot = {}
+    nofollow = required_o_nofollow()
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    for candidate in (
+        Path(db_path),
+        *(Path(str(db_path) + suffix) for suffix in SQLITE_SIDECAR_SUFFIXES),
+    ):
+        key = str(candidate)
+        try:
+            before = candidate.lstat()
+        except FileNotFoundError:
+            snapshot[key] = None
+            continue
+        except OSError as exc:
+            raise NamespacePathError(f"cannot inspect SQLite file: {candidate}") from exc
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or int(before.st_nlink) > 1
+        ):
+            raise NamespacePathError(
+                f"SQLite file must be a single-link regular non-symlink: {candidate}"
+            )
+        if int(before.st_nlink) != 1:
+            raise NamespacePathError(
+                f"SQLite file changed while snapshotting: {candidate}"
+            )
+        try:
+            fd = os.open(candidate, os.O_RDONLY | nofollow | cloexec)
+        except FileNotFoundError as exc:
+            raise NamespacePathError(
+                f"SQLite file changed while snapshotting: {candidate}"
+            ) from exc
+        except OSError as exc:
+            raise NamespacePathError(
+                f"cannot safely snapshot SQLite file: {candidate}"
+            ) from exc
+        try:
+            info = os.fstat(fd)
+            digest = sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            try:
+                current = candidate.lstat()
+            except FileNotFoundError as exc:
+                raise NamespacePathError(
+                    f"SQLite file changed while snapshotting: {candidate}"
+                ) from exc
+            identity = int(info.st_dev), int(info.st_ino)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or int(info.st_nlink) != 1
+                or stat.S_ISLNK(current.st_mode)
+                or identity != (int(current.st_dev), int(current.st_ino))
+            ):
+                raise NamespacePathError(
+                    f"SQLite file changed while snapshotting: {candidate}"
+                )
+            snapshot[key] = (
+                identity[0], identity[1], int(info.st_mode), int(info.st_size),
+                int(info.st_mtime_ns), digest.hexdigest(),
+            )
+        finally:
+            os.close(fd)
+    return snapshot
+
+
+def readonly_sqlite_mode(
+    db_path: Path,
+) -> tuple[bool, SQLiteStorageSnapshot]:
+    """Choose immutable for quiescent DBs, WAL-aware only for complete WAL state."""
+    snapshot = sqlite_storage_snapshot(db_path)
+    wal_state = snapshot[str(db_path) + "-wal"]
+    shm_state = snapshot[str(db_path) + "-shm"]
+    wal_active = wal_state is not None and wal_state[3] != 0
+    journal_state = snapshot[str(db_path) + "-journal"]
+    if journal_state is not None and journal_state[3] != 0:
+        raise NamespacePathError(
+            f"cannot perform zero-write read with a rollback journal: {db_path}"
+        )
+    if wal_active and shm_state is None:
+        raise NamespacePathError(
+            f"cannot perform zero-write read with incomplete WAL state: {db_path}"
+        )
+    return not wal_active, snapshot
+
+
+def temporary_sqlite_shadow(
+    db_path: Path, snapshot: SQLiteStorageSnapshot
+) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    """Copy a stable main/WAL byte snapshot outside HAUNT_HOME for safe reading."""
+    temporary = tempfile.TemporaryDirectory(prefix="haunt-sqlite-read-")
+    root = Path(temporary.name)
+    shadow = root / db_path.name
+    nofollow = required_o_nofollow()
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    try:
+        for source, destination in (
+            (db_path, shadow),
+            (Path(str(db_path) + "-wal"), Path(str(shadow) + "-wal")),
+        ):
+            expected = snapshot.get(str(source))
+            if expected is None:
+                continue
+            try:
+                source_fd = os.open(source, os.O_RDONLY | nofollow | cloexec)
+            except FileNotFoundError as exc:
+                raise NamespacePathError(
+                    f"SQLite source changed while copying read snapshot: {source}"
+                ) from exc
+            except OSError as exc:
+                raise NamespacePathError(
+                    f"cannot safely copy SQLite read snapshot: {source}"
+                ) from exc
+            try:
+                opened = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or int(opened.st_nlink) != 1
+                    or (int(opened.st_dev), int(opened.st_ino))
+                    != (expected[0], expected[1])
+                ):
+                    raise NamespacePathError(
+                        f"SQLite source changed while copying read snapshot: {source}"
+                    )
+                destination_fd = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                    FILE_MODE,
+                )
+                try:
+                    digest = sha256()
+                    copied = 0
+                    while True:
+                        chunk = os.read(source_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        copied += len(chunk)
+                        view = memoryview(chunk)
+                        while view:
+                            written = os.write(destination_fd, view)
+                            view = view[written:]
+                    os.fsync(destination_fd)
+                    after = os.fstat(source_fd)
+                    if (
+                        (int(after.st_dev), int(after.st_ino))
+                        != (expected[0], expected[1])
+                        or int(after.st_nlink) != 1
+                        or copied != expected[3]
+                        or digest.hexdigest() != expected[5]
+                    ):
+                        raise NamespacePathError(
+                            "SQLite source changed while copying read snapshot: "
+                            f"{source}"
+                        )
+                finally:
+                    os.close(destination_fd)
+            finally:
+                os.close(source_fd)
+        return temporary, shadow
+    except Exception:
+        temporary.cleanup()
+        raise
+
+
+def materialize_sqlite_shadow(db_path: Path) -> None:
+    """Recover a private WAL snapshot into its main file through guarded opens."""
+    primary = SQLitePrimaryGuard.acquire(db_path, create_missing=False)
+    try:
+        sidecars = SQLiteSidecarGuard.acquire(db_path, claim_missing=True)
+    except Exception:
+        primary.close()
+        raise
+    conn: sqlite3.Connection | None = None
+    try:
+        primary.verify()
+        sidecars.verify()
+        before = _descriptor_identities()
+        conn = sqlite3.connect(str(db_path))
+        _verify_sqlite_primary_open(before, primary, sidecars)
+        primary.verify()
+        sidecars.verify()
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+        if (
+            checkpoint is None
+            or int(checkpoint[0]) != 0
+            or int(checkpoint[1]) <= 0
+            or int(checkpoint[2]) != int(checkpoint[1])
+        ):
+            raise NamespacePathError(
+                f"cannot materialize private SQLite WAL snapshot: {db_path}"
+            )
+        truncated = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if truncated is None or int(truncated[0]) != 0:
+            raise NamespacePathError(
+                f"cannot truncate private SQLite WAL snapshot: {db_path}"
+            )
+        primary.verify()
+        sidecars.verify()
+    finally:
+        if conn is not None:
+            conn.close()
+        sidecars.close(clean_unused_claims=True)
+        primary.close()
 
 
 def haunt_home() -> Path:
@@ -684,7 +931,12 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
         conn: sqlite3.Connection | None = None
         primary: SQLitePrimaryGuard | None = None
         sidecars: SQLiteSidecarGuard | None = None
+        read_primary: SQLitePrimaryGuard | None = None
+        read_sidecars: SQLiteSidecarGuard | None = None
+        temporary: tempfile.TemporaryDirectory[str] | None = None
         locked = False
+        storage_before: SQLiteStorageSnapshot | None = None
+        storage_changed = False
         result: tuple[str, Path, int, int] | None = None
         try:
             SQLITE_OPEN_LOCK.acquire()
@@ -692,17 +944,34 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
             primary = SQLitePrimaryGuard.acquire(path, create_missing=False)
             sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=False)
             descriptors_before = _descriptor_identities()
-            # A quiescent registry can be opened immutable without creating
-            # WAL/SHM sidecars. If a writer appears, the bracket fingerprint
-            # changes and the retry uses the WAL-aware read-only mode.
-            immutable = "&immutable=1" if before[1] is None else ""
+            immutable_mode, storage_before = readonly_sqlite_mode(path)
+            read_path = path
+            read_primary = primary
+            read_sidecars = sidecars
+            if not immutable_mode:
+                temporary, read_path = temporary_sqlite_shadow(path, storage_before)
+                if sqlite_storage_snapshot(path) != storage_before:
+                    storage_changed = True
+                    raise NamespacePathError(
+                        "registry changed while creating a zero-write read snapshot"
+                    )
+                materialize_sqlite_shadow(read_path)
+                read_primary = SQLitePrimaryGuard.acquire(
+                    read_path, create_missing=False
+                )
+                read_sidecars = SQLiteSidecarGuard.acquire(
+                    read_path, claim_missing=False
+                )
+                descriptors_before = _descriptor_identities()
             conn = sqlite3.connect(
-                f"{path.resolve().as_uri()}?mode=ro{immutable}", uri=True
+                f"{read_path.resolve().as_uri()}?mode=ro&immutable=1", uri=True
             )
             conn.row_factory = sqlite3.Row
-            _verify_sqlite_primary_open(descriptors_before, primary, sidecars)
-            primary.verify()
-            sidecars.verify()
+            _verify_sqlite_primary_open(
+                descriptors_before, read_primary, read_sidecars
+            )
+            read_primary.verify()
+            read_sidecars.verify()
             tables = {
                 str(row[0])
                 for row in conn.execute(
@@ -757,13 +1026,24 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
         finally:
             if conn is not None:
                 conn.close()
+            if storage_before is not None:
+                try:
+                    storage_changed = sqlite_storage_snapshot(path) != storage_before
+                except NamespacePathError:
+                    storage_changed = True
             if sidecars is not None:
                 sidecars.close(clean_unused_claims=False)
             if primary is not None:
                 primary.close()
+            if read_sidecars is not None and read_sidecars is not sidecars:
+                read_sidecars.close(clean_unused_claims=True)
+            if read_primary is not None and read_primary is not primary:
+                read_primary.close()
+            if temporary is not None:
+                temporary.cleanup()
             if locked:
                 SQLITE_OPEN_LOCK.release()
-        if before != _registry_fingerprint():
+        if storage_changed or before != _registry_fingerprint():
             continue
         if result is None:
             _forget_registered_alias(name)
@@ -773,7 +1053,9 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
     # Repeated concurrent migrations: fail closed instead of caching or
     # returning a value from a registry snapshot already known to be stale.
     _forget_registered_alias(name)
-    return None
+    raise NamespacePathError(
+        "namespace registry changed repeatedly during alias resolution"
+    )
 
 
 def _registered_db_path(name: str) -> Path | None:
@@ -797,6 +1079,18 @@ def repository_identity(remote_url: str | None) -> str | None:
             # urllib rejects malformed bracketed IPv6 hosts and invalid ports.
             # A malformed remote must never collapse into a valid repository
             # identity or escape into namespace inference as an exception.
+            return None
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        if authority.startswith("["):
+            if "]" not in authority:
+                return None
+            try:
+                bracketed = ipaddress.ip_address(hostname)
+            except ValueError:
+                return None
+            if bracketed.version != 6:
+                return None
+        elif "[" in authority or "]" in authority:
             return None
         if ":" in hostname:
             hostname = f"[{hostname}]"
@@ -838,18 +1132,44 @@ def _registered_namespace_for_repo(
     conn: sqlite3.Connection | None = None
     primary: SQLitePrimaryGuard | None = None
     sidecars: SQLiteSidecarGuard | None = None
+    read_primary: SQLitePrimaryGuard | None = None
+    read_sidecars: SQLiteSidecarGuard | None = None
+    temporary: tempfile.TemporaryDirectory[str] | None = None
     locked = False
+    storage_before: SQLiteStorageSnapshot | None = None
+    candidate: str | None = None
+    rows: list[sqlite3.Row] = []
     try:
         SQLITE_OPEN_LOCK.acquire()
         locked = True
         primary = SQLitePrimaryGuard.acquire(path, create_missing=False)
         sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=False)
         descriptors_before = _descriptor_identities()
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        immutable_mode, storage_before = readonly_sqlite_mode(path)
+        read_path = path
+        read_primary = primary
+        read_sidecars = sidecars
+        if not immutable_mode:
+            temporary, read_path = temporary_sqlite_shadow(path, storage_before)
+            if sqlite_storage_snapshot(path) != storage_before:
+                raise NamespacePathError(
+                    "registry changed while creating a zero-write read snapshot"
+                )
+            materialize_sqlite_shadow(read_path)
+            read_primary = SQLitePrimaryGuard.acquire(
+                read_path, create_missing=False
+            )
+            read_sidecars = SQLiteSidecarGuard.acquire(
+                read_path, claim_missing=False
+            )
+            descriptors_before = _descriptor_identities()
+        conn = sqlite3.connect(
+            f"{read_path.resolve().as_uri()}?mode=ro&immutable=1", uri=True
+        )
         conn.row_factory = sqlite3.Row
-        _verify_sqlite_primary_open(descriptors_before, primary, sidecars)
-        primary.verify()
-        sidecars.verify()
+        _verify_sqlite_primary_open(descriptors_before, read_primary, read_sidecars)
+        read_primary.verify()
+        read_sidecars.verify()
         tables = {
             str(row[0])
             for row in conn.execute(
@@ -869,8 +1189,8 @@ def _registered_namespace_for_repo(
                     (remote_identity,),
                 ).fetchone()
                 if row:
-                    return str(row["canonical_label"])
-            if repo_root:
+                    candidate = str(row["canonical_label"])
+            if candidate is None and repo_root:
                 row = conn.execute(
                     """
                     SELECT i.canonical_label
@@ -881,19 +1201,39 @@ def _registered_namespace_for_repo(
                     (str(repo_root.resolve()),),
                 ).fetchone()
                 if row:
-                    return str(row["canonical_label"])
-        rows = conn.execute("SELECT name, repo_path FROM namespaces").fetchall()
+                    candidate = str(row["canonical_label"])
+        if candidate is None:
+            rows = conn.execute("SELECT name, repo_path FROM namespaces").fetchall()
     except sqlite3.Error:
         return None
     finally:
         if conn is not None:
             conn.close()
+        try:
+            storage_changed = bool(
+                storage_before is not None
+                and sqlite_storage_snapshot(path) != storage_before
+            )
+        except NamespacePathError:
+            storage_changed = True
         if sidecars is not None:
             sidecars.close(clean_unused_claims=False)
         if primary is not None:
             primary.close()
+        if read_sidecars is not None and read_sidecars is not sidecars:
+            read_sidecars.close(clean_unused_claims=True)
+        if read_primary is not None and read_primary is not primary:
+            read_primary.close()
+        if temporary is not None:
+            temporary.cleanup()
         if locked:
             SQLITE_OPEN_LOCK.release()
+    if storage_changed:
+        raise NamespacePathError(
+            "namespace registry changed during repository resolution"
+        )
+    if candidate is not None:
+        return candidate
     resolved_root = repo_root.resolve() if repo_root else None
     for row in rows:
         stored = str(row["repo_path"] or "").strip()
@@ -991,7 +1331,7 @@ def mkdir_private(path: Path) -> Path:
 def tighten_db_files(path: Path) -> None:
     """Tighten only verified SQLite files, never following a sidecar symlink."""
     validate_sqlite_sidecars(path)
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nofollow = required_o_nofollow()
     cloexec = getattr(os, "O_CLOEXEC", 0)
     for extra in (
         path,
