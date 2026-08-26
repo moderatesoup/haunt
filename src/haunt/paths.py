@@ -43,7 +43,13 @@ def bin_dir() -> Path:
 
 
 def namespace_db_path(name: str) -> Path:
-    return namespaces_dir() / f"{safe_name(name)}.db"
+    legacy_path = namespaces_dir() / f"{safe_name(name)}.db"
+    if legacy_path.exists():
+        return legacy_path
+    registered = _registered_db_path(name)
+    if registered is not None:
+        return registered
+    return legacy_path
 
 
 def safe_name(name: str) -> str:
@@ -51,6 +57,64 @@ def safe_name(name: str) -> str:
     if not cleaned:
         return "default"
     return cleaned[:80]
+
+
+def normalize_namespace_label(name: str) -> str:
+    """Normalize a namespace label for unique registry lookup.
+
+    Labels retain their display spelling, while identity comparisons are
+    case-insensitive and use the same filesystem-safe/truncation rules as
+    legacy namespace names.
+    """
+    return safe_name(name).casefold()
+
+
+def _registered_alias(name: str) -> tuple[str, Path] | None:
+    """Read an alias mapping without initializing or mutating the registry."""
+    path = registry_path()
+    if not path.is_file():
+        return None
+    conn: sqlite3.Connection | None = None
+    try:
+        # mode=ro is fail-closed for a missing registry and remains WAL-aware.
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if {"namespace_aliases", "namespace_identities"} <= tables:
+            row = conn.execute(
+                """
+                SELECT i.canonical_label, i.db_path
+                FROM namespace_aliases a
+                JOIN namespace_identities i ON i.namespace_id=a.namespace_id
+                WHERE a.normalized_label=?
+                """,
+                (normalize_namespace_label(name),),
+            ).fetchone()
+            if row:
+                return str(row["canonical_label"]), Path(str(row["db_path"]))
+            return None
+        row = conn.execute(
+            "SELECT name, db_path FROM namespaces WHERE name=?",
+            (safe_name(name),),
+        ).fetchone()
+        if row:
+            return str(row["name"]), Path(str(row["db_path"]))
+    except sqlite3.Error:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+    return None
+
+
+def _registered_db_path(name: str) -> Path | None:
+    registered = _registered_alias(name)
+    return registered[1] if registered else None
 
 
 def repository_identity(remote_url: str | None) -> str | None:
@@ -94,13 +158,47 @@ def _registered_namespace_for_repo(
     path = registry_path()
     if not path.is_file():
         return None
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if {"repository_bindings", "namespace_identities"} <= tables:
+            if remote_identity:
+                row = conn.execute(
+                    """
+                    SELECT i.canonical_label
+                    FROM repository_bindings b
+                    JOIN namespace_identities i ON i.namespace_id=b.namespace_id
+                    WHERE b.repository_identity=?
+                    """,
+                    (remote_identity,),
+                ).fetchone()
+                if row:
+                    return str(row["canonical_label"])
+            if repo_root:
+                row = conn.execute(
+                    """
+                    SELECT i.canonical_label
+                    FROM repository_bindings b
+                    JOIN namespace_identities i ON i.namespace_id=b.namespace_id
+                    WHERE b.repo_path=?
+                    """,
+                    (str(repo_root.resolve()),),
+                ).fetchone()
+                if row:
+                    return str(row["canonical_label"])
         rows = conn.execute("SELECT name, repo_path FROM namespaces").fetchall()
-        conn.close()
     except sqlite3.Error:
         return None
+    finally:
+        if conn is not None:
+            conn.close()
     resolved_root = repo_root.resolve() if repo_root else None
     for row in rows:
         stored = str(row["repo_path"] or "").strip()
@@ -149,7 +247,8 @@ def infer_namespace(cwd: Path | None = None) -> str:
     """Infer from remote identity, preserving a matching legacy registration."""
     env = os.environ.get("HAUNT_NAMESPACE")
     if env:
-        return safe_name(env)
+        registered = _registered_alias(env)
+        return registered[0] if registered else safe_name(env)
     if cwd is None:
         proj = os.environ.get("CURSOR_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR")
         root = Path(proj).expanduser().resolve() if proj else Path.cwd().resolve()
@@ -174,7 +273,8 @@ def infer_namespace(cwd: Path | None = None) -> str:
 
 def resolve_namespace(name: str | None = None, cwd: Path | None = None) -> str:
     if name:
-        return safe_name(name)
+        registered = _registered_alias(name)
+        return registered[0] if registered else safe_name(name)
     return infer_namespace(cwd)
 
 

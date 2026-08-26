@@ -14,11 +14,15 @@ from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
 from haunt.store import (
+    AliasRetirementError,
+    NamespaceCollisionError,
     Store,
     UnknownNamespaceError,
+    change_namespace_label,
     list_namespaces,
     open_existing,
     register_namespace,
+    retire_namespace_alias,
 )
 from haunt.temporal import TemporalParseError
 from haunt.util import clamp_limit, dumps, format_iso, human_display, snippet
@@ -321,6 +325,80 @@ def namespaces_cmd() -> None:
                 f"{human_display(r.get('sessions'), limit=16):>6} "
                 f"{human_display(r.get('entities'), limit=16):>6}  {db_path}"
             )
+
+
+namespace_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Manage canonical namespace labels and aliases without moving databases.",
+)
+app.add_typer(namespace_app, name="namespace")
+
+
+def _namespace_change(
+    old_label: str,
+    new_label: str,
+    *,
+    repository: str | None,
+    action: str,
+    apply: bool,
+) -> None:
+    try:
+        report = change_namespace_label(
+            old_label,
+            new_label,
+            repository=repository,
+            action=action,
+            apply=apply,
+        )
+    except (UnknownNamespaceError, NamespaceCollisionError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
+
+
+@namespace_app.command("migrate")
+def namespace_migrate_cmd(
+    old_label: str = typer.Argument(..., help="Existing canonical label or alias"),
+    new_label: str = typer.Argument(..., help="New canonical label"),
+    repository: Optional[str] = typer.Option(
+        None, "--repo", "--repository", help="Local repo path or git remote URL to bind"
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Apply atomically (default is dry-run)"),
+) -> None:
+    """Rename a canonical label, retaining the old label as an alias."""
+    _namespace_change(
+        old_label, new_label, repository=repository, action="rename", apply=apply
+    )
+
+
+@namespace_app.command("alias")
+def namespace_alias_cmd(
+    source_label: str = typer.Argument(..., help="Existing canonical label or alias"),
+    alias: str = typer.Argument(..., help="Additional label for the same namespace"),
+    repository: Optional[str] = typer.Option(
+        None, "--repo", "--repository", help="Local repo path or git remote URL to bind"
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Apply atomically (default is dry-run)"),
+) -> None:
+    """Add a unique alias to an existing canonical namespace."""
+    _namespace_change(
+        source_label, alias, repository=repository, action="alias", apply=apply
+    )
+
+
+@namespace_app.command("retire-alias")
+def namespace_retire_alias_cmd(
+    label: str = typer.Argument(..., help="Noncanonical alias to check or retire"),
+    apply: bool = typer.Option(False, "--apply", help="Retire when checks pass"),
+) -> None:
+    """Check registry references; external host config must be inspected manually."""
+    try:
+        report = retire_namespace_alias(label, apply=apply)
+    except (UnknownNamespaceError, AliasRetirementError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
 
 @app.command("health")

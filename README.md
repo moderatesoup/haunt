@@ -183,6 +183,9 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |
 | `haunt timeline [--since --until --clock --json]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias); human rows show source channel/origin and JSON preserves the complete provenance envelope |
 | `haunt namespaces` | list + counts |
+| `haunt namespace migrate OLD NEW [--repo PATH_OR_REMOTE] [--apply]` | dry-run/apply a canonical label rename; keeps `OLD` as an alias and never moves the DB |
+| `haunt namespace alias SOURCE ALIAS [--repo PATH_OR_REMOTE] [--apply]` | dry-run/apply an additional unique alias |
+| `haunt namespace retire-alias ALIAS [--apply]` | check registry-owned references and optionally retire an alias |
 | `haunt health [-n NAMESPACE]` | vec / embed / counts / db path |
 | `haunt worldview [-n NAMESPACE]` | compact namespace briefing: facts, entities, and procedures with source provenance |
 | `haunt procedure write NAME --body BODY` | store a named procedure |
@@ -198,7 +201,11 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 
 haunt is its own MCP server — it runs alongside any other servers you already have (IronRecall, etc.) without interfering.
 
-By default, one `haunt-mcp` process is bound immutably to one project namespace. New git-backed projects use the full remote identity (`host/owner/repo`), so same-leaf repositories do not collide. Existing namespaces registered to the same remote or repository path keep their current name. Passing another namespace to an ordinary tool is denied, and `memory_namespaces` returns only the bound namespace. `HAUNT_MCP_ADMIN=1` enables cross-namespace access for an intentionally admin-scoped process.
+By default, one `haunt-mcp` process is bound immutably to one canonical namespace identity. New git-backed projects use the full remote identity (`host/owner/repo`), so same-leaf repositories do not collide. Existing namespaces registered to the same remote or repository path keep their current name. A proven alias of the bound identity is accepted; an alias belonging to any other identity is denied. Passing another namespace to an ordinary tool is denied, and `memory_namespaces` returns only the bound namespace. `HAUNT_MCP_ADMIN=1` enables cross-namespace access for an intentionally admin-scoped process.
+
+Namespace labels are registry aliases for one stable identity and one existing SQLite file. `namespace migrate` changes the canonical display label while retaining the old label; `namespace alias` leaves the canonical label unchanged. Both commands are dry-run unless `--apply` is supplied, refuse normalized-label/repository/database collisions, and record the old/new labels plus any supplied normalized repository identity. They never copy, rename, or move memory databases. Repeating the same apply is safe.
+
+`namespace retire-alias` checks only references Haunt owns in its registry: the canonical-label record, repository bindings, and dependent aliases. Editor, MCP-host, hook, and other external configuration cannot be verified from the registry; inspect and update those settings before applying retirement. Missing or stale external configuration is an operator caveat, not an automatic blocker.
 
 `memory_purge` is marked destructive and is off for MCP by default. Use the confirmed `haunt delete` CLI flow, or explicitly launch a process with `HAUNT_MCP_ALLOW_PURGE=1`. Admin mode alone does not enable purge.
 

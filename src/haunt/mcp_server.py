@@ -23,6 +23,7 @@ from haunt.store import (
     list_namespaces,
     namespace_exists,
     open_existing,
+    resolve_namespace_identity,
 )
 from haunt.temporal import TemporalParseError
 from haunt.util import clamp_limit
@@ -66,13 +67,19 @@ def _truthy(raw: str | None) -> bool:
 @dataclass(frozen=True)
 class MCPAuthority:
     bound_namespace: str
+    bound_namespace_id: str | None = None
     admin: bool = False
     allow_purge: bool = False
 
     @classmethod
     def from_environment(cls) -> "MCPAuthority":
+        inferred = infer_namespace()
+        identity = resolve_namespace_identity(inferred)
         return cls(
-            bound_namespace=infer_namespace(),
+            bound_namespace=(
+                str(identity["canonical_label"]) if identity else safe_name(inferred)
+            ),
+            bound_namespace_id=(str(identity["namespace_id"]) if identity else None),
             admin=_truthy(os.environ.get("HAUNT_MCP_ADMIN")),
             allow_purge=_truthy(os.environ.get("HAUNT_MCP_ALLOW_PURGE")),
         )
@@ -82,8 +89,18 @@ class MCPAuthority:
             return resolve_namespace(requested) if requested else self.bound_namespace
         if requested is None:
             return self.bound_namespace
-        selected = safe_name(requested)
-        if selected != self.bound_namespace:
+        selected_identity = resolve_namespace_identity(requested)
+        selected = (
+            str(selected_identity["canonical_label"])
+            if selected_identity
+            else safe_name(requested)
+        )
+        same_identity = bool(
+            selected_identity
+            and self.bound_namespace_id
+            and selected_identity["namespace_id"] == self.bound_namespace_id
+        )
+        if not same_identity and selected != self.bound_namespace:
             raise MCPAuthorityError(
                 f"MCP process is bound to namespace {self.bound_namespace!r}; "
                 f"access to {selected!r} is denied"

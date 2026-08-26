@@ -18,11 +18,14 @@ from haunt.embed import embed_one
 from haunt.embed import embed_texts
 from haunt.embed import state as embed_state
 from haunt.paths import (
+    _git_repo_context,
     ensure_layout,
     haunt_home,
     mkdir_private,
-    namespace_db_path,
+    namespaces_dir,
+    normalize_namespace_label,
     registry_path,
+    repository_identity,
     resolve_namespace,
     safe_name,
     tighten_db_files,
@@ -60,6 +63,8 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 8: validated, versioned source provenance on events.
 SCHEMA_VERSION = 8
 SCHEMA_VERSION_KEY = "schema_version"
+REGISTRY_SCHEMA_VERSION = 2
+REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sessions", ("started_at", "ended_at")),
@@ -89,6 +94,14 @@ class UnknownNamespaceError(ValueError):
     def __init__(self, name: str):
         self.name = name
         super().__init__(f"unknown namespace: {name}")
+
+
+class NamespaceCollisionError(ValueError):
+    """Raised when a label, repository, or target file belongs elsewhere."""
+
+
+class AliasRetirementError(ValueError):
+    """Raised when a live registry-owned reference blocks alias retirement."""
 
 
 def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
@@ -141,7 +154,149 @@ def init_registry() -> None:
             )
             """
         )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS registry_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS namespace_identities (
+                namespace_id TEXT PRIMARY KEY,
+                canonical_label TEXT NOT NULL,
+                canonical_label_norm TEXT NOT NULL UNIQUE,
+                db_path TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS namespace_aliases (
+                normalized_label TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                namespace_id TEXT NOT NULL,
+                is_canonical INTEGER NOT NULL DEFAULT 0 CHECK(is_canonical IN (0,1)),
+                source_alias_norm TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(namespace_id) REFERENCES namespace_identities(namespace_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_namespace_one_canonical
+                ON namespace_aliases(namespace_id) WHERE is_canonical=1;
+            CREATE TABLE IF NOT EXISTS repository_bindings (
+                binding_id TEXT PRIMARY KEY,
+                namespace_id TEXT NOT NULL,
+                repository_identity TEXT,
+                repo_path TEXT,
+                label_norm TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(repository_identity IS NOT NULL OR repo_path IS NOT NULL),
+                FOREIGN KEY(namespace_id) REFERENCES namespace_identities(namespace_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_repository_remote_unique
+                ON repository_bindings(repository_identity)
+                WHERE repository_identity IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_repository_path_unique
+                ON repository_bindings(repo_path) WHERE repo_path IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS namespace_migrations (
+                migration_id TEXT PRIMARY KEY,
+                namespace_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('alias','rename')),
+                old_label TEXT NOT NULL,
+                old_label_norm TEXT NOT NULL,
+                new_label TEXT NOT NULL,
+                new_label_norm TEXT NOT NULL,
+                repository_identity TEXT,
+                repository_key TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                UNIQUE(namespace_id, action, old_label_norm, new_label_norm, repository_key),
+                FOREIGN KEY(namespace_id) REFERENCES namespace_identities(namespace_id)
+            );
+            """
+        )
         conn.commit()
+        version_row = conn.execute(
+            "SELECT value FROM registry_meta WHERE key=?",
+            (REGISTRY_SCHEMA_VERSION_KEY,),
+        ).fetchone()
+        legacy_count = int(conn.execute("SELECT COUNT(*) FROM namespaces").fetchone()[0])
+        identity_count = int(
+            conn.execute("SELECT COUNT(*) FROM namespace_identities").fetchone()[0]
+        )
+        if (
+            version_row
+            and str(version_row["value"]) == str(REGISTRY_SCHEMA_VERSION)
+            and identity_count >= legacy_count
+        ):
+            return
+        # Additively project every legacy registry row into the identity model.
+        # The legacy table and its database paths remain the compatibility view.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for row in conn.execute(
+                "SELECT name, repo_path, db_path, created_at, updated_at FROM namespaces"
+            ).fetchall():
+                label = str(row["name"])
+                norm = normalize_namespace_label(label)
+                by_alias = conn.execute(
+                    "SELECT namespace_id FROM namespace_aliases WHERE normalized_label=?",
+                    (norm,),
+                ).fetchone()
+                by_path = conn.execute(
+                    "SELECT namespace_id FROM namespace_identities WHERE db_path=?",
+                    (str(row["db_path"]),),
+                ).fetchone()
+                if by_alias and (not by_path or by_alias["namespace_id"] != by_path["namespace_id"]):
+                    raise NamespaceCollisionError(
+                        f"legacy namespace label collision after normalization: {label!r}"
+                    )
+                if by_path:
+                    namespace_id = str(by_path["namespace_id"])
+                    if not by_alias:
+                        conn.execute(
+                            """INSERT INTO namespace_aliases(
+                                   normalized_label,label,namespace_id,is_canonical,created_at
+                               ) VALUES (?,?,?,?,?)""",
+                            (norm, label, namespace_id, 0, str(row["created_at"])),
+                        )
+                else:
+                    namespace_id = new_id()
+                    conn.execute(
+                        """INSERT INTO namespace_identities(
+                               namespace_id,canonical_label,canonical_label_norm,db_path,
+                               created_at,updated_at
+                           ) VALUES (?,?,?,?,?,?)""",
+                        (
+                            namespace_id,
+                            label,
+                            norm,
+                            str(row["db_path"]),
+                            str(row["created_at"]),
+                            str(row["updated_at"]),
+                        ),
+                    )
+                    conn.execute(
+                        """INSERT INTO namespace_aliases(
+                               normalized_label,label,namespace_id,is_canonical,created_at
+                           ) VALUES (?,?,?,?,?)""",
+                        (norm, label, namespace_id, 1, str(row["created_at"])),
+                    )
+                legacy_repo = str(row["repo_path"] or "").strip()
+                if legacy_repo:
+                    remote_identity, local_path = _repository_context(legacy_repo)
+                    _bind_repository(
+                        conn,
+                        namespace_id=namespace_id,
+                        label_norm=norm,
+                        repo_identity=remote_identity,
+                        repo_path=local_path,
+                        now=str(row["updated_at"]),
+                    )
+            conn.execute(
+                "INSERT OR REPLACE INTO registry_meta(key,value) VALUES (?,?)",
+                (REGISTRY_SCHEMA_VERSION_KEY, str(REGISTRY_SCHEMA_VERSION)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
 
@@ -549,27 +704,188 @@ def ensure_vec_table(
         return False
 
 
-def register_namespace(name: str, repo_path: str | None = None) -> Path:
-    name = safe_name(name)
-    db = namespace_db_path(name)
-    now = now_iso()
-    repo = str(Path(repo_path).expanduser().resolve()) if repo_path else None
+def _repository_context(value: str | None) -> tuple[str | None, str | None]:
+    """Return normalized remote identity and local repository root, if known."""
+    raw = (value or "").strip()
+    if not raw:
+        return None, None
+    remote = repository_identity(raw)
+    if remote:
+        return remote, None
+    path = Path(raw).expanduser().resolve()
+    remote_url, root = _git_repo_context(path)
+    return repository_identity(remote_url), str((root or path).resolve())
+
+
+def _identity_row(conn: sqlite3.Connection, label: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT i.*
+        FROM namespace_aliases a
+        JOIN namespace_identities i ON i.namespace_id=a.namespace_id
+        WHERE a.normalized_label=?
+        """,
+        (normalize_namespace_label(label),),
+    ).fetchone()
+
+
+def resolve_namespace_identity(name: str) -> dict[str, Any] | None:
+    """Resolve a label to its canonical identity without creating a namespace."""
     conn = _registry()
     try:
-        row = conn.execute(
-            "SELECT name FROM namespaces WHERE name=?", (name,)
+        row = _identity_row(conn, name)
+        if not row:
+            return None
+        aliases = conn.execute(
+            """SELECT label, normalized_label, is_canonical, source_alias_norm
+               FROM namespace_aliases WHERE namespace_id=?
+               ORDER BY is_canonical DESC, normalized_label""",
+            (row["namespace_id"],),
+        ).fetchall()
+        return {**dict(row), "aliases": [dict(alias) for alias in aliases]}
+    finally:
+        conn.close()
+
+
+def _bind_repository(
+    conn: sqlite3.Connection,
+    *,
+    namespace_id: str,
+    label_norm: str,
+    repo_identity: str | None,
+    repo_path: str | None,
+    now: str,
+) -> None:
+    if not repo_identity and not repo_path:
+        return
+    remote_row = None
+    path_row = None
+    if repo_identity:
+        remote_row = conn.execute(
+            "SELECT namespace_id,binding_id FROM repository_bindings WHERE repository_identity=?",
+            (repo_identity,),
         ).fetchone()
+        if remote_row and remote_row["namespace_id"] != namespace_id:
+            raise NamespaceCollisionError(
+                f"repository {repo_identity!r} is already bound to another namespace"
+            )
+    if repo_path:
+        path_row = conn.execute(
+            "SELECT namespace_id,binding_id FROM repository_bindings WHERE repo_path=?",
+            (repo_path,),
+        ).fetchone()
+        if path_row and path_row["namespace_id"] != namespace_id:
+            raise NamespaceCollisionError(
+                f"repository path {repo_path!r} is already bound to another namespace"
+            )
+    if remote_row and path_row and remote_row["binding_id"] != path_row["binding_id"]:
+        raise NamespaceCollisionError(
+            "repository remote and path are recorded by different bindings"
+        )
+    row = remote_row or path_row
+    if row:
+        conn.execute(
+            """UPDATE repository_bindings
+               SET repo_path=COALESCE(?,repo_path),label_norm=?,updated_at=?
+               WHERE binding_id=?""",
+            (repo_path, label_norm, now, row["binding_id"]),
+        )
+        return
+    conn.execute(
+        """INSERT INTO repository_bindings(
+               binding_id,namespace_id,repository_identity,repo_path,label_norm,
+               created_at,updated_at
+           ) VALUES (?,?,?,?,?,?,?)""",
+        (new_id(), namespace_id, repo_identity, repo_path, label_norm, now, now),
+    )
+
+
+def register_namespace(name: str, repo_path: str | None = None) -> Path:
+    label = safe_name(name)
+    norm = normalize_namespace_label(label)
+    now = now_iso()
+    repo_identity, repo = _repository_context(repo_path)
+    conn = _registry()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _identity_row(conn, label)
+        if not row and (repo_identity or repo):
+            if repo_identity:
+                binding = conn.execute(
+                    "SELECT namespace_id FROM repository_bindings WHERE repository_identity=?",
+                    (repo_identity,),
+                ).fetchone()
+            else:
+                binding = conn.execute(
+                    "SELECT namespace_id FROM repository_bindings WHERE repo_path=?",
+                    (repo,),
+                ).fetchone()
+            if binding:
+                row = conn.execute(
+                    "SELECT * FROM namespace_identities WHERE namespace_id=?",
+                    (binding["namespace_id"],),
+                ).fetchone()
+                conn.execute(
+                    """INSERT INTO namespace_aliases(
+                           normalized_label,label,namespace_id,is_canonical,created_at
+                       ) VALUES (?,?,?,?,?)""",
+                    (norm, label, row["namespace_id"], 0, now),
+                )
         if row:
+            db = Path(str(row["db_path"]))
+            namespace_id = str(row["namespace_id"])
+            canonical = str(row["canonical_label"])
             conn.execute(
-                "UPDATE namespaces SET repo_path=COALESCE(?, repo_path), db_path=?, updated_at=? WHERE name=?",
-                (repo, str(db), now, name),
+                "UPDATE namespace_identities SET updated_at=? WHERE namespace_id=?",
+                (now, namespace_id),
             )
         else:
+            db = namespaces_dir() / f"{label}.db"
+            path_owner = conn.execute(
+                "SELECT canonical_label FROM namespace_identities WHERE db_path=?",
+                (str(db),),
+            ).fetchone()
+            if path_owner:
+                raise NamespaceCollisionError(
+                    f"database path {db} is already mapped to {path_owner['canonical_label']!r}"
+                )
+            namespace_id = new_id()
+            canonical = label
             conn.execute(
-                "INSERT INTO namespaces(name, repo_path, db_path, created_at, updated_at) VALUES (?,?,?,?,?)",
-                (name, repo, str(db), now, now),
+                """INSERT INTO namespace_identities(
+                       namespace_id,canonical_label,canonical_label_norm,db_path,
+                       created_at,updated_at
+                   ) VALUES (?,?,?,?,?,?)""",
+                (namespace_id, label, norm, str(db), now, now),
+            )
+            conn.execute(
+                """INSERT INTO namespace_aliases(
+                       normalized_label,label,namespace_id,is_canonical,created_at
+                   ) VALUES (?,?,?,?,?)""",
+                (norm, label, namespace_id, 1, now),
+            )
+            conn.execute(
+                """INSERT INTO namespaces(name,repo_path,db_path,created_at,updated_at)
+                   VALUES (?,?,?,?,?)""",
+                (canonical, repo, str(db), now, now),
+            )
+        _bind_repository(
+            conn,
+            namespace_id=namespace_id,
+            label_norm=norm,
+            repo_identity=repo_identity,
+            repo_path=repo,
+            now=now,
+        )
+        if repo:
+            conn.execute(
+                "UPDATE namespaces SET repo_path=COALESCE(?,repo_path),updated_at=? WHERE db_path=?",
+                (repo, now, str(db)),
             )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
     ns = _connect(db)
@@ -587,11 +903,9 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
 
 
 def namespace_exists(name: str) -> bool:
-    name = safe_name(name)
     conn = _registry()
     try:
-        row = conn.execute("SELECT 1 FROM namespaces WHERE name=?", (name,)).fetchone()
-        return bool(row)
+        return _identity_row(conn, name) is not None
     finally:
         conn.close()
 
@@ -599,10 +913,12 @@ def namespace_exists(name: str) -> bool:
 def touch_namespace(name: str) -> None:
     conn = _registry()
     try:
-        conn.execute(
-            "UPDATE namespaces SET updated_at=? WHERE name=?",
-            (now_iso(), safe_name(name)),
-        )
+        row = _identity_row(conn, name)
+        if not row:
+            return
+        now = now_iso()
+        conn.execute("UPDATE namespace_identities SET updated_at=? WHERE namespace_id=?", (now, row["namespace_id"]))
+        conn.execute("UPDATE namespaces SET updated_at=? WHERE db_path=?", (now, row["db_path"]))
         conn.commit()
     finally:
         conn.close()
@@ -613,9 +929,261 @@ def list_namespace_rows() -> list[dict[str, Any]]:
     conn = _registry()
     try:
         rows = conn.execute(
-            "SELECT name, repo_path, db_path, created_at, updated_at FROM namespaces ORDER BY name"
+            """SELECT i.namespace_id,i.canonical_label AS name,
+                      n.repo_path,i.db_path,i.created_at,i.updated_at
+               FROM namespace_identities i
+               LEFT JOIN namespaces n ON n.db_path=i.db_path
+               ORDER BY i.canonical_label_norm"""
         ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            aliases = conn.execute(
+                "SELECT label FROM namespace_aliases WHERE namespace_id=? ORDER BY normalized_label",
+                (row["namespace_id"],),
+            ).fetchall()
+            out.append({**dict(row), "aliases": [str(a["label"]) for a in aliases]})
+        return out
+    finally:
+        conn.close()
+
+
+def change_namespace_label(
+    old_label: str,
+    new_label: str,
+    *,
+    repository: str | None = None,
+    action: str = "rename",
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Plan or atomically apply a namespace alias/rename.
+
+    ``rename`` changes the canonical display label and retains the old label as
+    an alias. ``alias`` adds another label without changing the canonical one.
+    Neither operation moves, copies, or renames the namespace database.
+    """
+    if action not in {"alias", "rename"}:
+        raise ValueError("action must be 'alias' or 'rename'")
+    old_display = safe_name(old_label)
+    new_display = safe_name(new_label)
+    old_norm = normalize_namespace_label(old_display)
+    new_norm = normalize_namespace_label(new_display)
+    repo_identity, repo = _repository_context(repository)
+    now = now_iso()
+    conn = _registry()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        source = _identity_row(conn, old_display)
+        if not source:
+            raise UnknownNamespaceError(old_display)
+        namespace_id = str(source["namespace_id"])
+        recorded_repo_identity = repo_identity or (f"path:{repo}" if repo else None)
+        if recorded_repo_identity is None:
+            existing_binding = conn.execute(
+                """SELECT repository_identity,repo_path FROM repository_bindings
+                   WHERE namespace_id=?
+                   ORDER BY repository_identity IS NOT NULL DESC, created_at
+                   LIMIT 1""",
+                (namespace_id,),
+            ).fetchone()
+            if existing_binding:
+                recorded_repo_identity = str(
+                    existing_binding["repository_identity"]
+                    or f"path:{existing_binding['repo_path']}"
+                )
+        target = _identity_row(conn, new_display)
+        if target and target["namespace_id"] != namespace_id:
+            raise NamespaceCollisionError(
+                f"label {new_display!r} is already mapped to another namespace"
+            )
+        target_path = namespaces_dir() / f"{new_display}.db"
+        if not target and target_path != Path(str(source["db_path"])) and target_path.exists():
+            raise NamespaceCollisionError(
+                f"target label {new_display!r} has an unmapped database at {target_path}"
+            )
+        if repo_identity:
+            binding = conn.execute(
+                "SELECT namespace_id FROM repository_bindings WHERE repository_identity=?",
+                (repo_identity,),
+            ).fetchone()
+            if binding and binding["namespace_id"] != namespace_id:
+                raise NamespaceCollisionError(
+                    f"repository {repo_identity!r} is already bound to another namespace"
+                )
+        if repo:
+            binding = conn.execute(
+                "SELECT namespace_id FROM repository_bindings WHERE repo_path=?",
+                (repo,),
+            ).fetchone()
+            if binding and binding["namespace_id"] != namespace_id:
+                raise NamespaceCollisionError(
+                    f"repository path {repo!r} is already bound to another namespace"
+                )
+        result: dict[str, Any] = {
+            "action": action,
+            "mode": "apply" if apply else "dry-run",
+            "namespace_id": namespace_id,
+            "canonical_before": str(source["canonical_label"]),
+            "canonical_after": new_display if action == "rename" else str(source["canonical_label"]),
+            "old_label": old_display,
+            "old_normalized": old_norm,
+            "new_label": new_display,
+            "new_normalized": new_norm,
+            "repository_identity": recorded_repo_identity,
+            "repository_path": repo,
+            "db_path": str(source["db_path"]),
+            "database_operation": "none",
+            "idempotent": bool(target) and (
+                action == "alias" or source["canonical_label_norm"] == new_norm
+            ),
+        }
+        if not apply:
+            conn.rollback()
+            return result
+        if not target:
+            conn.execute(
+                """INSERT INTO namespace_aliases(
+                       normalized_label,label,namespace_id,is_canonical,
+                       source_alias_norm,created_at
+                   ) VALUES (?,?,?,?,?,?)""",
+                (
+                    new_norm,
+                    new_display,
+                    namespace_id,
+                    0,
+                    old_norm if action == "alias" and old_norm != new_norm else None,
+                    now,
+                ),
+            )
+        elif new_norm == old_norm and new_display != target["canonical_label"]:
+            conn.execute(
+                "UPDATE namespace_aliases SET label=? WHERE normalized_label=?",
+                (new_display, new_norm),
+            )
+        if action == "rename":
+            conn.execute(
+                "UPDATE namespace_aliases SET is_canonical=0 WHERE namespace_id=?",
+                (namespace_id,),
+            )
+            conn.execute(
+                "UPDATE namespace_aliases SET is_canonical=1,label=? WHERE normalized_label=?",
+                (new_display, new_norm),
+            )
+            conn.execute(
+                """UPDATE namespace_identities
+                   SET canonical_label=?,canonical_label_norm=?,updated_at=?
+                   WHERE namespace_id=?""",
+                (new_display, new_norm, now, namespace_id),
+            )
+            conn.execute(
+                "UPDATE namespaces SET name=?,updated_at=? WHERE db_path=?",
+                (new_display, now, source["db_path"]),
+            )
+            conn.execute(
+                "UPDATE repository_bindings SET label_norm=?,updated_at=? WHERE namespace_id=? AND label_norm=?",
+                (new_norm, now, namespace_id, old_norm),
+            )
+        repo_key = recorded_repo_identity or ""
+        before = conn.total_changes
+        conn.execute(
+            """INSERT OR IGNORE INTO namespace_migrations(
+                   migration_id,namespace_id,action,old_label,old_label_norm,
+                   new_label,new_label_norm,repository_identity,repository_key,applied_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                new_id(), namespace_id, action, old_display, old_norm,
+                new_display, new_norm, recorded_repo_identity, repo_key, now,
+            ),
+        )
+        history_inserted = conn.total_changes > before
+        _bind_repository(
+            conn,
+            namespace_id=namespace_id,
+            label_norm=new_norm,
+            repo_identity=repo_identity,
+            repo_path=repo,
+            now=now,
+        )
+        conn.commit()
+        result["applied"] = True
+        result["idempotent"] = not history_inserted
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def retire_namespace_alias(label: str, *, apply: bool = False) -> dict[str, Any]:
+    """Check registry-owned references and optionally retire a noncanonical alias."""
+    display = safe_name(label)
+    norm = normalize_namespace_label(display)
+    conn = _registry()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT a.*,i.canonical_label,i.db_path
+               FROM namespace_aliases a
+               JOIN namespace_identities i ON i.namespace_id=a.namespace_id
+               WHERE a.normalized_label=?""",
+            (norm,),
+        ).fetchone()
+        if not row:
+            raise UnknownNamespaceError(display)
+        blockers: list[dict[str, str]] = []
+        if row["is_canonical"] or normalize_namespace_label(str(row["canonical_label"])) == norm:
+            blockers.append({"kind": "canonical-label", "label": str(row["canonical_label"])})
+        for binding in conn.execute(
+            """SELECT repository_identity,repo_path FROM repository_bindings
+               WHERE namespace_id=? AND label_norm=?""",
+            (row["namespace_id"], norm),
+        ).fetchall():
+            blockers.append(
+                {
+                    "kind": "repository-binding",
+                    "reference": str(binding["repository_identity"] or binding["repo_path"]),
+                }
+            )
+        for alias in conn.execute(
+            "SELECT label FROM namespace_aliases WHERE source_alias_norm=?",
+            (norm,),
+        ).fetchall():
+            blockers.append({"kind": "dependent-alias", "label": str(alias["label"])})
+        result: dict[str, Any] = {
+            "mode": "apply" if apply else "dry-run",
+            "label": str(row["label"]),
+            "normalized_label": norm,
+            "namespace_id": str(row["namespace_id"]),
+            "canonical_label": str(row["canonical_label"]),
+            "db_path": str(row["db_path"]),
+            "safe": not blockers,
+            "blockers": blockers,
+            "operator_caveat": (
+                "External editor/host configuration is not recorded in the registry; "
+                "inspect and update it before retiring this alias."
+            ),
+        }
+        if blockers:
+            conn.rollback()
+            if apply:
+                kinds = ", ".join(blocker["kind"] for blocker in blockers)
+                raise AliasRetirementError(
+                    f"cannot retire alias {display!r}; registry references: {kinds}"
+                )
+            return result
+        if apply:
+            conn.execute(
+                "DELETE FROM namespace_aliases WHERE normalized_label=?",
+                (norm,),
+            )
+            conn.commit()
+            result["retired"] = True
+        else:
+            conn.rollback()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -746,10 +1314,15 @@ class ObserveResult:
 
 class Store:
     def __init__(self, name: str, repo_path: str | None = None, *, create: bool = True):
-        self.name = safe_name(name)
+        requested = safe_name(name)
         if create:
-            register_namespace(self.name, repo_path)
-        self.db_path = namespace_db_path(self.name)
+            register_namespace(requested, repo_path)
+        identity = resolve_namespace_identity(requested)
+        if not identity:
+            raise UnknownNamespaceError(requested)
+        self.namespace_id = str(identity["namespace_id"])
+        self.name = str(identity["canonical_label"])
+        self.db_path = Path(str(identity["db_path"]))
         self._privacy_purge_thread_id: int | None = None
         self.conn = _connect(self.db_path, create=create)
         self.conn.create_function(
@@ -2637,7 +3210,6 @@ class Store:
 
 def open_existing(name: str, repo_path: str | None = None) -> Store:
     """Open a registered namespace. Never creates a DB or registry row."""
-    name = safe_name(name)
     if not namespace_exists(name):
         raise UnknownNamespaceError(name)
     try:
@@ -2667,8 +3239,12 @@ def list_namespaces(*, only: str | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     rows = list_namespace_rows()
     if only is not None:
-        selected = safe_name(only)
-        rows = [row for row in rows if row["name"] == selected]
+        identity = resolve_namespace_identity(only)
+        rows = (
+            [row for row in rows if row["namespace_id"] == identity["namespace_id"]]
+            if identity
+            else []
+        )
     for row in rows:
         db = Path(row["db_path"])
         extra: dict[str, Any] = {
