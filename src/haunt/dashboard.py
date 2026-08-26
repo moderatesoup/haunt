@@ -1124,6 +1124,7 @@ async def api_contradict(request: Request) -> JSONResponse:
                 session_id=session_id,
                 reason=reason,
                 idempotency_key=idempotency_key,
+                channel="dashboard",
             )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)

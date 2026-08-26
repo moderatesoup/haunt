@@ -7,7 +7,11 @@ dashboard APIs. It describes how bytes entered Haunt; it is not evidence that
 the memory is true.
 
 Every new write has `schema_version: 1`, `kind`, and the actual nonempty
-`origin` passed to `Store.observe`. Unknown optional values are omitted or null;
+`channel` and `origin` passed to `Store.observe`. Direct Python calls default to
+`channel="python"`; the CLI and MCP server bind `cli` and `mcp`; Cursor and
+Claude Code hooks bind their host-specific channels. A correction replacement
+inherits the channel of the correction entry point. A caller-supplied channel
+must match that actual input. Unknown optional values are omitted or null;
 Haunt never guesses them.
 
 ## Native observations
@@ -23,10 +27,12 @@ Haunt never guesses them.
 }
 ```
 
-`channel`, `producer_tool`, and `producer_call_id` are optional. Producer
-fields are accepted only when they match the tool/call inputs actually supplied
-to `Store.observe`; a call ID requires a tool. Cursor and Claude hooks record
-their known channel and supplied host call ID automatically.
+The stored `channel` is mandatory. `producer_tool` and `producer_call_id` are
+optional, but are accepted only when they match the tool/call inputs actually
+supplied to `Store.observe`; a call ID requires a tool. Cursor and Claude hooks
+record their known channel and supplied host call ID automatically. Actual
+origin, channel, tool name, and call ID must be nonempty strings no larger than
+2,048 UTF-8 bytes. They are validated before embedding or session work begins.
 
 ## Imports
 
@@ -34,6 +40,7 @@ their known channel and supplied host call ID automatically.
 {
   "schema_version": 1,
   "kind": "import",
+  "channel": "archive_import",
   "origin": "archive-importer",
   "source_platform": "example-chat",
   "source_native_id": "message-123",
@@ -56,7 +63,9 @@ preserved.
 Unsupported versions, fields, fidelity values, types, sizes, timestamps, and
 hashes fail before any session, event, memory, embedding job, graph, or index
 write. An idempotency-key replay must carry the exact same canonical provenance
-or it conflicts.
+or it conflicts. A retry against a legacy null or invalid stored envelope fails
+closed because Haunt cannot prove that the attempted attribution is identical.
+The old row remains readable and unchanged.
 
 ## Legacy and invalid rows
 

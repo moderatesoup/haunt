@@ -93,6 +93,7 @@ def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
         kwargs.pop("content", ""),
         session_id=session_id,
         origin=ORIGIN,
+        channel="claude_code_hook",
         meta={"hook": event},
         idempotency_key=hook_idempotency_key(
             payload,

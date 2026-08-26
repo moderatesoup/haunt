@@ -16,6 +16,19 @@ from haunt.provenance import IMPORT_FIDELITIES, native_provenance
 from haunt.store import SCHEMA_VERSION, Store
 
 
+LOGICAL_TABLES = (
+    "sessions",
+    "events",
+    "memories",
+    "memories_fts",
+    "embedding_jobs",
+    "entities",
+    "relations",
+    "entity_mentions",
+    "relation_evidence",
+)
+
+
 @pytest.fixture
 def provenance_env(tmp_path, monkeypatch):
     home = tmp_path / "haunthome"
@@ -33,11 +46,13 @@ def provenance_env(tmp_path, monkeypatch):
     embed.reset()
 
 
-def _import_envelope(fidelity: str = "lossless") -> dict[str, Any]:
+def _import_envelope(
+    fidelity: str = "lossless", *, channel: str = "python"
+) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "kind": "import",
-        "channel": "archive-upload",
+        "channel": channel,
         "source_platform": "聊天平台",
         "source_native_id": "消息-雪-🧊",
         "source_format": "vendor-json",
@@ -46,6 +61,13 @@ def _import_envelope(fidelity: str = "lossless") -> dict[str, Any]:
         "fidelity": fidelity,
         "original_blob_sha256": "sha256:" + "ab" * 32,
         "transforms": ["decode:utf-8", "normalize:newlines"],
+    }
+
+
+def _logical_counts(store: Store) -> dict[str, int]:
+    return {
+        table: store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in LOGICAL_TABLES
     }
 
 
@@ -59,6 +81,7 @@ def test_import_fidelity_round_trip_and_canonical_time(provenance_env, fidelity)
         )
         detail = st.get_memory(result.memory_id)
         browse = st.browse_memories(limit=10)["memories"]
+        timeline = st.events(limit=10)
         trace = st.trace(result.memory_id)
 
     expected = dict(_import_envelope(fidelity), origin="import-cli")
@@ -66,6 +89,7 @@ def test_import_fidelity_round_trip_and_canonical_time(provenance_env, fidelity)
     assert result.provenance == expected
     assert detail["provenance"] == expected
     assert browse[0]["provenance"] == expected
+    assert timeline[0]["provenance"] == expected
     assert trace["members"][0]["provenance"] == expected
 
 
@@ -82,6 +106,7 @@ def test_unknowns_remain_absent_and_original_blob_absence_is_explicit(provenance
         stored = st.get_memory(result.memory_id)["provenance"]
     assert stored == {
         **provenance,
+        "channel": "python",
         "origin": "batch",
         "imported_at": "2025-01-01T00:00:00.000000+00:00",
     }
@@ -113,6 +138,7 @@ def test_native_tool_and_call_are_actual_observe_inputs(provenance_env):
             producer_call_id="调用-α-42",
             origin="cursor",
             provenance=provenance,
+            channel="cursor_hook",
         )
         stored = st.get_memory(result.memory_id)["provenance"]
     assert stored["channel"] == "cursor_hook"
@@ -139,6 +165,77 @@ def test_native_producer_claims_must_match_actual_observe_inputs(provenance_env)
                 defer_embedding=True,
             )
         assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"origin": ""}, "origin"),
+        ({"origin": 0}, "origin"),
+        ({"origin": "雪" * 683}, "2048 UTF-8 bytes"),
+        ({"channel": ""}, "channel"),
+        ({"channel": 0}, "channel"),
+        ({"channel": "雪" * 683}, "2048 UTF-8 bytes"),
+        ({"tool_name": ""}, "tool_name"),
+        ({"tool_name": 0}, "tool_name"),
+        ({"tool_name": "雪" * 683}, "2048 UTF-8 bytes"),
+        ({"producer_call_id": ""}, "producer_call_id"),
+        ({"producer_call_id": 0}, "producer_call_id"),
+        (
+            {"tool_name": "Shell", "producer_call_id": "雪" * 683},
+            "2048 UTF-8 bytes",
+        ),
+        ({"producer_call_id": "call-without-tool"}, "requires tool_name"),
+    ],
+)
+def test_actual_attribution_is_strictly_validated_before_store_writes(
+    provenance_env, kwargs, message
+):
+    with Store("default") as st:
+        before = _logical_counts(st)
+        with pytest.raises(ValueError, match=message):
+            st.observe("rejected actual attribution", defer_embedding=True, **kwargs)
+        assert _logical_counts(st) == before
+
+
+@pytest.mark.parametrize(
+    "provenance, kwargs, message",
+    [
+        (
+            {"schema_version": 1, "kind": "native", "channel": "mcp"},
+            {},
+            "channel",
+        ),
+        (
+            {"schema_version": 1, "kind": "native", "origin": "claimed"},
+            {},
+            "origin",
+        ),
+        (
+            {"schema_version": 1, "kind": "native", "producer_tool": 0},
+            {},
+            "producer_tool",
+        ),
+        (
+            {"schema_version": 1, "kind": "native", "producer_call_id": 0},
+            {},
+            "producer_call_id",
+        ),
+    ],
+)
+def test_supplied_native_attribution_must_match_actual_entry_inputs(
+    provenance_env, provenance, kwargs, message
+):
+    with Store("default") as st:
+        before = _logical_counts(st)
+        with pytest.raises(ValueError, match=message):
+            st.observe(
+                "rejected claimed attribution",
+                provenance=provenance,
+                defer_embedding=True,
+                **kwargs,
+            )
+        assert _logical_counts(st) == before
 
 
 @pytest.mark.parametrize(
@@ -195,27 +292,10 @@ def test_invalid_provenance_rejected_before_any_logical_write(
     provenance_env, bad, message
 ):
     with Store("default") as st:
-        tables = (
-            "sessions",
-            "events",
-            "memories",
-            "memories_fts",
-            "embedding_jobs",
-            "entities",
-            "relations",
-            "entity_mentions",
-            "relation_evidence",
-        )
-        before = {
-            table: st.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in tables
-        }
+        before = _logical_counts(st)
         with pytest.raises(ValueError, match=message):
             st.observe("must not land", provenance=bad, defer_embedding=True)
-        after = {
-            table: st.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in tables
-        }
+        after = _logical_counts(st)
     assert after == before
 
 
@@ -257,7 +337,9 @@ def test_provenance_migration_preserves_legacy_origin_and_meta_bytes(provenance_
     }
 
 
-def test_legacy_idempotency_retry_remains_compatible_and_honest(provenance_env):
+def test_legacy_idempotency_retry_fails_closed_when_attribution_is_unknown(
+    provenance_env,
+):
     with Store("default") as st:
         old = st.observe(
             "legacy retry",
@@ -268,20 +350,20 @@ def test_legacy_idempotency_retry_remains_compatible_and_honest(provenance_env):
         )
         st.conn.execute("UPDATE events SET provenance=NULL WHERE id=?", (old.event_id,))
         st.conn.commit()
-        retry = st.observe(
-            "legacy retry",
-            origin="old-hook",
-            idempotency_key="old-hook-key",
-            defer_embedding=True,
-        )
+        with pytest.raises(ValueError, match="cannot verify legacy provenance"):
+            st.observe(
+                "legacy retry",
+                origin="old-hook",
+                idempotency_key="old-hook-key",
+                defer_embedding=True,
+            )
         assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
-    assert retry.deduplicated is True
-    assert retry.provenance == {
-        "schema_version": 1,
-        "kind": "legacy_unstructured",
-        "origin": "old-hook",
-        "meta": '{"old": "bytes"}',
-    }
+        assert st.get_memory(old.memory_id)["provenance"] == {
+            "schema_version": 1,
+            "kind": "legacy_unstructured",
+            "origin": "old-hook",
+            "meta": '{"old": "bytes"}',
+        }
 
 
 def test_corrupt_or_unsupported_stored_envelope_fails_honest(provenance_env):
@@ -299,6 +381,27 @@ def test_corrupt_or_unsupported_stored_envelope_fails_honest(provenance_env):
         "origin": "cli",
     }
     assert not _contains_key(detail, "confidence")
+
+
+def test_invalid_stored_idempotency_retry_fails_closed(provenance_env):
+    with Store("default") as st:
+        result = st.observe(
+            "tampered retry",
+            idempotency_key="tampered-key",
+            defer_embedding=True,
+        )
+        st.conn.execute(
+            "UPDATE events SET provenance=? WHERE id=?",
+            ('{"schema_version":99,"kind":"native"}', result.event_id),
+        )
+        st.conn.commit()
+        with pytest.raises(ValueError, match="cannot verify invalid stored provenance"):
+            st.observe(
+                "tampered retry",
+                idempotency_key="tampered-key",
+                defer_embedding=True,
+            )
+        assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
 
 
 def test_idempotency_replays_exact_provenance_and_conflicts_on_change(provenance_env):
@@ -372,6 +475,7 @@ def test_corrected_import_trace_reaches_lineage_and_both_source_envelopes(
             origin="reviewer",
             reason="source amended",
             idempotency_key="correct-import-1",
+            channel="review_workflow",
         )
         trace = st.trace(correction["replacement_memory_id"])
     assert trace["lineage_status"] == "linked"
@@ -380,6 +484,7 @@ def test_corrected_import_trace_reaches_lineage_and_both_source_envelopes(
     assert trace["members"][1]["provenance"] == {
         "schema_version": 1,
         "kind": "native",
+        "channel": "review_workflow",
         "origin": "reviewer",
     }
     assert trace["corrections"][0]["reason"] == "source amended"
@@ -482,6 +587,7 @@ def test_purge_removes_provenance_canaries_from_all_tables_and_surfaces(provenan
     assert surfaces["detail"]["provenance"] == {
         "schema_version": 1,
         "kind": "native",
+        "channel": "privacy_purge",
         "origin": "privacy-sanitized",
     }
     assert json.loads(session["meta"]) == {
@@ -491,8 +597,10 @@ def test_purge_removes_provenance_canaries_from_all_tables_and_surfaces(provenan
     }
 
 
-def test_cli_mcp_and_dashboard_share_the_same_envelope(provenance_env, monkeypatch):
-    envelope = _import_envelope("derived")
+def test_cli_mcp_and_dashboard_share_the_same_envelope_schema(
+    provenance_env, monkeypatch
+):
+    cli_envelope = _import_envelope("derived", channel="cli")
     runner = CliRunner()
     cli = runner.invoke(
         app,
@@ -504,7 +612,7 @@ def test_cli_mcp_and_dashboard_share_the_same_envelope(provenance_env, monkeypat
             "--origin",
             "importer",
             "--provenance-json",
-            json.dumps(envelope, ensure_ascii=False),
+            json.dumps(cli_envelope, ensure_ascii=False),
         ],
     )
     assert cli.exit_code == 0, cli.output
@@ -514,12 +622,13 @@ def test_cli_mcp_and_dashboard_share_the_same_envelope(provenance_env, monkeypat
     from haunt import mcp_server
 
     mcp_server._MCP_AUTHORITY = None
+    mcp_envelope = _import_envelope("derived", channel="mcp")
     mcp_payload = json.loads(
         mcp_server.memory_observe(
             "mcp imported",
             namespace="default",
             origin="importer",
-            provenance=envelope,
+            provenance=mcp_envelope,
         )
     )
     assert mcp_payload["ok"] is True
@@ -536,13 +645,20 @@ def test_cli_mcp_and_dashboard_share_the_same_envelope(provenance_env, monkeypat
         for row in browse["memories"]
         if row["memory_id"] == mcp_payload["memory_id"]
     )
-    assert cli_provenance == mcp_payload["provenance"]
+    assert cli_provenance["channel"] == "cli"
+    assert mcp_payload["provenance"]["channel"] == "mcp"
+    assert {k: v for k, v in cli_provenance.items() if k != "channel"} == {
+        k: v for k, v in mcp_payload["provenance"].items() if k != "channel"
+    }
     assert detail["provenance"] == mcp_payload["provenance"]
     assert browsed["provenance"] == mcp_payload["provenance"]
 
 
 def test_cli_and_mcp_invalid_parser_version_write_nothing(provenance_env, monkeypatch):
-    bad = {**_import_envelope(), "parser_version": {"not": "text"}}
+    cli_bad = {
+        **_import_envelope(channel="cli"),
+        "parser_version": {"not": "text"},
+    }
     runner = CliRunner()
     cli = runner.invoke(
         app,
@@ -552,7 +668,7 @@ def test_cli_and_mcp_invalid_parser_version_write_nothing(provenance_env, monkey
             "-n",
             "default",
             "--provenance-json",
-            json.dumps(bad),
+            json.dumps(cli_bad),
         ],
     )
     assert cli.exit_code == 2
@@ -561,9 +677,237 @@ def test_cli_and_mcp_invalid_parser_version_write_nothing(provenance_env, monkey
     from haunt import mcp_server
 
     mcp_server._MCP_AUTHORITY = None
+    mcp_bad = {
+        **_import_envelope(channel="mcp"),
+        "parser_version": {"not": "text"},
+    }
     mcp = json.loads(
-        mcp_server.memory_observe("bad mcp", namespace="default", provenance=bad)
+        mcp_server.memory_observe("bad mcp", namespace="default", provenance=mcp_bad)
     )
     assert mcp["ok"] is False
     with Store("default") as st:
         assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_cli_rejects_invalid_actual_and_claimed_attribution_without_writes(
+    provenance_env,
+):
+    runner = CliRunner()
+    oversized = "雪" * 683
+    naive_import = {
+        **_import_envelope(channel="cli"),
+        "imported_at": "2025-01-01T00:00:00",
+    }
+    cases = [
+        ["--origin", ""],
+        ["--origin", oversized],
+        ["--tool-name", ""],
+        ["--tool-name", oversized],
+        ["--producer-call-id", "call-without-tool"],
+        ["--tool-name", "Shell", "--producer-call-id", oversized],
+        [
+            "--provenance-json",
+            json.dumps({"schema_version": 1, "kind": "native", "channel": 0}),
+        ],
+        [
+            "--provenance-json",
+            json.dumps({"schema_version": 1, "kind": "native", "channel": "mcp"}),
+        ],
+        ["--provenance-json", json.dumps(naive_import)],
+    ]
+    with Store("default") as st:
+        before = _logical_counts(st)
+    for index, options in enumerate(cases):
+        result = runner.invoke(
+            app,
+            ["observe", f"invalid cli {index}", "-n", "default", *options],
+        )
+        assert result.exit_code == 2, (options, result.output)
+        assert "error:" in result.output
+    with Store("default") as st:
+        assert _logical_counts(st) == before
+
+
+def test_mcp_rejects_invalid_actual_and_claimed_attribution_without_writes(
+    provenance_env, monkeypatch
+):
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    oversized = "雪" * 683
+    naive_import = {
+        **_import_envelope(channel="mcp"),
+        "imported_at": "2025-01-01T00:00:00",
+    }
+    cases = [
+        {"origin": ""},
+        {"origin": 0},
+        {"origin": oversized},
+        {"tool_name": ""},
+        {"tool_name": 0},
+        {"tool_name": oversized},
+        {"producer_call_id": "call-without-tool"},
+        {"tool_name": "Shell", "producer_call_id": 0},
+        {"tool_name": "Shell", "producer_call_id": oversized},
+        {
+            "provenance": {
+                "schema_version": 1,
+                "kind": "native",
+                "channel": 0,
+            }
+        },
+        {
+            "provenance": {
+                "schema_version": 1,
+                "kind": "native",
+                "channel": "cli",
+            }
+        },
+        {"provenance": naive_import},
+    ]
+    with Store("default") as st:
+        before = _logical_counts(st)
+    for index, kwargs in enumerate(cases):
+        payload = json.loads(
+            mcp_server.memory_observe(
+                f"invalid mcp {index}", namespace="default", **kwargs
+            )
+        )
+        assert payload["ok"] is False, kwargs
+        assert payload["namespace"] == "default"
+        assert payload["error"]
+    invalid_procedure = json.loads(
+        mcp_server.memory_procedure(
+            "write",
+            name="bad attribution",
+            body="must not land",
+            namespace="default",
+            origin=0,
+        )
+    )
+    assert invalid_procedure["ok"] is False
+    assert invalid_procedure["namespace"] == "default"
+    assert "origin" in invalid_procedure["error"]
+    with Store("default") as st:
+        assert _logical_counts(st) == before
+
+
+def test_cli_and_mcp_fail_closed_on_unverifiable_idempotency_replays(
+    provenance_env, monkeypatch
+):
+    runner = CliRunner()
+    cli_args = [
+        "observe",
+        "legacy cli replay",
+        "-n",
+        "default",
+        "--idempotency-key",
+        "legacy-cli-key",
+    ]
+    first_cli = runner.invoke(app, cli_args)
+    assert first_cli.exit_code == 0, first_cli.output
+    with Store("default") as st:
+        cli_event = st.conn.execute(
+            "SELECT id FROM events WHERE idempotency_key='legacy-cli-key'"
+        ).fetchone()["id"]
+        st.conn.execute("UPDATE events SET provenance=NULL WHERE id=?", (cli_event,))
+        st.conn.commit()
+        count_after_cli = st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    cli_replay = runner.invoke(app, cli_args)
+    assert cli_replay.exit_code == 2
+    assert "cannot verify legacy provenance" in cli_replay.output
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    first_mcp = json.loads(
+        mcp_server.memory_observe(
+            "invalid mcp replay",
+            namespace="default",
+            idempotency_key="invalid-mcp-key",
+        )
+    )
+    assert first_mcp["ok"] is True
+    with Store("default") as st:
+        st.conn.execute(
+            "UPDATE events SET provenance=? WHERE id=?",
+            ('{"schema_version":99,"kind":"native"}', first_mcp["event_id"]),
+        )
+        st.conn.commit()
+        count_after_mcp = st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    mcp_replay = json.loads(
+        mcp_server.memory_observe(
+            "invalid mcp replay",
+            namespace="default",
+            idempotency_key="invalid-mcp-key",
+        )
+    )
+    assert mcp_replay["ok"] is False
+    assert "cannot verify invalid stored provenance" in mcp_replay["error"]
+    with Store("default") as st:
+        assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == count_after_mcp
+        assert count_after_mcp == count_after_cli + 1
+
+
+def test_cli_mcp_and_dashboard_corrections_record_actual_replacement_channel(
+    provenance_env, monkeypatch
+):
+    with Store("default") as st:
+        targets = [st.observe(f"target {index}").memory_id for index in range(3)]
+
+    runner = CliRunner()
+    cli_result = runner.invoke(
+        app,
+        [
+            "correct",
+            targets[0],
+            "-n",
+            "default",
+            "--replacement",
+            "cli replacement",
+            "--idempotency-key",
+            "cli-correction-channel",
+        ],
+    )
+    assert cli_result.exit_code == 0, cli_result.output
+    cli_payload = json.loads(cli_result.stdout)
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_payload = json.loads(
+        mcp_server.memory_contradict(
+            targets[1],
+            "mcp-correction-channel",
+            replacement="mcp replacement",
+            namespace="default",
+        )
+    )
+    assert mcp_payload["ok"] is True
+
+    from tests.dashutil import make_dash_client
+
+    client = make_dash_client()
+    dashboard_response = client.post(
+        f"/api/namespace/default/memory/{targets[2]}/contradict",
+        json={
+            "replacement": "dashboard replacement",
+            "idempotency_key": "dashboard-correction-channel",
+        },
+    )
+    assert dashboard_response.status_code == 200, dashboard_response.text
+    dashboard_payload = dashboard_response.json()
+
+    with Store("default") as st:
+        assert st.get_memory(cli_payload["replacement_memory_id"])["provenance"][
+            "channel"
+        ] == "cli"
+        assert st.get_memory(mcp_payload["replacement_memory_id"])["provenance"][
+            "channel"
+        ] == "mcp"
+        assert st.get_memory(dashboard_payload["replacement_memory_id"])[
+            "provenance"
+        ]["channel"] == "dashboard"

@@ -45,9 +45,16 @@ def _optional_text(value: Any, field: str, *, limit: int = _TEXT_MAX) -> str | N
         raise ValueError(f"provenance.{field} must be a string or null")
     if not value:
         raise ValueError(f"provenance.{field} must be nonempty or null")
-    if len(value) > limit:
-        raise ValueError(f"provenance.{field} must be {limit} characters or fewer")
+    if len(value.encode("utf-8")) > limit:
+        raise ValueError(f"provenance.{field} must be {limit} UTF-8 bytes or fewer")
     return value
+
+
+def _actual_text(value: Any, field: str) -> str:
+    checked = _optional_text(value, field)
+    if checked is None:
+        raise ValueError(f"{field} must be a nonempty string")
+    return checked
 
 
 def _canonical_time(value: Any, field: str) -> str:
@@ -69,6 +76,7 @@ def validate_provenance(
     value: Mapping[str, Any] | None,
     *,
     origin: str,
+    channel: str,
     tool_name: str | None = None,
     producer_call_id: str | None = None,
 ) -> dict[str, Any]:
@@ -77,22 +85,29 @@ def validate_provenance(
     An omitted envelope is a native observation. Its origin and producer tool
     are actual Store.observe inputs, not inferred source claims.
     """
-    if not isinstance(origin, str) or not origin:
-        raise ValueError("origin must be a nonempty string")
+    actual_origin = _actual_text(origin, "origin")
+    actual_channel = _actual_text(channel, "channel")
+    actual_tool = (
+        None if tool_name is None else _actual_text(tool_name, "tool_name")
+    )
+    actual_call = (
+        None
+        if producer_call_id is None
+        else _actual_text(producer_call_id, "producer_call_id")
+    )
+    if actual_call is not None and actual_tool is None:
+        raise ValueError("producer_call_id requires tool_name")
     if value is None:
         envelope: dict[str, Any] = {
             "schema_version": PROVENANCE_SCHEMA_VERSION,
             "kind": "native",
-            "origin": origin,
+            "channel": actual_channel,
+            "origin": actual_origin,
         }
-        if tool_name is not None:
-            envelope["producer_tool"] = _optional_text(tool_name, "producer_tool")
-        if producer_call_id is not None:
-            if tool_name is None:
-                raise ValueError("producer_call_id requires tool_name")
-            envelope["producer_call_id"] = _optional_text(
-                producer_call_id, "producer_call_id"
-            )
+        if actual_tool is not None:
+            envelope["producer_tool"] = actual_tool
+        if actual_call is not None:
+            envelope["producer_call_id"] = actual_call
         return envelope
     if not isinstance(value, Mapping):
         raise ValueError("provenance must be an object")
@@ -115,28 +130,28 @@ def validate_provenance(
     for field in sorted(_COMMON - {"schema_version", "kind"}):
         if field in envelope:
             envelope[field] = _optional_text(envelope[field], field)
+    supplied_channel = envelope.get("channel")
+    if "channel" in envelope and supplied_channel != actual_channel:
+        raise ValueError("provenance.channel must match the observation channel")
+    envelope["channel"] = actual_channel
     supplied_origin = envelope.get("origin")
-    if supplied_origin is not None and supplied_origin != origin:
+    if "origin" in envelope and supplied_origin != actual_origin:
         raise ValueError("provenance.origin must match the observation origin")
-    envelope["origin"] = origin
+    envelope["origin"] = actual_origin
     supplied_tool = envelope.get("producer_tool")
-    if supplied_tool is not None and supplied_tool != tool_name:
+    if supplied_tool is not None and supplied_tool != actual_tool:
         raise ValueError(
             "provenance.producer_tool must match the observation tool_name"
         )
-    if tool_name is not None:
-        envelope["producer_tool"] = tool_name
+    if actual_tool is not None:
+        envelope["producer_tool"] = actual_tool
     supplied_call_id = envelope.get("producer_call_id")
-    if supplied_call_id is not None and supplied_call_id != producer_call_id:
+    if supplied_call_id is not None and supplied_call_id != actual_call:
         raise ValueError(
             "provenance.producer_call_id must match the observation producer_call_id"
         )
-    if producer_call_id is not None:
-        if tool_name is None:
-            raise ValueError("producer_call_id requires tool_name")
-        envelope["producer_call_id"] = _optional_text(
-            producer_call_id, "producer_call_id"
-        )
+    if actual_call is not None:
+        envelope["producer_call_id"] = actual_call
 
     if kind == "import":
         for field in (
@@ -215,6 +230,7 @@ def public_provenance(
                 validated = validate_provenance(
                     parsed,
                     origin=origin,
+                    channel=parsed.get("channel"),
                     tool_name=tool_name,
                     producer_call_id=parsed.get("producer_call_id"),
                 )
@@ -237,7 +253,7 @@ def public_provenance(
 
 def native_provenance(
     *,
-    channel: str | None,
+    channel: str,
     origin: str,
     tool: str | None = None,
     call_id: str | None = None,
@@ -256,6 +272,7 @@ def native_provenance(
     return validate_provenance(
         value,
         origin=origin,
+        channel=channel,
         tool_name=tool,
         producer_call_id=call_id,
     )

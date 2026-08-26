@@ -66,7 +66,12 @@ TOMBSTONE_SCHEMA_VERSION = 1
 PURGE_SAFE_ORIGIN = "privacy-sanitized"
 PURGE_SAFE_SESSION_SOURCE = "privacy-sanitized"
 PURGE_SAFE_PROVENANCE = provenance_json(
-    {"schema_version": 1, "kind": "native", "origin": PURGE_SAFE_ORIGIN}
+    {
+        "schema_version": 1,
+        "kind": "native",
+        "channel": "privacy_purge",
+        "origin": PURGE_SAFE_ORIGIN,
+    }
 )
 
 
@@ -826,6 +831,7 @@ class Store:
         producer_call_id: str | None = None,
         event_time: str | None = None,
         origin: str = "cli",
+        channel: str = "python",
         meta: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
         valid_from: str | None = None,
@@ -839,6 +845,7 @@ class Store:
         canonical_provenance = validate_provenance(
             provenance,
             origin=origin,
+            channel=channel,
             tool_name=tool_name,
             producer_call_id=producer_call_id,
         )
@@ -999,6 +1006,20 @@ class Store:
             return None
         if row["content"] != expected_text:
             raise ValueError("idempotency_key was reused with different content")
+        if row["provenance"] is None:
+            raise ValueError(
+                "idempotency_key replay cannot verify legacy provenance"
+            )
+        stored_provenance = public_provenance(
+            row["provenance"],
+            origin=row["origin"],
+            legacy_meta=row["meta"],
+            tool_name=row["tool_name"],
+        )
+        if stored_provenance.get("kind") == "invalid_stored":
+            raise ValueError(
+                "idempotency_key replay cannot verify invalid stored provenance"
+            )
         # A retry cannot silently replace source attribution. This remains
         # compatible with new native calls because their canonical envelope is
         # deterministic from the same observe inputs.
@@ -1031,12 +1052,7 @@ class Store:
             ).fetchone()
             is not None,
             deduplicated=True,
-            provenance=public_provenance(
-                row["provenance"],
-                origin=row["origin"],
-                legacy_meta=row["meta"],
-                tool_name=row["tool_name"],
-            ),
+            provenance=stored_provenance,
         )
 
 
@@ -2291,6 +2307,7 @@ class Store:
         *,
         trigger: str = "",
         origin: str = "cli",
+        channel: str = "python",
         session_id: str | None = None,
     ) -> ObserveResult:
         """Store a named procedure. Verbatim body, stored as tier=procedural."""
@@ -2301,6 +2318,7 @@ class Store:
             tier="procedural",
             session_id=session_id,
             origin=origin,
+            channel=channel,
             meta=meta,
         )
 
@@ -2388,6 +2406,7 @@ class Store:
         replacement: str | None = None,
         namespace: str | None = None,
         origin: str = "cli",
+        channel: str = "python",
         session_id: str | None = None,
         reason: str | None = None,
     ) -> dict[str, Any]:
@@ -2478,6 +2497,7 @@ class Store:
                     event_time=ts,
                     valid_from=ts,
                     origin=origin,
+                    channel=channel,
                     commit=False,
                 )
                 replacement_memory_id = r.memory_id

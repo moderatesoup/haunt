@@ -181,6 +181,7 @@ def memory_observe(
                 event_time=event_time,
                 idempotency_key=idempotency_key,
                 origin=origin,
+                channel="mcp",
                 provenance=provenance,
             )
     except ValueError as exc:
@@ -397,8 +398,17 @@ def memory_procedure(
             return _json({"ok": False, "error": "name is required for write"})
         if not body:
             return _json({"ok": False, "error": "body is required for write"})
-        with Store(ns) as st:
-            r = st.procedure_write(name, body, trigger=trigger or "", origin=origin)
+        try:
+            with Store(ns) as st:
+                r = st.procedure_write(
+                    name,
+                    body,
+                    trigger=trigger or "",
+                    origin=origin,
+                    channel="mcp",
+                )
+        except ValueError as exc:
+            return _json({"ok": False, "error": str(exc), "namespace": ns})
         return _json({
             "ok": True,
             "action": "write",
@@ -500,6 +510,7 @@ def memory_contradict(
                 session_id=session_id,
                 reason=reason,
                 idempotency_key=idempotency_key,
+                channel="mcp",
             )
     except (UnknownNamespaceError, ValueError) as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})

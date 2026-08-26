@@ -114,8 +114,10 @@ supersede and delete (`README.md:95-96`) with a durable correction audit trail.
 ## 2. Provenance is structured attribution, not fact confidence
 
 New observations **MUST** be able to carry a versioned, machine-readable source
-envelope. For native memories, it identifies the channel/origin and any producer
-tool/call IDs that Haunt actually received. For imports, it additionally records
+envelope. For native memories, it identifies the actual entry-point channel,
+origin, and any producer tool/call IDs that Haunt actually received. These
+actual inputs are bounded and validated before any observation-side write, and
+claimed fields must match them exactly. For imports, it additionally records
 the source platform and native ID when known, parser/format version, import time,
 fidelity, original-blob hash/reference when retained, and transform names.
 
@@ -124,6 +126,10 @@ guess an actor, platform, timestamp precision, source-native ID, fidelity, or
 transform. Existing string `origin` and free-form `meta` data remain readable;
 when they cannot be losslessly upgraded, they are
 `legacy_unstructured`, not synthetic structured provenance.
+
+An idempotency replay succeeds only when stored structured provenance is valid
+and byte-for-byte equal to the newly canonicalized attribution. Legacy-null or
+invalid stored attribution remains readable but cannot be safely replayed.
 
 Import fidelity describes preservation by the import process:
 `lossless`, `lossy`, `reconstructed`, or `derived`. It does not describe whether

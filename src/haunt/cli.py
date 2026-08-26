@@ -82,6 +82,7 @@ def observe_cmd(
     tool_output: Optional[str] = typer.Option(None, "--tool-output"),
     producer_call_id: Optional[str] = typer.Option(None, "--producer-call-id"),
     event_time: Optional[str] = typer.Option(None, "--event-time"),
+    idempotency_key: Optional[str] = typer.Option(None, "--idempotency-key"),
     origin: str = typer.Option("cli", "--origin"),
     provenance_json: Optional[str] = typer.Option(
         None,
@@ -108,11 +109,16 @@ def observe_cmd(
                 tool_output=tool_output,
                 producer_call_id=producer_call_id,
                 event_time=event_time,
+                idempotency_key=idempotency_key,
                 origin=origin,
+                channel="cli",
                 provenance=provenance,
             )
-    except (json.JSONDecodeError, ValueError) as exc:
-        typer.echo(f"error: invalid provenance: {exc}", err=True)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"error: invalid provenance JSON: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     ents = ",".join(result.entities[:8]) if result.entities else "-"
     typer.echo(
@@ -348,7 +354,9 @@ def procedure_write_cmd(
     """Store a named procedure."""
     ns = _ns(namespace)
     with Store(ns) as st:
-        r = st.procedure_write(name, body, trigger=when or "", origin="cli")
+        r = st.procedure_write(
+            name, body, trigger=when or "", origin="cli", channel="cli"
+        )
     typer.echo(f"ok  procedure={name}  memory={r.memory_id}  ns={r.namespace}")
 
 
@@ -476,6 +484,7 @@ def correct_cmd(
                 idempotency_key=idempotency_key,
                 session_id=session_id,
                 origin=origin,
+                channel="cli",
             )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
