@@ -45,7 +45,8 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 3: durable queue for hook-deferred embeddings.
 # 4: append-only correction lineage plus privacy-erasure tombstones.
 # 5: privacy-safe rekeying for erased target and correction sessions.
-SCHEMA_VERSION = 5
+# 6: schema-enforced normal-vs-privacy-scrubbed correction invariants.
+SCHEMA_VERSION = 6
 SCHEMA_VERSION_KEY = "schema_version"
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -296,11 +297,76 @@ def _schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _ensure_correction_invariant_triggers(conn: sqlite3.Connection) -> None:
+    """Reject malformed normal rows while allowing purge-scrubbed lineage."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='corrections'"
+    ).fetchone()
+    if not exists:
+        return
+    valid = """
+        (
+            NEW.target_tombstone_id IS NULL
+            AND NEW.replacement_tombstone_id IS NULL
+            AND NEW.origin IS NOT NULL
+            AND NEW.session_id IS NOT NULL
+            AND NEW.idempotency_key IS NOT NULL
+            AND length(trim(
+                NEW.idempotency_key,
+                char(9) || char(10) || char(11) || char(12) || char(13) || ' '
+            )) > 0
+            AND length(NEW.idempotency_key) <= 512
+            AND NEW.request_identity IS NOT NULL
+            AND length(NEW.request_identity) = 71
+            AND substr(NEW.request_identity, 1, 7) = 'sha256:'
+            AND substr(NEW.request_identity, 8) NOT GLOB '*[^0-9a-f]*'
+            AND NEW.request_payload IS NOT NULL
+            AND typeof(NEW.request_payload) = 'blob'
+            AND NEW.response_json IS NOT NULL
+            AND json_valid(NEW.response_json) = 1
+        )
+        OR
+        (
+            (NEW.target_tombstone_id IS NOT NULL
+             OR NEW.replacement_tombstone_id IS NOT NULL)
+            AND NEW.origin IS NULL
+            AND NEW.session_id IS NULL
+            AND NEW.reason IS NULL
+            AND NEW.idempotency_key IS NULL
+            AND NEW.request_identity IS NULL
+            AND NEW.request_payload IS NULL
+            AND NEW.response_json IS NULL
+        )
+    """
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS corrections_invariant_insert
+        BEFORE INSERT ON corrections
+        WHEN NOT ({valid})
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid correction invariant');
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS corrections_invariant_update
+        BEFORE UPDATE ON corrections
+        WHEN NOT ({valid})
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid correction invariant');
+        END
+        """
+    )
+
+
 def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     """Create tables and run one-time migrations. Not invoked per query."""
     _init_namespace_schema(conn)
     current = _schema_version(conn)
     if current >= SCHEMA_VERSION:
+        _ensure_correction_invariant_triggers(conn)
+        conn.commit()
         return
     if current < 1:
         _normalize_stored_clocks(conn)
@@ -368,6 +434,7 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
                 WHERE replacement_tombstone_id IS NOT NULL;
             """
         )
+    _ensure_correction_invariant_triggers(conn)
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
         (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
@@ -1299,6 +1366,8 @@ class Store:
             """
             SELECT m.id, m.event_id, m.content,
                    e.origin, e.session_id,
+                   e.ts AS event_ts, e.event_time, e.role AS event_role,
+                   e.tier AS event_tier,
                    e.idempotency_key AS event_idempotency_key,
                    e.content AS event_content,
                    e.tool_name, e.tool_input, e.tool_output,
@@ -1323,6 +1392,7 @@ class Store:
         }
 
         try:
+            self.conn.execute("BEGIN IMMEDIATE")
             # Privacy erasure is the sole exception to correction immutability.
             # Replace an erased chain member with a fresh opaque tombstone and
             # scrub correction request/context fields that could retain it.
@@ -1436,38 +1506,64 @@ class Store:
 
             self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
 
-            try:
+            has_fts = self.conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='memories_fts'"
+            ).fetchone()
+            if has_fts:
                 self.conn.execute(
                     "DELETE FROM memories_fts WHERE id=?", (memory_id,)
                 )
                 deleted["fts_deleted"] = True
-            except sqlite3.Error:
-                pass
-            if _vec_loaded(self.conn):
-                try:
-                    has_vec = self.conn.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type='table' AND name='vec_memories'"
-                    ).fetchone()
-                    if has_vec:
-                        self.conn.execute(
-                            "DELETE FROM vec_memories WHERE id=?", (memory_id,)
-                        )
-                        deleted["vec_deleted"] = True
-                except sqlite3.Error:
-                    pass
+            has_vec = self.conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='vec_memories'"
+            ).fetchone()
+            if has_vec:
+                self.conn.execute(
+                    "DELETE FROM vec_memories WHERE id=?", (memory_id,)
+                )
+                deleted["vec_deleted"] = True
 
             other_memories = self.conn.execute(
                 "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
             ).fetchone()[0]
-            if other_memories == 0:
-                from haunt.graph import remove_event_evidence
+            from haunt.graph import remove_event_evidence
 
-                rel_count, entity_count = remove_event_evidence(
-                    self.conn, event_id
+            rel_count, entity_count = remove_event_evidence(self.conn, event_id)
+            deleted["relations_deleted"] = rel_count
+            deleted["entities_deleted"] = entity_count
+            if other_memories == 0:
+                self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+                deleted["event_deleted"] = True
+            else:
+                # One event may have more than one materialized memory. The
+                # survivors remain, but neither the shared event's identifier
+                # nor its target-owned context may survive privacy erasure.
+                safe_event_id = new_id()
+                self.conn.execute(
+                    """
+                    INSERT INTO events(
+                        id, idempotency_key, session_id, ts, event_time, role,
+                        content, tool_name, tool_input, tool_output, origin,
+                        tier, meta
+                    ) VALUES (?, NULL, ?, ?, ?, ?, '', NULL, NULL, NULL, ?, ?, ?)
+                    """,
+                    (
+                        safe_event_id,
+                        row["session_id"],
+                        row["event_ts"],
+                        row["event_time"],
+                        row["event_role"],
+                        PURGE_SAFE_ORIGIN,
+                        row["event_tier"],
+                        dumps({}),
+                    ),
                 )
-                deleted["relations_deleted"] = rel_count
-                deleted["entities_deleted"] = entity_count
+                self.conn.execute(
+                    "UPDATE memories SET event_id=? WHERE event_id=?",
+                    (safe_event_id, event_id),
+                )
                 self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
                 deleted["event_deleted"] = True
 
@@ -2174,9 +2270,6 @@ class Store:
         if session_id is not None and not isinstance(session_id, str):
             raise ValueError("session_id must be a string or null")
         replacement_text = replacement
-        if replacement_text is not None:
-            self.ensure_current_embeddings()
-            self.process_embedding_jobs(limit=32)
 
         try:
             self.conn.execute("BEGIN IMMEDIATE")

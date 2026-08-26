@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -41,6 +42,17 @@ def _assert_tokens_absent_from_payload(payload, tokens):
         assert token not in serialized
 
 
+def _all_table_snapshot(store):
+    snapshot = {}
+    for table_row in store.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall():
+        table = table_row["name"]
+        rows = [tuple(row) for row in store.conn.execute(f'SELECT * FROM "{table}"')]
+        snapshot[table] = sorted(rows, key=repr)
+    return snapshot
+
+
 def test_v3_migration_is_additive_idempotent_and_survives_restart(lineage_env):
     from haunt.store import SCHEMA_VERSION, Store
 
@@ -69,6 +81,55 @@ def test_v3_migration_is_additive_idempotent_and_survives_restart(lineage_env):
         assert st.get_meta("schema_version") == str(SCHEMA_VERSION)
 
 
+def test_v5_upgrade_installs_correction_invariants_and_survives_restart(lineage_env):
+    from haunt.store import SCHEMA_VERSION, Store
+    from haunt.util import new_id, now_iso
+
+    with Store("default") as st:
+        target = st.observe("schema upgrade target")
+        result = st.contradict(
+            target.memory_id,
+            replacement="schema upgrade replacement",
+            idempotency_key="schema-upgrade-valid",
+        )
+        st.conn.execute("DROP TRIGGER corrections_invariant_insert")
+        st.conn.execute("DROP TRIGGER corrections_invariant_update")
+        st.conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        st.conn.commit()
+
+    with Store("default") as st:
+        assert st.get_meta("schema_version") == str(SCHEMA_VERSION)
+        assert st.trace(result["replacement_memory_id"])["lineage_status"] == "linked"
+        triggers = {
+            row["name"]
+            for row in st.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            ).fetchall()
+        }
+        assert {
+            "corrections_invariant_insert",
+            "corrections_invariant_update",
+        } <= triggers
+        with pytest.raises(sqlite3.IntegrityError, match="correction invariant"):
+            st.conn.execute(
+                """
+                INSERT INTO corrections(
+                    id, target_memory_id, corrected_at, origin, session_id,
+                    idempotency_key, request_identity, request_payload, response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id(),
+                    new_id(),
+                    now_iso(),
+                    "test",
+                    "session",
+                    None,
+                    "sha256:" + "0" * 64,
+                    b"payload",
+                    "{}",
+                ),
+            )
 def test_three_link_trace_from_middle_and_restart(lineage_env):
     from haunt.store import Store
 
@@ -345,6 +406,85 @@ def test_replacement_failure_rolls_back_projection_and_lineage(lineage_env, monk
         assert st.trace(original.memory_id)["lineage_status"] == "standalone"
 
 
+def test_ineligible_corrections_do_not_touch_embedding_or_job_state(
+    lineage_env, monkeypatch
+):
+    import haunt.store as store_module
+    from haunt.store import Store
+
+    with Store("default") as st:
+        already = st.observe("already superseded target")
+        st.contradict(already.memory_id, idempotency_key="eligible-first")
+        keyed = st.observe("idempotency conflict target")
+        st.contradict(keyed.memory_id, idempotency_key="eligibility-conflict")
+        pending = st.observe("pending embedding remains", defer_embedding=True)
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("embedding work ran before correction eligibility")
+
+        monkeypatch.setattr(Store, "ensure_current_embeddings", forbidden)
+        monkeypatch.setattr(Store, "process_embedding_jobs", forbidden)
+        monkeypatch.setattr(store_module, "embed_one", forbidden)
+
+        before = _all_table_snapshot(st)
+        missing = st.contradict(
+            "missing-correction-target",
+            replacement="must not embed",
+            idempotency_key="eligibility-missing",
+        )
+        assert missing["ok"] is False and "not found" in missing["error"]
+        assert _all_table_snapshot(st) == before
+
+        superseded = st.contradict(
+            already.memory_id,
+            replacement="must not embed",
+            idempotency_key="eligibility-already",
+        )
+        assert superseded["conflict"] == "already_superseded"
+        assert _all_table_snapshot(st) == before
+
+        conflict = st.contradict(
+            keyed.memory_id,
+            replacement="different canonical payload",
+            idempotency_key="eligibility-conflict",
+        )
+        assert conflict["conflict"] == "idempotency_key_reused"
+        assert _all_table_snapshot(st) == before
+        assert st.conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (pending.memory_id,)
+        ).fetchone() is not None
+
+
+def test_replacement_failure_rolls_back_fts_jobs_sessions_and_projection(
+    lineage_env, monkeypatch
+):
+    import haunt.graph as graph
+    import haunt.store as store_module
+    from haunt.store import Store
+
+    with Store("default") as st:
+        original = st.observe("deep rollback original")
+        before = _all_table_snapshot(st)
+
+        monkeypatch.setattr(store_module, "embed_one", lambda _text: None)
+
+        def fail_after_derived_writes(*_args, **_kwargs):
+            raise RuntimeError("failure after derived writes")
+
+        monkeypatch.setattr(graph, "extract_and_store", fail_after_derived_writes)
+        with pytest.raises(RuntimeError, match="after derived writes"):
+            st.contradict(
+                original.memory_id,
+                replacement="derived rollback replacement canary",
+                origin="derived-rollback-origin",
+                session_id="derived-rollback-session",
+                idempotency_key="derived-rollback-key",
+            )
+
+        assert _all_table_snapshot(st) == before
+        assert st.get_memory(original.memory_id)["valid_to"] is None
+
+
 def test_current_and_as_of_recall_follow_projection(lineage_env):
     from haunt.recall import recall
     from haunt.store import Store
@@ -365,6 +505,165 @@ def test_current_and_as_of_recall_follow_projection(lineage_env):
     assert [h.memory_id for h in current] == [result["replacement_memory_id"]]
     assert [h.memory_id for h in historical] == [old.memory_id]
     assert [h.memory_id for h in exact] == [result["replacement_memory_id"]]
+
+
+@pytest.mark.parametrize("derived_table", ["memories_fts", "vec_memories"])
+def test_purge_derived_delete_failure_rolls_back_everything(
+    lineage_env, derived_table
+):
+    from haunt.store import Store
+
+    canary = f"PURGE-{derived_table}-ROLLBACK-CANARY"
+    with Store("default") as st:
+        target = st.observe(
+            canary,
+            origin=canary + "-ORIGIN",
+            session_id=canary + "-SESSION",
+        )
+        if derived_table == "vec_memories":
+            st.conn.execute(
+                "CREATE TABLE vec_memories(id TEXT PRIMARY KEY, embedding BLOB)"
+            )
+            st.conn.execute(
+                "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
+                (target.memory_id, canary.encode("utf-8")),
+            )
+            st.conn.commit()
+        before = _all_table_snapshot(st)
+
+        def deny_delete(action, arg1, _arg2, _db, _trigger):
+            if action == sqlite3.SQLITE_DELETE and arg1 == derived_table:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        st.conn.set_authorizer(deny_delete)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                st.purge(target.memory_id)
+        finally:
+            st.conn.set_authorizer(None)
+
+        assert _all_table_snapshot(st) == before
+        assert st.get_memory(target.memory_id)["content"] == canary
+        assert st.conn.execute(
+            f'SELECT 1 FROM "{derived_table}" WHERE id=?', (target.memory_id,)
+        ).fetchone() is not None
+        assert st.conn.execute(
+            "SELECT COUNT(*) FROM lineage_tombstones"
+        ).fetchone()[0] == 0
+
+
+def test_purge_allows_deliberately_missing_derived_tables(lineage_env):
+    from haunt.store import Store
+
+    with Store("default") as st:
+        target = st.observe("missing derived tables purge")
+        st.conn.execute("DROP TABLE memories_fts")
+        st.conn.commit()
+        result = st.purge(target.memory_id)
+        assert result["ok"] is True
+        assert result["fts_deleted"] is False
+        assert result["vec_deleted"] is False
+        assert st.get_memory(target.memory_id) is None
+
+
+def test_purge_sanitizes_shared_event_and_preserves_survivor_on_all_surfaces(
+    lineage_env, monkeypatch
+):
+    monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
+    from haunt.mcp_server import memory_trace
+    from haunt.store import PURGE_SAFE_ORIGIN, Store
+    from haunt.util import new_id, now_iso
+    from tests.dashutil import make_dash_client
+
+    tokens = {
+        "content": "SHARED-EVENT-TARGET-CONTENT-CANARY",
+        "origin": "SHARED-EVENT-TARGET-ORIGIN-CANARY",
+        "session": "SHARED-EVENT-TARGET-SESSION-CANARY",
+        "event_key": "SHARED-EVENT-IDEMPOTENCY-CANARY",
+        "tool_name": "SHARED-EVENT-TOOL-NAME-CANARY",
+        "tool_input": "SHARED-EVENT-TOOL-INPUT-CANARY",
+        "tool_output": "SHARED-EVENT-TOOL-OUTPUT-CANARY",
+        "event_meta": "SHARED-EVENT-META-CANARY",
+    }
+    survivor_content = "SHARED-EVENT-SURVIVOR-CONTENT"
+    with Store("default") as st:
+        target = st.observe(
+            tokens["content"],
+            role="tool",
+            tier="semantic",
+            session_id=tokens["session"],
+            origin=tokens["origin"],
+            idempotency_key=tokens["event_key"],
+            tool_name=tokens["tool_name"],
+            tool_input=tokens["tool_input"],
+            tool_output=tokens["tool_output"],
+            meta={"source": tokens["event_meta"]},
+        )
+        survivor_id = new_id()
+        ts = now_iso()
+        st.conn.execute(
+            """
+            INSERT INTO memories(
+                id, event_id, tier, content, embedding,
+                valid_from, valid_to, created_at
+            ) VALUES (?, ?, 'semantic', ?, NULL, ?, NULL, ?)
+            """,
+            (survivor_id, target.event_id, survivor_content, ts, ts),
+        )
+        st.conn.execute(
+            "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
+            (survivor_id, survivor_content),
+        )
+        st.conn.execute(
+            "INSERT INTO embedding_jobs(memory_id, queued_at) VALUES (?, ?)",
+            (survivor_id, ts),
+        )
+        st.set_meta("current_session", tokens["session"])
+
+        result = st.purge(target.memory_id)
+
+        assert result["ok"] is True
+        assert result["event_deleted"] is True
+        survivor = st.get_memory(survivor_id)
+        assert survivor["content"] == survivor_content
+        assert survivor["event_id"] != target.event_id
+        assert survivor["origin"] == PURGE_SAFE_ORIGIN
+        assert survivor["session_id"] != tokens["session"]
+        event = st.conn.execute(
+            """
+            SELECT idempotency_key, content, tool_name, tool_input,
+                   tool_output, origin, meta, session_id
+            FROM events WHERE id=?
+            """,
+            (survivor["event_id"],),
+        ).fetchone()
+        assert tuple(event) == (
+            None,
+            "",
+            None,
+            None,
+            None,
+            PURGE_SAFE_ORIGIN,
+            "{}",
+            survivor["session_id"],
+        )
+        assert st.get_meta("current_session") == survivor["session_id"]
+        assert st.conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (survivor_id,)
+        ).fetchone() is not None
+        absent = tuple(tokens.values()) + (target.memory_id, target.event_id)
+        _assert_tokens_absent_from_tables(st, absent)
+        _assert_tokens_absent_from_payload(st.trace(survivor_id), absent)
+
+    detail = make_dash_client().get(
+        f"/api/namespace/default/memory/{survivor_id}"
+    )
+    assert detail.status_code == 200
+    _assert_tokens_absent_from_payload(detail.json(), absent)
+    _assert_tokens_absent_from_payload(
+        json.loads(memory_trace(survivor_id, namespace="default")), absent
+    )
 
 
 def test_purge_scrubs_canaries_and_keeps_safe_gap(lineage_env):
@@ -785,6 +1084,117 @@ def test_schema_has_one_correction_per_target_and_canonical_identity(lineage_env
             r["name"] for r in st.conn.execute("PRAGMA index_list(corrections)").fetchall()
         }
         assert "idx_corrections_target_memory" in indexes
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("idempotency_key", None),
+        ("idempotency_key", ""),
+        ("idempotency_key", " \t\n"),
+        ("idempotency_key", "k" * 513),
+        ("request_identity", None),
+        ("request_identity", "sha256:short"),
+        ("request_identity", "sha256:" + "z" * 64),
+        ("request_payload", None),
+        ("request_payload", "not-a-blob"),
+        ("response_json", None),
+        ("response_json", "not-json"),
+    ],
+)
+def test_schema_rejects_malformed_normal_corrections(lineage_env, field, invalid):
+    from haunt.store import Store
+    from haunt.util import new_id, now_iso
+
+    values = {
+        "id": new_id(),
+        "target_memory_id": new_id(),
+        "corrected_at": now_iso(),
+        "origin": "direct-sql-test",
+        "session_id": "direct-sql-session",
+        "idempotency_key": "direct-sql-key",
+        "request_identity": "sha256:" + "0" * 64,
+        "request_payload": b"payload",
+        "response_json": "{}",
+    }
+    values[field] = invalid
+    with Store("default") as st:
+        with pytest.raises(sqlite3.IntegrityError, match="correction invariant"):
+            st.conn.execute(
+                """
+                INSERT INTO corrections(
+                    id, target_memory_id, corrected_at, origin, session_id,
+                    idempotency_key, request_identity, request_payload, response_json
+                ) VALUES (:id, :target_memory_id, :corrected_at, :origin, :session_id,
+                          :idempotency_key, :request_identity, :request_payload,
+                          :response_json)
+                """,
+                values,
+            )
+
+
+def test_schema_enforces_key_uniqueness_and_allows_scrubbed_tombstones(lineage_env):
+    from haunt.store import Store
+    from haunt.util import new_id, now_iso
+
+    with Store("default") as st:
+        def insert_normal(correction_id, target_id):
+            st.conn.execute(
+                """
+                INSERT INTO corrections(
+                    id, target_memory_id, corrected_at, origin, session_id,
+                    idempotency_key, request_identity, request_payload, response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    correction_id,
+                    target_id,
+                    now_iso(),
+                    "direct-sql-test",
+                    "direct-sql-session",
+                    "duplicate-schema-key",
+                    "sha256:" + "1" * 64,
+                    b"payload",
+                    "{}",
+                ),
+            )
+
+        insert_normal(new_id(), new_id())
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            insert_normal(new_id(), new_id())
+
+        tombstone_id = new_id()
+        st.conn.execute(
+            """
+            INSERT INTO lineage_tombstones(schema_version, tombstone_id, status, erased_at)
+            VALUES (1, ?, 'erased', ?)
+            """,
+            (tombstone_id, now_iso()),
+        )
+        st.conn.execute(
+            """
+            INSERT INTO corrections(id, target_tombstone_id, corrected_at)
+            VALUES (?, ?, ?)
+            """,
+            (new_id(), tombstone_id, now_iso()),
+        )
+        invalid_tombstone_id = new_id()
+        st.conn.execute(
+            """
+            INSERT INTO lineage_tombstones(schema_version, tombstone_id, status, erased_at)
+            VALUES (1, ?, 'erased', ?)
+            """,
+            (invalid_tombstone_id, now_iso()),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="correction invariant"):
+            st.conn.execute(
+                """
+                INSERT INTO corrections(
+                    id, target_tombstone_id, corrected_at, idempotency_key
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (new_id(), invalid_tombstone_id, now_iso(), "must-be-scrubbed"),
+            )
 
 
 def test_idempotency_key_omission_is_rejected_without_writes_on_all_surfaces(

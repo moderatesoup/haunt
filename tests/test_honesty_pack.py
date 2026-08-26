@@ -275,7 +275,7 @@ def test_contradict_already_superseded_is_ok_false_and_keeps_valid_to(honesty_en
         assert n == 2, "already-superseded contradict must not store another replacement"
 
 
-def test_dashboard_contradict_already_superseded_is_not_500(honesty_env):
+def test_dashboard_contradict_already_superseded_is_409(honesty_env):
     from tests.dashutil import make_dash_client
     from haunt.store import Store
 
@@ -294,9 +294,10 @@ def test_dashboard_contradict_already_superseded_is_not_500(honesty_env):
             "idempotency_key": "dashboard-already-again",
         },
     )
-    assert resp.status_code != 500
+    assert resp.status_code == 409
     data = resp.json()
     assert data["ok"] is False
+    assert data["conflict"] == "already_superseded"
     with Store("default") as st:
         stored = st.conn.execute(
             "SELECT valid_to FROM memories WHERE id=?", (mid,)

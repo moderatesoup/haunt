@@ -1130,7 +1130,10 @@ async def api_contradict(request: Request) -> JSONResponse:
         status = 200
     elif "not found" in (result.get("error") or ""):
         status = 404
-    elif result.get("conflict") == "idempotency_key_reused":
+    elif result.get("conflict") in {
+        "idempotency_key_reused",
+        "already_superseded",
+    }:
         status = 409
     else:
         status = 200
