@@ -123,7 +123,7 @@ regression comparison for every later epic without requiring embeddings.
 
 ## E1 — Add append-only correction lineage and trace
 
-**Status:** Blocked
+**Status:** Done
 
 **Depends on:** E0
 
@@ -180,9 +180,29 @@ that lineage.
   the lineage insert must fail the trace assertion.
 - Erasure tests plant unique canaries in content, every source identifier, blob
   hash, origin/provenance, and reasons; after purge, surviving database rows,
-  trace JSON, dashboard/MCP output, and export contain none of them. A response
-  schema test rejects any tombstone key outside the four-field allowlist.
+  Store/CLI trace JSON, dashboard output, and MCP output contain none of them.
+  A response schema test rejects any tombstone key outside the four-field
+  allowlist. E4 must add the corresponding canonical-export purge proof before
+  export/import can be marked done.
 - Existing temporal and purge suites remain green.
+
+**Completion evidence (2026-08-25)**
+
+- Schema v7 stores append-only correction rows, enforces normal-row insert
+  invariants and UPDATE/DELETE guards in SQLite, and permits mutation only
+  inside the connection-local privacy-purge transaction.
+- Exact canonical payload, replay, fork prevention, rollback, restart,
+  historical recall, legacy-unlinked trace, and CLI/MCP/dashboard behavior are
+  covered by `tests/test_correction_lineage.py` and adjacent compatibility
+  suites.
+- Privacy tests cover first/middle/last/shared-event erasure; reused target and
+  correction sessions; UTF-8 and opaque BLOB metadata; tool, event, session,
+  request-payload, and metadata-key canaries; derived-index failure rollback;
+  and the strict four-field tombstone across every currently shipped serialized
+  surface.
+- The final independent GPT-5.6 Terra merge-gate review was CLEAN. The final
+  focused lineage suite passed 50 tests; the dependency-correct FTS profile
+  passed 372 tests with 1 skip and 7 expected failures before CI.
 
 **Non-goals**
 

@@ -139,22 +139,27 @@ def test_contradict_null_body_is_400_and_keeps_valid_to(leftover_env):
     assert _valid_to(r.memory_id) is None
 
 
-def test_contradict_empty_replacement_string_is_none_and_still_supersedes(leftover_env):
+def test_contradict_whitespace_replacement_is_stored_verbatim(leftover_env):
     from haunt.store import Store
 
-    r = _observe("empty replacement is just supersede")
+    r = _observe("whitespace replacement is intentional")
     resp = _post(
         f"/api/namespace/default/memory/{r.memory_id}/contradict",
-        json={"replacement": "   "},
+        json={"replacement": "   ", "idempotency_key": "whitespace-replacement"},
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["ok"] is True
-    assert "replacement_memory_id" not in data
+    assert "replacement_memory_id" in data
     assert _valid_to(r.memory_id) is not None
     with Store("default", create=False) as st:
         n = st.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-    assert n == 1, "blank replacement must not insert a new memory"
+        replacement = st.conn.execute(
+            "SELECT content FROM memories WHERE id=?",
+            (data["replacement_memory_id"],),
+        ).fetchone()["content"]
+    assert n == 2
+    assert replacement == "   "
 
 
 def test_contradict_valid_after_bad_payloads_still_works(leftover_env):
@@ -163,7 +168,10 @@ def test_contradict_valid_after_bad_payloads_still_works(leftover_env):
     assert _post(url, json={"replacement": {"not": "a string"}}).status_code == 400
     assert _post(url, data={"replacement": "nope"}).status_code == 415
     assert _valid_to(r.memory_id) is None
-    ok = _post(url, json={"replacement": "corrected fact"})
+    ok = _post(
+        url,
+        json={"replacement": "corrected fact", "idempotency_key": "valid-after-bad"},
+    )
     assert ok.status_code == 200
     assert ok.json()["ok"] is True
     assert _valid_to(r.memory_id) is not None
@@ -175,7 +183,11 @@ def test_store_contradict_non_string_replacement_raises_and_keeps_valid_to(lefto
     with Store("default") as st:
         r = st.observe("store ValueError must not mutate", role="system", tier="semantic")
         with pytest.raises(ValueError, match="replacement must be a string or null"):
-            st.contradict(r.memory_id, replacement={"not": "a string"})
+            st.contradict(
+                r.memory_id,
+                replacement={"not": "a string"},
+                idempotency_key="invalid-replacement",
+            )
         row = st.conn.execute(
             "SELECT valid_to FROM memories WHERE id=?", (r.memory_id,)
         ).fetchone()

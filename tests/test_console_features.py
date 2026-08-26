@@ -141,7 +141,9 @@ class TestRecallTemporalFilters:
                 event_time="2024-03-10T10:00:00+00:00",
             )
             st.contradict(
-                r.memory_id, replacement="the port is 9090 UNIQUE-DASH-9090"
+                r.memory_id,
+                replacement="the port is 9090 UNIQUE-DASH-9090",
+                idempotency_key="console-as-of",
             )
 
         current = dash_client.get(
@@ -195,7 +197,7 @@ class TestContradictRoute:
         )
         resp = dash_client.post(
             f"/api/namespace/default/memory/{r.memory_id}/contradict",
-            json={},
+            json={"idempotency_key": "console-no-replacement"},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -219,7 +221,10 @@ class TestContradictRoute:
         )
         resp = dash_client.post(
             f"/api/namespace/default/memory/{r.memory_id}/contradict",
-            json={"replacement": "the database host is db.new.example.com"},
+            json={
+                "replacement": "the database host is db.new.example.com",
+                "idempotency_key": "console-with-replacement",
+            },
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -241,7 +246,7 @@ class TestContradictRoute:
     def test_contradict_not_found(self, dash_client):
         resp = dash_client.post(
             "/api/namespace/default/memory/nonexistent-id-999/contradict",
-            json={},
+            json={"idempotency_key": "console-not-found"},
         )
         assert resp.status_code == 404
         data = resp.json()
@@ -260,7 +265,7 @@ class TestContradictRoute:
         )
         resp = dash_client.post(
             f"/api/namespace/default/memory/{r.memory_id}/contradict",
-            json={},
+            json={"idempotency_key": "console-does-not-purge"},
         )
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
@@ -278,7 +283,7 @@ class TestContradictRoute:
         r = observe("namespace field test", namespace="default", role="user")
         resp = dash_client.post(
             f"/api/namespace/default/memory/{r.memory_id}/contradict",
-            json={},
+            json={"idempotency_key": "console-namespace"},
         )
         assert resp.status_code == 200
         assert resp.json()["namespace"] == "default"

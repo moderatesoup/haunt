@@ -14,7 +14,7 @@ from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
 from haunt.store import Store, UnknownNamespaceError, list_namespaces, open_existing, register_namespace
 from haunt.temporal import TemporalParseError
-from haunt.util import clamp_limit, format_iso, snippet
+from haunt.util import clamp_limit, dumps, format_iso, snippet
 
 app = typer.Typer(
     add_completion=False,
@@ -405,7 +405,7 @@ def delete_cmd(
             for r in rows:
                 result = st.purge(r["id"])
                 typer.echo(
-                    f"purged memory={r['id'][:12]}…  fts={result.get('fts_deleted')}  "
+                    f"purged  fts={result.get('fts_deleted')}  "
                     f"vec={result.get('vec_deleted')}  rels={result.get('relations_deleted')}  "
                     f"event={result.get('event_deleted')}"
                 )
@@ -422,11 +422,62 @@ def delete_cmd(
         typer.echo(f"error: {result.get('error', 'unknown')}", err=True)
         raise typer.Exit(1)
     typer.echo(
-        f"ok  purged memory={result['memory_id'][:12]}…  event={result['event_id'][:12]}…  "
-        f"fts={result['fts_deleted']}  vec={result['vec_deleted']}  "
+        f"ok  purged  fts={result['fts_deleted']}  vec={result['vec_deleted']}  "
         f"rels={result['relations_deleted']}  ents={result['entities_deleted']}  "
         f"event_deleted={result['event_deleted']}"
     )
+
+
+@app.command("correct")
+def correct_cmd(
+    memory_id: str = typer.Argument(..., help="Memory ID to supersede"),
+    replacement: Optional[str] = typer.Option(
+        None,
+        "--replacement",
+        help="Verbatim replacement; omit for none (empty/whitespace are intentional)",
+    ),
+    reason: Optional[str] = typer.Option(None, "--reason"),
+    idempotency_key: str = typer.Option(
+        ...,
+        "--idempotency-key",
+        help="Required stable caller key for safe retries",
+    ),
+    session_id: Optional[str] = typer.Option(None, "--session"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+    origin: str = typer.Option("cli", "--origin"),
+) -> None:
+    """Append a correction, optionally with a verbatim replacement."""
+    ns = _ns(namespace)
+    try:
+        with _existing(ns) as st:
+            result = st.contradict(
+                memory_id,
+                replacement=replacement,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                session_id=session_id,
+                origin=origin,
+            )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(dumps({"namespace": ns, **result}))
+    if not result.get("ok"):
+        raise typer.Exit(1)
+
+
+@app.command("trace")
+def trace_cmd(
+    memory_id: str = typer.Argument(..., help="Any surviving memory in the chain"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+) -> None:
+    """Print an ordered correction trace as JSON."""
+    ns = _ns(namespace)
+    with _existing(ns) as st:
+        result = st.trace(memory_id)
+    typer.echo(dumps(result))
+    if not result.get("ok"):
+        raise typer.Exit(1)
 
 
 @app.command("install")

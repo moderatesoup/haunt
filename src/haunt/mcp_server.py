@@ -463,15 +463,21 @@ def memory_purge(
 
 @server.tool(
     description=(
-        "Mark a memory superseded: sets valid_to=now on the old row. "
-        "Optionally store a replacement as a new semantic memory."
+        "Mark a memory superseded and append its correction record. "
+        "A replacement string is stored verbatim as a new semantic memory; "
+        "omit/null means no replacement, while empty and whitespace-only strings "
+        "are intentional. A nonempty caller idempotency_key is required for "
+        "safe exact-payload retries."
     )
 )
 def memory_contradict(
     memory_id: str,
+    idempotency_key: str,
     replacement: Optional[str] = None,
     namespace: Optional[str] = None,
-    origin: str = "mcp",
+    origin: Any = "mcp",
+    session_id: Any = None,
+    reason: Optional[str] = None,
 ) -> str:
     try:
         ns = _mcp_namespace(namespace)
@@ -479,10 +485,39 @@ def memory_contradict(
         return _authority_error(exc)
     try:
         with open_existing(ns) as st:
-            result = st.contradict(memory_id, replacement=replacement, origin=origin)
-    except UnknownNamespaceError as exc:
+            result = st.contradict(
+                memory_id,
+                replacement=replacement,
+                origin=origin,
+                session_id=session_id,
+                reason=reason,
+                idempotency_key=idempotency_key,
+            )
+    except (UnknownNamespaceError, ValueError) as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
     result["namespace"] = ns
+    return _json(result)
+
+
+@server.tool(
+    description=(
+        "Trace the ordered correction chain containing a surviving memory, "
+        "including source event/session context and privacy-erasure gaps."
+    )
+)
+def memory_trace(
+    memory_id: str,
+    namespace: Optional[str] = None,
+) -> str:
+    try:
+        ns = _mcp_namespace(namespace)
+    except MCPAuthorityError as exc:
+        return _authority_error(exc)
+    try:
+        with open_existing(ns) as st:
+            result = st.trace(memory_id)
+    except UnknownNamespaceError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     return _json(result)
 
 

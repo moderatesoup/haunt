@@ -103,6 +103,7 @@ def _seed(corpus: dict[str, Any]) -> dict[str, str]:
                 ):
                     contradicted = store.contradict(
                         old_memory_id,
+                        idempotency_key=f"frozen-eval:{record['id']}",
                         replacement=record["content"],
                         origin="frozen-retrieval-eval",
                     )

@@ -89,11 +89,11 @@ Features:
 - **Browse** memories with filters: tier, origin, session, time range. Paginated.
 - **Search / recall** with hybrid vec+FTS. Results link to detail view. Clicking any result row opens the detail panel.
 - **All-namespaces search**: select "all namespaces" in the sidebar to fan out a single query across every registered namespace. Results are merged by score and each hit shows a namespace badge. API: `GET /api/recall?q=&k=&tier=`.
-- **Memory detail** with full provenance: origin, session_id, event_id, memory_id, role, tier, event_time, valid_from/valid_to, db_path (absolute), haunt_home, tool name/input/output, related memories from the same session, entity mentions.
+- **Memory detail** with source context and correction trace: origin, session_id, event_id, memory_id, role, tier, event_time, valid_from/valid_to, ordered lineage, db_path (absolute), haunt_home, tool name/input/output, related memories from the same session, entity mentions.
 - **Timeline** view: events in time order with since/until day filters. Rows click through to memory detail.
 - **Time-bounded search**: `as_of`, `since`, `until` date filters on recall (both per-namespace and all-namespaces).
-- **Supersede** a memory from the detail panel (sets `valid_to=now`, optional replacement text). Keeps original data — distinct from delete.
-- **Delete** a memory from the UI (with confirmation). Hard purge removes the memory, FTS index, vector embedding, graph rows, and orphan events. Recall will not return deleted content.
+- **Supersede** a memory from the detail panel (append-only correction record plus `valid_to=now`, optional replacement text). Keeps original data — distinct from delete.
+- **Delete** a memory from the UI (with confirmation). Hard purge removes the memory, FTS index, vector embedding, graph rows, and orphan events. Recall will not return deleted content. If surviving correction history crosses the erased member, trace shows only a fresh opaque four-field tombstone; purge is the explicit exception to ordinary append-only lineage. Every target or adjacent correction session ID is rekeyed when surviving events still use it; unrelated event content/origin and clean session metadata remain intact while erased context is sanitized.
 - **Procedures and worldview** visible (browse, view detail; write stays CLI/MCP).
 - **Health** strip: sqlite-vec status/version, embed model+dim+availability, last write age, event count, namespace, absolute db_path. Always visible (persistent header), live-updating (15s poll).
 
@@ -178,6 +178,8 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt init [name] [--repo PATH]` | create a namespace |
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
 | `haunt recall QUERY [--as-of --since --until --clock --tier --k]` | hybrid recall (vec + FTS5 + RRF); query-time temporal compile |
+| `haunt correct MEMORY_ID --idempotency-key KEY [--replacement --reason]` | atomically append a correction and optional verbatim replacement; omitted/null, empty, and whitespace-only replacement values are distinct; a nonempty caller key is required for safe retries |
+| `haunt trace MEMORY_ID` | ordered correction chain from any surviving member, including erased-gap tombstones |
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |
 | `haunt timeline [--since --until --clock]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias) |
 | `haunt namespaces` | list + counts |
@@ -206,7 +208,7 @@ Every explicit recall hit includes `trusted` and `trust_reason`. Tool input/outp
 
 `haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
 
-Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`.
+Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_trace`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`. `memory_contradict` requires a nonempty caller `idempotency_key`; supplying the same key and exact correction payload safely replays the original result. Replacement strings are verbatim: omitted/null means no replacement, while empty and whitespace-only strings create replacements with those exact bytes.
 
 ## Environment variables
 

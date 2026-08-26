@@ -193,7 +193,10 @@ def test_honest_127_and_token_reads_and_contradicts(auth_env):
     )
     resp = client.post(
         f"/api/namespace/default/memory/{r.memory_id}/contradict",
-        json={"replacement": "corrected locally"},
+        json={
+            "replacement": "corrected locally",
+            "idempotency_key": "auth-local",
+        },
     )
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
@@ -207,7 +210,7 @@ def test_same_origin_origin_header_still_contradicts(auth_env):
     client = make_dash_client()
     resp = client.post(
         f"/api/namespace/default/memory/{r.memory_id}/contradict",
-        json={},
+        json={"idempotency_key": "auth-same-origin"},
         headers={"Origin": "http://127.0.0.1:7340"},
     )
     assert resp.status_code == 200

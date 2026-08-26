@@ -287,7 +287,11 @@ def test_episodic_not_in_procedure_list(haunt_env):
 def test_contradict_supersedes_memory(haunt_env):
     with Store("default") as st:
         r = st.observe("the port is 8080", role="system", tier="semantic")
-        result = st.contradict(r.memory_id, replacement="the port is 9090")
+        result = st.contradict(
+            r.memory_id,
+            replacement="the port is 9090",
+            idempotency_key="lore-basic",
+        )
 
     assert result["ok"] is True
     assert result["superseded"] == r.memory_id
@@ -307,7 +311,9 @@ def test_contradict_supersedes_memory(haunt_env):
 
 def test_contradict_not_found(haunt_env):
     with Store("default") as st:
-        result = st.contradict("nonexistent-id-12345")
+        result = st.contradict(
+            "nonexistent-id-12345", idempotency_key="lore-not-found"
+        )
     assert result["ok"] is False
     assert "not found" in result["error"]
 
@@ -325,7 +331,11 @@ def test_default_recall_excludes_superseded(haunt_env):
             tier="semantic",
             event_time="2024-06-01T12:00:00+00:00",
         )
-        st.contradict(r.memory_id, replacement="the port is 9090 UNIQUE-PORT-9090")
+        st.contradict(
+            r.memory_id,
+            replacement="the port is 9090 UNIQUE-PORT-9090",
+            idempotency_key="lore-current",
+        )
 
     current = recall("UNIQUE-PORT", namespace="default", k=8)
     assert current, "replacement should still recall"
@@ -342,7 +352,11 @@ def test_as_of_past_still_returns_later_superseded(haunt_env):
             tier="semantic",
             event_time="2024-06-01T12:00:00+00:00",
         )
-        st.contradict(r.memory_id, replacement="the port is 9090 UNIQUE-ASOF-9090")
+        st.contradict(
+            r.memory_id,
+            replacement="the port is 9090 UNIQUE-ASOF-9090",
+            idempotency_key="lore-as-of",
+        )
 
     past = recall(
         "UNIQUE-ASOF",

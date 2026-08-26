@@ -15,7 +15,8 @@ def test_purge_removes_memory_and_keeps_other(haunt_env):
         result = st.purge(r1.memory_id)
 
     assert result["ok"] is True
-    assert result["memory_id"] == r1.memory_id
+    assert "memory_id" not in result
+    assert "event_id" not in result
 
     with Store("default") as st:
         gone = st.conn.execute(
