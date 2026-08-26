@@ -2,9 +2,10 @@
 
 Haunt stores source attribution on the event that produced a memory. The
 `provenance` value is structured JSON and is returned as the same object by
-Store detail/browse/trace/timeline, CLI observe, MCP observe/trace, and the
-dashboard APIs. It describes how bytes entered Haunt; it is not evidence that
-the memory is true.
+Store detail/browse/trace/timeline and procedure get/list, CLI observe/timeline/
+procedure output, MCP observe/trace/timeline/procedure output, and the dashboard
+APIs. It describes how bytes entered Haunt; it is not evidence that the memory
+is true.
 
 Every new write has `schema_version: 1`, `kind`, and the actual nonempty
 `channel` and `origin` passed to `Store.observe`. Direct Python calls default to
@@ -13,6 +14,11 @@ Claude Code hooks bind their host-specific channels. A correction replacement
 inherits the channel of the correction entry point. A caller-supplied channel
 must match that actual input. Unknown optional values are omitted or null;
 Haunt never guesses them.
+
+The direct Python `Store.observe`, top-level `observe`, `procedure_write`, and
+correction-replacement defaults all bind both channel and origin to `python`.
+Public integrations override both explicitly; a storage default never claims
+that a direct Python caller came from the CLI.
 
 ## Native observations
 
@@ -66,6 +72,13 @@ write. An idempotency-key replay must carry the exact same canonical provenance
 or it conflicts. A retry against a legacy null or invalid stored envelope fails
 closed because Haunt cannot prove that the attempted attribution is identical.
 The old row remains readable and unchanged.
+
+`haunt timeline --json` returns the same event objects as Store, MCP, and the
+dashboard, including valid, `legacy_unstructured`, or `invalid_stored`
+provenance. Human timeline rows show `source=<channel>/<origin>`, using
+`unknown` rather than inventing a missing legacy or invalid channel. Procedure
+get/list results likewise retain the provenance of their sourced memory across
+Store, MCP, CLI, dashboard, and worldview output.
 
 ## Legacy and invalid rows
 

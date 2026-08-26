@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 
 from haunt.cli import app
 from haunt.provenance import IMPORT_FIDELITIES, native_provenance
-from haunt.store import SCHEMA_VERSION, Store
+from haunt.store import SCHEMA_VERSION, Store, observe as public_observe
 
 
 LOGICAL_TABLES = (
@@ -144,6 +144,54 @@ def test_native_tool_and_call_are_actual_observe_inputs(provenance_env):
     assert stored["channel"] == "cursor_hook"
     assert stored["producer_tool"] == "Shell"
     assert stored["producer_call_id"] == "调用-α-42"
+
+
+def test_direct_python_write_defaults_are_honest_across_public_apis(
+    provenance_env,
+):
+    with Store("default") as st:
+        direct = st.observe("direct Store observation")
+        procedure = st.procedure_write("direct procedure", "python steps")
+        target = st.observe("direct correction target")
+        correction = st.contradict(
+            target.memory_id,
+            replacement="direct correction replacement",
+            idempotency_key="direct-python-correction",
+        )
+        direct_detail = st.get_memory(direct.memory_id)
+        procedure_detail = st.procedure_get("direct procedure")
+        replacement_detail = st.get_memory(correction["replacement_memory_id"])
+        correction_origin = st.conn.execute(
+            "SELECT origin FROM corrections WHERE id=?",
+            (correction["correction_id"],),
+        ).fetchone()["origin"]
+
+    helper = public_observe(
+        "top-level Python helper observation",
+        namespace="default",
+        defer_embedding=True,
+    )
+    with Store("default") as st:
+        helper_detail = st.get_memory(helper.memory_id)
+
+    expected = {
+        "schema_version": 1,
+        "kind": "native",
+        "channel": "python",
+        "origin": "python",
+    }
+    assert direct.provenance == expected
+    assert direct_detail["origin"] == "python"
+    assert direct_detail["provenance"] == expected
+    assert procedure.provenance == expected
+    assert procedure_detail is not None
+    assert procedure_detail["provenance"] == expected
+    assert replacement_detail["origin"] == "python"
+    assert replacement_detail["provenance"] == expected
+    assert correction_origin == "python"
+    assert helper.provenance == expected
+    assert helper_detail["origin"] == "python"
+    assert helper_detail["provenance"] == expected
 
 
 def test_native_producer_claims_must_match_actual_observe_inputs(provenance_env):
@@ -378,7 +426,7 @@ def test_corrupt_or_unsupported_stored_envelope_fails_honest(provenance_env):
     assert detail["provenance"] == {
         "schema_version": 1,
         "kind": "invalid_stored",
-        "origin": "cli",
+        "origin": "python",
     }
     assert not _contains_key(detail, "confidence")
 
@@ -652,6 +700,193 @@ def test_cli_mcp_and_dashboard_share_the_same_envelope_schema(
     }
     assert detail["provenance"] == mcp_payload["provenance"]
     assert browsed["provenance"] == mcp_payload["provenance"]
+
+
+def test_cli_timeline_json_and_human_outputs_surface_all_provenance_states(
+    provenance_env, monkeypatch
+):
+    with Store("default") as st:
+        native = st.observe("timeline native")
+        imported = st.observe(
+            "timeline import",
+            origin="archive",
+            provenance=_import_envelope("reconstructed"),
+        )
+        legacy = st.observe("timeline legacy", origin="legacy-source")
+        invalid = st.observe("timeline invalid")
+        st.conn.execute(
+            "UPDATE events SET provenance=NULL WHERE id=?",
+            (legacy.event_id,),
+        )
+        st.conn.execute(
+            "UPDATE events SET provenance=? WHERE id=?",
+            ('{"schema_version":99,"kind":"native"}', invalid.event_id),
+        )
+        st.conn.commit()
+        store_rows = st.events(limit=20)
+
+    runner = CliRunner()
+    machine = runner.invoke(
+        app, ["timeline", "-n", "default", "--limit", "20", "--json"]
+    )
+    assert machine.exit_code == 0, machine.output
+    payload = json.loads(machine.stdout)
+    assert payload["namespace"] == "default"
+    assert payload["events"] == store_rows
+    by_content = {row["content"]: row for row in payload["events"]}
+    assert by_content["timeline native"]["provenance"] == native.provenance
+    assert by_content["timeline import"]["provenance"] == imported.provenance
+    assert by_content["timeline legacy"]["provenance"] == {
+        "schema_version": 1,
+        "kind": "legacy_unstructured",
+        "origin": "legacy-source",
+        "meta": "{}",
+    }
+    assert by_content["timeline invalid"]["provenance"] == {
+        "schema_version": 1,
+        "kind": "invalid_stored",
+        "origin": "python",
+    }
+
+    human = runner.invoke(app, ["timeline", "-n", "default", "--limit", "20"])
+    assert human.exit_code == 0, human.output
+    assert "source=python/python" in human.stdout
+    assert "source=python/archive" in human.stdout
+    assert "source=unknown/legacy-source" in human.stdout
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_payload = json.loads(
+        mcp_server.memory_timeline(namespace="default", limit=20)
+    )
+    assert mcp_payload["events"] == payload["events"]
+
+    from tests.dashutil import make_dash_client
+
+    dashboard = make_dash_client().get(
+        "/api/namespace/default/timeline?limit=20"
+    )
+    assert dashboard.status_code == 200, dashboard.text
+    assert dashboard.json()["events"] == payload["events"]
+
+
+@pytest.mark.parametrize(
+    "args, expected_error",
+    [
+        (["-n", "default", "--clock", "not-a-clock"], "clock"),
+        (["-n", "missing-timeline-namespace"], "unknown namespace"),
+    ],
+)
+def test_cli_timeline_json_errors_use_stable_envelope(
+    provenance_env, args, expected_error
+):
+    result = CliRunner().invoke(app, ["timeline", *args, "--json"])
+    assert result.exit_code == 2
+    payload = json.loads(result.stderr or result.output)
+    assert payload["ok"] is False
+    assert payload["namespace"]
+    assert expected_error in payload["error"]
+
+
+def test_procedure_get_and_list_keep_provenance_across_store_mcp_and_cli(
+    provenance_env, monkeypatch
+):
+    with Store("default") as st:
+        native = st.procedure_write("native procedure", "native steps")
+        imported = st.observe(
+            "imported steps",
+            role="system",
+            tier="procedural",
+            origin="archive",
+            meta={
+                "kind": "procedure",
+                "name": "imported procedure",
+                "trigger": "when imported",
+            },
+            provenance=_import_envelope("lossless"),
+        )
+        legacy = st.procedure_write(
+            "legacy procedure", "legacy steps", origin="legacy-procedure-source"
+        )
+        invalid = st.procedure_write("invalid procedure", "invalid steps")
+        st.conn.execute(
+            "UPDATE events SET provenance=NULL WHERE id=?",
+            (legacy.event_id,),
+        )
+        st.conn.execute(
+            "UPDATE events SET provenance=? WHERE id=?",
+            ('{"schema_version":99,"kind":"native"}', invalid.event_id),
+        )
+        st.conn.commit()
+
+        native_get = st.procedure_get("native procedure")
+        imported_get = st.procedure_get("imported procedure")
+        legacy_get = st.procedure_get("legacy procedure")
+        invalid_get = st.procedure_get("invalid procedure")
+        listed = {row["name"]: row for row in st.procedure_list()}
+
+    assert native_get is not None and native_get["provenance"] == native.provenance
+    assert imported_get is not None
+    assert imported_get["provenance"] == imported.provenance
+    assert legacy_get is not None
+    assert legacy_get["provenance"]["kind"] == "legacy_unstructured"
+    assert legacy_get["provenance"]["origin"] == "legacy-procedure-source"
+    assert invalid_get is not None
+    assert invalid_get["provenance"] == {
+        "schema_version": 1,
+        "kind": "invalid_stored",
+        "origin": "python",
+    }
+    for name, expected in (
+        ("native procedure", native_get),
+        ("imported procedure", imported_get),
+        ("legacy procedure", legacy_get),
+        ("invalid procedure", invalid_get),
+    ):
+        assert listed[name]["provenance"] == expected["provenance"]
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_get = json.loads(
+        mcp_server.memory_procedure(
+            "get", name="imported procedure", namespace="default"
+        )
+    )
+    assert mcp_get["ok"] is True
+    assert mcp_get["procedure"]["provenance"] == imported.provenance
+    mcp_list = json.loads(mcp_server.memory_procedure("list", namespace="default"))
+    assert mcp_list["ok"] is True
+    mcp_listed = {row["name"]: row for row in mcp_list["procedures"]}
+    assert mcp_listed["native procedure"]["provenance"] == native.provenance
+    assert mcp_listed["legacy procedure"]["provenance"][
+        "kind"
+    ] == "legacy_unstructured"
+    assert mcp_listed["invalid procedure"]["provenance"]["kind"] == "invalid_stored"
+
+    runner = CliRunner()
+    cli_get = runner.invoke(
+        app, ["procedure", "get", "native procedure", "-n", "default"]
+    )
+    assert cli_get.exit_code == 0, cli_get.output
+    native_json = json.dumps(native.provenance, ensure_ascii=False, sort_keys=True)
+    assert f"provenance {native_json}" in cli_get.stdout
+    cli_legacy = runner.invoke(
+        app, ["procedure", "get", "legacy procedure", "-n", "default"]
+    )
+    assert cli_legacy.exit_code == 0, cli_legacy.output
+    assert '"kind": "legacy_unstructured"' in cli_legacy.stdout
+    cli_invalid = runner.invoke(
+        app, ["procedure", "get", "invalid procedure", "-n", "default"]
+    )
+    assert cli_invalid.exit_code == 0, cli_invalid.output
+    assert '"kind": "invalid_stored"' in cli_invalid.stdout
+    cli_list = runner.invoke(app, ["procedure", "list", "-n", "default"])
+    assert cli_list.exit_code == 0, cli_list.output
+    assert f"provenance {native_json}" in cli_list.stdout
 
 
 def test_cli_and_mcp_invalid_parser_version_write_nothing(provenance_env, monkeypatch):

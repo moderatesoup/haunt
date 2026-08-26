@@ -374,8 +374,8 @@ def memory_worldview(
     description=(
         "Named how-to procedures (verbatim steps). "
         "action=write: store a named procedure. "
-        "action=get: retrieve by name. "
-        "action=list: list all active procedures."
+        "action=get: retrieve by name with source provenance. "
+        "action=list: list all active procedures with source provenance."
     )
 )
 def memory_procedure(

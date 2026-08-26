@@ -192,18 +192,28 @@ def timeline_cmd(
         "write_time is a deprecated alias for storage_time.",
     ),
     limit: int = typer.Option(50, "--limit"),
+    json_out: bool = typer.Option(False, "--json", help="Output stable JSON"),
 ) -> None:
     """Events in clock order (newest first). Default clock is event_time."""
     ns = _ns(namespace)
     limit = clamp_limit(limit, default=50)
     try:
-        with _existing(ns) as st:
+        with open_existing(ns) as st:
             rows = st.events(
                 session_id=session, since=since, until=until, clock=clock, limit=limit
             )
-    except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
+    except (UnknownNamespaceError, ValueError) as exc:
+        if json_out:
+            typer.echo(
+                dumps({"ok": False, "error": str(exc), "namespace": ns}),
+                err=True,
+            )
+        else:
+            typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
+    if json_out:
+        typer.echo(dumps({"namespace": ns, "events": rows}))
+        return
     if not rows:
         typer.echo("no events")
         return
@@ -211,8 +221,14 @@ def timeline_cmd(
         body = r["content"] or ""
         if r["tool_name"]:
             body = f"[tool:{r['tool_name']}] {body}".strip()
+        provenance = r["provenance"]
+        source = (
+            f"{provenance.get('channel') or 'unknown'}/"
+            f"{provenance.get('origin') or 'unknown'}"
+        )
         typer.echo(
-            f"{format_iso(r['event_time'])}  {r['role']:<10} {r['tier']:<12} {r['id']}  {snippet(body, 120)}"
+            f"{format_iso(r['event_time'])}  {r['role']:<10} {r['tier']:<12} "
+            f"{r['id']}  source={source}  {snippet(body, 120)}"
         )
 
 
@@ -365,7 +381,7 @@ def procedure_get_cmd(
     name: str = typer.Argument(..., help="Procedure name"),
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
 ) -> None:
-    """Retrieve a named procedure."""
+    """Retrieve a named procedure with source provenance."""
     ns = _ns(namespace)
     with _existing(ns) as st:
         proc = st.procedure_get(name)
@@ -377,6 +393,7 @@ def procedure_get_cmd(
         typer.echo(f"trigger  {proc['trigger']}")
     typer.echo(f"id       {proc['id']}")
     typer.echo(f"created  {proc['created_at']}")
+    typer.echo(f"provenance {dumps(proc['provenance'])}")
     typer.echo(f"---")
     typer.echo(proc["body"])
 
@@ -385,7 +402,7 @@ def procedure_get_cmd(
 def procedure_list_cmd(
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
 ) -> None:
-    """List all active procedures."""
+    """List all active procedures with source provenance."""
     ns = _ns(namespace)
     with _existing(ns) as st:
         procs = st.procedure_list()
@@ -395,6 +412,7 @@ def procedure_list_cmd(
     typer.echo(f"{'name':<28} {'trigger':<32} id")
     for p in procs:
         typer.echo(f"{p['name']:<28} {p.get('trigger', ''):<32} {p['id'][:12]}")
+        typer.echo(f"  provenance {dumps(p['provenance'])}")
 
 
 @app.command("delete")

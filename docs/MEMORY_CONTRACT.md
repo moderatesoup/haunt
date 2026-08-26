@@ -121,6 +121,12 @@ claimed fields must match them exactly. For imports, it additionally records
 the source platform and native ID when known, parser/format version, import time,
 fidelity, original-blob hash/reference when retained, and transform names.
 
+Direct Python observation, procedure, and correction-replacement APIs bind both
+origin and channel to `python` by default. CLI, MCP, dashboard, hooks, and
+evaluation code bind their own actual entry point explicitly. Timeline and
+procedure read surfaces return the same stored envelope rather than dropping or
+reconstructing source fields.
+
 Unknown values **MUST** remain absent or explicitly unknown. Haunt **MUST NOT**
 guess an actor, platform, timestamp precision, source-native ID, fidelity, or
 transform. Existing string `origin` and free-form `meta` data remain readable;

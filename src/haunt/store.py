@@ -830,7 +830,7 @@ class Store:
         tool_output: str | None = None,
         producer_call_id: str | None = None,
         event_time: str | None = None,
-        origin: str = "cli",
+        origin: str = "python",
         channel: str = "python",
         meta: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
@@ -2306,7 +2306,7 @@ class Store:
         body: str,
         *,
         trigger: str = "",
-        origin: str = "cli",
+        origin: str = "python",
         channel: str = "python",
         session_id: str | None = None,
     ) -> ObserveResult:
@@ -2326,7 +2326,8 @@ class Store:
         """Retrieve a procedure by name. Returns newest matching row."""
         row = self.conn.execute(
             """
-            SELECT m.id, m.content, m.valid_from, m.valid_to, m.created_at, e.meta
+            SELECT m.id, m.content, m.valid_from, m.valid_to, m.created_at,
+                   e.meta, e.origin, e.tool_name, e.provenance
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.tier='procedural'
@@ -2348,13 +2349,20 @@ class Store:
             "trigger": emeta.get("trigger", ""),
             "valid_from": row["valid_from"],
             "created_at": row["created_at"],
+            "provenance": public_provenance(
+                row["provenance"],
+                origin=row["origin"],
+                legacy_meta=row["meta"],
+                tool_name=row["tool_name"],
+            ),
         }
 
     def procedure_list(self) -> list[dict[str, Any]]:
         """List all active procedures (valid_to IS NULL)."""
         rows = self.conn.execute(
             """
-            SELECT m.id, m.content, m.created_at, e.meta
+            SELECT m.id, m.content, m.created_at, e.meta,
+                   e.origin, e.tool_name, e.provenance
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.tier='procedural'
@@ -2372,6 +2380,12 @@ class Store:
                 "body": r["content"],
                 "trigger": emeta.get("trigger", ""),
                 "created_at": r["created_at"],
+                "provenance": public_provenance(
+                    r["provenance"],
+                    origin=r["origin"],
+                    legacy_meta=r["meta"],
+                    tool_name=r["tool_name"],
+                ),
             })
         return out
 
@@ -2405,7 +2419,7 @@ class Store:
         idempotency_key: str,
         replacement: str | None = None,
         namespace: str | None = None,
-        origin: str = "cli",
+        origin: str = "python",
         channel: str = "python",
         session_id: str | None = None,
         reason: str | None = None,
@@ -2558,6 +2572,8 @@ def observe(
     namespace: str | None = None,
     **kwargs: Any,
 ) -> ObserveResult:
+    kwargs.setdefault("origin", "python")
+    kwargs.setdefault("channel", "python")
     with get_store(namespace) as store:
         return store.observe(content, **kwargs)
 

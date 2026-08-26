@@ -181,13 +181,13 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt correct MEMORY_ID --idempotency-key KEY [--replacement --reason]` | atomically append a correction and optional verbatim replacement; omitted/null, empty, and whitespace-only replacement values are distinct; a nonempty caller key is required for safe retries |
 | `haunt trace MEMORY_ID` | ordered correction chain from any surviving member, including erased-gap tombstones |
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |
-| `haunt timeline [--since --until --clock]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias) |
+| `haunt timeline [--since --until --clock --json]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias); human rows show source channel/origin and JSON preserves the complete provenance envelope |
 | `haunt namespaces` | list + counts |
 | `haunt health [-n NAMESPACE]` | vec / embed / counts / db path |
 | `haunt worldview [-n NAMESPACE]` | compact namespace briefing: facts, entities, procedures |
 | `haunt procedure write NAME --body BODY` | store a named procedure |
-| `haunt procedure get NAME` | retrieve a named procedure |
-| `haunt procedure list` | list all active procedures |
+| `haunt procedure get NAME` | retrieve a named procedure and its provenance |
+| `haunt procedure list` | list all active procedures and their provenance |
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
 | `haunt dash [--port 7340] [--install-icon] [--no-open] [--allow-remote]` | local memory console (127.0.0.1); prints a launch token required on `/api/*`; `--allow-remote` is unsafe without that token; namespaces are not auth |
 | `haunt install` | bind all known hosts (Cursor, Claude Code): hooks + MCP + rules + skill |
