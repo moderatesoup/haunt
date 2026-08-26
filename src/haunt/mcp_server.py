@@ -199,15 +199,20 @@ class MCPAuthority:
     def pin_open_store(self, store: Store) -> str:
         """Pin from an opened Store's stable ID, never from its label."""
         identity = None
+        last_error: NamespacePathError | None = None
         for _attempt in range(16):
             try:
                 identity = resolve_namespace_id(store.namespace_id)
             except NamespacePathError as exc:
                 if not is_concurrent_registry_change(exc):
                     raise
+                last_error = exc
                 continue
-            if identity is not None:
+            else:
+                last_error = None
                 break
+        if last_error is not None:
+            raise last_error
         if identity is None:
             raise MCPAuthorityError(
                 f"opened namespace identity {store.namespace_id!r} is no longer registered"

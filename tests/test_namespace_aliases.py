@@ -1285,6 +1285,42 @@ def test_mcp_identity_retry_fails_immediately_on_unsafe_path_error(
     assert calls == 1
 
 
+@pytest.mark.parametrize("surface", ["current", "pin"])
+def test_mcp_identity_retry_exhaustion_preserves_terminal_drift_error(
+    alias_home, monkeypatch, surface
+):
+    import haunt.mcp_server as mcp
+
+    with Store("mcp-drift-bound") as store:
+        identity = resolve_namespace_identity("mcp-drift-bound")
+        assert identity is not None
+        authority = mcp.MCPAuthority(
+            bound_namespace="mcp-drift-bound",
+            bound_namespace_id=(
+                identity["namespace_id"] if surface == "current" else None
+            ),
+        )
+        drift = NamespacePathError(
+            "SQLite zero-write read observed storage drift: registry.db"
+        )
+        calls = 0
+
+        def always_drift(_namespace_id):
+            nonlocal calls
+            calls += 1
+            raise drift
+
+        monkeypatch.setattr(mcp, "resolve_namespace_id", always_drift)
+        with pytest.raises(NamespacePathError) as caught:
+            if surface == "current":
+                authority._current_identity()
+            else:
+                authority.pin_open_store(store)
+
+    assert calls == 16
+    assert caught.value is drift
+
+
 def test_fresh_mcp_process_pins_after_first_observe_and_survives_rename(
     alias_home, monkeypatch
 ):
