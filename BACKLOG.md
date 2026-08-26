@@ -576,6 +576,46 @@ does not support the query.
   separation test proves E0 cases/results are not calibration inputs. A mutation
   that uses `rrf_score` as the threshold must fail.
 
+**Blocker evidence (2026-08-26)**
+
+- E6 v1 is frozen separately from E0 at dataset hash
+  `8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c`
+  and split hash
+  `d57b1a02e30d48087065528bfc01575d67735295003de26b1087bb348d05414d`.
+  Its 40 records and 160 cases have no logical-ID, canonical record, or query
+  hash overlap with E0; the sealed E0 paths have a byte-for-byte empty diff.
+- The FTS-only fit cohort is separable at `0.875`; held-out Recall@5,
+  conditional retention, and negative abstention are all `1.0`. This proves the
+  harness but does not close E6 because a separate pinned hybrid profile is
+  required.
+- Under hashed local `BAAI/bge-m3` ONNX inputs (dimension 1024) and actual
+  sqlite-vec native cosine execution, the fit-only boundary needed for 100%
+  negative abstention retains only `6/20` conditional positives (`0.30`, below
+  the required `0.95`). Held-out pre-abstention Recall@5 is `15/20` (`0.75`);
+  at that unchanged fit-only boundary, all 20 negatives abstain but only `6/15`
+  conditional positives remain (`0.40`). Close absent-attribute negatives
+  dominate real semantic positives on both strength and the diagnostic top-two
+  distance margin, so no approved raw-evidence threshold can meet both gates.
+- Reproduction runs with ambient fake API/Hugging Face keys. FTS uses strict
+  `HAUNT_OFFLINE=1`; hybrid leaves it unset, requires an explicit verified local
+  cache, denies socket/DNS/HTTP access, proves zero attempts, and fails on any
+  non-native vector arm. Coverage evidence is case-folded/deduplicated and uses
+  one batched SQL statement for the fixed top five; 1k/10k/100k timing evidence
+  is recorded separately as a non-cross-machine gate.
+- Evidence and reproduction live in `src/haunt/abstention_eval.py`,
+  `scripts/reproduce_abstention_eval.py`,
+  `scripts/benchmark_abstention_evidence.py`, and
+  `tests/fixtures/abstention_eval/v1/`. No public runtime policy, threshold
+  artifact, CLI/MCP/dashboard behavior, or fallback compatibility behavior is
+  shipped while the hybrid gate is unsatisfied.
+- Honest unblock choices are: predeclare and review a new raw retrieval feature
+  in a new E6 evidence version; explicitly amend the contract to permit a
+  reader/cross-encoder; or leave hybrid abstention unshipped. Removing or
+  relabeling hard negatives, padding with lexical positives, thresholding RRF,
+  fitting held-out labels, or silently falling back to FTS are not valid fixes.
+
+E6 therefore remains **Blocked**. E7 remains blocked on E6.
+
 **Non-goals**
 
 - Fact confidence, truth verification, source reputation, a reader LLM, or a
