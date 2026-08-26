@@ -11,7 +11,7 @@ import typer
 from haunt import __version__
 from haunt.bootstrap import bootstrap, format_report
 from haunt.embed import state as embed_state
-from haunt.paths import haunt_home, resolve_namespace
+from haunt.paths import NamespacePathError, haunt_home, resolve_namespace
 from haunt.planner import planned_recall
 from haunt.store import (
     AliasRetirementError,
@@ -76,9 +76,13 @@ def init_cmd(
 ) -> None:
     """Create a namespace (one SQLite file)."""
     ns = name or resolve_namespace(None, cwd=repo)
-    db = register_namespace(ns, repo_path=str(repo) if repo else None)
-    with Store(ns) as st:
-        stats = st.stats()
+    try:
+        db = register_namespace(ns, repo_path=str(repo) if repo else None)
+        with Store(ns) as st:
+            stats = st.stats()
+    except (NamespaceCollisionError, NamespacePathError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
     typer.echo(f"namespace  {ns}")
     typer.echo(f"db         {db}")
     typer.echo(f"events     {stats['events']}")
@@ -299,7 +303,11 @@ def timeline_cmd(
 @app.command("namespaces")
 def namespaces_cmd() -> None:
     """List namespaces with counts."""
-    rows = list_namespaces()
+    try:
+        rows = list_namespaces()
+    except NamespacePathError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
     if not rows:
         typer.echo("no namespaces (run: haunt bootstrap)")
         return

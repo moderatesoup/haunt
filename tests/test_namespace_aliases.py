@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 
 from haunt.cli import app
 from haunt.paths import (
+    NamespacePathError,
     infer_namespace,
     namespace_db_path,
     registry_path,
@@ -108,6 +109,67 @@ def test_additive_upgrade_preserves_legacy_name_and_path(alias_home):
     assert conn.execute("SELECT COUNT(*) FROM namespace_identities").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM namespace_aliases").fetchone()[0] == 1
     conn.close()
+
+
+def test_v3_identity_upgrade_records_physical_database_identity(tmp_path, monkeypatch):
+    home = tmp_path / "v3-home"
+    namespace_root = home / "namespaces"
+    namespace_root.mkdir(parents=True)
+    db = namespace_root / "v3.db"
+    db.touch()
+    registry = home / "registry.db"
+    conn = sqlite3.connect(registry)
+    conn.executescript(
+        """
+        CREATE TABLE namespaces(
+            name TEXT PRIMARY KEY,repo_path TEXT,db_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+        );
+        CREATE TABLE registry_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE namespace_identities(
+            namespace_id TEXT PRIMARY KEY,canonical_label TEXT NOT NULL,
+            canonical_label_norm TEXT NOT NULL UNIQUE,db_path TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+        );
+        CREATE TABLE namespace_aliases(
+            normalized_label TEXT PRIMARY KEY,label TEXT NOT NULL,
+            namespace_id TEXT NOT NULL,is_canonical INTEGER NOT NULL,
+            source_alias_norm TEXT,created_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute("INSERT INTO registry_meta VALUES ('schema_version','3')")
+    conn.execute(
+        "INSERT INTO namespaces VALUES (?,?,?,?,?)",
+        ("v3", None, str(db), "2025-01-01", "2025-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO namespace_identities VALUES (?,?,?,?,?,?)",
+        ("v3-id", "v3", "v3", str(db), "2025-01-01", "2025-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO namespace_aliases VALUES (?,?,?,?,?,?)",
+        ("v3", "v3", "v3-id", 1, None, "2025-01-01"),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+
+    init_registry()
+    conn = sqlite3.connect(registry)
+    row = conn.execute(
+        "SELECT db_device,db_inode FROM namespace_identities WHERE namespace_id='v3-id'"
+    ).fetchone()
+    version = conn.execute(
+        "SELECT value FROM registry_meta WHERE key='schema_version'"
+    ).fetchone()[0]
+    conn.close()
+    assert row == (db.stat().st_dev, db.stat().st_ino)
+    assert version == "4"
+    with Store("v3", create=False) as store:
+        assert store.namespace_id == "v3-id"
 
 
 def test_remote_forms_share_identity_but_same_leaf_other_remote_does_not(alias_home):
@@ -494,30 +556,27 @@ def test_unmapped_physical_targets_cannot_gain_identity_or_authority(
         owner_db = store.db_path
         owner_id = store.namespace_id
 
-    symlink_target = alias_home / "namespaces" / "symlink-target.db"
-    symlink_target.symlink_to(owner_db)
-    hardlink_target = alias_home / "namespaces" / "hardlink-target.db"
-    hardlink_target.hardlink_to(owner_db)
-    regular_target = alias_home / "namespaces" / "unmapped-target.db"
-    regular_target.touch()
     outside_db = tmp_path / "outside.db"
     outside_db.touch()
-    outside_target = alias_home / "namespaces" / "outside-target.db"
-    outside_target.symlink_to(outside_db)
+    attacks = {
+        "symlink-target": lambda path: path.symlink_to(owner_db),
+        "hardlink-target": lambda path: path.hardlink_to(owner_db),
+        "unmapped-target": lambda path: path.touch(),
+        "outside-target": lambda path: path.symlink_to(outside_db),
+    }
 
-    for label in (
-        "symlink-target",
-        "hardlink-target",
-        "unmapped-target",
-        "outside-target",
-    ):
-        with pytest.raises(NamespaceCollisionError):
+    from haunt.mcp_server import MCPAuthority, MCPAuthorityError
+
+    authority = MCPAuthority(
+        bound_namespace="physical-owner",
+        bound_namespace_id=owner_id,
+    )
+    assert authority.select("physical-owner") == "physical-owner"
+    for label, build_attack in attacks.items():
+        target = alias_home / "namespaces" / f"{label}.db"
+        build_attack(target)
+        with pytest.raises((NamespaceCollisionError, NamespacePathError)):
             Store(label)
-        assert not namespace_exists(label)
-    with pytest.raises(NamespaceCollisionError):
-        register_namespace("symlink-target", owner_remote)
-
-    for label in ("symlink-target", "hardlink-target", "outside-target"):
         cli = CliRunner().invoke(
             app,
             [
@@ -530,17 +589,16 @@ def test_unmapped_physical_targets_cannot_gain_identity_or_authority(
         )
         assert cli.exit_code == 2, cli.output
         assert "error:" in cli.output
-
-    from haunt.mcp_server import MCPAuthority, MCPAuthorityError
-
-    authority = MCPAuthority(
-        bound_namespace="physical-owner",
-        bound_namespace_id=owner_id,
-    )
-    assert authority.select("physical-owner") == "physical-owner"
-    for label in ("symlink-target", "hardlink-target", "outside-target"):
-        with pytest.raises(MCPAuthorityError):
+        with pytest.raises((MCPAuthorityError, NamespacePathError)):
             authority.select(label)
+        target.unlink()
+        assert not namespace_exists(label)
+
+    symlink_target = alias_home / "namespaces" / "symlink-target.db"
+    symlink_target.symlink_to(owner_db)
+    with pytest.raises((NamespaceCollisionError, NamespacePathError)):
+        register_namespace("symlink-target", owner_remote)
+    symlink_target.unlink()
 
     conn = sqlite3.connect(registry_path())
     assert conn.execute("SELECT COUNT(*) FROM namespace_identities").fetchone()[0] == 1
@@ -588,14 +646,283 @@ def test_legacy_ambiguous_physical_database_paths_fail_closed(
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
 
-    with pytest.raises(NamespaceCollisionError, match="same file"):
+    with pytest.raises(NamespacePathError):
         change_namespace_label("first", "third", apply=False)
-    with pytest.raises(NamespaceCollisionError, match="same file"):
+    with pytest.raises(NamespacePathError):
         init_registry()
     conn = sqlite3.connect(registry)
-    assert conn.execute("SELECT COUNT(*) FROM namespace_identities").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM namespace_aliases").fetchone()[0] == 0
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert "namespace_identities" not in tables
+    assert "namespace_aliases" not in tables
     conn.close()
+
+
+@pytest.mark.parametrize("kind", ["symlink-root", "outside-db"])
+def test_unsafe_legacy_storage_dry_run_is_exactly_read_only(
+    tmp_path, monkeypatch, kind
+):
+    home = tmp_path / f"unsafe-legacy-{kind}"
+    home.mkdir()
+    external = tmp_path / f"external-{kind}"
+    external.mkdir()
+    external_db = external / "legacy.db"
+    external_db.touch()
+    if kind == "symlink-root":
+        (home / "namespaces").symlink_to(external, target_is_directory=True)
+        stored_db = home / "namespaces" / "legacy.db"
+    else:
+        (home / "namespaces").mkdir()
+        stored_db = external_db
+    registry = home / "registry.db"
+    conn = sqlite3.connect(registry)
+    conn.execute(
+        """CREATE TABLE namespaces(
+               name TEXT PRIMARY KEY,repo_path TEXT,db_path TEXT NOT NULL,
+               created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"""
+    )
+    conn.execute(
+        "INSERT INTO namespaces VALUES (?,?,?,?,?)",
+        ("legacy", None, str(stored_db), "2025-01-01", "2025-01-01"),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+
+    before_bytes = registry.read_bytes()
+    conn = sqlite3.connect(f"{registry.resolve().as_uri()}?mode=ro", uri=True)
+    before_schema = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+    before_rows = conn.execute("SELECT * FROM namespaces").fetchall()
+    before_version = conn.execute("PRAGMA data_version").fetchone()[0]
+
+    with pytest.raises(NamespacePathError):
+        change_namespace_label("legacy", "new", apply=False)
+    assert registry.read_bytes() == before_bytes
+    assert conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == before_schema
+    assert conn.execute("SELECT * FROM namespaces").fetchall() == before_rows
+    assert conn.execute("PRAGMA data_version").fetchone()[0] == before_version
+    conn.close()
+    assert not Path(str(registry) + "-wal").exists()
+    assert not Path(str(registry) + "-shm").exists()
+    listed = list_namespace_rows()
+    assert len(listed) == 1
+    assert listed[0]["namespace_id"] is None
+    assert listed[0]["name"] == "legacy"
+    assert listed[0]["error"]
+    assert registry.read_bytes() == before_bytes
+    assert not Path(str(registry) + "-wal").exists()
+    assert not Path(str(registry) + "-shm").exists()
+    with pytest.raises(NamespacePathError):
+        init_registry()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_atomic_fresh_claim_rejects_exact_replacement_hook(
+    alias_home, monkeypatch, kind
+):
+    with Store("claim-owner") as owner:
+        owner.observe("CLAIM-OWNER-CANARY")
+        owner_db = owner.db_path
+        owner_before = owner.stats()["events"]
+    import haunt.store as store_module
+
+    target = alias_home / "namespaces" / "claimed.db"
+
+    def replace_claim(path):
+        assert path == target
+        path.unlink()
+        if kind == "symlink":
+            path.symlink_to(owner_db)
+        else:
+            path.hardlink_to(owner_db)
+
+    monkeypatch.setattr(store_module, "_fresh_namespace_claim_hook", replace_claim)
+    with pytest.raises(NamespacePathError):
+        Store("claimed")
+    assert target.is_symlink() if kind == "symlink" else target.exists()
+    target.unlink()
+    assert owner_db.stat().st_nlink == 1
+    assert not list((alias_home / "namespaces").glob(".haunt-claim-*"))
+
+    conn = sqlite3.connect(registry_path())
+    assert conn.execute(
+        "SELECT COUNT(*) FROM namespace_aliases WHERE normalized_label='claimed'"
+    ).fetchone()[0] == 0
+    row = conn.execute(
+        "SELECT db_device,db_inode FROM namespace_identities "
+        "WHERE canonical_label_norm='claim-owner'"
+    ).fetchone()
+    conn.close()
+    assert row == (owner_db.stat().st_dev, owner_db.stat().st_ino)
+    with Store("claim-owner", create=False) as owner:
+        assert owner.stats()["events"] == owner_before
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_mapped_open_rejects_exact_replacement_before_sqlite_use(
+    alias_home, tmp_path, monkeypatch, kind
+):
+    with Store("mapped-owner") as owner:
+        owner.observe("MAPPED-OWNER-CANARY")
+        owner_db = owner.db_path
+    with Store("redirect-target") as redirect:
+        redirect.observe("REDIRECT-CANARY")
+        redirect_db = redirect.db_path
+    redirect_before = redirect_db.read_bytes()
+    backup = tmp_path / "mapped-owner-backup.db"
+    import haunt.store as store_module
+
+    def replace_before_open(path):
+        assert path == owner_db
+        owner_db.rename(backup)
+        if kind == "symlink":
+            owner_db.symlink_to(redirect_db)
+        else:
+            owner_db.hardlink_to(redirect_db)
+
+    monkeypatch.setattr(
+        store_module, "_mapped_namespace_open_hook", replace_before_open
+    )
+    with pytest.raises(NamespacePathError):
+        Store("mapped-owner", create=False)
+    assert redirect_db.read_bytes() == redirect_before
+
+    owner_db.unlink()
+    backup.rename(owner_db)
+    assert redirect_db.stat().st_nlink == 1
+    monkeypatch.setattr(store_module, "_mapped_namespace_open_hook", lambda _path: None)
+    with Store("mapped-owner", create=False) as owner:
+        assert owner.stats()["events"] == 1
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_mapped_open_verifies_handle_when_replacement_is_swapped_back(
+    alias_home, tmp_path, monkeypatch, kind
+):
+    with Store("handle-owner") as owner:
+        owner.observe("HANDLE-OWNER-CANARY")
+        owner_db = owner.db_path
+    with Store("handle-redirect") as redirect:
+        redirect.observe("HANDLE-REDIRECT-CANARY")
+        redirect_db = redirect.db_path
+    redirect_before = redirect_db.read_bytes()
+    backup = tmp_path / "handle-owner-backup.db"
+    import haunt.store as store_module
+
+    original_raw_connect = store_module._raw_connect
+    replaced = False
+
+    def replace_before_open(path):
+        nonlocal replaced
+        assert path == owner_db
+        replaced = True
+        owner_db.rename(backup)
+        if kind == "symlink":
+            owner_db.symlink_to(redirect_db)
+        else:
+            owner_db.hardlink_to(redirect_db)
+
+    def connect_then_restore(path, *, create=True):
+        conn = original_raw_connect(path, create=create)
+        if replaced and path == owner_db:
+            owner_db.unlink()
+            backup.rename(owner_db)
+        return conn
+
+    monkeypatch.setattr(
+        store_module, "_mapped_namespace_open_hook", replace_before_open
+    )
+    monkeypatch.setattr(store_module, "_raw_connect", connect_then_restore)
+    with pytest.raises(NamespacePathError, match="SQLite did not open"):
+        Store("handle-owner", create=False)
+    assert owner_db.stat().st_ino != redirect_db.stat().st_ino
+    assert redirect_db.read_bytes() == redirect_before
+
+
+def test_cached_and_listed_identity_reject_regular_file_replacement(
+    alias_home, tmp_path
+):
+    with Store("replace-owner") as owner:
+        owner.observe("REPLACE-OWNER-CANARY")
+        owner_db = owner.db_path
+    assert namespace_db_path("replace-owner") == owner_db
+    backup = tmp_path / "replace-owner-backup.db"
+    owner_db.rename(backup)
+    owner_db.touch()
+
+    with pytest.raises(NamespacePathError):
+        namespace_db_path("replace-owner")
+    with pytest.raises(NamespacePathError):
+        resolve_namespace_identity("replace-owner")
+    listed = next(row for row in list_namespace_rows() if row["name"] == "replace-owner")
+    assert "physical identity changed" in listed["error"]
+
+    owner_db.unlink()
+    backup.rename(owner_db)
+    with Store("replace-owner", create=False) as owner:
+        assert owner.stats()["events"] == 1
+
+
+def test_cached_resolution_validates_every_registry_database(alias_home, tmp_path):
+    safe_db = register_namespace("all-source-safe")
+    unsafe_db = register_namespace("all-source-unsafe")
+    assert namespace_db_path("all-source-safe") == safe_db
+    backup = tmp_path / "all-source-unsafe-backup.db"
+    outside = tmp_path / "outside.db"
+    outside.touch()
+    unsafe_db.rename(backup)
+    unsafe_db.symlink_to(outside)
+
+    with pytest.raises(NamespacePathError, match="non-symlink"):
+        namespace_db_path("all-source-safe")
+    with pytest.raises(NamespacePathError, match="non-symlink"):
+        resolve_namespace_identity("all-source-safe")
+    listed = {row["name"]: row for row in list_namespace_rows()}
+    assert "non-symlink" in listed["all-source-safe"]["error"]
+    assert "non-symlink" in listed["all-source-unsafe"]["error"]
+
+    unsafe_db.unlink()
+    backup.rename(unsafe_db)
+
+
+def test_current_registry_rejects_symlinked_namespace_root_everywhere(
+    alias_home, tmp_path
+):
+    owner_db = register_namespace("root-owner")
+    assert namespace_db_path("root-owner") == owner_db
+    root = alias_home / "namespaces"
+    real_root = tmp_path / "real-namespace-root"
+    root.rename(real_root)
+    root.symlink_to(real_root, target_is_directory=True)
+
+    with pytest.raises(NamespacePathError, match="real non-symlink directory"):
+        namespace_db_path("root-owner")
+    with pytest.raises(NamespacePathError, match="real non-symlink directory"):
+        resolve_namespace_identity("root-owner")
+    with pytest.raises(NamespacePathError, match="real non-symlink directory"):
+        Store("root-owner", create=False)
+    rows = list_namespace_rows()
+    assert len(rows) == 1
+    assert "real non-symlink directory" in rows[0]["error"]
+    cli = CliRunner().invoke(app, ["namespaces"])
+    assert cli.exit_code == 0, cli.output
+    assert "real non-symlink directory" in cli.output
+
+    from haunt.mcp_server import MCPAuthority
+
+    authority = MCPAuthority(bound_namespace="root-owner")
+    with pytest.raises(NamespacePathError, match="real non-symlink directory"):
+        authority.select("root-owner")
 
 
 def test_registered_alias_beats_later_alias_shaped_database(alias_home):

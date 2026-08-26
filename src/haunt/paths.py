@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import threading
 from hashlib import sha256
@@ -21,9 +22,13 @@ _RegistryFingerprint = tuple[
     tuple[int, int, int, int, int] | None,
 ]
 _NAMESPACE_ALIAS_CACHE: dict[
-    tuple[str, str], tuple[_RegistryFingerprint, str, Path]
+    tuple[str, str], tuple[_RegistryFingerprint, str, Path, int, int]
 ] = {}
 _NAMESPACE_ALIAS_CACHE_LOCK = threading.Lock()
+
+
+class NamespacePathError(ValueError):
+    """Raised when namespace storage could redirect outside its physical identity."""
 
 
 def haunt_home() -> Path:
@@ -76,6 +81,104 @@ def normalize_namespace_label(name: str) -> str:
     return safe_name(name).casefold()
 
 
+def validate_namespace_root(*, create: bool = False) -> Path:
+    """Return the real namespace root, rejecting symlinks and non-directories."""
+    root = namespaces_dir()
+    if create:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise NamespacePathError(
+                f"cannot create namespace database root {root}: {exc}"
+            ) from exc
+    try:
+        info = root.lstat()
+    except OSError as exc:
+        raise NamespacePathError(
+            f"namespace database root is missing or unreadable: {root}"
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise NamespacePathError(
+            f"namespace database root must be a real non-symlink directory: {root}"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise NamespacePathError(
+            f"cannot resolve namespace database root {root}"
+        ) from exc
+    if create and not _is_user_home(root):
+        root.chmod(DIR_MODE)
+    return resolved
+
+
+def validate_namespace_db_paths(
+    paths: list[str],
+    *,
+    expected: dict[str, tuple[int | None, int | None]] | None = None,
+) -> dict[str, tuple[int, int]]:
+    """Validate and identify every mapped DB under the real namespace root."""
+    root = namespaces_dir()
+    root_resolved = validate_namespace_root()
+    root_lexical = Path(os.path.abspath(os.path.normpath(str(root))))
+    seen: dict[tuple[int, int], str] = {}
+    identities: dict[str, tuple[int, int]] = {}
+    for raw in paths:
+        path = Path(raw)
+        lexical = Path(os.path.abspath(os.path.normpath(str(path))))
+        if not path.is_absolute() or path != lexical or lexical.parent != root_lexical:
+            raise NamespacePathError(
+                f"namespace database path must be a canonical direct child of {root}: {raw}"
+            )
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise NamespacePathError(
+                f"namespace database is missing or unreadable: {raw}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise NamespacePathError(
+                f"namespace database must be a regular non-symlink file: {raw}"
+            )
+        if int(info.st_nlink) != 1:
+            raise NamespacePathError(
+                f"namespace database must have exactly one filesystem link: {raw}"
+            )
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise NamespacePathError(
+                f"cannot resolve namespace database path: {raw}"
+            ) from exc
+        if resolved.parent != root_resolved:
+            raise NamespacePathError(
+                f"namespace database resolves outside {root}: {raw}"
+            )
+        identity = int(info.st_dev), int(info.st_ino)
+        expected_identity = (expected or {}).get(raw)
+        if raw in (expected or {}) and (
+            expected_identity is None
+            or any(value is None for value in expected_identity)
+        ):
+            raise NamespacePathError(
+                f"namespace database has no recorded physical identity: {raw}"
+            )
+        if expected_identity:
+            if identity != (int(expected_identity[0]), int(expected_identity[1])):
+                raise NamespacePathError(
+                    f"namespace database physical identity changed: {raw}"
+                )
+        previous = seen.get(identity)
+        if previous is not None and previous != raw:
+            raise NamespacePathError(
+                "distinct namespace database paths identify the same physical file: "
+                f"{previous!r} and {raw!r}"
+            )
+        seen[identity] = raw
+        identities[raw] = identity
+    return identities
+
+
 def _alias_cache_key(name: str) -> tuple[str, str]:
     return str(registry_path()), normalize_namespace_label(name)
 
@@ -103,6 +206,8 @@ def _remember_registered_alias(
     name: str,
     canonical: str,
     db_path: Path,
+    db_device: int,
+    db_inode: int,
     *,
     fingerprint: _RegistryFingerprint,
 ) -> bool:
@@ -114,6 +219,8 @@ def _remember_registered_alias(
             fingerprint,
             canonical,
             db_path,
+            db_device,
+            db_inode,
         )
     return True
 
@@ -123,12 +230,42 @@ def _forget_registered_alias(name: str) -> None:
         _NAMESPACE_ALIAS_CACHE.pop(_alias_cache_key(name), None)
 
 
+def validate_registry_db_sources(
+    conn: sqlite3.Connection, tables: set[str]
+) -> dict[str, tuple[int, int]]:
+    mapped_paths: list[str] = []
+    expected_paths: dict[str, tuple[int | None, int | None]] = {}
+    if "namespace_identities" in tables:
+        columns = {
+            str(info["name"])
+            for info in conn.execute(
+                "PRAGMA table_info(namespace_identities)"
+            ).fetchall()
+        }
+        identities = conn.execute("SELECT * FROM namespace_identities").fetchall()
+        mapped_paths.extend(str(identity["db_path"]) for identity in identities)
+        if {"db_device", "db_inode"} <= columns:
+            expected_paths.update(
+                {
+                    str(identity["db_path"]): (
+                        identity["db_device"],
+                        identity["db_inode"],
+                    )
+                    for identity in identities
+                }
+            )
+    if "namespaces" in tables:
+        mapped_paths.extend(
+            str(legacy["db_path"])
+            for legacy in conn.execute("SELECT db_path FROM namespaces").fetchall()
+        )
+    return validate_namespace_db_paths(mapped_paths, expected=expected_paths)
+
+
 def _registered_alias(name: str) -> tuple[str, Path] | None:
     """Read an alias mapping without initializing or mutating the registry."""
     with _NAMESPACE_ALIAS_CACHE_LOCK:
         cached = _NAMESPACE_ALIAS_CACHE.get(_alias_cache_key(name))
-    if cached is not None and cached[0] == _registry_fingerprint():
-        return cached[1], cached[2]
     # The fingerprint must bracket the query. Otherwise a retirement and
     # reassignment between SELECT and cache publication can pin stale identity.
     for _attempt in range(3):
@@ -138,7 +275,7 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
             _forget_registered_alias(name)
             return None
         conn: sqlite3.Connection | None = None
-        result: tuple[str, Path] | None = None
+        result: tuple[str, Path, int, int] | None = None
         try:
             # A quiescent registry can be opened immutable without creating
             # WAL/SHM sidecars. If a writer appears, the bracket fingerprint
@@ -154,7 +291,18 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-            if {"namespace_aliases", "namespace_identities"} <= tables:
+            physical = validate_registry_db_sources(conn, tables)
+            if cached is not None and cached[0] == before:
+                cached_path = str(cached[2])
+                cached_physical = physical.get(cached_path)
+                if cached_physical == (cached[3], cached[4]):
+                    result = (
+                        cached[1],
+                        cached[2],
+                        cached[3],
+                        cached[4],
+                    )
+            if result is None and {"namespace_aliases", "namespace_identities"} <= tables:
                 row = conn.execute(
                     """
                     SELECT i.canonical_label, i.db_path
@@ -165,14 +313,26 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
                     (normalize_namespace_label(name),),
                 ).fetchone()
                 if row:
-                    result = str(row["canonical_label"]), Path(str(row["db_path"]))
-            else:
+                    db_path = str(row["db_path"])
+                    result = (
+                        str(row["canonical_label"]),
+                        Path(db_path),
+                        physical[db_path][0],
+                        physical[db_path][1],
+                    )
+            elif result is None:
                 row = conn.execute(
                     "SELECT name, db_path FROM namespaces WHERE name=?",
                     (safe_name(name),),
                 ).fetchone()
                 if row:
-                    result = str(row["name"]), Path(str(row["db_path"]))
+                    db_path = str(row["db_path"])
+                    result = (
+                        str(row["name"]),
+                        Path(db_path),
+                        physical[db_path][0],
+                        physical[db_path][1],
+                    )
         except sqlite3.Error:
             _forget_registered_alias(name)
             return None
@@ -185,7 +345,7 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
             _forget_registered_alias(name)
             return None
         if _remember_registered_alias(name, *result, fingerprint=before):
-            return result
+            return result[0], result[1]
     # Repeated concurrent migrations: fail closed instead of caching or
     # returning a value from a registry snapshot already known to be stale.
     _forget_registered_alias(name)
@@ -261,6 +421,7 @@ def _registered_namespace_for_repo(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
+        validate_registry_db_sources(conn, tables)
         if {"repository_bindings", "namespace_identities"} <= tables:
             if remote_identity:
                 row = conn.execute(
@@ -430,6 +591,8 @@ def repair_private_modes(root: Path | None = None) -> list[str]:
 
 def ensure_layout() -> Path:
     home = haunt_home()
-    for p in (home, namespaces_dir(), bin_dir(), models_dir()):
+    mkdir_private(home)
+    validate_namespace_root(create=True)
+    for p in (bin_dir(), models_dir()):
         mkdir_private(p)
     return home

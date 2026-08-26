@@ -5,8 +5,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 import struct
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import get_ident
@@ -23,6 +27,7 @@ from haunt.paths import (
     ensure_layout,
     haunt_home,
     mkdir_private,
+    NamespacePathError,
     namespaces_dir,
     normalize_namespace_label,
     registry_path,
@@ -30,6 +35,9 @@ from haunt.paths import (
     resolve_namespace,
     safe_name,
     tighten_db_files,
+    validate_namespace_db_paths,
+    validate_namespace_root,
+    validate_registry_db_sources,
 )
 from haunt.provenance import (
     encode_json_safe_sqlite_key,
@@ -64,8 +72,9 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 8: validated, versioned source provenance on events.
 SCHEMA_VERSION = 8
 SCHEMA_VERSION_KEY = "schema_version"
-REGISTRY_SCHEMA_VERSION = 3
+REGISTRY_SCHEMA_VERSION = 4
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
+_NAMESPACE_DB_HANDLE_LOCK = threading.RLock()
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sessions", ("started_at", "ended_at")),
@@ -105,43 +114,15 @@ class AliasRetirementError(ValueError):
     """Raised when a live registry-owned reference blocks alias retirement."""
 
 
-def _physical_db_key(path_value: str | Path) -> tuple[str, int | str, int | None]:
-    """Identify an existing file by inode, otherwise by canonical path."""
-    path = Path(path_value).expanduser()
-    try:
-        resolved = str(path.resolve(strict=False))
-    except (OSError, RuntimeError):
-        resolved = str(path.absolute())
-    try:
-        stat = path.stat()
-    except OSError:
-        return "path", resolved, None
-    return "inode", int(stat.st_dev), int(stat.st_ino)
-
-
-def _assert_unambiguous_physical_db_paths(paths: list[str]) -> None:
-    """Refuse distinct registry paths that identify one physical database."""
-    seen: dict[tuple[str, int | str, int | None], str] = {}
-    for raw in paths:
-        key = _physical_db_key(raw)
-        previous = seen.get(key)
-        if previous is not None and previous != raw:
-            raise NamespaceCollisionError(
-                "ambiguous physical namespace database paths: "
-                f"{previous!r} and {raw!r} identify the same file"
-            )
-        seen[key] = raw
-
-
 def _validate_unmapped_namespace_target(
     target: Path, *, mapped_db_path: Path | None = None
 ) -> None:
     """Refuse a new label path that exists, escapes the DB root, or aliases a file."""
     root = namespaces_dir()
     try:
-        root_resolved = root.resolve(strict=False)
+        root_resolved = validate_namespace_root()
         target_resolved = target.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
+    except (NamespacePathError, OSError, RuntimeError) as exc:
         raise NamespaceCollisionError(
             f"cannot establish a safe database path for {target}"
         ) from exc
@@ -164,17 +145,28 @@ def _validate_unmapped_namespace_target(
     )
 
 
-def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
+def _raw_connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     if not create and not path.exists():
         raise FileNotFoundError(path)
-    mkdir_private(path.parent)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    if create:
+        mkdir_private(path.parent)
+    # Serialize opens with namespace descriptor verification. SQLite's unix
+    # VFS can retain/reuse descriptors while sibling connections hold locks.
+    with _NAMESPACE_DB_HANDLE_LOCK:
+        conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _configure_connection(
+    conn: sqlite3.Connection, path: Path, *, tighten: bool = True
+) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
-    tighten_db_files(path)
+    if tighten:
+        tighten_db_files(path)
     from haunt.embed import fts_only
 
     if not fts_only():
@@ -191,6 +183,152 @@ def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     return conn
 
 
+def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
+    conn = _raw_connect(path, create=create)
+    try:
+        return _configure_connection(conn, path)
+    except Exception:
+        conn.close()
+        raise
+
+
+def _fd_snapshot() -> dict[int, tuple[int, int]]:
+    """Return open descriptor identities for safe SQLite-open verification."""
+    for directory in (Path("/proc/self/fd"), Path("/dev/fd")):
+        try:
+            names = list(directory.iterdir())
+        except OSError:
+            continue
+        out: dict[int, tuple[int, int]] = {}
+        for entry in names:
+            try:
+                fd = int(entry.name)
+                info = os.fstat(fd)
+            except (OSError, ValueError):
+                continue
+            out[fd] = int(info.st_dev), int(info.st_ino)
+        return out
+    raise NamespacePathError(
+        "this platform cannot verify the physical file opened by SQLite"
+    )
+
+
+def _verify_new_sqlite_fd(
+    before: dict[int, tuple[int, int]],
+    expected: tuple[int, int],
+    *,
+    allow_verified_vfs_reuse: bool = False,
+) -> None:
+    after = _fd_snapshot()
+    opened = {
+        identity
+        for fd, identity in after.items()
+        if fd not in before or before[fd] != identity
+    }
+    if expected in opened:
+        return
+    other_namespace_databases: set[tuple[int, int]] = set()
+    if allow_verified_vfs_reuse:
+        root = validate_namespace_root()
+        for candidate in root.iterdir():
+            if not candidate.name.endswith(".db"):
+                continue
+            try:
+                info = candidate.lstat()
+            except OSError:
+                continue
+            identity = (int(info.st_dev), int(info.st_ino))
+            if stat.S_ISREG(info.st_mode) and identity != expected:
+                other_namespace_databases.add(identity)
+    if (
+        allow_verified_vfs_reuse
+        and expected in before.values()
+        and not (opened & other_namespace_databases)
+    ):
+        # SQLite's POSIX VFS deliberately retains an inode descriptor when a
+        # connection closes while sibling connections still hold locks, then
+        # reuses it for the next connection. In that case no descriptor delta
+        # exists, but the retained descriptor was already verified as the
+        # expected physical file. Unrelated registry/WAL descriptor churn is
+        # ignored, but the appearance of a different namespace DB descriptor
+        # fails closed. The caller still brackets this with path and
+        # stored-inode validation before any PRAGMA or application query.
+        return
+    raise NamespacePathError(
+        "SQLite did not open the claimed namespace database identity"
+    )
+
+
+def _mapped_namespace_open_hook(_path: Path) -> None:
+    """Test hook immediately before an existing mapped DB is opened."""
+
+
+def _fresh_namespace_claim_hook(_path: Path) -> None:
+    """Test hook after atomic target claim and before registry publication."""
+
+
+def _validate_all_registered_namespace_dbs_read_only() -> None:
+    """Validate every legacy/current mapping without initializing the registry."""
+    registry = registry_path()
+    if not registry.is_file():
+        raise NamespacePathError(f"namespace registry is missing: {registry}")
+    conn = sqlite3.connect(f"{registry.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        validate_registry_db_sources(conn, tables)
+    finally:
+        conn.close()
+
+
+def _open_mapped_namespace_db(
+    path: Path, *, expected: tuple[int | None, int | None]
+) -> sqlite3.Connection:
+    _validate_all_registered_namespace_dbs_read_only()
+    expected_map = {str(path): expected}
+    actual = validate_namespace_db_paths([str(path)], expected=expected_map)[str(path)]
+    _mapped_namespace_open_hook(path)
+    with _NAMESPACE_DB_HANDLE_LOCK:
+        before = _fd_snapshot()
+        conn = _raw_connect(path, create=False)
+        try:
+            _verify_new_sqlite_fd(
+                before, actual, allow_verified_vfs_reuse=True
+            )
+            validate_namespace_db_paths(
+                [str(path)], expected={str(path): actual}
+            )
+            _validate_all_registered_namespace_dbs_read_only()
+            return _configure_connection(conn, path, tighten=False)
+        except Exception:
+            conn.close()
+            raise
+
+
+def _preflight_registry_storage_read_only() -> None:
+    """Reject unsafe existing mappings before migration opens the registry RW."""
+    registry = registry_path()
+    if not registry.exists():
+        return
+    conn = sqlite3.connect(f"{registry.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        validate_registry_db_sources(conn, tables)
+    finally:
+        conn.close()
+
+
 def _vec_loaded(conn: sqlite3.Connection) -> bool:
     try:
         conn.execute("SELECT vec_version()")
@@ -201,8 +339,57 @@ def _vec_loaded(conn: sqlite3.Connection) -> bool:
 
 def init_registry() -> None:
     ensure_layout()
+    _preflight_registry_storage_read_only()
     conn = _connect(registry_path())
     try:
+        existing_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        preflight_paths: list[str] = []
+        preflight_expected: dict[str, tuple[int | None, int | None]] = {}
+        preflight_version = None
+        if "registry_meta" in existing_tables:
+            preflight_version_row = conn.execute(
+                "SELECT value FROM registry_meta WHERE key=?",
+                (REGISTRY_SCHEMA_VERSION_KEY,),
+            ).fetchone()
+            preflight_version = (
+                str(preflight_version_row["value"])
+                if preflight_version_row
+                else None
+            )
+        if "namespace_identities" in existing_tables:
+            columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(namespace_identities)"
+                ).fetchall()
+            }
+            identities = conn.execute(
+                "SELECT * FROM namespace_identities"
+            ).fetchall()
+            preflight_paths.extend(str(row["db_path"]) for row in identities)
+            if (
+                {"db_device", "db_inode"} <= columns
+                and preflight_version == str(REGISTRY_SCHEMA_VERSION)
+            ):
+                preflight_expected.update(
+                    {
+                        str(row["db_path"]): (row["db_device"], row["db_inode"])
+                        for row in identities
+                    }
+                )
+        if "namespaces" in existing_tables:
+            preflight_paths.extend(
+                str(row["db_path"])
+                for row in conn.execute("SELECT db_path FROM namespaces").fetchall()
+            )
+        validate_namespace_db_paths(
+            preflight_paths, expected=preflight_expected
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS namespaces (
@@ -225,6 +412,8 @@ def init_registry() -> None:
                 canonical_label TEXT NOT NULL,
                 canonical_label_norm TEXT NOT NULL UNIQUE,
                 db_path TEXT NOT NULL UNIQUE,
+                db_device INTEGER NOT NULL,
+                db_inode INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -279,15 +468,32 @@ def init_registry() -> None:
         legacy_rows = conn.execute(
             "SELECT name,repo_path,db_path,created_at,updated_at FROM namespaces"
         ).fetchall()
-        identity_paths = [
-            str(row["db_path"])
-            for row in conn.execute(
-                "SELECT db_path FROM namespace_identities"
-            ).fetchall()
-        ]
-        _assert_unambiguous_physical_db_paths(
+        identity_rows = conn.execute(
+            "SELECT * FROM namespace_identities"
+        ).fetchall()
+        identity_paths = [str(row["db_path"]) for row in identity_rows]
+        physical_identities = validate_namespace_db_paths(
             [*identity_paths, *(str(row["db_path"]) for row in legacy_rows)]
         )
+        identity_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(namespace_identities)"
+            ).fetchall()
+        }
+        has_physical_columns = {"db_device", "db_inode"} <= identity_columns
+        if (
+            has_physical_columns
+            and version_row
+            and str(version_row["value"]) == str(REGISTRY_SCHEMA_VERSION)
+        ):
+            validate_namespace_db_paths(
+                identity_paths,
+                expected={
+                    str(row["db_path"]): (row["db_device"], row["db_inode"])
+                    for row in identity_rows
+                },
+            )
         fully_projected = all(
             conn.execute(
                 """SELECT 1
@@ -302,6 +508,7 @@ def init_registry() -> None:
         if (
             version_row
             and str(version_row["value"]) == str(REGISTRY_SCHEMA_VERSION)
+            and has_physical_columns
             and fully_projected
         ):
             return
@@ -309,6 +516,14 @@ def init_registry() -> None:
         # The legacy table and its database paths remain the compatibility view.
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if "db_device" not in identity_columns:
+                conn.execute(
+                    "ALTER TABLE namespace_identities ADD COLUMN db_device INTEGER"
+                )
+            if "db_inode" not in identity_columns:
+                conn.execute(
+                    "ALTER TABLE namespace_identities ADD COLUMN db_inode INTEGER"
+                )
             by_db: dict[str, list[sqlite3.Row]] = {}
             for row in legacy_rows:
                 by_db.setdefault(str(row["db_path"]), []).append(row)
@@ -340,13 +555,15 @@ def init_registry() -> None:
                     conn.execute(
                         """INSERT INTO namespace_identities(
                                namespace_id,canonical_label,canonical_label_norm,db_path,
-                               created_at,updated_at
-                           ) VALUES (?,?,?,?,?,?)""",
+                               db_device,db_inode,created_at,updated_at
+                           ) VALUES (?,?,?,?,?,?,?,?)""",
                         (
                             namespace_id,
                             canonical_label,
                             canonical_norm,
                             db_path,
+                            physical_identities[db_path][0],
+                            physical_identities[db_path][1],
                             str(canonical_row["created_at"]),
                             str(canonical_row["updated_at"]),
                         ),
@@ -389,6 +606,18 @@ def init_registry() -> None:
                             repo_path=local_path,
                             now=str(row["updated_at"]),
                         )
+            for identity in conn.execute(
+                "SELECT namespace_id,db_path FROM namespace_identities"
+            ).fetchall():
+                db_path = str(identity["db_path"])
+                physical = physical_identities.get(db_path)
+                if physical is None:
+                    physical = validate_namespace_db_paths([db_path])[db_path]
+                conn.execute(
+                    """UPDATE namespace_identities
+                       SET db_device=?,db_inode=? WHERE namespace_id=?""",
+                    (physical[0], physical[1], identity["namespace_id"]),
+                )
             conn.execute(
                 "INSERT OR REPLACE INTO registry_meta(key,value) VALUES (?,?)",
                 (REGISTRY_SCHEMA_VERSION_KEY, str(REGISTRY_SCHEMA_VERSION)),
@@ -776,6 +1005,131 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@dataclass
+class _FreshNamespaceClaim:
+    target: Path
+    temporary: Path
+    claim_fd: int
+    identity: tuple[int, int]
+    conn: sqlite3.Connection
+
+    def verify_for_publication(self) -> None:
+        """Confirm the live claim and final name still identify one safe file."""
+        info = os.fstat(self.claim_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or int(info.st_nlink) != 1
+            or (int(info.st_dev), int(info.st_ino)) != self.identity
+        ):
+            raise NamespacePathError(
+                "fresh namespace database claim changed before publication"
+            )
+        validate_namespace_db_paths(
+            [str(self.target)], expected={str(self.target): self.identity}
+        )
+
+    def close(self, *, remove_target: bool) -> None:
+        with _NAMESPACE_DB_HANDLE_LOCK:
+            self.conn.close()
+        try:
+            os.close(self.claim_fd)
+        except OSError:
+            pass
+        for extra in (
+            self.temporary,
+            Path(str(self.temporary) + "-wal"),
+            Path(str(self.temporary) + "-shm"),
+        ):
+            try:
+                extra.unlink()
+            except FileNotFoundError:
+                pass
+        if remove_target:
+            try:
+                current = self.target.lstat()
+            except OSError:
+                return
+            if (
+                stat.S_ISREG(current.st_mode)
+                and (int(current.st_dev), int(current.st_ino)) == self.identity
+            ):
+                self.target.unlink()
+
+
+def _claim_fresh_namespace_db(target: Path) -> _FreshNamespaceClaim:
+    """Initialize a fresh DB privately, then atomically claim its final path."""
+    _validate_unmapped_namespace_target(target)
+    root = validate_namespace_root()
+    claim_fd, raw_temporary = tempfile.mkstemp(
+        prefix=".haunt-claim-", suffix=".db", dir=str(root)
+    )
+    temporary = Path(raw_temporary)
+    info = os.fstat(claim_fd)
+    identity = int(info.st_dev), int(info.st_ino)
+    if not stat.S_ISREG(info.st_mode) or int(info.st_nlink) != 1:
+        os.close(claim_fd)
+        temporary.unlink(missing_ok=True)
+        raise NamespacePathError("failed to claim a unique regular namespace database")
+    before = _fd_snapshot()
+    conn: sqlite3.Connection | None = None
+    linked = False
+    try:
+        conn = _raw_connect(temporary, create=False)
+        _verify_new_sqlite_fd(before, identity)
+        validate_namespace_db_paths(
+            [str(temporary)], expected={str(temporary): identity}
+        )
+        _configure_connection(conn, temporary)
+        _init_namespace_schema(conn)
+        try:
+            os.link(temporary, target, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise NamespaceCollisionError(
+                f"target label has an unmapped filesystem entry at {target}"
+            ) from exc
+        linked = True
+        temporary.unlink()
+        _fresh_namespace_claim_hook(target)
+        validate_namespace_db_paths(
+            [str(target)], expected={str(target): identity}
+        )
+        _verify_new_sqlite_fd(before, identity)
+        return _FreshNamespaceClaim(
+            target=target,
+            temporary=temporary,
+            claim_fd=claim_fd,
+            identity=identity,
+            conn=conn,
+        )
+    except Exception:
+        if conn is not None:
+            conn.close()
+        try:
+            os.close(claim_fd)
+        except OSError:
+            pass
+        for extra in (
+            temporary,
+            Path(str(temporary) + "-wal"),
+            Path(str(temporary) + "-shm"),
+        ):
+            try:
+                extra.unlink()
+            except FileNotFoundError:
+                pass
+        if linked:
+            try:
+                current = target.lstat()
+            except OSError:
+                current = None
+            if current is not None and (
+                stat.S_ISREG(current.st_mode)
+                and (int(current.st_dev), int(current.st_ino)) == identity
+            ):
+                target.unlink()
+        raise
+
+
 def ensure_vec_table(
     conn: sqlite3.Connection, dim: int, *, commit: bool = True
 ) -> bool:
@@ -933,6 +1287,8 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
     now = now_iso()
     repo_identity, repo = _repository_context(repo_path)
     conn = _registry()
+    claim: _FreshNamespaceClaim | None = None
+    row: sqlite3.Row | None = None
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = _identity_row(conn, label)
@@ -980,15 +1336,24 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
                 raise NamespaceCollisionError(
                     f"database path {db} is already mapped to {path_owner['canonical_label']!r}"
                 )
-            _validate_unmapped_namespace_target(db)
+            claim = _claim_fresh_namespace_db(db)
             namespace_id = new_id()
             canonical = label
             conn.execute(
                 """INSERT INTO namespace_identities(
                        namespace_id,canonical_label,canonical_label_norm,db_path,
-                       created_at,updated_at
-                   ) VALUES (?,?,?,?,?,?)""",
-                (namespace_id, label, norm, str(db), now, now),
+                       db_device,db_inode,created_at,updated_at
+                   ) VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    namespace_id,
+                    label,
+                    norm,
+                    str(db),
+                    claim.identity[0],
+                    claim.identity[1],
+                    now,
+                    now,
+                ),
             )
             conn.execute(
                 """INSERT INTO namespace_aliases(
@@ -1014,15 +1379,28 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
                 "UPDATE namespaces SET repo_path=COALESCE(?,repo_path),updated_at=? WHERE db_path=?",
                 (repo, now, str(db)),
             )
+        if claim is not None:
+            # Registry publication is the commit below, so revalidate the
+            # still-open atomic claim immediately before making it visible.
+            claim.verify_for_publication()
         conn.commit()
     except Exception:
         conn.rollback()
+        if claim is not None:
+            claim.close(remove_target=True)
         raise
     finally:
         conn.close()
-    ns = _connect(db)
+    ns = (
+        claim.conn
+        if claim is not None
+        else _open_mapped_namespace_db(
+            db, expected=(row["db_device"], row["db_inode"])
+        )
+    )
     try:
-        _ensure_namespace_schema(ns)
+        if claim is None:
+            _ensure_namespace_schema(ns)
         if repo:
             ns.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('repo_path', ?)",
@@ -1030,7 +1408,11 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
             )
             ns.commit()
     finally:
-        ns.close()
+        if claim is not None:
+            claim.close(remove_target=False)
+        else:
+            with _NAMESPACE_DB_HANDLE_LOCK:
+                ns.close()
     resolve_namespace_identity(label)
     return db
 
@@ -1062,34 +1444,108 @@ def touch_namespace(name: str) -> None:
 
 
 def list_namespace_rows() -> list[dict[str, Any]]:
-    init_registry()
-    conn = _registry()
+    registry_error: str | None = None
+    registry_exception: NamespacePathError | None = None
     try:
-        rows = conn.execute(
-            """SELECT i.namespace_id,i.canonical_label AS name,
-                      i.db_path,i.created_at,i.updated_at
-               FROM namespace_identities i
-               ORDER BY i.canonical_label_norm"""
-        ).fetchall()
-        legacy_rows = conn.execute(
-            """SELECT name,repo_path,db_path,created_at
-               FROM namespaces
-               ORDER BY db_path,created_at,name"""
-        ).fetchall()
+        init_registry()
+    except NamespacePathError as exc:
+        registry_error = str(exc)
+        registry_exception = exc
+    try:
+        conn = _readonly_registry() if registry_error else _connect(registry_path())
+    except FileNotFoundError:
+        if registry_exception is not None:
+            raise registry_exception
+        return []
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        rows = (
+            conn.execute(
+                """SELECT i.*
+                   FROM namespace_identities i
+                   ORDER BY i.canonical_label_norm"""
+            ).fetchall()
+            if "namespace_identities" in tables
+            else []
+        )
+        legacy_rows = (
+            conn.execute(
+                """SELECT name,repo_path,db_path,created_at,updated_at
+                   FROM namespaces
+                   ORDER BY db_path,created_at,name"""
+            ).fetchall()
+            if "namespaces" in tables
+            else []
+        )
         legacy_by_path: dict[str, list[sqlite3.Row]] = {}
         for legacy in legacy_rows:
             legacy_by_path.setdefault(str(legacy["db_path"]), []).append(legacy)
+        if registry_error is None:
+            try:
+                validate_namespace_db_paths(
+                    [
+                        *(str(row["db_path"]) for row in rows),
+                        *(str(row["db_path"]) for row in legacy_rows),
+                    ],
+                    expected={
+                        str(row["db_path"]): (
+                            row["db_device"] if "db_device" in row.keys() else None,
+                            row["db_inode"] if "db_inode" in row.keys() else None,
+                        )
+                        for row in rows
+                    },
+                )
+            except NamespacePathError as exc:
+                registry_error = str(exc)
+        if not rows:
+            out: list[dict[str, Any]] = []
+            for db_path in sorted(legacy_by_path):
+                group = sorted(
+                    legacy_by_path[db_path],
+                    key=lambda candidate: (
+                        str(candidate["created_at"]),
+                        normalize_namespace_label(str(candidate["name"])),
+                        str(candidate["name"]),
+                    ),
+                )
+                canonical = group[0]
+                out.append(
+                    {
+                        "namespace_id": None,
+                        "canonical_label": str(canonical["name"]),
+                        "canonical_label_norm": normalize_namespace_label(
+                            str(canonical["name"])
+                        ),
+                        "db_path": db_path,
+                        "created_at": str(canonical["created_at"]),
+                        "updated_at": str(canonical["updated_at"]),
+                        "name": str(canonical["name"]),
+                        "repo_path": canonical["repo_path"],
+                        "aliases": [str(candidate["name"]) for candidate in group],
+                        **({"error": registry_error} if registry_error else {}),
+                    }
+                )
+            return out
         out: list[dict[str, Any]] = []
         for row in rows:
-            aliases = conn.execute(
-                "SELECT label FROM namespace_aliases WHERE namespace_id=? ORDER BY normalized_label",
-                (row["namespace_id"],),
-            ).fetchall()
+            aliases = (
+                conn.execute(
+                    "SELECT label FROM namespace_aliases WHERE namespace_id=? ORDER BY normalized_label",
+                    (row["namespace_id"],),
+                ).fetchall()
+                if "namespace_aliases" in tables
+                else []
+            )
             legacy = legacy_by_path.get(str(row["db_path"]), [])
             ordered_legacy = sorted(
                 legacy,
                 key=lambda candidate: (
-                    str(candidate["name"]) != str(row["name"]),
+                    str(candidate["name"]) != str(row["canonical_label"]),
                     str(candidate["created_at"]),
                     str(candidate["name"]),
                 ),
@@ -1098,8 +1554,10 @@ def list_namespace_rows() -> list[dict[str, Any]]:
             out.append(
                 {
                     **dict(row),
+                    "name": str(row["canonical_label"]),
                     "repo_path": repo_path,
                     "aliases": [str(a["label"]) for a in aliases],
+                    **({"error": registry_error} if registry_error else {}),
                 }
             )
         return out
@@ -1170,20 +1628,35 @@ def _plan_namespace_label_read_only(
             ).fetchall()
         }
         physical_paths: list[str] = []
+        expected_paths: dict[str, tuple[int | None, int | None]] = {}
+        has_physical_columns = False
         if "namespace_identities" in tables:
-            physical_paths.extend(
-                str(row["db_path"])
+            columns = {
+                str(row["name"])
                 for row in conn.execute(
-                    "SELECT db_path FROM namespace_identities"
+                    "PRAGMA table_info(namespace_identities)"
                 ).fetchall()
-            )
+            }
+            has_physical_columns = {"db_device", "db_inode"} <= columns
+            identity_rows = conn.execute(
+                "SELECT * FROM namespace_identities"
+            ).fetchall()
+            physical_paths.extend(str(row["db_path"]) for row in identity_rows)
+            if has_physical_columns:
+                expected_paths.update(
+                    {
+                        str(row["db_path"]): (row["db_device"], row["db_inode"])
+                        for row in identity_rows
+                    }
+                )
         if "namespaces" in tables:
             physical_paths.extend(
                 str(row["db_path"])
                 for row in conn.execute("SELECT db_path FROM namespaces").fetchall()
             )
-        _assert_unambiguous_physical_db_paths(physical_paths)
+        validate_namespace_db_paths(physical_paths, expected=expected_paths)
         current_schema = {"namespace_aliases", "namespace_identities"} <= tables
+        requires_registry_upgrade = not current_schema or not has_physical_columns
         source = _identity_row(conn, old_display) if current_schema else None
         if source is not None:
             namespace_id: str | None = str(source["namespace_id"])
@@ -1238,6 +1711,7 @@ def _plan_namespace_label_read_only(
             # A registry can contain the new tables before legacy projection
             # has completed. Planning still reads the authoritative legacy row.
             current_schema = False
+            requires_registry_upgrade = True
             canonical, group, legacy_rows = _legacy_namespace_change_source(
                 conn, old_display, old_norm
             )
@@ -1303,7 +1777,7 @@ def _plan_namespace_label_read_only(
             "action": action,
             "mode": "dry-run",
             "namespace_id": namespace_id,
-            "requires_registry_upgrade": not current_schema,
+            "requires_registry_upgrade": requires_registry_upgrade,
             "canonical_before": canonical_label,
             "canonical_after": new_display if action == "rename" else canonical_label,
             "old_label": old_display,
@@ -1740,7 +2214,10 @@ class Store:
         self.name = str(identity["canonical_label"])
         self.db_path = Path(str(identity["db_path"]))
         self._privacy_purge_thread_id: int | None = None
-        self.conn = _connect(self.db_path, create=create)
+        self.conn = _open_mapped_namespace_db(
+            self.db_path,
+            expected=(identity.get("db_device"), identity.get("db_inode")),
+        )
         self.conn.create_function(
             "haunt_privacy_purge_authorized",
             0,
@@ -1753,7 +2230,8 @@ class Store:
         self._ensure_graph_evidence()
 
     def close(self) -> None:
-        self.conn.close()
+        with _NAMESPACE_DB_HANDLE_LOCK:
+            self.conn.close()
 
     def __enter__(self) -> "Store":
         return self
@@ -3655,17 +4133,23 @@ def list_namespaces(*, only: str | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     rows = list_namespace_rows()
     if only is not None:
-        identity = resolve_namespace_identity(only)
-        rows = (
-            [row for row in rows if row["namespace_id"] == identity["namespace_id"]]
-            if identity
-            else []
-        )
+        requested_norm = normalize_namespace_label(only)
+        rows = [
+            row
+            for row in rows
+            if any(
+                normalize_namespace_label(str(alias)) == requested_norm
+                for alias in row.get("aliases", [row["name"]])
+            )
+        ]
     for row in rows:
         db = Path(row["db_path"])
-        extra: dict[str, Any] = {
-            "db_size_bytes": db.stat().st_size if db.exists() else 0,
-        }
+        extra: dict[str, Any] = {"db_size_bytes": 0}
+        if row.get("error"):
+            extra["error"] = str(row["error"])
+            out.append({**row, **extra})
+            continue
+        extra["db_size_bytes"] = db.stat().st_size if db.exists() else 0
         try:
             with Store(row["name"], create=False) as st:
                 stats = st.stats()
@@ -3678,7 +4162,7 @@ def list_namespaces(*, only: str | None = None) -> list[dict[str, Any]]:
                         "db_size_bytes": stats["db_size_bytes"],
                     }
                 )
-        except (sqlite3.Error, OSError) as exc:
+        except (sqlite3.Error, OSError, NamespacePathError) as exc:
             extra["error"] = str(exc)
         out.append({**row, **extra})
     return json_safe_sqlite(out)
