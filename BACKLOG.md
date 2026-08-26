@@ -28,7 +28,7 @@ not completion.
 |---|---|---|
 | Evaluation | The optional LongMemEval temporal probe remains external-data-only (`scripts/score_lme_temporal.py:74-154`). E0 now provides a deterministic FTS-only `K=3` regression gate with logical-ID normalization, corpus/config hashes, exact ordered results, Porter morphology, serialized tool-I/O trust metadata, and non-vacuous positive/negative assertions (`src/haunt/frozen_retrieval_eval.py`; `tests/test_frozen_retrieval_eval.py`). | E0 is complete. Pinned hybrid evaluation and calibration remain E6 work. |
 | Correction | `Store.contradict()` updates `memories.valid_to` and may add an unlinked replacement (`src/haunt/store.py:1502-1565`); current recall hides closed rows (`src/haunt/recall.py:93-123`). | An append-only correction record and traversable old-to-new lineage. |
-| Provenance | Events carry session, time, role, tool fields, an `origin` string, and free-form `meta` (`src/haunt/store.py:131-164`, `src/haunt/store.py:569-659`). | A validated, structured source/import envelope and a trace surface. |
+| Provenance | Schema v8 stores a validated v1 source/import envelope on each new event while preserving legacy `origin`/`meta` bytes; detail, browse, timeline, correction trace, CLI, MCP, and dashboard expose the same structured attribution (`src/haunt/provenance.py`; `src/haunt/store.py`; `tests/test_structured_provenance.py`). | E2 is complete. Canonical bundle transport remains E4 work. |
 | Namespace identity | Repository remotes derive collision-resistant names and legacy registrations are reused (`src/haunt/paths.py:56-117`, `src/haunt/paths.py:148-178`). | Explicit aliases, rename/move migration, collision handling, and retirement rules. |
 | Portability | Namespace schema migration is versioned (`src/haunt/store.py:278-321`), but no canonical export/import exists. | A versioned, deterministic, embedding-free round trip. |
 | Retrieval | Recall fuses vector and FTS ranks with RRF and retains component ranks internally (`src/haunt/recall.py:31-78`, `src/haunt/recall.py:243-288`). | A stable explanation contract and a calibrated ability to return no answer. |
@@ -212,7 +212,7 @@ that lineage.
 
 ## E2 — Structure source and import provenance
 
-**Status:** Blocked
+**Status:** Done
 
 **Depends on:** E1
 
@@ -249,6 +249,25 @@ that source metadata measures truth.
   provenance object.
 - A trace test starts at a corrected imported memory and reaches both its
   correction lineage and source envelope.
+
+**Completion evidence**
+
+- `src/haunt/provenance.py` defines the bounded schema-v1 native/import
+  envelope, canonical UTC/hash rules, four fidelity values, actual producer
+  matching, honest legacy/invalid labels, and no truth-confidence field.
+- Schema v8 adds event provenance without rewriting old `origin` or `meta`;
+  `Store.observe()` validates and canonicalizes it before any session, event,
+  derived job, graph, or index write. Idempotency includes exact canonical
+  attribution, including concurrent retry behavior.
+- `tests/test_structured_provenance.py` covers every fidelity, Unicode source
+  and call IDs, unknown fields, parser/version/hash rejection with zero rows,
+  byte-preserving migration/restart, corrected-import trace, cross-surface
+  parity, corrupt stored envelopes, recursive no-confidence assertions, and
+  privacy purge canaries across all tables and serialized surfaces.
+- The dependency-correct Python 3.14/MCP 2.1 full suite passed with 497 tests,
+  5 environment/data skips, and 7 declared temporal xfails. The focused E2,
+  E1, hook, host, migration, purge, and frozen-eval group also passed under
+  Python 3.12/MCP 2.1.
 
 **Non-goals**
 

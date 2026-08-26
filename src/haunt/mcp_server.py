@@ -147,7 +147,7 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
-@server.tool(description="Store a verbatim agent turn or tool call. No summarization.")
+@server.tool(description="Store a verbatim agent turn or tool call. No summarization. provenance is a versioned source-attribution envelope; import fidelity is not confidence, and unknown source fields stay absent or null.")
 def memory_observe(
     text: str = "",
     namespace: Optional[str] = None,
@@ -157,27 +157,34 @@ def memory_observe(
     tool_name: Optional[str] = None,
     tool_input: Optional[str] = None,
     tool_output: Optional[str] = None,
+    producer_call_id: Optional[str] = None,
     event_time: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     origin: str = "mcp",
+    provenance: Optional[dict[str, Any]] = None,
 ) -> str:
     try:
         ns = _mcp_namespace(namespace)
     except MCPAuthorityError as exc:
         return _authority_error(exc)
-    with Store(ns) as st:
-        r = st.observe(
-            text,
-            role=role,
-            tier=tier,
-            session_id=session,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            tool_output=tool_output,
-            event_time=event_time,
-            idempotency_key=idempotency_key,
-            origin=origin,
-        )
+    try:
+        with Store(ns) as st:
+            r = st.observe(
+                text,
+                role=role,
+                tier=tier,
+                session_id=session,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_output=tool_output,
+                producer_call_id=producer_call_id,
+                event_time=event_time,
+                idempotency_key=idempotency_key,
+                origin=origin,
+                provenance=provenance,
+            )
+    except ValueError as exc:
+        return _json({"ok": False, "error": str(exc), "namespace": ns})
     return _json(
         {
             "ok": True,
@@ -190,6 +197,7 @@ def memory_observe(
             "embedding_queued": r.embedding_queued,
             "entities": r.entities,
             "deduplicated": r.deduplicated,
+            "provenance": r.provenance,
         }
     )
 

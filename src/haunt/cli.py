@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -79,29 +80,47 @@ def observe_cmd(
     tool_name: Optional[str] = typer.Option(None, "--tool-name"),
     tool_input: Optional[str] = typer.Option(None, "--tool-input"),
     tool_output: Optional[str] = typer.Option(None, "--tool-output"),
+    producer_call_id: Optional[str] = typer.Option(None, "--producer-call-id"),
     event_time: Optional[str] = typer.Option(None, "--event-time"),
     origin: str = typer.Option("cli", "--origin"),
+    provenance_json: Optional[str] = typer.Option(
+        None,
+        "--provenance-json",
+        help="Versioned source provenance envelope as JSON",
+    ),
 ) -> None:
     """Store a chat turn or tool call as-is. No summarization."""
     ns = _ns(namespace)
-    with Store(ns) as st:
-        result = st.observe(
-            text,
-            role=role,
-            tier=tier,
-            session_id=session,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            tool_output=tool_output,
-            event_time=event_time,
-            origin=origin,
+    try:
+        provenance = (
+            json.loads(provenance_json) if provenance_json is not None else None
         )
+        if provenance is not None and not isinstance(provenance, dict):
+            raise ValueError("provenance must be a JSON object")
+        with Store(ns) as st:
+            result = st.observe(
+                text,
+                role=role,
+                tier=tier,
+                session_id=session,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_output=tool_output,
+                producer_call_id=producer_call_id,
+                event_time=event_time,
+                origin=origin,
+                provenance=provenance,
+            )
+    except (json.JSONDecodeError, ValueError) as exc:
+        typer.echo(f"error: invalid provenance: {exc}", err=True)
+        raise typer.Exit(2) from exc
     ents = ",".join(result.entities[:8]) if result.entities else "-"
     typer.echo(
         f"ok  event={result.event_id}  memory={result.memory_id}  "
         f"ns={result.namespace}  tier={result.tier}  "
         f"session={result.session_id}  embedded={int(result.embedded)}  entities={ents}"
     )
+    typer.echo(f"provenance {dumps(result.provenance)}")
 
 
 @app.command("recall")
