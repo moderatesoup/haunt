@@ -679,3 +679,56 @@ def test_timeline_k_fills_past_events_limit_max(honesty_env):
         assert older1.memory_id in ids
         assert older2.memory_id in ids
         assert not any(mid in ids for mid in recent_ids)
+
+
+def test_direct_timeline_limit_clamps_and_refills_past_full_superseded_page(honesty_env):
+    """Direct ``limit=150`` follows the K_MAX=100 contract without underfill.
+
+    The first event page is entirely superseded. The next page contains
+    equal-time current events, so this simultaneously verifies bounded refill
+    and the two-stage timeline tie rule: event IDs choose the page, then the
+    materialized memory IDs determine its display order.
+    """
+    from haunt.planner import run_timeline
+    from haunt.store import Store
+    from haunt.temporal import TemporalQuery
+
+    with Store("default") as st:
+        superseded_ids = []
+        for i in range(100):
+            rec = st.observe(
+                f"superseded direct page {i:03d}",
+                event_time="2026-08-09T12:00:00+00:00",
+            )
+            superseded_ids.append(rec.memory_id)
+        for memory_id in superseded_ids:
+            st.contradict(memory_id)
+
+        active = [
+            st.observe(
+                f"active equal-time page {i:03d}",
+                event_time="2026-08-08T12:00:00+00:00",
+            )
+            for i in range(105)
+        ]
+        tq = TemporalQuery(
+            temporal=True,
+            cleaned_query="",
+            start=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+            clock="event_time",
+            granularity="year",
+            certainty="exact",
+            confidence=1.0,
+        )
+        hits = run_timeline(tq, st, limit=150)
+
+    # K_MAX applies to direct planner calls too. The selected second page is
+    # its first 100 stable event IDs, while display sorts its equal-time
+    # materialized memories by memory ID.
+    selected = sorted(active, key=lambda result: result.event_id)[:100]
+    assert len(hits) == 100
+    assert [hit.memory_id for hit in hits] == sorted(
+        result.memory_id for result in selected
+    )
+    assert not {hit.memory_id for hit in hits}.intersection(superseded_ids)

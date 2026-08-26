@@ -18,7 +18,7 @@ from typing import Literal
 from haunt.recall import Hit, RecallResult, execution_metadata, recall
 from haunt.store import Store, open_existing
 from haunt.temporal import TemporalQuery, compile
-from haunt.util import clamp_k, iso_or_now, normalize_clock, utc_iso
+from haunt.util import LIMIT_MAX, clamp_k, iso_or_now, normalize_clock, utc_iso
 
 Plan = Literal["timeline", "recall", "union"]
 
@@ -275,10 +275,13 @@ def run_timeline(
 ) -> list[Hit]:
     """A: events in [start, end] on the chosen clock(s).
 
-    Fetch enough events to fill ``limit`` *current* memories. Superseded
-    rows (valid_to IS NOT NULL) are skipped by ``_hits_from_events``; a
-    short prefix of recent superseded events must not starve k.
+    Direct callers share the public ``clamp_k`` contract, so ``limit`` is
+    always in [1, K_MAX]. Fetch enough bounded event pages to fill that many
+    *current* memories. Superseded rows (valid_to IS NOT NULL) are skipped by
+    ``_hits_from_events``; a short prefix of recent superseded events must not
+    starve the requested count.
     """
+    limit = clamp_k(limit)
     since, until = _iso(tq.start), _iso(tq.end)
     chosen = clock or tq.clock
     merged: dict[str, Hit] = {}
@@ -293,9 +296,10 @@ def run_timeline(
             "include_untrusted": True,
             "session_id": session_id,
         }
-        # Page through events. store.events clamps LIMIT to 100; doubling
-        # fetch_n past that made len(rows) < fetch_n and starved refill.
-        batch = max(int(limit), 1)
+        # Page through events at the store's hard page ceiling. ``limit`` is
+        # already clamped, but retaining this min keeps pagination correct if
+        # the two public bounds ever diverge.
+        batch = min(limit, LIMIT_MAX)
         offset = 0
         while True:
             rows = store.events(
