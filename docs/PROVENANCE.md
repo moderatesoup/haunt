@@ -127,3 +127,11 @@ not guess its meaning. In particular, it cannot match a named procedure and is
 omitted from procedure indexes/worldview summaries, while memory detail and
 trace still expose its exact base64 representation. Guarded JSON selectors and
 tolerant legacy parsing keep those reads from becoming server errors.
+
+Machine JSON always retains the exact envelopes above. Human CLI views use a
+separate bounded renderer: BLOBs appear as
+`<sqlite-blob base64:...>`, non-finite values as
+`<sqlite-real nan|+infinity|-infinity>`, and other JSON-safe values as text or
+stable JSON. Normal strings keep their familiar display, while terminal
+control characters are escaped. This prevents migrated dynamic SQLite values
+from reaching string-only timestamp, snippet, slicing, or width formatters.

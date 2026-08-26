@@ -268,6 +268,10 @@ that source metadata measures truth.
   response shapes compatible. Guarded JSON selectors and tolerant stored-meta
   parsing make malformed BLOB procedure metadata an honest no-match instead of
   a read-surface failure.
+- Human CLI reads use one bounded, terminal-control-safe renderer for the
+  already-serialized values. Timeline, worldview, recall, graph, namespace,
+  and procedure formatting no longer applies string-only operations directly
+  to migrated SQLite dynamic types; JSON output remains exact and unchanged.
 - `tests/test_structured_provenance.py` covers every fidelity, Unicode source
   and call IDs, unknown fields, parser/version/hash rejection with zero rows,
   byte-preserving migration/restart, corrected-import trace, actual Store/CLI/
@@ -277,11 +281,12 @@ that source metadata measures truth.
   explicit-null/omitted/empty transform semantics, corrupt stored envelopes,
   recursive no-confidence assertions, schema-v7 BLOB origin/meta migration and
   restart across Store/CLI/MCP/dashboard/procedure/worldview surfaces, strict
-  JSON serialization, exact base64 recovery, and privacy purge canaries across
-  all tables and serialized surfaces.
-- The dependency-correct Python 3.14/MCP 2.1 full suite passes with 546 tests,
+  JSON serialization, exact base64 recovery, exhaustive bounded human CLI
+  rendering, and privacy purge canaries across all tables and serialized
+  surfaces.
+- The dependency-correct Python 3.14/MCP 2.1 full suite passes with 559 tests,
   5 environment/data skips, and 7 declared temporal xfails. The focused E2,
-  E1, E0, hook, host, migration, and FTS compatibility group passes 212 tests
+  E1, E0, hook, host, migration, and FTS compatibility group passes 225 tests
   under Python 3.12/MCP 2.1; that pyenv build cannot load SQLite extensions, so
   its unrelated vector-required tests are not a valid profile.
 

@@ -21,7 +21,7 @@ from haunt.provenance import (
     public_provenance,
 )
 from haunt.store import SCHEMA_VERSION, Store, observe as public_observe
-from haunt.util import loads
+from haunt.util import format_iso, human_display, loads
 
 
 LOGICAL_TABLES = (
@@ -108,7 +108,60 @@ def test_json_safe_sqlite_losslessly_encodes_blob_memoryview_and_nonfinite_real(
     fallback = object()
     assert loads(raw, default=fallback) is fallback
     assert loads(memoryview(raw), default=fallback) is fallback
-    json.dumps(json_safe_sqlite({"blob": memoryview(raw), "real": math.nan}), allow_nan=False)
+    json.dumps(
+        json_safe_sqlite({"blob": memoryview(raw), "real": math.nan}), allow_nan=False
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("ordinary text 雪", "ordinary text 雪"),
+        (None, "null"),
+        (7, "7"),
+        (2.5, "2.5"),
+        (math.inf, "<sqlite-real +infinity>"),
+        (
+            {"encoding": "sqlite-real", "data": "nan"},
+            "<sqlite-real nan>",
+        ),
+        (
+            {"encoding": "sqlite-real", "data": []},
+            '{"encoding": "sqlite-real", "data": []}',
+        ),
+        ([1, None, "x"], '[1, null, "x"]'),
+    ],
+)
+def test_human_display_is_stable_for_serialized_sqlite_types(value, expected):
+    assert human_display(value) == expected
+
+
+def test_human_display_marks_blobs_escapes_controls_and_bounds_output():
+    raw = b"\x00\xff</script>\x1b[31m" * 200
+    encoded = base64.b64encode(raw).decode("ascii")
+    assert human_display(b"abc") == "<sqlite-blob base64:YWJj>"
+    assert human_display(memoryview(b"abc")) == "<sqlite-blob base64:YWJj>"
+    assert human_display("normal\x1b[31m") == "normal\\u001b[31m"
+    bounded = human_display(
+        {"encoding": "base64", "data": encoded},
+        limit=80,
+    )
+    assert bounded.startswith("<sqlite-blob base64:")
+    assert bounded.endswith("…")
+    assert len(bounded) == 80
+    assert "</script>" not in bounded
+    assert format_iso(None) == ""
+    assert format_iso(0) == "0"
+
+
+def test_human_display_preserves_safe_layout_but_blocks_terminal_controls():
+    value = "line1\r\nline2\rline3\tok\x1b]0;owned\x07\u202e"
+    rendered = human_display(value, limit=200, preserve_layout=True)
+    assert rendered == ("line1\nline2\nline3\tok\\u001b]0;owned\\u0007\\u202e")
+    assert "\r" not in rendered
+    assert "\x1b" not in rendered
+    assert "\x07" not in rendered
+    assert "\u202e" not in rendered
 
 
 @pytest.mark.parametrize("fidelity", IMPORT_FIDELITIES)
@@ -220,9 +273,7 @@ def test_null_transforms_round_trip_and_idempotency_distinguishes_omission(
     assert all(not _contains_key(output, "confidence") for output in outputs)
 
 
-def test_null_transforms_round_trip_cli_mcp_and_dashboard(
-    provenance_env, monkeypatch
-):
+def test_null_transforms_round_trip_cli_mcp_and_dashboard(provenance_env, monkeypatch):
     cli_envelope = {**_import_envelope(channel="cli"), "transforms": None}
     cli_result = CliRunner().invoke(
         app,
@@ -752,9 +803,12 @@ def test_non_utf8_legacy_procedure_meta_fails_honest_without_read_surface_crash(
     assert "Traceback" not in cli_get.output
     cli_trace = runner.invoke(app, ["trace", corrupt.memory_id, "-n", "default"])
     assert cli_trace.exit_code == 0, cli_trace.output
-    assert _decode_public_blob(
-        json.loads(cli_trace.stdout)["members"][0]["provenance"]["meta"]
-    ) == opaque_meta
+    assert (
+        _decode_public_blob(
+            json.loads(cli_trace.stdout)["members"][0]["provenance"]["meta"]
+        )
+        == opaque_meta
+    )
 
     monkeypatch.setenv("HAUNT_NAMESPACE", "default")
     from haunt import mcp_server
@@ -769,16 +823,14 @@ def test_non_utf8_legacy_procedure_meta_fails_honest_without_read_surface_crash(
     mcp_list = json.loads(mcp_server.memory_procedure("list", namespace="default"))
     assert mcp_list["ok"] is True
     assert mcp_list["procedures"] == []
-    assert json.loads(mcp_server.memory_worldview(namespace="default"))[
-        "procedures"
-    ] == []
+    assert (
+        json.loads(mcp_server.memory_worldview(namespace="default"))["procedures"] == []
+    )
 
     from tests.dashutil import make_dash_client
 
     client = make_dash_client()
-    dashboard_detail = client.get(
-        f"/api/namespace/default/memory/{corrupt.memory_id}"
-    )
+    dashboard_detail = client.get(f"/api/namespace/default/memory/{corrupt.memory_id}")
     dashboard_namespace = client.get("/api/namespace/default")
     dashboard_procedures = client.get("/api/namespace/default/procedures")
     dashboard_worldview = client.get("/api/namespace/default/worldview")
@@ -904,9 +956,7 @@ def test_invalid_stored_provenance_with_blob_origin_and_meta_is_json_safe(
     )
     assert cli.exit_code == 0, cli.output
     cli_event = next(
-        row
-        for row in json.loads(cli.stdout)["events"]
-        if row["id"] == result.event_id
+        row for row in json.loads(cli.stdout)["events"] if row["id"] == result.event_id
     )
     assert _decode_public_blob(cli_event["origin"]) == blob_origin
     assert _decode_public_blob(cli_event["meta"]) == blob_meta
@@ -1223,9 +1273,7 @@ def test_purge_erases_blob_provenance_canary_and_its_public_base64_form(
     assert encoded_canary not in mcp_trace
     from tests.dashutil import make_dash_client
 
-    dashboard = make_dash_client().get(
-        f"/api/namespace/default/memory/{survivor_id}"
-    )
+    dashboard = make_dash_client().get(f"/api/namespace/default/memory/{survivor_id}")
     assert dashboard.status_code == 200, dashboard.text
     assert encoded_canary not in dashboard.text
 
@@ -1343,18 +1391,241 @@ def test_cli_timeline_json_and_human_outputs_surface_all_provenance_states(
     from haunt import mcp_server
 
     mcp_server._MCP_AUTHORITY = None
-    mcp_payload = json.loads(
-        mcp_server.memory_timeline(namespace="default", limit=20)
-    )
+    mcp_payload = json.loads(mcp_server.memory_timeline(namespace="default", limit=20))
     assert mcp_payload["events"] == payload["events"]
 
     from tests.dashutil import make_dash_client
 
-    dashboard = make_dash_client().get(
-        "/api/namespace/default/timeline?limit=20"
-    )
+    dashboard = make_dash_client().get("/api/namespace/default/timeline?limit=20")
     assert dashboard.status_code == 200, dashboard.text
     assert dashboard.json()["events"] == payload["events"]
+
+
+def test_cli_human_timeline_handles_legacy_blob_fields_and_stays_bounded(
+    provenance_env,
+):
+    ordinary_time = "2026-01-02T03:04:05.000000+00:00"
+    blob_event_time = b"\xff\x00time</script>\x1b[2J\x80"
+    blob_content = b"\x00\xfecontent</script>\x1b[31m\x81" * 2000
+    memoryview_origin = b"\x80\x00origin</script>\x1b[5m\xff"
+    with Store("default") as st:
+        ordinary = st.observe(
+            "ordinary timeline text",
+            event_time=ordinary_time,
+            defer_embedding=True,
+        )
+        dynamic = st.observe("dynamic timeline placeholder", defer_embedding=True)
+        control = st.observe("text </script> \x1b[33m", defer_embedding=True)
+        st.conn.execute(
+            "UPDATE events SET event_time=?, role=?, content=?, tool_name=?, "
+            "origin=?, tier=?, provenance=NULL WHERE id=?",
+            (
+                sqlite3.Binary(blob_event_time),
+                7,
+                sqlite3.Binary(blob_content),
+                math.inf,
+                memoryview(memoryview_origin),
+                2.5,
+                dynamic.event_id,
+            ),
+        )
+        st.conn.execute(
+            "UPDATE events SET role=? WHERE id=?",
+            ("assistant\x1b[31m", control.event_id),
+        )
+        st.conn.commit()
+        store_rows = st.events(limit=20)
+        raw = st.conn.execute(
+            "SELECT typeof(event_time), event_time, typeof(content), content, "
+            "typeof(origin), origin, typeof(tool_name), tool_name "
+            "FROM events WHERE id=?",
+            (dynamic.event_id,),
+        ).fetchone()
+
+    runner = CliRunner()
+    human = runner.invoke(app, ["timeline", "-n", "default", "--limit", "20"])
+    assert human.exit_code == 0, human.output
+    assert "ordinary timeline text" in human.stdout
+    ordinary_line = (
+        f"{format_iso(ordinary_time)}  {'user':<10} {'episodic':<12} "
+        f"{ordinary.event_id}  source=python/python  ordinary timeline text"
+    )
+    assert ordinary_line in human.stdout
+    assert "<sqlite-blob base64:" in human.stdout
+    assert "[tool:Inf]" in human.stdout
+    assert "7          2.5" in human.stdout
+    assert "\\u001b" in human.stdout
+    assert "\x1b" not in human.stdout
+    assert len(human.stdout) < 2500
+
+    machine = runner.invoke(
+        app, ["timeline", "-n", "default", "--limit", "20", "--json"]
+    )
+    assert machine.exit_code == 0, machine.output
+    payload = json.loads(machine.stdout)
+    assert payload == {"namespace": "default", "events": store_rows}
+    dynamic_event = next(
+        event for event in payload["events"] if event["id"] == dynamic.event_id
+    )
+    assert _decode_public_blob(dynamic_event["event_time"]) == blob_event_time
+    assert dynamic_event["role"] == "7"
+    assert _decode_public_blob(dynamic_event["content"]) == blob_content
+    # TEXT affinity honestly preserves SQLite's coercion of a bound infinity.
+    assert dynamic_event["tool_name"] == "Inf"
+    assert _decode_public_blob(dynamic_event["origin"]) == memoryview_origin
+    assert dynamic_event["tier"] == "2.5"
+    ordinary_event = next(
+        event for event in payload["events"] if event["id"] == ordinary.event_id
+    )
+    assert ordinary_event["tool_name"] is None
+    assert not _contains_key(payload, "confidence")
+
+    assert raw[0] == "blob" and bytes(raw[1]) == blob_event_time
+    assert raw[2] == "blob" and bytes(raw[3]) == blob_content
+    assert raw[4] == "blob" and bytes(raw[5]) == memoryview_origin
+    assert raw[6] == "text" and raw[7] == "Inf"
+
+
+def test_cli_human_timeline_accepts_all_json_safe_sqlite_value_shapes(
+    provenance_env, monkeypatch
+):
+    blob = b"\x00\xff</script>\x1b[2J\x80" * 500
+    blob_envelope = json_safe_sqlite(blob)
+    memoryview_envelope = json_safe_sqlite(memoryview(b"memoryview\x00\xff"))
+    values = [
+        None,
+        "ordinary text",
+        7,
+        2.5,
+        {"encoding": "sqlite-real", "data": "+infinity"},
+        blob_envelope,
+        memoryview_envelope,
+        {"nested": [1, None, "text"]},
+        "control\x1b[31m",
+    ]
+    rows = [
+        {
+            "id": f"event-{index}",
+            "event_time": value,
+            "role": value,
+            "tier": value,
+            "content": value,
+            "tool_name": None,
+            "provenance": {
+                "schema_version": 1,
+                "kind": "legacy_unstructured",
+                "origin": value,
+                "meta": None,
+            },
+        }
+        for index, value in enumerate(values)
+    ]
+
+    class FakeStore:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def events(self, **_kwargs):
+            return rows
+
+    import haunt.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "open_existing", lambda _namespace: FakeStore())
+    runner = CliRunner()
+    human = runner.invoke(app, ["timeline", "-n", "default", "--limit", "20"])
+    assert human.exit_code == 0, human.output
+    assert "ordinary text" in human.stdout
+    assert "null" in human.stdout
+    assert "7" in human.stdout
+    assert "2.5" in human.stdout
+    assert "<sqlite-real +infinity>" in human.stdout
+    assert "<sqlite-blob base64:" in human.stdout
+    assert "\\u001b" in human.stdout
+    assert "\x1b" not in human.stdout
+    assert "</script>" not in human.stdout
+    assert len(human.stdout) < 5000
+
+    machine = runner.invoke(
+        app, ["timeline", "-n", "default", "--limit", "20", "--json"]
+    )
+    assert machine.exit_code == 0, machine.output
+    assert json.loads(machine.stdout) == {"namespace": "default", "events": rows}
+
+
+def test_cli_human_worldview_and_procedure_accept_serialized_blob_fields(
+    provenance_env,
+):
+    fact_id_blob = b"\xff\x00fact-id</script>\x80"
+    fact_content_blob = b"\x00\xfefact-content</script>\x1b[2J\x81" * 1000
+    procedure_id_blob = b"\x80\x00procedure-id</script>\xff"
+    procedure_body_blob = b"\x00\xffprocedure-body</script>\x1b[31m\x80" * 1000
+    with Store("default") as st:
+        fact = st.observe("fact placeholder", tier="semantic", defer_embedding=True)
+        procedure = st.procedure_write("blob body procedure", "body placeholder")
+        st.conn.execute(
+            "DELETE FROM embedding_jobs WHERE memory_id IN (?, ?)",
+            (fact.memory_id, procedure.memory_id),
+        )
+        st.conn.execute(
+            "UPDATE memories SET id=?, content=? WHERE id=?",
+            (
+                memoryview(fact_id_blob),
+                sqlite3.Binary(fact_content_blob),
+                fact.memory_id,
+            ),
+        )
+        st.conn.execute(
+            "UPDATE memories SET id=?, content=? WHERE id=?",
+            (
+                sqlite3.Binary(procedure_id_blob),
+                memoryview(procedure_body_blob),
+                procedure.memory_id,
+            ),
+        )
+        st.conn.commit()
+        worldview = st.worldview()
+        procedure_get = st.procedure_get("blob body procedure")
+        raw_rows = st.conn.execute(
+            "SELECT id, content FROM memories WHERE typeof(id)='blob' ORDER BY rowid"
+        ).fetchall()
+
+    assert procedure_get is not None
+    runner = CliRunner()
+    human_worldview = runner.invoke(app, ["worldview", "-n", "default"])
+    machine_worldview = runner.invoke(app, ["worldview", "-n", "default", "--json"])
+    human_get = runner.invoke(
+        app, ["procedure", "get", "blob body procedure", "-n", "default"]
+    )
+    human_list = runner.invoke(app, ["procedure", "list", "-n", "default"])
+    for result in (human_worldview, machine_worldview, human_get, human_list):
+        assert result.exit_code == 0, result.output
+        assert "\x1b" not in result.output
+    assert "<sqlite-" in human_worldview.stdout
+    assert "<sqlite-blob base64:" in human_get.stdout
+    assert "<sqlite-blob" in human_list.stdout
+    assert len(human_worldview.stdout) < 1500
+    assert len(human_get.stdout) < 9000
+    assert len(human_list.stdout) < 5000
+
+    machine = json.loads(machine_worldview.stdout)
+    assert machine == worldview
+    fact_output = next(row for row in machine["facts"] if isinstance(row["id"], dict))
+    assert _decode_public_blob(fact_output["id"]) == fact_id_blob
+    assert _decode_public_blob(fact_output["content"]) == fact_content_blob
+    procedure_output = next(
+        row for row in machine["procedures"] if row["name"] == "blob body procedure"
+    )
+    assert _decode_public_blob(procedure_output["id"]) == procedure_id_blob
+    assert _decode_public_blob(procedure_get["body"]) == procedure_body_blob
+    assert not _contains_key(machine, "confidence")
+
+    assert bytes(raw_rows[0]["id"]) == fact_id_blob
+    assert bytes(raw_rows[0]["content"]) == fact_content_blob
+    assert bytes(raw_rows[1]["id"]) == procedure_id_blob
+    assert bytes(raw_rows[1]["content"]) == procedure_body_blob
 
 
 @pytest.mark.parametrize(
@@ -1485,23 +1756,17 @@ def test_procedure_get_and_list_keep_provenance_across_store_mcp_and_cli(
     assert mcp_list["ok"] is True
     mcp_listed = {row["name"]: row for row in mcp_list["procedures"]}
     assert mcp_listed["native procedure"]["provenance"] == native.provenance
-    assert mcp_listed["legacy procedure"]["provenance"][
-        "kind"
-    ] == "legacy_unstructured"
+    assert mcp_listed["legacy procedure"]["provenance"]["kind"] == "legacy_unstructured"
     assert mcp_listed["invalid procedure"]["provenance"]["kind"] == "invalid_stored"
     mcp_worldview = json.loads(mcp_server.memory_worldview(namespace="default"))
-    mcp_worldview_procedures = {
-        row["name"]: row for row in mcp_worldview["procedures"]
-    }
+    mcp_worldview_procedures = {row["name"]: row for row in mcp_worldview["procedures"]}
     for name, expected in (
         ("native procedure", native_get),
         ("imported procedure", imported_get),
         ("legacy procedure", legacy_get),
         ("invalid procedure", invalid_get),
     ):
-        assert mcp_worldview_procedures[name]["provenance"] == expected[
-            "provenance"
-        ]
+        assert mcp_worldview_procedures[name]["provenance"] == expected["provenance"]
 
     runner = CliRunner()
     cli_get = runner.invoke(
@@ -1523,17 +1788,15 @@ def test_procedure_get_and_list_keep_provenance_across_store_mcp_and_cli(
     cli_list = runner.invoke(app, ["procedure", "list", "-n", "default"])
     assert cli_list.exit_code == 0, cli_list.output
     assert f"provenance {native_json}" in cli_list.stdout
-    cli_worldview = runner.invoke(
-        app, ["worldview", "-n", "default", "--json"]
-    )
+    cli_worldview = runner.invoke(app, ["worldview", "-n", "default", "--json"])
     assert cli_worldview.exit_code == 0, cli_worldview.output
     cli_worldview_procedures = {
-        row["name"]: row
-        for row in json.loads(cli_worldview.stdout)["procedures"]
+        row["name"]: row for row in json.loads(cli_worldview.stdout)["procedures"]
     }
-    assert cli_worldview_procedures["legacy procedure"]["provenance"][
-        "kind"
-    ] == "legacy_unstructured"
+    assert (
+        cli_worldview_procedures["legacy procedure"]["provenance"]["kind"]
+        == "legacy_unstructured"
+    )
 
 
 def test_cli_and_mcp_invalid_parser_version_write_nothing(provenance_env, monkeypatch):
@@ -1772,7 +2035,10 @@ def test_cli_and_mcp_fail_closed_on_unverifiable_idempotency_replays(
     assert mcp_replay["ok"] is False
     assert "cannot verify invalid stored provenance" in mcp_replay["error"]
     with Store("default") as st:
-        assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == count_after_mcp
+        assert (
+            st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            == count_after_mcp
+        )
         assert count_after_mcp == count_after_cli + 1
 
 
@@ -1827,12 +2093,17 @@ def test_cli_mcp_and_dashboard_corrections_record_actual_replacement_channel(
     dashboard_payload = dashboard_response.json()
 
     with Store("default") as st:
-        assert st.get_memory(cli_payload["replacement_memory_id"])["provenance"][
-            "channel"
-        ] == "cli"
-        assert st.get_memory(mcp_payload["replacement_memory_id"])["provenance"][
-            "channel"
-        ] == "mcp"
-        assert st.get_memory(dashboard_payload["replacement_memory_id"])[
-            "provenance"
-        ]["channel"] == "dashboard"
+        assert (
+            st.get_memory(cli_payload["replacement_memory_id"])["provenance"]["channel"]
+            == "cli"
+        )
+        assert (
+            st.get_memory(mcp_payload["replacement_memory_id"])["provenance"]["channel"]
+            == "mcp"
+        )
+        assert (
+            st.get_memory(dashboard_payload["replacement_memory_id"])["provenance"][
+                "channel"
+            ]
+            == "dashboard"
+        )

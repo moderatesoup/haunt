@@ -144,6 +144,12 @@ Malformed legacy BLOB metadata remains available through detail/trace but is
 not guessed into typed procedure fields; guarded selectors treat it as no
 match rather than raising.
 
+Human CLI output is a bounded presentation of those already-serialized
+values, never a replacement for the machine envelope. It labels BLOB and
+non-finite REAL values explicitly, escapes terminal controls, and accepts every
+JSON-safe scalar/container without assuming timestamp, content, role, tier,
+identifier, or procedure fields are strings.
+
 For ordered import transforms, omitted, explicit `null`, and an empty list are
 distinct: not supplied, explicitly unknown, and known to have no transforms,
 respectively. Validation and idempotency preserve that distinction.
