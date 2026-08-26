@@ -10,7 +10,6 @@ import sqlite3
 import stat
 import struct
 import tempfile
-import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import get_ident
@@ -34,10 +33,13 @@ from haunt.paths import (
     repository_identity,
     resolve_namespace,
     safe_name,
+    SQLITE_OPEN_LOCK,
+    SQLiteSidecarGuard,
     tighten_db_files,
     validate_namespace_db_paths,
     validate_namespace_root,
     validate_registry_db_sources,
+    validate_sqlite_sidecars,
 )
 from haunt.provenance import (
     encode_json_safe_sqlite_key,
@@ -74,7 +76,7 @@ SCHEMA_VERSION = 8
 SCHEMA_VERSION_KEY = "schema_version"
 REGISTRY_SCHEMA_VERSION = 4
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
-_NAMESPACE_DB_HANDLE_LOCK = threading.RLock()
+_NAMESPACE_DB_HANDLE_LOCK = SQLITE_OPEN_LOCK
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sessions", ("started_at", "ended_at")),
@@ -133,6 +135,10 @@ def _validate_unmapped_namespace_target(
     if mapped_db_path is not None and target == mapped_db_path:
         return
     try:
+        validate_sqlite_sidecars(target, require_absent=True)
+    except NamespacePathError as exc:
+        raise NamespaceCollisionError(str(exc)) from exc
+    try:
         target.lstat()
     except FileNotFoundError:
         return
@@ -145,6 +151,34 @@ def _validate_unmapped_namespace_target(
     )
 
 
+class _SidecarGuardedConnection(sqlite3.Connection):
+    """SQLite connection that retains sidecar claims until SQLite closes."""
+
+    _sidecar_guard: SQLiteSidecarGuard | None = None
+    _clean_unused_sidecar_claims = True
+
+    def set_sidecar_guard(
+        self, guard: SQLiteSidecarGuard, *, clean_unused_claims: bool
+    ) -> None:
+        self._sidecar_guard = guard
+        self._clean_unused_sidecar_claims = clean_unused_claims
+
+    def preserve_sidecar_claims(self) -> None:
+        self._clean_unused_sidecar_claims = False
+
+    def close(self) -> None:
+        guard = self._sidecar_guard
+        self._sidecar_guard = None
+        with _NAMESPACE_DB_HANDLE_LOCK:
+            try:
+                super().close()
+            finally:
+                if guard is not None:
+                    guard.close(
+                        clean_unused_claims=self._clean_unused_sidecar_claims
+                    )
+
+
 def _raw_connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     if not create and not path.exists():
         raise FileNotFoundError(path)
@@ -153,15 +187,68 @@ def _raw_connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     # Serialize opens with namespace descriptor verification. SQLite's unix
     # VFS can retain/reuse descriptors while sibling connections hold locks.
     with _NAMESPACE_DB_HANDLE_LOCK:
-        conn = sqlite3.connect(str(path), check_same_thread=False)
+        conn = sqlite3.connect(
+            str(path),
+            check_same_thread=False,
+            factory=_SidecarGuardedConnection,
+        )
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _configure_connection(
-    conn: sqlite3.Connection, path: Path, *, tighten: bool = True
+def _sqlite_sidecar_open_hook(_path: Path) -> None:
+    """Test hook after sidecar claim/validation and before SQLite open."""
+
+
+def _sqlite_sidecar_pragma_hook(_path: Path) -> None:
+    """Test hook after SQLite open and before the first configuring PRAGMA."""
+
+
+def _open_readonly_connection(
+    path: Path, *, immutable: bool = False, claim_missing: bool = True
 ) -> sqlite3.Connection:
+    with _NAMESPACE_DB_HANDLE_LOCK:
+        sidecars = SQLiteSidecarGuard.acquire(
+            path, claim_missing=claim_missing
+        )
+        conn: sqlite3.Connection | None = None
+        try:
+            _sqlite_sidecar_open_hook(path)
+            sidecars.verify()
+            immutable_query = "&immutable=1" if immutable else ""
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro{immutable_query}",
+                uri=True,
+                factory=_SidecarGuardedConnection,
+            )
+            assert isinstance(conn, _SidecarGuardedConnection)
+            conn.set_sidecar_guard(sidecars, clean_unused_claims=True)
+            conn.row_factory = sqlite3.Row
+            sidecars.verify()
+            if claim_missing:
+                conn.execute("PRAGMA schema_version").fetchone()
+                validate_sqlite_sidecars(path)
+            return conn
+        except Exception:
+            if conn is not None:
+                conn.close()
+            else:
+                sidecars.close(clean_unused_claims=True)
+            raise
+
+
+def _configure_connection(
+    conn: sqlite3.Connection,
+    path: Path,
+    *,
+    tighten: bool = True,
+    sidecars: SQLiteSidecarGuard | None = None,
+) -> sqlite3.Connection:
+    _sqlite_sidecar_pragma_hook(path)
+    if sidecars is not None:
+        sidecars.verify()
     conn.execute("PRAGMA journal_mode=WAL")
+    validate_sqlite_sidecars(path)
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -184,12 +271,25 @@ def _configure_connection(
 
 
 def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
-    conn = _raw_connect(path, create=create)
-    try:
-        return _configure_connection(conn, path)
-    except Exception:
-        conn.close()
-        raise
+    with _NAMESPACE_DB_HANDLE_LOCK:
+        sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=True)
+        conn: sqlite3.Connection | None = None
+        try:
+            _sqlite_sidecar_open_hook(path)
+            sidecars.verify()
+            conn = _raw_connect(path, create=create)
+            assert isinstance(conn, _SidecarGuardedConnection)
+            conn.set_sidecar_guard(sidecars, clean_unused_claims=True)
+            sidecars.verify()
+            result = _configure_connection(conn, path, sidecars=sidecars)
+            conn.preserve_sidecar_claims()
+            return result
+        except Exception:
+            if conn is not None:
+                conn.close()
+            else:
+                sidecars.close(clean_unused_claims=True)
+            raise
 
 
 def _fd_snapshot() -> dict[int, tuple[int, int]]:
@@ -272,8 +372,7 @@ def _validate_all_registered_namespace_dbs_read_only() -> None:
     registry = registry_path()
     if not registry.is_file():
         raise NamespacePathError(f"namespace registry is missing: {registry}")
-    conn = sqlite3.connect(f"{registry.resolve().as_uri()}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = _open_readonly_connection(registry)
     try:
         tables = {
             str(row[0])
@@ -292,21 +391,36 @@ def _open_mapped_namespace_db(
     _validate_all_registered_namespace_dbs_read_only()
     expected_map = {str(path): expected}
     actual = validate_namespace_db_paths([str(path)], expected=expected_map)[str(path)]
-    _mapped_namespace_open_hook(path)
+    sidecars: SQLiteSidecarGuard | None = None
+    conn: sqlite3.Connection | None = None
     with _NAMESPACE_DB_HANDLE_LOCK:
-        before = _fd_snapshot()
-        conn = _raw_connect(path, create=False)
         try:
+            sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=True)
+            _mapped_namespace_open_hook(path)
+            _sqlite_sidecar_open_hook(path)
+            sidecars.verify()
+            before = _fd_snapshot()
+            conn = _raw_connect(path, create=False)
+            assert isinstance(conn, _SidecarGuardedConnection)
+            conn.set_sidecar_guard(sidecars, clean_unused_claims=True)
             _verify_new_sqlite_fd(
                 before, actual, allow_verified_vfs_reuse=True
             )
+            sidecars.verify()
             validate_namespace_db_paths(
                 [str(path)], expected={str(path): actual}
             )
             _validate_all_registered_namespace_dbs_read_only()
-            return _configure_connection(conn, path, tighten=False)
+            result = _configure_connection(
+                conn, path, tighten=False, sidecars=sidecars
+            )
+            conn.preserve_sidecar_claims()
+            return result
         except Exception:
-            conn.close()
+            if conn is not None:
+                conn.close()
+            elif sidecars is not None:
+                sidecars.close(clean_unused_claims=True)
             raise
 
 
@@ -315,8 +429,7 @@ def _preflight_registry_storage_read_only() -> None:
     registry = registry_path()
     if not registry.exists():
         return
-    conn = sqlite3.connect(f"{registry.resolve().as_uri()}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = _open_readonly_connection(registry)
     try:
         tables = {
             str(row[0])
@@ -1012,6 +1125,7 @@ class _FreshNamespaceClaim:
     claim_fd: int
     identity: tuple[int, int]
     conn: sqlite3.Connection
+    sidecars: SQLiteSidecarGuard
 
     def verify_for_publication(self) -> None:
         """Confirm the live claim and final name still identify one safe file."""
@@ -1031,15 +1145,12 @@ class _FreshNamespaceClaim:
     def close(self, *, remove_target: bool) -> None:
         with _NAMESPACE_DB_HANDLE_LOCK:
             self.conn.close()
+        self.sidecars.remove_claimed_files()
         try:
             os.close(self.claim_fd)
         except OSError:
             pass
-        for extra in (
-            self.temporary,
-            Path(str(self.temporary) + "-wal"),
-            Path(str(self.temporary) + "-shm"),
-        ):
+        for extra in (self.temporary,):
             try:
                 extra.unlink()
             except FileNotFoundError:
@@ -1072,14 +1183,22 @@ def _claim_fresh_namespace_db(target: Path) -> _FreshNamespaceClaim:
         raise NamespacePathError("failed to claim a unique regular namespace database")
     before = _fd_snapshot()
     conn: sqlite3.Connection | None = None
+    sidecars: SQLiteSidecarGuard | None = None
     linked = False
     try:
+        sidecars = SQLiteSidecarGuard.acquire(temporary, claim_missing=True)
+        _sqlite_sidecar_open_hook(temporary)
+        sidecars.verify()
         conn = _raw_connect(temporary, create=False)
+        assert isinstance(conn, _SidecarGuardedConnection)
+        conn.set_sidecar_guard(sidecars, clean_unused_claims=True)
         _verify_new_sqlite_fd(before, identity)
+        sidecars.verify()
         validate_namespace_db_paths(
             [str(temporary)], expected={str(temporary): identity}
         )
-        _configure_connection(conn, temporary)
+        _configure_connection(conn, temporary, sidecars=sidecars)
+        conn.preserve_sidecar_claims()
         _init_namespace_schema(conn)
         try:
             os.link(temporary, target, follow_symlinks=False)
@@ -1100,19 +1219,20 @@ def _claim_fresh_namespace_db(target: Path) -> _FreshNamespaceClaim:
             claim_fd=claim_fd,
             identity=identity,
             conn=conn,
+            sidecars=sidecars,
         )
     except Exception:
         if conn is not None:
             conn.close()
+        elif sidecars is not None:
+            sidecars.close(clean_unused_claims=True)
+        if sidecars is not None:
+            sidecars.remove_claimed_files()
         try:
             os.close(claim_fd)
         except OSError:
             pass
-        for extra in (
-            temporary,
-            Path(str(temporary) + "-wal"),
-            Path(str(temporary) + "-shm"),
-        ):
+        for extra in (temporary,):
             try:
                 extra.unlink()
             except FileNotFoundError:
@@ -1570,9 +1690,7 @@ def _readonly_registry() -> sqlite3.Connection:
     path = registry_path()
     if not path.is_file():
         raise FileNotFoundError(path)
-    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return _open_readonly_connection(path, claim_missing=False)
 
 
 def _legacy_namespace_change_source(
@@ -1655,6 +1773,8 @@ def _plan_namespace_label_read_only(
                 for row in conn.execute("SELECT db_path FROM namespaces").fetchall()
             )
         validate_namespace_db_paths(physical_paths, expected=expected_paths)
+        for physical_path in dict.fromkeys(physical_paths):
+            validate_sqlite_sidecars(Path(physical_path))
         current_schema = {"namespace_aliases", "namespace_identities"} <= tables
         requires_registry_upgrade = not current_schema or not has_physical_columns
         source = _identity_row(conn, old_display) if current_schema else None

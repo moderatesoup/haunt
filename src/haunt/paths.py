@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import subprocess
 import threading
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -16,6 +17,8 @@ SAFE_NS = re.compile(r"[^a-zA-Z0-9._-]+")
 
 DIR_MODE = 0o700
 FILE_MODE = 0o600
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+SQLITE_OPEN_LOCK = threading.RLock()
 
 _RegistryFingerprint = tuple[
     tuple[int, int, int, int, int] | None,
@@ -29,6 +32,223 @@ _NAMESPACE_ALIAS_CACHE_LOCK = threading.Lock()
 
 class NamespacePathError(ValueError):
     """Raised when namespace storage could redirect outside its physical identity."""
+
+
+@dataclass
+class _SQLiteSidecarEntry:
+    path: Path
+    fd: int | None
+    identity: tuple[int, int] | None
+    claimed: bool = False
+
+
+class SQLiteSidecarGuard:
+    """Hold and verify SQLite sidecar names across a database open/configure."""
+
+    def __init__(self, db_path: Path, entries: list[_SQLiteSidecarEntry]):
+        self.db_path = db_path
+        self.entries = entries
+        self._closed = False
+
+    @classmethod
+    def acquire(
+        cls, db_path: Path, *, claim_missing: bool
+    ) -> "SQLiteSidecarGuard":
+        db_path = Path(db_path)
+        lexical = Path(os.path.abspath(os.path.normpath(str(db_path))))
+        if not db_path.is_absolute() or db_path != lexical:
+            raise NamespacePathError(
+                f"SQLite database path must be canonical and absolute: {db_path}"
+            )
+        parent = db_path.parent
+        try:
+            parent_info = parent.lstat()
+        except OSError as exc:
+            raise NamespacePathError(
+                f"SQLite database directory is missing or unreadable: {parent}"
+            ) from exc
+        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+            raise NamespacePathError(
+                f"SQLite database directory must be a real non-symlink directory: {parent}"
+            )
+
+        entries: list[_SQLiteSidecarEntry] = []
+        guard = cls(db_path, entries)
+        try:
+            for suffix in SQLITE_SIDECAR_SUFFIXES:
+                sidecar = Path(str(db_path) + suffix)
+                entries.append(
+                    cls._acquire_one(sidecar, claim_missing=claim_missing)
+                )
+            guard.verify()
+            return guard
+        except Exception:
+            guard.close(clean_unused_claims=True)
+            raise
+
+    @staticmethod
+    def _acquire_one(path: Path, *, claim_missing: bool) -> _SQLiteSidecarEntry:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        nonblock = getattr(os, "O_NONBLOCK", 0)
+        for _attempt in range(3):
+            try:
+                before = path.lstat()
+            except FileNotFoundError:
+                if not claim_missing:
+                    return _SQLiteSidecarEntry(path, None, None)
+                try:
+                    fd = os.open(
+                        path,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                        FILE_MODE,
+                    )
+                except FileExistsError:
+                    continue
+                info = os.fstat(fd)
+                return _SQLiteSidecarEntry(
+                    path,
+                    fd,
+                    (int(info.st_dev), int(info.st_ino)),
+                    claimed=True,
+                )
+            except OSError as exc:
+                raise NamespacePathError(
+                    f"cannot inspect SQLite sidecar: {path}"
+                ) from exc
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+                raise NamespacePathError(
+                    f"SQLite sidecar must be a regular non-symlink file: {path}"
+                )
+            if int(before.st_nlink) != 1:
+                raise NamespacePathError(
+                    f"SQLite sidecar must have exactly one filesystem link: {path}"
+                )
+            try:
+                fd = os.open(path, os.O_RDONLY | nofollow | cloexec | nonblock)
+            except OSError as exc:
+                raise NamespacePathError(
+                    f"cannot safely open SQLite sidecar: {path}"
+                ) from exc
+            info = os.fstat(fd)
+            identity = (int(info.st_dev), int(info.st_ino))
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or int(info.st_nlink) != 1
+                or identity != (int(before.st_dev), int(before.st_ino))
+            ):
+                os.close(fd)
+                raise NamespacePathError(
+                    f"SQLite sidecar physical identity changed while opening: {path}"
+                )
+            return _SQLiteSidecarEntry(path, fd, identity)
+        raise NamespacePathError(
+            f"SQLite sidecar changed repeatedly while claiming its name: {path}"
+        )
+
+    def verify(self) -> None:
+        """Fail unless every held/absent sidecar name remains unchanged."""
+        for entry in self.entries:
+            if entry.fd is None:
+                try:
+                    entry.path.lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise NamespacePathError(
+                        f"cannot inspect SQLite sidecar: {entry.path}"
+                    ) from exc
+                raise NamespacePathError(
+                    f"SQLite sidecar appeared during safe open: {entry.path}"
+                )
+            info = os.fstat(entry.fd)
+            held = (int(info.st_dev), int(info.st_ino))
+            try:
+                current = entry.path.lstat()
+            except OSError as exc:
+                raise NamespacePathError(
+                    f"SQLite sidecar disappeared during safe open: {entry.path}"
+                ) from exc
+            current_identity = (int(current.st_dev), int(current.st_ino))
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or int(info.st_nlink) != 1
+                or int(current.st_nlink) != 1
+                or held != entry.identity
+                or current_identity != entry.identity
+            ):
+                raise NamespacePathError(
+                    f"SQLite sidecar physical identity changed: {entry.path}"
+                )
+
+    def close(self, *, clean_unused_claims: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for entry in self.entries:
+            if clean_unused_claims and entry.claimed and entry.identity is not None:
+                try:
+                    current = entry.path.lstat()
+                except OSError:
+                    current = None
+                if current is not None and (
+                    stat.S_ISREG(current.st_mode)
+                    and not stat.S_ISLNK(current.st_mode)
+                    and (int(current.st_dev), int(current.st_ino)) == entry.identity
+                    and int(current.st_size) == 0
+                ):
+                    try:
+                        entry.path.unlink()
+                    except OSError:
+                        pass
+            if entry.fd is not None:
+                try:
+                    os.close(entry.fd)
+                except OSError:
+                    pass
+
+    def remove_claimed_files(self) -> None:
+        """Remove only sidecar paths that still name this guard's claimed inode."""
+        for entry in self.entries:
+            if not entry.claimed or entry.identity is None:
+                continue
+            try:
+                current = entry.path.lstat()
+            except OSError:
+                continue
+            if (
+                stat.S_ISREG(current.st_mode)
+                and not stat.S_ISLNK(current.st_mode)
+                and (int(current.st_dev), int(current.st_ino)) == entry.identity
+            ):
+                try:
+                    entry.path.unlink()
+                except OSError:
+                    pass
+
+
+def validate_sqlite_sidecars(
+    db_path: Path, *, require_absent: bool = False
+) -> dict[str, tuple[int, int]]:
+    """Validate existing sidecars without creating, deleting, or chmodding them."""
+    with SQLITE_OPEN_LOCK:
+        guard = SQLiteSidecarGuard.acquire(Path(db_path), claim_missing=False)
+        try:
+            existing = {
+                str(entry.path): entry.identity
+                for entry in guard.entries
+                if entry.identity is not None
+            }
+            if require_absent and existing:
+                joined = ", ".join(sorted(existing))
+                raise NamespacePathError(
+                    f"unmapped SQLite sidecar already exists: {joined}"
+                )
+            return {path: identity for path, identity in existing.items() if identity}
+        finally:
+            guard.close(clean_unused_claims=False)
 
 
 def haunt_home() -> Path:
@@ -259,7 +479,10 @@ def validate_registry_db_sources(
             str(legacy["db_path"])
             for legacy in conn.execute("SELECT db_path FROM namespaces").fetchall()
         )
-    return validate_namespace_db_paths(mapped_paths, expected=expected_paths)
+    physical = validate_namespace_db_paths(mapped_paths, expected=expected_paths)
+    for mapped_path in dict.fromkeys(mapped_paths):
+        validate_sqlite_sidecars(Path(mapped_path))
+    return physical
 
 
 def _registered_alias(name: str) -> tuple[str, Path] | None:
@@ -275,8 +498,13 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
             _forget_registered_alias(name)
             return None
         conn: sqlite3.Connection | None = None
+        sidecars: SQLiteSidecarGuard | None = None
+        locked = False
         result: tuple[str, Path, int, int] | None = None
         try:
+            SQLITE_OPEN_LOCK.acquire()
+            locked = True
+            sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=False)
             # A quiescent registry can be opened immutable without creating
             # WAL/SHM sidecars. If a writer appears, the bracket fingerprint
             # changes and the retry uses the WAL-aware read-only mode.
@@ -285,6 +513,7 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
                 f"{path.resolve().as_uri()}?mode=ro{immutable}", uri=True
             )
             conn.row_factory = sqlite3.Row
+            sidecars.verify()
             tables = {
                 str(row[0])
                 for row in conn.execute(
@@ -339,6 +568,10 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
         finally:
             if conn is not None:
                 conn.close()
+            if sidecars is not None:
+                sidecars.close(clean_unused_claims=False)
+            if locked:
+                SQLITE_OPEN_LOCK.release()
         if before != _registry_fingerprint():
             continue
         if result is None:
@@ -412,9 +645,15 @@ def _registered_namespace_for_repo(
     if not path.is_file():
         return None
     conn: sqlite3.Connection | None = None
+    sidecars: SQLiteSidecarGuard | None = None
+    locked = False
     try:
+        SQLITE_OPEN_LOCK.acquire()
+        locked = True
+        sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=False)
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        sidecars.verify()
         tables = {
             str(row[0])
             for row in conn.execute(
@@ -453,6 +692,10 @@ def _registered_namespace_for_repo(
     finally:
         if conn is not None:
             conn.close()
+        if sidecars is not None:
+            sidecars.close(clean_unused_claims=False)
+        if locked:
+            SQLITE_OPEN_LOCK.release()
     resolved_root = repo_root.resolve() if repo_root else None
     for row in rows:
         stored = str(row["repo_path"] or "").strip()
@@ -548,11 +791,52 @@ def mkdir_private(path: Path) -> Path:
 
 
 def tighten_db_files(path: Path) -> None:
-    """chmod 0600 on a sqlite db and sibling WAL/SHM, if they exist."""
-    for extra in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
-        if extra.is_file() and not _is_user_home(extra):
-            if (extra.stat().st_mode & 0o777) != FILE_MODE:
-                extra.chmod(FILE_MODE)
+    """Tighten only verified SQLite files, never following a sidecar symlink."""
+    validate_sqlite_sidecars(path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    for extra in (
+        path,
+        *(Path(str(path) + suffix) for suffix in SQLITE_SIDECAR_SUFFIXES),
+    ):
+        try:
+            before = extra.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise NamespacePathError(f"cannot inspect SQLite file: {extra}") from exc
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or int(before.st_nlink) != 1
+        ):
+            raise NamespacePathError(
+                f"SQLite file must be a single-link regular non-symlink: {extra}"
+            )
+        try:
+            fd = os.open(extra, os.O_RDONLY | nofollow | cloexec)
+        except OSError as exc:
+            raise NamespacePathError(f"cannot safely open SQLite file: {extra}") from exc
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or int(opened.st_nlink) != 1
+                or (int(opened.st_dev), int(opened.st_ino))
+                != (int(before.st_dev), int(before.st_ino))
+            ):
+                raise NamespacePathError(
+                    f"SQLite file physical identity changed before chmod: {extra}"
+                )
+            if not _is_user_home(extra) and (opened.st_mode & 0o777) != FILE_MODE:
+                try:
+                    os.fchmod(fd, FILE_MODE)
+                except (AttributeError, OSError) as exc:
+                    raise NamespacePathError(
+                        f"cannot safely tighten SQLite file mode: {extra}"
+                    ) from exc
+        finally:
+            os.close(fd)
 
 
 def repair_private_modes(root: Path | None = None) -> list[str]:
@@ -577,15 +861,50 @@ def repair_private_modes(root: Path | None = None) -> list[str]:
     for d in (home / "namespaces", home / "bin", home / "models"):
         if d.is_dir():
             _chmod(d, DIR_MODE)
+    def _tighten_database(db_path: Path) -> None:
+        candidates = (
+            db_path,
+            *(Path(str(db_path) + suffix) for suffix in SQLITE_SIDECAR_SUFFIXES),
+        )
+        before_modes: dict[Path, int] = {}
+        for candidate in candidates:
+            try:
+                info = candidate.lstat()
+            except OSError:
+                continue
+            before_modes[candidate] = info.st_mode & 0o777
+        tighten_db_files(db_path)
+        for candidate, before_mode in before_modes.items():
+            try:
+                after_mode = candidate.lstat().st_mode & 0o777
+            except OSError:
+                continue
+            if before_mode != after_mode:
+                changed.append(str(candidate))
+
     registry = home / "registry.db"
-    for f in (registry, Path(str(registry) + "-wal"), Path(str(registry) + "-shm")):
-        _chmod(f, FILE_MODE)
+    if registry.exists():
+        _tighten_database(registry)
+    else:
+        validate_sqlite_sidecars(registry, require_absent=True)
     ns_dir = home / "namespaces"
     if ns_dir.is_dir():
-        for f in ns_dir.iterdir():
-            name = f.name
-            if name.endswith(".db") or name.endswith(".db-wal") or name.endswith(".db-shm"):
-                _chmod(f, FILE_MODE)
+        entries = list(ns_dir.iterdir())
+        databases = {
+            entry
+            for entry in entries
+            if entry.name.endswith(".db") and not entry.name.startswith(".haunt-claim-")
+        }
+        for entry in entries:
+            for suffix in SQLITE_SIDECAR_SUFFIXES:
+                if entry.name.endswith(f".db{suffix}"):
+                    main = Path(str(entry)[: -len(suffix)])
+                    if main not in databases:
+                        raise NamespacePathError(
+                            f"unmapped SQLite sidecar already exists: {entry}"
+                        )
+        for database in sorted(databases):
+            _tighten_database(database)
     return changed
 
 
