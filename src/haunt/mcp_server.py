@@ -348,7 +348,8 @@ def memory_session_end(
 @server.tool(
     description=(
         "Compact per-namespace briefing for session start. Returns current facts "
-        "(semantic memories), top entity names, procedure index, and counts."
+        "(semantic memories), top entity names, procedure index with source "
+        "provenance, and counts."
     )
 )
 def memory_worldview(

@@ -19,7 +19,14 @@ from starlette.routing import Route
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.recall import recall, Hit, RRF_K
-from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
+from haunt.store import (
+    Store,
+    UnknownNamespaceError,
+    list_namespaces,
+    list_namespace_rows,
+    namespace_exists,
+    open_existing,
+)
 from haunt.util import clamp_limit
 
 TOKEN_HEADER = "X-Haunt-Token"
@@ -1061,16 +1068,24 @@ async def api_health(request: Request) -> JSONResponse:
 
 async def api_timeline(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
-    missing = _missing_namespace(name)
-    if missing:
-        return missing
     params = request.query_params
     since = params.get("since") or None
     until = params.get("until") or None
     clock = params.get("clock") or None
     limit = clamp_limit(params.get("limit") or 100, default=100)
-    with Store(name, create=False) as st:
-        events = st.events(since=since, until=until, clock=clock, limit=limit)
+    try:
+        with open_existing(name) as st:
+            events = st.events(
+                since=since,
+                until=until,
+                clock=clock,
+                limit=limit,
+            )
+    except (UnknownNamespaceError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "namespace": name},
+            status_code=400,
+        )
     return JSONResponse({"namespace": name, "events": events})
 
 

@@ -184,7 +184,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt timeline [--since --until --clock --json]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias); human rows show source channel/origin and JSON preserves the complete provenance envelope |
 | `haunt namespaces` | list + counts |
 | `haunt health [-n NAMESPACE]` | vec / embed / counts / db path |
-| `haunt worldview [-n NAMESPACE]` | compact namespace briefing: facts, entities, procedures |
+| `haunt worldview [-n NAMESPACE]` | compact namespace briefing: facts, entities, and procedures with source provenance |
 | `haunt procedure write NAME --body BODY` | store a named procedure |
 | `haunt procedure get NAME` | retrieve a named procedure and its provenance |
 | `haunt procedure list` | list all active procedures and their provenance |

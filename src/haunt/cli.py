@@ -394,7 +394,7 @@ def procedure_get_cmd(
     typer.echo(f"id       {proc['id']}")
     typer.echo(f"created  {proc['created_at']}")
     typer.echo(f"provenance {dumps(proc['provenance'])}")
-    typer.echo(f"---")
+    typer.echo("---")
     typer.echo(proc["body"])
 
 

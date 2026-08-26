@@ -2261,7 +2261,8 @@ class Store:
             dict(r)
             for r in self.conn.execute(
                 """
-                SELECT m.id, m.content, e.meta
+                SELECT m.id, m.content, e.meta,
+                       e.origin, e.tool_name, e.provenance
                 FROM memories m
                 JOIN events e ON e.id = m.event_id
                 WHERE m.tier='procedural' AND m.valid_to IS NULL AND e.meta LIKE '%"kind": "procedure"%'
@@ -2276,6 +2277,12 @@ class Store:
                 "id": p["id"],
                 "name": emeta.get("name", ""),
                 "trigger": emeta.get("trigger", ""),
+                "provenance": public_provenance(
+                    p["provenance"],
+                    origin=p["origin"],
+                    legacy_meta=p["meta"],
+                    tool_name=p["tool_name"],
+                ),
             })
 
         names = self.top_entities(limit=names_cap, trusted_only=True)

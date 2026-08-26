@@ -80,6 +80,10 @@ provenance. Human timeline rows show `source=<channel>/<origin>`, using
 get/list results likewise retain the provenance of their sourced memory across
 Store, MCP, CLI, dashboard, and worldview output.
 
+Dashboard timeline validation failures are JSON HTTP 400 responses with the
+same `ok: false`, `error`, and `namespace` fields used by CLI JSON and MCP error
+envelopes; invalid clocks, timestamps, or namespaces do not become text 500s.
+
 ## Legacy and invalid rows
 
 The v8 migration adds the provenance column without rewriting existing

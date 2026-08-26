@@ -790,6 +790,42 @@ def test_cli_timeline_json_errors_use_stable_envelope(
     assert expected_error in payload["error"]
 
 
+@pytest.mark.parametrize(
+    "path, namespace, expected_error",
+    [
+        (
+            "/api/namespace/default/timeline?clock=not-a-clock",
+            "default",
+            "clock must be",
+        ),
+        (
+            "/api/namespace/default/timeline?since=not-a-time",
+            "default",
+            "not-a-time",
+        ),
+        (
+            "/api/namespace/missing-dashboard-timeline/timeline",
+            "missing-dashboard-timeline",
+            "unknown namespace",
+        ),
+    ],
+)
+def test_dashboard_timeline_errors_are_exact_json_400_envelopes(
+    provenance_env, path, namespace, expected_error
+):
+    from tests.dashutil import make_dash_client
+
+    response = make_dash_client().get(path)
+    assert response.status_code == 400
+    assert response.headers["content-type"] == "application/json"
+    payload = response.json()
+    assert set(payload) == {"ok", "error", "namespace"}
+    assert payload["ok"] is False
+    assert payload["namespace"] == namespace
+    assert expected_error in payload["error"]
+    assert "Internal Server Error" not in response.text
+
+
 def test_procedure_get_and_list_keep_provenance_across_store_mcp_and_cli(
     provenance_env, monkeypatch
 ):
@@ -826,6 +862,7 @@ def test_procedure_get_and_list_keep_provenance_across_store_mcp_and_cli(
         legacy_get = st.procedure_get("legacy procedure")
         invalid_get = st.procedure_get("invalid procedure")
         listed = {row["name"]: row for row in st.procedure_list()}
+        worldview = {row["name"]: row for row in st.worldview()["procedures"]}
 
     assert native_get is not None and native_get["provenance"] == native.provenance
     assert imported_get is not None
@@ -846,6 +883,7 @@ def test_procedure_get_and_list_keep_provenance_across_store_mcp_and_cli(
         ("invalid procedure", invalid_get),
     ):
         assert listed[name]["provenance"] == expected["provenance"]
+        assert worldview[name]["provenance"] == expected["provenance"]
 
     monkeypatch.setenv("HAUNT_NAMESPACE", "default")
     from haunt import mcp_server
@@ -866,6 +904,19 @@ def test_procedure_get_and_list_keep_provenance_across_store_mcp_and_cli(
         "kind"
     ] == "legacy_unstructured"
     assert mcp_listed["invalid procedure"]["provenance"]["kind"] == "invalid_stored"
+    mcp_worldview = json.loads(mcp_server.memory_worldview(namespace="default"))
+    mcp_worldview_procedures = {
+        row["name"]: row for row in mcp_worldview["procedures"]
+    }
+    for name, expected in (
+        ("native procedure", native_get),
+        ("imported procedure", imported_get),
+        ("legacy procedure", legacy_get),
+        ("invalid procedure", invalid_get),
+    ):
+        assert mcp_worldview_procedures[name]["provenance"] == expected[
+            "provenance"
+        ]
 
     runner = CliRunner()
     cli_get = runner.invoke(
@@ -887,6 +938,17 @@ def test_procedure_get_and_list_keep_provenance_across_store_mcp_and_cli(
     cli_list = runner.invoke(app, ["procedure", "list", "-n", "default"])
     assert cli_list.exit_code == 0, cli_list.output
     assert f"provenance {native_json}" in cli_list.stdout
+    cli_worldview = runner.invoke(
+        app, ["worldview", "-n", "default", "--json"]
+    )
+    assert cli_worldview.exit_code == 0, cli_worldview.output
+    cli_worldview_procedures = {
+        row["name"]: row
+        for row in json.loads(cli_worldview.stdout)["procedures"]
+    }
+    assert cli_worldview_procedures["legacy procedure"]["provenance"][
+        "kind"
+    ] == "legacy_unstructured"
 
 
 def test_cli_and_mcp_invalid_parser_version_write_nothing(provenance_env, monkeypatch):
