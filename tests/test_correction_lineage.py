@@ -21,6 +21,25 @@ def lineage_env(tmp_path, monkeypatch):
     embed.reset()
 
 
+def _assert_tokens_absent_from_tables(store, tokens):
+    for table_row in store.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall():
+        table = table_row["name"]
+        for row in store.conn.execute(f'SELECT * FROM "{table}"').fetchall():
+            serialized = json.dumps(
+                [value.hex() if isinstance(value, bytes) else value for value in row]
+            )
+            for token in tokens:
+                assert token not in serialized, table
+
+
+def _assert_tokens_absent_from_payload(payload, tokens):
+    serialized = json.dumps(payload)
+    for token in tokens:
+        assert token not in serialized
+
+
 def test_v3_migration_is_additive_idempotent_and_survives_restart(lineage_env):
     from haunt.store import SCHEMA_VERSION, Store
 
@@ -46,6 +65,22 @@ def test_v3_migration_is_additive_idempotent_and_survives_restart(lineage_env):
             "legacy database memory",
             "replacement after migration",
         ]
+        assert st.get_meta("schema_version") == str(SCHEMA_VERSION)
+
+
+def test_v4_migration_adds_correction_session_ownership(lineage_env):
+    from haunt.store import SCHEMA_VERSION, Store
+
+    with Store("default") as st:
+        st.conn.execute("ALTER TABLE corrections DROP COLUMN session_created")
+        st.conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+        st.conn.commit()
+
+    with Store("default") as st:
+        columns = {
+            row["name"] for row in st.conn.execute("PRAGMA table_info(corrections)")
+        }
+        assert "session_created" in columns
         assert st.get_meta("schema_version") == str(SCHEMA_VERSION)
 
 
@@ -326,8 +361,8 @@ def test_purge_scrubs_canaries_and_keeps_safe_gap(lineage_env):
             erased_id,
             replacement="surviving last",
             reason=canary,
-            origin="safe-successor-origin",
-            session_id="safe-successor-session",
+            origin=canary,
+            session_id=canary,
             idempotency_key=canary + "-2",
         )
         last = out["replacement_memory_id"]
@@ -347,17 +382,231 @@ def test_purge_scrubs_canaries_and_keeps_safe_gap(lineage_env):
         assert erased_id not in serialized_trace
         assert erased_event not in serialized_trace
 
-        for table_row in st.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        ).fetchall():
-            table = table_row["name"]
-            for row in st.conn.execute(f'SELECT * FROM "{table}"').fetchall():
-                serialized = json.dumps(
-                    [value.hex() if isinstance(value, bytes) else value for value in row]
-                )
-                assert canary not in serialized, table
-                assert erased_id not in serialized, table
-                assert erased_event not in serialized, table
+        _assert_tokens_absent_from_tables(st, (canary, erased_id, erased_event))
+
+
+@pytest.mark.parametrize("purge_position", ["first", "middle", "last", "all"])
+def test_purge_privacy_matrix_scans_tables_trace_and_api(
+    lineage_env, monkeypatch, purge_position
+):
+    monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
+    from haunt.mcp_server import memory_trace
+    from haunt.store import Store
+    from tests.dashutil import make_dash_client
+
+    tokens = {
+        "a_content": "PURGE-A-CONTENT-CANARY",
+        "a_origin": "PURGE-A-ORIGIN-CANARY",
+        "a_session": "PURGE-A-SESSION-CANARY",
+        "c1_origin": "PURGE-C1-ORIGIN-CANARY",
+        "c1_session": "PURGE-C1-SESSION-CANARY",
+        "c1_reason": "PURGE-C1-REASON-CANARY",
+        "c1_key": "PURGE-C1-IDEMPOTENCY-CANARY",
+        "b_content": "PURGE-B-REPLACEMENT-CANARY",
+        "c2_origin": "PURGE-C2-ORIGIN-CANARY",
+        "c2_session": "PURGE-C2-SESSION-CANARY",
+        "c2_reason": "PURGE-C2-REASON-CANARY",
+        "c2_key": "PURGE-C2-IDEMPOTENCY-CANARY",
+        "c_content": "PURGE-C-REPLACEMENT-CANARY",
+    }
+    with Store("default") as st:
+        a = st.observe(
+            tokens["a_content"],
+            origin=tokens["a_origin"],
+            session_id=tokens["a_session"],
+        )
+        c1 = st.contradict(
+            a.memory_id,
+            replacement=tokens["b_content"],
+            origin=tokens["c1_origin"],
+            session_id=tokens["c1_session"],
+            reason=tokens["c1_reason"],
+            idempotency_key=tokens["c1_key"],
+        )
+        b_id = c1["replacement_memory_id"]
+        b_event = c1["replacement_event_id"]
+        c2 = st.contradict(
+            b_id,
+            replacement=tokens["c_content"],
+            origin=tokens["c2_origin"],
+            session_id=tokens["c2_session"],
+            reason=tokens["c2_reason"],
+            idempotency_key=tokens["c2_key"],
+        )
+        c_id = c2["replacement_memory_id"]
+        c_event = c2["replacement_event_id"]
+
+        if purge_position == "first":
+            st.purge(a.memory_id)
+            surviving_id = c_id
+            absent = (
+                tokens["a_content"], tokens["a_origin"], tokens["a_session"],
+                tokens["c1_origin"], tokens["c1_session"], tokens["c1_reason"],
+                tokens["c1_key"], a.memory_id, a.event_id,
+            )
+        elif purge_position == "middle":
+            st.purge(b_id)
+            surviving_id = c_id
+            absent = (
+                tokens["b_content"], tokens["c1_origin"], tokens["c1_session"],
+                tokens["c1_reason"], tokens["c1_key"], tokens["c2_origin"],
+                tokens["c2_session"], tokens["c2_reason"], tokens["c2_key"],
+                b_id, b_event,
+            )
+        elif purge_position == "last":
+            st.purge(c_id)
+            surviving_id = b_id
+            absent = (
+                tokens["c_content"], tokens["c2_origin"], tokens["c2_session"],
+                tokens["c2_reason"], tokens["c2_key"], c_id, c_event,
+            )
+        else:
+            st.purge(a.memory_id)
+            st.purge(b_id)
+            st.purge(c_id)
+            surviving_id = None
+            absent = tuple(tokens.values()) + (
+                a.memory_id, a.event_id, b_id, b_event, c_id, c_event,
+            )
+
+        _assert_tokens_absent_from_tables(st, absent)
+        store_trace = st.trace(surviving_id) if surviving_id else st.trace(c_id)
+        _assert_tokens_absent_from_payload(store_trace, absent)
+
+    client = make_dash_client()
+    detail_id = surviving_id if surviving_id else c_id
+    detail_response = client.get(f"/api/namespace/default/memory/{detail_id}")
+    _assert_tokens_absent_from_payload(detail_response.json(), absent)
+    _assert_tokens_absent_from_payload(
+        json.loads(memory_trace(detail_id, namespace="default")), absent
+    )
+
+
+def test_purge_sanitizes_shared_correction_session_without_deleting_unrelated(
+    lineage_env, monkeypatch
+):
+    monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
+    from haunt.mcp_server import memory_trace
+    from haunt.store import PURGE_SAFE_SESSION_SOURCE, Store
+    from tests.dashutil import make_dash_client
+
+    canary = "SHARED-CORRECTION-CONTEXT-CANARY"
+    shared_session = canary + "-SESSION-ID"
+    unrelated_content = "UNRELATED-SHARED-SESSION-CONTENT-SURVIVES"
+    with Store("default") as st:
+        original = st.observe("shared session purge target")
+        correction = st.contradict(
+            original.memory_id,
+            replacement="surviving replacement content",
+            origin=canary,
+            session_id=shared_session,
+            reason=canary,
+            idempotency_key=canary,
+        )
+        replacement_id = correction["replacement_memory_id"]
+        unrelated = st.observe(
+            unrelated_content,
+            origin="safe-unrelated-origin",
+            session_id=shared_session,
+        )
+        st.conn.execute(
+            "UPDATE sessions SET meta=? WHERE id=?",
+            (
+                json.dumps(
+                    {
+                        "correction_context": canary,
+                        "keep": "unrelated-session-metadata",
+                    }
+                ),
+                shared_session,
+            ),
+        )
+        st.set_meta("current_session", shared_session)
+
+        ownership = st.conn.execute(
+            "SELECT session_created FROM corrections WHERE id=?",
+            (correction["correction_id"],),
+        ).fetchone()
+        assert ownership["session_created"] == 1
+
+        st.purge(original.memory_id)
+
+        replacement = st.get_memory(replacement_id)
+        unrelated_after = st.get_memory(unrelated.memory_id)
+        assert replacement["origin"] == PURGE_SAFE_SESSION_SOURCE
+        assert replacement["session_id"] != shared_session
+        assert unrelated_after["content"] == unrelated_content
+        assert unrelated_after["origin"] == "safe-unrelated-origin"
+        assert unrelated_after["session_id"] == replacement["session_id"]
+        assert st.conn.execute(
+            "SELECT 1 FROM sessions WHERE id=?", (shared_session,)
+        ).fetchone() is None
+        session = st.conn.execute(
+            "SELECT source, meta FROM sessions WHERE id=?",
+            (replacement["session_id"],),
+        ).fetchone()
+        assert session["source"] == PURGE_SAFE_SESSION_SOURCE
+        assert json.loads(session["meta"]) == {
+            "keep": "unrelated-session-metadata"
+        }
+        assert st.get_meta("current_session") == replacement["session_id"]
+        absent = (canary, original.memory_id, original.event_id)
+        _assert_tokens_absent_from_tables(st, absent)
+        _assert_tokens_absent_from_payload(st.trace(replacement_id), absent)
+
+    detail = make_dash_client().get(
+        f"/api/namespace/default/memory/{replacement_id}"
+    )
+    assert detail.status_code == 200
+    _assert_tokens_absent_from_payload(detail.json(), absent)
+    _assert_tokens_absent_from_payload(
+        json.loads(memory_trace(replacement_id, namespace="default")), absent
+    )
+
+
+def test_purge_does_not_scrub_preexisting_shared_session_metadata(lineage_env):
+    from haunt.store import Store
+
+    session_id = "preexisting-shared-session"
+    session_origin = "preexisting-shared-origin"
+    session_meta = {"keep": "unrelated-session-metadata"}
+    with Store("default") as st:
+        unrelated = st.observe(
+            "preexisting unrelated event survives",
+            origin=session_origin,
+            session_id=session_id,
+        )
+        st.conn.execute(
+            "UPDATE sessions SET meta=? WHERE id=?",
+            (json.dumps(session_meta), session_id),
+        )
+        original = st.observe("target using preexisting session")
+        correction = st.contradict(
+            original.memory_id,
+            replacement="replacement leaves preexisting session",
+            origin=session_origin,
+            session_id=session_id,
+            idempotency_key="preexisting-session-correction",
+        )
+        st.set_meta("current_session", session_id)
+        ownership = st.conn.execute(
+            "SELECT session_created FROM corrections WHERE id=?",
+            (correction["correction_id"],),
+        ).fetchone()
+        assert ownership["session_created"] == 0
+        st.purge(original.memory_id)
+
+        session = st.conn.execute(
+            "SELECT source, meta FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        assert session["source"] == session_origin
+        assert json.loads(session["meta"]) == session_meta
+        assert st.get_meta("current_session") == session_id
+        assert st.get_memory(unrelated.memory_id)["content"] == (
+            "preexisting unrelated event survives"
+        )
+        replacement = st.get_memory(correction["replacement_memory_id"])
+        assert replacement["session_id"] != session_id
 
 
 def test_schema_has_one_correction_per_target_and_canonical_identity(lineage_env):

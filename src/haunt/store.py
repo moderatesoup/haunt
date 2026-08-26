@@ -44,7 +44,8 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 2: graph evidence tables + hook idempotency key.
 # 3: durable queue for hook-deferred embeddings.
 # 4: append-only correction lineage plus privacy-erasure tombstones.
-SCHEMA_VERSION = 4
+# 5: track correction-created sessions for privacy-safe purge rekeying.
+SCHEMA_VERSION = 5
 SCHEMA_VERSION_KEY = "schema_version"
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -57,6 +58,8 @@ _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 CORRECTION_KEY_MAX = 512
 TOMBSTONE_SCHEMA_VERSION = 1
+PURGE_SAFE_ORIGIN = "privacy-sanitized"
+PURGE_SAFE_SESSION_SOURCE = "privacy-sanitized"
 
 
 class UnknownNamespaceError(ValueError):
@@ -338,6 +341,7 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
                 corrected_at TEXT NOT NULL,
                 origin TEXT,
                 session_id TEXT,
+                session_created INTEGER NOT NULL DEFAULT 0,
                 reason TEXT,
                 idempotency_key TEXT,
                 request_identity TEXT,
@@ -365,6 +369,16 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
                 WHERE replacement_tombstone_id IS NOT NULL;
             """
         )
+    if current < 5:
+        correction_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(corrections)").fetchall()
+        }
+        if "session_created" not in correction_columns:
+            conn.execute(
+                "ALTER TABLE corrections ADD COLUMN "
+                "session_created INTEGER NOT NULL DEFAULT 0"
+            )
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
         (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
@@ -1252,7 +1266,7 @@ class Store:
         """
         row = self.conn.execute(
             """
-            SELECT m.id, m.event_id, e.session_id
+            SELECT m.id, m.event_id, m.content, e.origin, e.session_id
             FROM memories m JOIN events e ON e.id=m.event_id
             WHERE m.id=?
             """,
@@ -1292,6 +1306,18 @@ class Store:
                 if r["target_memory_id"] == memory_id
             ) or any(r["replacement_memory_id"] == memory_id for r in lineage_rows)
             tombstone: dict[str, Any] | None = None
+            sessions_to_cleanup: dict[str, dict[str, Any]] = {}
+            erased_values = {
+                str(value)
+                for value in (
+                    memory_id,
+                    event_id,
+                    row["content"],
+                    row["origin"],
+                    row["session_id"],
+                )
+                if value is not None and str(value)
+            }
             if needs_tombstone:
                 tombstone = {
                     "schema_version": TOMBSTONE_SCHEMA_VERSION,
@@ -1308,7 +1334,48 @@ class Store:
                     tuple(tombstone.values()),
                 )
             for correction in lineage_rows:
+                correction_session = correction["session_id"]
+                if correction_session is not None:
+                    session_info = sessions_to_cleanup.setdefault(
+                        str(correction_session),
+                        {
+                            "correction_created": False,
+                            "safe_session": None,
+                            "sensitive_values": set(erased_values),
+                        },
+                    )
+                    session_info["correction_created"] = bool(
+                        session_info["correction_created"]
+                        or correction["session_created"]
+                    )
+                    session_info["sensitive_values"].update(
+                        str(value)
+                        for value in (
+                            correction["origin"],
+                            correction["session_id"],
+                            correction["reason"],
+                            correction["idempotency_key"],
+                            correction["request_identity"],
+                            correction["target_tombstone_id"],
+                            correction["replacement_tombstone_id"],
+                        )
+                        if value is not None and str(value)
+                    )
                 if correction["target_memory_id"] == memory_id:
+                    sanitized_session = self._sanitize_correction_replacement_event(
+                        correction, erased_memory_id=memory_id
+                    )
+                    if sanitized_session is not None:
+                        old_session, safe_session = sanitized_session
+                        session_info = sessions_to_cleanup.setdefault(
+                            old_session,
+                            {
+                                "correction_created": False,
+                                "safe_session": None,
+                                "sensitive_values": set(erased_values),
+                            },
+                        )
+                        session_info["safe_session"] = safe_session
                     has_successor = (
                         correction["replacement_memory_id"] is not None
                         or correction["replacement_tombstone_id"] is not None
@@ -1378,8 +1445,16 @@ class Store:
                 deleted["entities_deleted"] = entity_count
                 self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
                 deleted["event_deleted"] = True
+                sessions_to_cleanup.setdefault(
+                    str(row["session_id"]),
+                    {
+                        "correction_created": False,
+                        "safe_session": None,
+                        "sensitive_values": set(erased_values),
+                    },
+                )
 
-                session_id = row["session_id"]
+            for session_id, session_info in sessions_to_cleanup.items():
                 session_refs = self.conn.execute(
                     """
                     SELECT
@@ -1388,12 +1463,53 @@ class Store:
                     """,
                     (session_id, session_id),
                 ).fetchone()[0]
-                if session_refs == 0:
-                    self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                safe_session = session_info["safe_session"]
+                safe_meta = self._purge_safe_session_meta(
+                    session_id, session_info["sensitive_values"]
+                )
+                if session_info["correction_created"] and session_refs > 0:
+                    if safe_session is None:
+                        safe_session = self._create_purge_safe_session(meta=safe_meta)
+                    else:
+                        self.conn.execute(
+                            "UPDATE sessions SET meta=? WHERE id=?",
+                            (safe_meta, safe_session),
+                        )
+                    # This session ID was minted by the purged correction. Rekey
+                    # every remaining reference without touching event content
+                    # or unrelated origins, then remove all old source/meta.
                     self.conn.execute(
-                        "DELETE FROM meta WHERE key='current_session' AND value=?",
-                        (session_id,),
+                        "UPDATE events SET session_id=? WHERE session_id=?",
+                        (safe_session, session_id),
                     )
+                    self.conn.execute(
+                        "UPDATE corrections SET session_id=? WHERE session_id=?",
+                        (safe_session, session_id),
+                    )
+                    self.conn.execute(
+                        "UPDATE meta SET value=? WHERE key='current_session' AND value=?",
+                        (safe_session, session_id),
+                    )
+                    self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                    deleted["session_deleted"] = True
+                elif session_refs == 0:
+                    if session_info["correction_created"] and safe_session is not None:
+                        self.conn.execute(
+                            "UPDATE sessions SET meta=? WHERE id=?",
+                            (safe_meta, safe_session),
+                        )
+                    self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                    if safe_session is None:
+                        self.conn.execute(
+                            "DELETE FROM meta WHERE key='current_session' AND value=?",
+                            (session_id,),
+                        )
+                    else:
+                        self.conn.execute(
+                            "UPDATE meta SET value=? "
+                            "WHERE key='current_session' AND value=?",
+                            (safe_session, session_id),
+                        )
                     deleted["session_deleted"] = True
 
             if tombstone is not None:
@@ -1410,6 +1526,120 @@ class Store:
         except Exception:
             pass
         return deleted
+
+    def _sanitize_correction_replacement_event(
+        self,
+        correction: sqlite3.Row,
+        *,
+        erased_memory_id: str,
+    ) -> tuple[str, str] | None:
+        """Remove purged correction context from its surviving replacement event.
+
+        Only the direct replacement created by this correction is eligible.
+        Content and unrelated event origins are never changed. The returned old
+        session is deleted or safely rekeyed after adjacent correction records
+        have been scrubbed.
+        """
+        replacement_id = correction["replacement_memory_id"]
+        if replacement_id is None or replacement_id == erased_memory_id:
+            return None
+        event = self.conn.execute(
+            """
+            SELECT e.id, e.origin, e.session_id
+            FROM memories m JOIN events e ON e.id=m.event_id
+            WHERE m.id=?
+            """,
+            (replacement_id,),
+        ).fetchone()
+        if event is None:
+            return None
+
+        correction_origin = correction["origin"]
+        correction_session = correction["session_id"]
+        origin_matches = (
+            correction_origin is not None and event["origin"] == correction_origin
+        )
+        session_matches = (
+            correction_session is not None
+            and event["session_id"] == correction_session
+        )
+        if not origin_matches and not session_matches:
+            return None
+
+        updates: list[str] = []
+        params: list[Any] = []
+        old_session: str | None = None
+        safe_session: str | None = None
+        if origin_matches:
+            updates.append("origin=?")
+            params.append(PURGE_SAFE_ORIGIN)
+        if session_matches:
+            old_session = str(event["session_id"])
+            safe_session = self._create_purge_safe_session()
+            updates.append("session_id=?")
+            params.append(safe_session)
+        params.append(event["id"])
+        self.conn.execute(
+            f"UPDATE events SET {', '.join(updates)} WHERE id=?",
+            params,
+        )
+        if old_session is None or safe_session is None:
+            return None
+        return old_session, safe_session
+
+    def _create_purge_safe_session(self, *, meta: str | None = None) -> str:
+        safe_session = new_id()
+        self.conn.execute(
+            """
+            INSERT INTO sessions(id, started_at, ended_at, source, meta)
+            VALUES (?, ?, NULL, ?, ?)
+            """,
+            (
+                safe_session,
+                now_iso(),
+                PURGE_SAFE_SESSION_SOURCE,
+                dumps({}) if meta is None else meta,
+            ),
+        )
+        return safe_session
+
+    def _purge_safe_session_meta(
+        self, session_id: str, sensitive_values: set[str]
+    ) -> str:
+        """Preserve unrelated session metadata while removing purge context."""
+        row = self.conn.execute(
+            "SELECT meta FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        original = loads(None if row is None else row["meta"], default={})
+        dropped = object()
+
+        def tainted(value: str) -> bool:
+            return any(
+                value == token or (len(token) >= 8 and token in value)
+                for token in sensitive_values
+            )
+
+        def sanitize(value: Any) -> Any:
+            if isinstance(value, str):
+                return dropped if tainted(value) else value
+            if isinstance(value, dict):
+                clean: dict[Any, Any] = {}
+                for key, child in value.items():
+                    if isinstance(key, str) and tainted(key):
+                        continue
+                    sanitized = sanitize(child)
+                    if sanitized is not dropped:
+                        clean[key] = sanitized
+                return clean
+            if isinstance(value, list):
+                return [
+                    sanitized
+                    for child in value
+                    if (sanitized := sanitize(child)) is not dropped
+                ]
+            return value
+
+        return dumps(sanitize(original))
 
     def _prune_erased_only_lineage(self) -> None:
         """During purge, discard components that no surviving memory can trace."""
@@ -1928,7 +2158,24 @@ class Store:
 
             ts = now_iso()
             correction_id = new_id()
+            reused_session: str | None = None
+            if session_id:
+                existing_session = self.conn.execute(
+                    "SELECT id FROM sessions WHERE id=?", (session_id,)
+                ).fetchone()
+                if existing_session is not None:
+                    reused_session = str(existing_session["id"])
+            else:
+                current_session = self.get_meta("current_session")
+                if current_session:
+                    existing_session = self.conn.execute(
+                        "SELECT id FROM sessions WHERE id=? AND ended_at IS NULL",
+                        (current_session,),
+                    ).fetchone()
+                    if existing_session is not None:
+                        reused_session = str(existing_session["id"])
             sid = self.ensure_session(session_id, source=origin, commit=False)
+            session_created = reused_session != sid
             cur = self.conn.execute(
                 "UPDATE memories SET valid_to=? WHERE id=? AND valid_to IS NULL",
                 (ts, memory_id),
@@ -1972,9 +2219,9 @@ class Store:
                 """
                 INSERT INTO corrections(
                     id, target_memory_id, replacement_memory_id, corrected_at,
-                    origin, session_id, reason, idempotency_key,
+                    origin, session_id, session_created, reason, idempotency_key,
                     request_identity, request_payload, response_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     correction_id,
@@ -1983,6 +2230,7 @@ class Store:
                     ts,
                     origin,
                     sid,
+                    int(session_created),
                     reason,
                     key,
                     request_identity,

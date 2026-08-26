@@ -93,7 +93,7 @@ Features:
 - **Timeline** view: events in time order with since/until day filters. Rows click through to memory detail.
 - **Time-bounded search**: `as_of`, `since`, `until` date filters on recall (both per-namespace and all-namespaces).
 - **Supersede** a memory from the detail panel (append-only correction record plus `valid_to=now`, optional replacement text). Keeps original data — distinct from delete.
-- **Delete** a memory from the UI (with confirmation). Hard purge removes the memory, FTS index, vector embedding, graph rows, and orphan events. Recall will not return deleted content. If surviving correction history crosses the erased member, trace shows only a fresh opaque four-field tombstone; purge is the explicit exception to ordinary append-only lineage.
+- **Delete** a memory from the UI (with confirmation). Hard purge removes the memory, FTS index, vector embedding, graph rows, and orphan events. Recall will not return deleted content. If surviving correction history crosses the erased member, trace shows only a fresh opaque four-field tombstone; purge is the explicit exception to ordinary append-only lineage. Surviving correction-created replacements are moved to fresh sanitized event/session context, and any shared correction-minted session is safely rekeyed without deleting unrelated event content.
 - **Procedures and worldview** visible (browse, view detail; write stays CLI/MCP).
 - **Health** strip: sqlite-vec status/version, embed model+dim+availability, last write age, event count, namespace, absolute db_path. Always visible (persistent header), live-updating (15s poll).
 
