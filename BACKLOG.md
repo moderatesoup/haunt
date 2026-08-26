@@ -212,7 +212,7 @@ that lineage.
 
 ## E2 — Structure source and import provenance
 
-**Status:** In progress
+**Status:** Done
 
 **Depends on:** E1
 
@@ -250,7 +250,7 @@ that source metadata measures truth.
 - A trace test starts at a corrected imported memory and reaches both its
   correction lineage and source envelope.
 
-**Implementation evidence (pending independent review)**
+**Completion evidence (2026-08-25)**
 
 - `src/haunt/provenance.py` defines the bounded schema-v1 native/import
   envelope, canonical UTC/hash rules, four fidelity values, actual producer
@@ -300,6 +300,11 @@ that source metadata measures truth.
   tests under both Python 3.10 and Python 3.12 with MCP 2.1. Those pyenv builds
   cannot load SQLite extensions, so their unrelated vector-required full-suite
   bootstrap failures are not a valid compatibility profile.
+- The final independent GPT-5.6 Terra merge-gate review was CLEAN at
+  `4664ab5722363d1e78cac93d927c79e87f2d8224`. Its isolated Python 3.10 and
+  Python 3.12 MCP 2.1 FTS profiles each passed 149 E2/E1/E0 tests, and its
+  independent corrupt-store, exact-recall, mapping-key, and encoded-purge
+  mutation matrix found no remaining issue.
 
 **Non-goals**
 
