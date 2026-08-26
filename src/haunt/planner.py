@@ -16,7 +16,13 @@ import sqlite3
 from datetime import datetime
 from typing import Literal
 
-from haunt.recall import Hit, RecallResult, execution_metadata, recall
+from haunt.recall import (
+    Hit,
+    RecallResult,
+    classify_recall_residue,
+    execution_metadata,
+    recall,
+)
 from haunt.store import ReadOnlyStore, Store, open_existing_readonly
 from haunt.temporal import TemporalQuery, compile
 from haunt.util import LIMIT_MAX, clamp_k, iso_or_now, normalize_clock, utc_iso
@@ -255,11 +261,17 @@ def _hits_from_events(
 ) -> list[Hit]:
     hits: list[Hit] = []
     seen: set[str] = set()
+    recall_class_select = (
+        "e.recall_class AS recall_class"
+        if bool(getattr(store, "recall_class_available", False))
+        else "NULL AS recall_class"
+    )
     for ev in events:
         row = store.conn.execute(
-            """
+            f"""
             SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
-                   e.role, e.event_time, e.ts, e.tool_name, e.origin
+                   e.role, e.event_time, e.ts, e.tool_name, e.tool_input,
+                   e.tool_output, e.origin, {recall_class_select}
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.event_id=? AND m.valid_to IS NULL
@@ -271,6 +283,13 @@ def _hits_from_events(
         if not row or row["id"] in seen:
             continue
         seen.add(row["id"])
+        raw_tool, classification_source = classify_recall_residue(
+            recall_class=row["recall_class"],
+            role=row["role"],
+            tool_name=row["tool_name"],
+            tool_input=row["tool_input"],
+            tool_output=row["tool_output"],
+        )
         hits.append(
             Hit(
                 memory_id=row["id"],
@@ -288,6 +307,9 @@ def _hits_from_events(
                 filter_context=filter_context,
                 vector_stage={"state": "not_run", "reason": "timeline_time_order"},
                 fts_stage={"state": "not_run", "reason": "timeline_time_order"},
+                recall_class=row["recall_class"],
+                classification_source=classification_source,
+                raw_tool_structure=raw_tool,
             )
         )
         if len(hits) >= limit:

@@ -377,10 +377,97 @@ def test_residue_remains_reachable_in_events_timeline_trace_and_detail(
         timeline = planned_recall(
             "what happened on 2026-01-15", now=None, store=store, k=8
         )
-    assert {hit.memory_id for hit in timeline} >= {raw_tool.memory_id, task.memory_id}
+    timeline_by_id = {hit.memory_id: hit for hit in timeline}
+    assert set(timeline_by_id) >= {raw_tool.memory_id, task.memory_id}
+    assert timeline_by_id[raw_tool.memory_id].recall_class == "tool"
+    assert timeline_by_id[raw_tool.memory_id].classification_source == "events.recall_class"
+    assert timeline_by_id[raw_tool.memory_id].trusted is False
+    assert timeline_by_id[task.memory_id].recall_class == "task"
+    assert timeline_by_id[task.memory_id].classification_source == "events.recall_class"
     assert timeline.execution["residue_filter"] == "not_applicable"
     assert timeline.execution["residue_filter_source"] == "not_applicable"
     assert all(hit.filter_context["residue_filter"] == "not_applicable" for hit in timeline)
+
+    cli = CliRunner().invoke(
+        app, ["recall", "what happened on 2026-01-15", "-n", "release-gate", "--json"]
+    )
+    assert cli.exit_code == 0, cli.output
+    cli_by_id = {hit["memory_id"]: hit for hit in json.loads(cli.stdout)["hits"]}
+    assert cli_by_id[raw_tool.memory_id]["recall_class"] == "tool"
+    assert cli_by_id[raw_tool.memory_id]["classification_source"] == "events.recall_class"
+    assert cli_by_id[raw_tool.memory_id]["trusted"] is False
+    assert cli_by_id[task.memory_id]["recall_class"] == "task"
+
+    from tests.dashutil import make_dash_client
+
+    dashboard = make_dash_client().get(
+        "/api/namespace/release-gate/recall", params={"q": "what happened on 2026-01-15"}
+    )
+    assert dashboard.status_code == 200, dashboard.text
+    dashboard_by_id = {hit["memory_id"]: hit for hit in dashboard.json()["hits"]}
+    assert dashboard_by_id[raw_tool.memory_id]["recall_class"] == "tool"
+    assert dashboard_by_id[raw_tool.memory_id]["trusted"] is False
+    assert dashboard_by_id[task.memory_id]["recall_class"] == "task"
+
+    try:
+        from haunt.mcp_server import memory_recall
+    except ImportError:
+        memory_recall = None
+    if memory_recall is not None:
+        mcp = json.loads(memory_recall(query="what happened on 2026-01-15"))
+        mcp_by_id = {hit["memory_id"]: hit for hit in mcp["hits"]}
+        assert mcp_by_id[raw_tool.memory_id]["recall_class"] == "tool"
+        assert mcp_by_id[raw_tool.memory_id]["trusted"] is False
+        assert mcp_by_id[task.memory_id]["recall_class"] == "task"
+
+
+def test_input_only_and_output_only_tool_residue_stays_untrusted_when_opted_in(
+    recall_gate_home,
+):
+    """All raw tool shapes use the same trust boundary in ranking and timeline."""
+    _, _, _, _, _ = recall_gate_home
+    with Store("release-gate", create=False) as store:
+        input_only = store.observe(
+            "INPUT-ONLY-TOOL-RESIDUE-CANARY",
+            tool_input="input-only payload",
+            event_time="2026-01-17T12:00:00+00:00",
+            defer_embedding=True,
+        )
+        output_only = store.observe(
+            "OUTPUT-ONLY-TOOL-RESIDUE-CANARY",
+            tool_output="output-only payload",
+            event_time="2026-01-17T13:00:00+00:00",
+            defer_embedding=True,
+        )
+    assert not recall(
+        "INPUT-ONLY-TOOL-RESIDUE-CANARY", namespace="release-gate", use_vectors=False
+    )
+    assert not recall(
+        "OUTPUT-ONLY-TOOL-RESIDUE-CANARY", namespace="release-gate", use_vectors=False
+    )
+    ranked = recall(
+        "TOOL-RESIDUE-CANARY",
+        namespace="release-gate",
+        use_vectors=False,
+        include_residue=True,
+    )
+    ranked_by_id = {hit.memory_id: hit for hit in ranked}
+    for memory_id in (input_only.memory_id, output_only.memory_id):
+        hit = ranked_by_id[memory_id]
+        assert hit.recall_class == "tool"
+        assert hit.trusted is False
+        assert hit.trust_reason == "untrusted-tool-io"
+
+    with open_existing_readonly("release-gate") as store:
+        timeline = planned_recall(
+            "what happened on 2026-01-17", now=None, store=store, k=8
+        )
+    timeline_by_id = {hit.memory_id: hit for hit in timeline}
+    for memory_id in (input_only.memory_id, output_only.memory_id):
+        hit = timeline_by_id[memory_id]
+        assert hit.recall_class == "tool"
+        assert hit.trusted is False
+        assert hit.trust_reason == "untrusted-tool-io"
 
 
 def test_repeated_python_cli_dashboard_and_mcp_recall_are_source_immutable(
@@ -438,6 +525,13 @@ def test_alias_and_old_schema_read_only_recall_never_repairs_source(recall_gate_
     change_namespace_label(
         "release-gate", "renamed-gate", apply=True, plan_digest=plan["plan_digest"]
     )
+    with Store("renamed-gate", create=False) as store:
+        legacy_raw = store.observe(
+            "V8-RAW-TOOL-TIMELINE-CANARY",
+            tool_input="historical raw tool input",
+            event_time="2026-01-18T12:00:00+00:00",
+            defer_embedding=True,
+        )
     db = home / "namespaces" / "release-gate.db"
     # Model a pre-v9 source. It is opened only through the read-only path below.
     conn = sqlite3.connect(db)
@@ -455,7 +549,60 @@ def test_alias_and_old_schema_read_only_recall_never_repairs_source(recall_gate_
         assert [hit.memory_id for hit in hits] == [eligible.memory_id]
         assert hits.execution["recall_class_capability"] == "unavailable"
         assert not recall("TOOL-RECALL-CANARY", store=store, use_vectors=False)
+        timeline = planned_recall(
+            "what happened on 2026-01-18", now=None, store=store, k=8
+        )
+        legacy_timeline = next(
+            hit for hit in timeline if hit.memory_id == legacy_raw.memory_id
+        )
+        assert legacy_timeline.recall_class is None
+        assert legacy_timeline.classification_source == "raw_tool_structure"
+        assert legacy_timeline.trusted is False
     assert _tree_snapshot(home) == before
+
+    cli = CliRunner().invoke(
+        app, ["recall", "what happened on 2026-01-18", "-n", "release-gate", "--json"]
+    )
+    assert cli.exit_code == 0, cli.output
+    cli_legacy = next(
+        hit
+        for hit in json.loads(cli.stdout)["hits"]
+        if hit["memory_id"] == legacy_raw.memory_id
+    )
+    assert cli_legacy["recall_class"] is None
+    assert cli_legacy["classification_source"] == "raw_tool_structure"
+    assert cli_legacy["trusted"] is False
+
+    from tests.dashutil import make_dash_client
+
+    dashboard = make_dash_client().get(
+        "/api/namespace/release-gate/recall", params={"q": "what happened on 2026-01-18"}
+    )
+    assert dashboard.status_code == 200, dashboard.text
+    dashboard_legacy = next(
+        hit
+        for hit in dashboard.json()["hits"]
+        if hit["memory_id"] == legacy_raw.memory_id
+    )
+    assert dashboard_legacy["recall_class"] is None
+    assert dashboard_legacy["classification_source"] == "raw_tool_structure"
+    assert dashboard_legacy["trusted"] is False
+
+    try:
+        from haunt.mcp_server import memory_recall
+    except ImportError:
+        memory_recall = None
+    if memory_recall is not None:
+        mcp_legacy = next(
+            hit
+            for hit in json.loads(
+                memory_recall(query="what happened on 2026-01-18", namespace="release-gate")
+            )["hits"]
+            if hit["memory_id"] == legacy_raw.memory_id
+        )
+        assert mcp_legacy["recall_class"] is None
+        assert mcp_legacy["classification_source"] == "raw_tool_structure"
+        assert mcp_legacy["trusted"] is False
 
     # A normal writer may upgrade on its explicit lifecycle, but does not
     # guess/backfill classes for historical v8 events. Restart remains v9.

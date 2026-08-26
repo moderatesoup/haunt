@@ -1721,6 +1721,10 @@ def _resolve_namespace_identity_once(name: str) -> dict[str, Any] | None:
 _CONCURRENT_REGISTRY_CHANGE_MARKERS = (
     "storage drift",
     "registry changed repeatedly",
+    # Shared zero-write snapshots may name the source rather than the
+    # registry.  Registry identity resolution still owns the retry policy, so
+    # recognize this equivalent transient contention result there.
+    "SQLite source changed repeatedly while creating a zero-write read snapshot",
     "incomplete WAL state",
     "changed while copying read snapshot",
     "changed while snapshotting",

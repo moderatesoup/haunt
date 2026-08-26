@@ -114,11 +114,20 @@ class Hit:
     references: dict[str, Any] | None = None
     recall_class: str | None = None
     classification_source: str = "legacy_unknown"
+    # Keep structured tool detection internal: callers still receive only the
+    # established public tool_name field, while trust cannot be bypassed by a
+    # tool_input-only or tool_output-only event.
+    raw_tool_structure: bool | None = None
 
     @property
     def trusted(self) -> bool:
         """False for raw tool I/O. Recalled text is always data, not authority."""
-        return self.role != "tool" and self.tool_name is None
+        raw_tool = (
+            self.raw_tool_structure
+            if self.raw_tool_structure is not None
+            else self.role == "tool" or self.tool_name is not None
+        )
+        return not raw_tool
 
     @property
     def trust_reason(self) -> str:
@@ -236,6 +245,34 @@ class Hit:
 def _stage(state: str, reason: str) -> dict[str, str]:
     """Build one of the explicit per-modality execution states."""
     return {"state": state, "reason": reason}
+
+
+def classify_recall_residue(
+    *,
+    recall_class: Any,
+    role: Any,
+    tool_name: Any,
+    tool_input: Any,
+    tool_output: Any,
+) -> tuple[bool, str]:
+    """Return raw-tool status and the honest stored/structural class source.
+
+    A legacy v8 source has no ``recall_class`` column, while structurally raw
+    tool rows still need both the ranked filter and untrusted label.  Keeping
+    the calculation here makes ranked and timeline hits agree without exposing
+    raw input/output bytes on ``Hit``.
+    """
+    raw_tool = role == "tool" or any(
+        value is not None for value in (tool_name, tool_input, tool_output)
+    )
+    classification_source = (
+        "events.recall_class"
+        if recall_class is not None
+        else "raw_tool_structure"
+        if raw_tool
+        else "legacy_unknown"
+    )
+    return raw_tool, classification_source
 
 
 def _ordering_explanation(hit: Hit, *, is_rrf: bool) -> dict[str, str]:
@@ -600,19 +637,12 @@ def recall(
                 continue
             vr = vec_rank.get(mid)
             fr = fts_rank.get(mid)
-            raw_tool = (
-                row["role"] == "tool"
-                or any(
-                    row[field] is not None
-                    for field in ("tool_name", "tool_input", "tool_output")
-                )
-            )
-            classification_source = (
-                "events.recall_class"
-                if row["recall_class"] is not None
-                else "raw_tool_structure"
-                if raw_tool
-                else "legacy_unknown"
+            raw_tool, classification_source = classify_recall_residue(
+                recall_class=row["recall_class"],
+                role=row["role"],
+                tool_name=row["tool_name"],
+                tool_input=row["tool_input"],
+                tool_output=row["tool_output"],
             )
             hits.append(
                 Hit(
@@ -639,6 +669,7 @@ def recall(
                     fts_stage=fts_execution,
                     recall_class=row["recall_class"],
                     classification_source=classification_source,
+                    raw_tool_structure=raw_tool,
                 )
             )
         references = store.recall_references_many([hit.memory_id for hit in hits])

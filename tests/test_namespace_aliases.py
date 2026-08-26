@@ -1204,6 +1204,33 @@ def test_fresh_mcp_authority_pins_first_identity_concurrently(alias_home):
     assert not namespace_exists("fresh-bound")
 
 
+def test_zero_write_snapshot_contention_marker_retries_registry_resolution(
+    alias_home, monkeypatch,
+):
+    """Shared snapshot wording remains retryable in E3's identity loop."""
+    import haunt.store as store_mod
+
+    with Store("snapshot-retry"):
+        pass
+    original = store_mod._resolve_namespace_identity_once
+    attempts = 0
+
+    def transient(name):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise NamespacePathError(
+                "SQLite source changed repeatedly while creating a zero-write "
+                "read snapshot: registry.db"
+            )
+        return original(name)
+
+    monkeypatch.setattr(store_mod, "_resolve_namespace_identity_once", transient)
+    resolved = store_mod.resolve_namespace_identity("snapshot-retry")
+    assert resolved is not None
+    assert attempts == 2
+
+
 @pytest.mark.parametrize("surface", ["current", "pin"])
 def test_mcp_identity_retry_accepts_only_recognized_registry_drift(
     alias_home, monkeypatch, surface
