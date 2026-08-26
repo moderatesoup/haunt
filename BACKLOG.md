@@ -267,11 +267,12 @@ that source metadata measures truth.
   MCP/dashboard/hook channels, strict UTF-8 input bounds and zero-write
   rejection, honest direct-Python defaults, timeline and procedure provenance
   parity, dashboard timeline JSON errors, worldview procedure attribution,
-  corrupt stored envelopes, recursive no-confidence assertions, and privacy
-  purge canaries across all tables and serialized surfaces.
-- The dependency-correct Python 3.14/MCP 2.1 full suite passes with 527 tests,
+  explicit-null/omitted/empty transform semantics, corrupt stored envelopes,
+  recursive no-confidence assertions, and privacy purge canaries across all
+  tables and serialized surfaces.
+- The dependency-correct Python 3.14/MCP 2.1 full suite passes with 535 tests,
   5 environment/data skips, and 7 declared temporal xfails. The focused E2,
-  E1, E0, hook, host, migration, and FTS compatibility group passes 193 tests
+  E1, E0, hook, host, migration, and FTS compatibility group passes 201 tests
   under Python 3.12/MCP 2.1; that pyenv build cannot load SQLite extensions, so
   its unrelated vector-required tests are not a valid profile.
 

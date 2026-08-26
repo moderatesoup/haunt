@@ -133,6 +133,10 @@ transform. Existing string `origin` and free-form `meta` data remain readable;
 when they cannot be losslessly upgraded, they are
 `legacy_unstructured`, not synthetic structured provenance.
 
+For ordered import transforms, omitted, explicit `null`, and an empty list are
+distinct: not supplied, explicitly unknown, and known to have no transforms,
+respectively. Validation and idempotency preserve that distinction.
+
 An idempotency replay succeeds only when stored structured provenance is valid
 and byte-for-byte equal to the newly canonicalized attribution. Legacy-null or
 invalid stored attribution remains readable but cannot be safely replayed.

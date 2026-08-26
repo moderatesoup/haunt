@@ -183,18 +183,28 @@ def validate_provenance(
             )
         if "transforms" in envelope:
             transforms = envelope["transforms"]
-            if not isinstance(transforms, list):
-                raise ValueError("provenance.transforms must be an array")
-            if len(transforms) > _TRANSFORM_COUNT_MAX:
-                raise ValueError(
-                    f"provenance.transforms may contain at most {_TRANSFORM_COUNT_MAX} items"
-                )
-            envelope["transforms"] = [
-                _optional_text(item, f"transforms[{index}]", limit=_TRANSFORM_MAX)
-                for index, item in enumerate(transforms)
-            ]
-            if any(item is None for item in envelope["transforms"]):
-                raise ValueError("provenance.transforms items must be strings")
+            if transforms is not None:
+                if not isinstance(transforms, list):
+                    raise ValueError(
+                        "provenance.transforms must be an array or null"
+                    )
+                if len(transforms) > _TRANSFORM_COUNT_MAX:
+                    raise ValueError(
+                        "provenance.transforms may contain at most "
+                        f"{_TRANSFORM_COUNT_MAX} items"
+                    )
+                envelope["transforms"] = [
+                    _optional_text(
+                        item,
+                        f"transforms[{index}]",
+                        limit=_TRANSFORM_MAX,
+                    )
+                    for index, item in enumerate(transforms)
+                ]
+                if any(item is None for item in envelope["transforms"]):
+                    raise ValueError(
+                        "provenance.transforms items must be strings"
+                    )
 
     encoded = json.dumps(
         envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")

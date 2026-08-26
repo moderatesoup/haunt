@@ -122,6 +122,115 @@ def test_unknowns_remain_absent_and_original_blob_absence_is_explicit(provenance
         assert absent not in stored
 
 
+def test_null_transforms_round_trip_and_idempotency_distinguishes_omission(
+    provenance_env,
+):
+    explicit_null = {**_import_envelope(), "transforms": None}
+    omitted = dict(explicit_null)
+    omitted.pop("transforms")
+    with Store("default") as st:
+        first = st.observe(
+            "null transform import",
+            origin="archive",
+            provenance=explicit_null,
+            idempotency_key="null-transforms-key",
+            defer_embedding=True,
+        )
+        replay = st.observe(
+            "null transform import",
+            origin="archive",
+            provenance=explicit_null,
+            idempotency_key="null-transforms-key",
+            defer_embedding=True,
+        )
+        with pytest.raises(ValueError, match="different provenance"):
+            st.observe(
+                "null transform import",
+                origin="archive",
+                provenance=omitted,
+                idempotency_key="null-transforms-key",
+                defer_embedding=True,
+            )
+        with pytest.raises(ValueError, match="different provenance"):
+            st.observe(
+                "null transform import",
+                origin="archive",
+                provenance={**explicit_null, "transforms": []},
+                idempotency_key="null-transforms-key",
+                defer_embedding=True,
+            )
+        outputs = [
+            first.provenance,
+            replay.provenance,
+            st.get_memory(first.memory_id)["provenance"],
+            st.browse_memories()["memories"][0]["provenance"],
+            st.events()[0]["provenance"],
+            st.trace(first.memory_id)["members"][0]["provenance"],
+        ]
+        assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+        empty = st.observe(
+            "known empty transform import",
+            origin="archive",
+            provenance={**explicit_null, "transforms": []},
+            defer_embedding=True,
+        )
+    assert replay.deduplicated is True
+    assert all(output["transforms"] is None for output in outputs)
+    assert empty.provenance["transforms"] == []
+    assert all(not _contains_key(output, "confidence") for output in outputs)
+
+
+def test_null_transforms_round_trip_cli_mcp_and_dashboard(
+    provenance_env, monkeypatch
+):
+    cli_envelope = {**_import_envelope(channel="cli"), "transforms": None}
+    cli_result = CliRunner().invoke(
+        app,
+        [
+            "observe",
+            "CLI null transforms",
+            "-n",
+            "default",
+            "--origin",
+            "archive",
+            "--provenance-json",
+            json.dumps(cli_envelope),
+        ],
+    )
+    assert cli_result.exit_code == 0, cli_result.output
+    cli_provenance = json.loads(cli_result.stdout.split("provenance ", 1)[1])
+    assert "transforms" in cli_provenance
+    assert cli_provenance["transforms"] is None
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_envelope = {**_import_envelope(channel="mcp"), "transforms": None}
+    mcp_payload = json.loads(
+        mcp_server.memory_observe(
+            "MCP null transforms",
+            namespace="default",
+            origin="archive",
+            provenance=mcp_envelope,
+        )
+    )
+    assert mcp_payload["ok"] is True
+    assert "transforms" in mcp_payload["provenance"]
+    assert mcp_payload["provenance"]["transforms"] is None
+
+    from tests.dashutil import make_dash_client
+
+    detail = make_dash_client().get(
+        f"/api/namespace/default/memory/{mcp_payload['memory_id']}"
+    )
+    assert detail.status_code == 200, detail.text
+    dashboard_provenance = detail.json()["provenance"]
+    assert "transforms" in dashboard_provenance
+    assert dashboard_provenance["transforms"] is None
+    assert not _contains_key(dashboard_provenance, "confidence")
+
+
 def test_native_tool_and_call_are_actual_observe_inputs(provenance_env):
     provenance = native_provenance(
         channel="cursor_hook",
@@ -333,6 +442,9 @@ def test_hooks_capture_only_supplied_tool_call_ids(
         ({**_import_envelope(), "source_native_id": "x" * 2049}, "2048"),
         ({**_import_envelope(), "transforms": ["x"] * 129}, "128"),
         ({**_import_envelope(), "transforms": [""]}, "nonempty"),
+        ({**_import_envelope(), "transforms": "decode:utf-8"}, "array or null"),
+        ({**_import_envelope(), "transforms": 0}, "array or null"),
+        ({**_import_envelope(), "transforms": {}}, "array or null"),
         ({**_import_envelope(), "confidence": 0.9}, "unsupported"),
     ],
 )
@@ -984,6 +1096,49 @@ def test_cli_and_mcp_invalid_parser_version_write_nothing(provenance_env, monkey
     assert mcp["ok"] is False
     with Store("default") as st:
         assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("invalid_transforms", ["decode:utf-8", 0, {}])
+def test_cli_and_mcp_reject_non_list_non_null_transforms_without_writes(
+    provenance_env, monkeypatch, invalid_transforms
+):
+    cli_bad = {
+        **_import_envelope(channel="cli"),
+        "transforms": invalid_transforms,
+    }
+    cli = CliRunner().invoke(
+        app,
+        [
+            "observe",
+            "bad CLI transforms",
+            "-n",
+            "default",
+            "--provenance-json",
+            json.dumps(cli_bad),
+        ],
+    )
+    assert cli.exit_code == 2
+    assert "array or null" in cli.output
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_bad = {
+        **_import_envelope(channel="mcp"),
+        "transforms": invalid_transforms,
+    }
+    mcp = json.loads(
+        mcp_server.memory_observe(
+            "bad MCP transforms",
+            namespace="default",
+            provenance=mcp_bad,
+        )
+    )
+    assert mcp["ok"] is False
+    assert "array or null" in mcp["error"]
+    with Store("default") as st:
+        assert _logical_counts(st) == {table: 0 for table in LOGICAL_TABLES}
 
 
 def test_cli_rejects_invalid_actual_and_claimed_attribution_without_writes(

@@ -64,7 +64,10 @@ Imports require canonicalizable `imported_at`, one of `lossless`, `lossy`,
 `sha256:<64 hex>` or explicit `null` when no original blob was retained.
 Platform/native ID, format/parser version, and transforms are optional because
 unknown is not the same as empty or inferred. When present, transform order is
-preserved.
+preserved. For `transforms`, omission means the importer did not provide the
+field, `null` means explicitly unknown, and `[]` means the importer knows that
+no transforms ran. These three representations remain distinct through reads,
+exports, and idempotency checks.
 
 Unsupported versions, fields, fidelity values, types, sizes, timestamps, and
 hashes fail before any session, event, memory, embedding job, graph, or index
