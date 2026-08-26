@@ -88,7 +88,16 @@ RECALL_CLASSES = ("tool", "task")
 #     existing rows. Measurement only -- phase 1 changes no write
 #     behavior, suppresses nothing, and collapses no rows. See
 #     _content_hash for why normalization is deliberately absent.
-SCHEMA_VERSION = 10
+# 11: partial index on memories(tier, created_at) WHERE valid_to IS NULL.
+#     Every "current slice" read (default recall's m.valid_to IS NULL
+#     filter, worldview/procedure_get/procedure_list's tier-scoped current
+#     scans) previously drove a full scan of every memory row ever
+#     written, including every superseded one -- a namespace's correction
+#     history made its own current-fact lookups slower forever. The
+#     partial index's row count tracks only the live set, independent of
+#     how much lineage has accumulated. No column, table, or query result
+#     changes -- read-path speed only. See C10 backlog notes.
+SCHEMA_VERSION = 11
 SCHEMA_VERSION_KEY = "schema_version"
 REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
@@ -1622,6 +1631,17 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
         # hash is deterministically recomputable. This only ever fills the
         # new column -- it never reads back and rewrites `content` itself.
         _backfill_content_hashes(conn)
+    if current < 11:
+        # Additive, no backfill needed: an index has no historical rows to
+        # repopulate, only future lookups to speed up. CREATE INDEX builds
+        # it from whatever is already in `memories` right now.
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memories_current
+                ON memories(tier, created_at)
+                WHERE valid_to IS NULL
+            """
+        )
     _ensure_correction_invariant_triggers(conn)
     _ensure_correction_append_only_triggers(conn)
     _ensure_provenance_type_triggers(conn)
@@ -6193,10 +6213,6 @@ class Store:
         if requested is None:
             return {"ok": False, "error": "memory not found"}
 
-        correction_rows = self.conn.execute(
-            "SELECT * FROM corrections ORDER BY corrected_at, rowid"
-        ).fetchall()
-
         def node(row: sqlite3.Row, prefix: str) -> tuple[str, str] | None:
             memory = row[f"{prefix}_memory_id"]
             if memory is not None:
@@ -6206,21 +6222,45 @@ class Store:
                 return ("tombstone", str(tombstone))
             return None
 
-        incoming: dict[tuple[str, str], sqlite3.Row] = {}
-        outgoing: dict[tuple[str, str], sqlite3.Row] = {}
-        for correction in correction_rows:
-            target = node(correction, "target")
-            replacement = node(correction, "replacement")
-            if target is not None:
-                outgoing[target] = correction
-            if replacement is not None:
-                incoming[replacement] = correction
+        # A normal correction's target/replacement is unique across the
+        # entire table: idx_corrections_target_memory,
+        # idx_corrections_target_tombstone, idx_corrections_replacement_memory,
+        # and idx_corrections_replacement_tombstone are all UNIQUE partial
+        # indexes over these four columns (see _ensure_namespace_schema's v4
+        # migration), and the invariant trigger enforces that every row sets
+        # exactly one target column and at most one replacement column. So at
+        # most one correction row can ever target a given node, and at most
+        # one can ever have it as a replacement -- each lookup below is one
+        # indexed point query, not a scan. Walking an N-link chain this way
+        # costs O(N) point lookups instead of loading every correction this
+        # namespace has ever recorded, no matter how short the requested
+        # chain is or how much unrelated lineage exists alongside it.
+        def correction_targeting(target: tuple[str, str]) -> sqlite3.Row | None:
+            kind, ident = target
+            column = "target_memory_id" if kind == "memory" else "target_tombstone_id"
+            return self.conn.execute(
+                f"SELECT * FROM corrections WHERE {column}=?", (ident,)
+            ).fetchone()
+
+        def correction_replacing(replacement: tuple[str, str]) -> sqlite3.Row | None:
+            kind, ident = replacement
+            column = (
+                "replacement_memory_id"
+                if kind == "memory"
+                else "replacement_tombstone_id"
+            )
+            return self.conn.execute(
+                f"SELECT * FROM corrections WHERE {column}=?", (ident,)
+            ).fetchone()
 
         start = ("memory", memory_id)
         seen: set[tuple[str, str]] = set()
-        while start in incoming and start not in seen:
+        while start not in seen:
+            incoming_correction = correction_replacing(start)
+            if incoming_correction is None:
+                break
             seen.add(start)
-            predecessor = node(incoming[start], "target")
+            predecessor = node(incoming_correction, "target")
             if predecessor is None:
                 break
             start = predecessor
@@ -6231,6 +6271,7 @@ class Store:
         seen.clear()
         while current not in seen:
             seen.add(current)
+            outgoing_correction = correction_targeting(current)
             if current[0] == "tombstone":
                 tomb = self.conn.execute(
                     """
@@ -6263,7 +6304,7 @@ class Store:
                     legacy_meta=member.pop("meta"),
                     tool_name=member.get("tool_name"),
                 )
-                if current in outgoing:
+                if outgoing_correction is not None:
                     member["status"] = "superseded"
                 elif member["valid_to"] is not None:
                     member["status"] = "legacy_unlinked"
@@ -6271,24 +6312,23 @@ class Store:
                     member["status"] = "current"
                 members.append(member)
 
-            correction = outgoing.get(current)
-            if correction is None:
+            if outgoing_correction is None:
                 break
             corrections.append(
                 {
-                    "correction_id": correction["id"],
-                    "corrected_at": correction["corrected_at"],
-                    "origin": correction["origin"],
-                    "session_id": correction["session_id"],
-                    "reason": correction["reason"],
+                    "correction_id": outgoing_correction["id"],
+                    "corrected_at": outgoing_correction["corrected_at"],
+                    "origin": outgoing_correction["origin"],
+                    "session_id": outgoing_correction["session_id"],
+                    "reason": outgoing_correction["reason"],
                 }
             )
-            successor = node(correction, "replacement")
+            successor = node(outgoing_correction, "replacement")
             if successor is None:
                 break
             current = successor
 
-        linked = bool(corrections or incoming.get(("memory", memory_id)))
+        linked = bool(corrections or correction_replacing(("memory", memory_id)))
         lineage_status = (
             "linked"
             if linked

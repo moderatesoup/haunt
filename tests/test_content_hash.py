@@ -267,9 +267,9 @@ def test_stats_preserves_all_c4_and_earlier_keys(dup_env):
 def test_fresh_database_has_content_hash_column_and_index_at_v10(dup_env):
     from haunt.store import SCHEMA_VERSION, Store
 
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION == 11
     with Store("dup-test") as store:
-        assert store.get_meta("schema_version") == "10"
+        assert store.get_meta("schema_version") == "11"
         columns = {
             row["name"]
             for row in store.conn.execute("PRAGMA table_info(memories)").fetchall()

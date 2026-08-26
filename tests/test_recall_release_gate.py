@@ -606,18 +606,18 @@ def test_alias_and_old_schema_read_only_recall_never_repairs_source(recall_gate_
 
     # A normal writer may upgrade on its explicit lifecycle, but does not
     # guess/backfill classes for historical v8 events. Restart remains at
-    # the current SCHEMA_VERSION (v10 as of C7's content_hash migration).
+    # the current SCHEMA_VERSION (v11 as of C10's current-slice index).
     with Store("renamed-gate", create=False) as store:
         assert store.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()[0] == "10"
+        ).fetchone()[0] == "11"
         assert store.conn.execute(
             "SELECT COUNT(*) FROM events WHERE recall_class IS NOT NULL"
         ).fetchone()[0] == 0
     with Store("renamed-gate", create=False) as restarted:
         assert restarted.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()[0] == "10"
+        ).fetchone()[0] == "11"
 
 
 def test_stable_id_readonly_open_survives_label_change(recall_gate_home):
