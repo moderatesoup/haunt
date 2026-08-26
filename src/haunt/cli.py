@@ -431,7 +431,11 @@ def delete_cmd(
 @app.command("correct")
 def correct_cmd(
     memory_id: str = typer.Argument(..., help="Memory ID to supersede"),
-    replacement: Optional[str] = typer.Option(None, "--replacement"),
+    replacement: Optional[str] = typer.Option(
+        None,
+        "--replacement",
+        help="Verbatim replacement; omit for none (empty/whitespace are intentional)",
+    ),
     reason: Optional[str] = typer.Option(None, "--reason"),
     idempotency_key: Optional[str] = typer.Option(
         None,

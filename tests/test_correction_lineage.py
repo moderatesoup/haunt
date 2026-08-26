@@ -142,6 +142,84 @@ def test_replay_and_conflict_before_and_after_restart(lineage_env):
         assert st.conn.execute("SELECT COUNT(*) FROM corrections").fetchone()[0] == 1
 
 
+def test_canonical_payload_distinguishes_null_empty_whitespace_and_reason(lineage_env):
+    from haunt.store import Store
+
+    with Store("default") as st:
+        null_target = st.observe("null target")
+        first = st.contradict(
+            null_target.memory_id,
+            replacement=None,
+            reason=None,
+            origin="first-origin",
+            session_id="first-session",
+            idempotency_key="canonical-null",
+        )
+        changes = st.conn.total_changes
+        replay = st.contradict(
+            null_target.memory_id,
+            replacement=None,
+            reason=None,
+            origin="",
+            session_id=object(),
+            idempotency_key="canonical-null",
+        )
+        assert replay == {**first, "deduplicated": True}
+        assert st.conn.total_changes == changes
+
+        conflict = st.contradict(
+            null_target.memory_id,
+            replacement="",
+            reason=None,
+            origin="",
+            session_id=object(),
+            idempotency_key="canonical-null",
+        )
+        assert conflict["conflict"] == "idempotency_key_reused"
+
+        reason_conflict = st.contradict(
+            null_target.memory_id,
+            replacement=None,
+            reason="",
+            origin="",
+            session_id=object(),
+            idempotency_key="canonical-null",
+        )
+        assert reason_conflict["conflict"] == "idempotency_key_reused"
+
+        empty_target = st.observe("empty target")
+        empty = st.contradict(
+            empty_target.memory_id,
+            replacement="",
+            reason="",
+            idempotency_key="canonical-empty",
+        )
+        whitespace_target = st.observe("whitespace target")
+        whitespace = st.contradict(
+            whitespace_target.memory_id,
+            replacement="   ",
+            idempotency_key="canonical-whitespace",
+        )
+        assert st.get_memory(empty["replacement_memory_id"])["content"] == ""
+        assert st.get_memory(whitespace["replacement_memory_id"])["content"] == "   "
+        assert st.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 5
+
+        invalid_target = st.observe("invalid metadata target")
+        with pytest.raises(ValueError, match="origin"):
+            st.contradict(
+                invalid_target.memory_id,
+                origin="",
+                idempotency_key="new-invalid-origin",
+            )
+        with pytest.raises(ValueError, match="session_id"):
+            st.contradict(
+                invalid_target.memory_id,
+                session_id=object(),
+                idempotency_key="new-invalid-session",
+            )
+        assert st.get_memory(invalid_target.memory_id)["valid_to"] is None
+
+
 @pytest.mark.parametrize(
     ("same_key", "same_payload", "expected_conflict"),
     [
@@ -326,6 +404,68 @@ def test_dashboard_detail_and_mutation_expose_lineage_and_idempotency(lineage_en
     assert len(detail.json()["trace"]["members"]) == 2
 
 
+def test_dashboard_json_preserves_replacement_bytes_and_replay_order(lineage_env):
+    from haunt.dashboard import HTML
+    from haunt.store import Store
+    from tests.dashutil import make_dash_client
+
+    with Store("default") as st:
+        targets = [st.observe(f"dashboard canonical {i}") for i in range(3)]
+    client = make_dash_client()
+
+    null_path = f"/api/namespace/default/memory/{targets[0].memory_id}/contradict"
+    first = client.post(null_path, json={"idempotency_key": "dash-null"})
+    replay = client.post(
+        null_path,
+        json={
+            "replacement": None,
+            "idempotency_key": "dash-null",
+            "session_id": {"invalid": True},
+        },
+    )
+    conflict = client.post(
+        null_path,
+        json={
+            "replacement": "",
+            "idempotency_key": "dash-null",
+            "session_id": {"invalid": True},
+        },
+    )
+    assert first.status_code == replay.status_code == 200
+    assert replay.json()["deduplicated"] is True
+    assert conflict.status_code == 409
+    assert conflict.json()["conflict"] == "idempotency_key_reused"
+
+    results = []
+    for target, value, key in (
+        (targets[1], "", "dash-empty"),
+        (targets[2], "   ", "dash-whitespace"),
+    ):
+        response = client.post(
+            f"/api/namespace/default/memory/{target.memory_id}/contradict",
+            json={"replacement": value, "idempotency_key": key},
+        )
+        assert response.status_code == 200
+        results.append(response.json())
+    with Store("default") as st:
+        assert st.get_memory(results[0]["replacement_memory_id"])["content"] == ""
+        assert st.get_memory(results[1]["replacement_memory_id"])["content"] == "   "
+        invalid_target = st.observe("dashboard invalid metadata")
+
+    invalid = client.post(
+        f"/api/namespace/default/memory/{invalid_target.memory_id}/contradict",
+        json={"idempotency_key": "dash-invalid", "session_id": {"invalid": True}},
+    )
+    assert invalid.status_code == 400
+    assert "session_id" in invalid.json()["error"]
+
+    assert '<textarea id="contradictReplacement"' in HTML
+    assert 'if($("contradictHasReplacement").checked)' in HTML
+    assert 'body.replacement=$("contradictReplacement").value;' in HTML
+    assert '$("contradictReplacement").value.trim()' not in HTML
+    assert "const body={idempotency_key:" in HTML
+
+
 def test_cli_correct_and_trace_surfaces(lineage_env):
     from haunt.cli import app
     from haunt.store import Store
@@ -354,3 +494,135 @@ def test_cli_correct_and_trace_surfaces(lineage_env):
     )
     assert traced.exit_code == 0, traced.output
     assert json.loads(traced.stdout)["lineage_status"] == "linked"
+
+
+def test_cli_preserves_null_empty_whitespace_and_replay_order(lineage_env):
+    from haunt.cli import app
+    from haunt.store import Store
+    from typer.testing import CliRunner
+
+    with Store("default") as st:
+        targets = [st.observe(f"cli canonical {i}") for i in range(3)]
+    runner = CliRunner()
+
+    base = ["correct", targets[0].memory_id, "--idempotency-key", "cli-null", "-n", "default"]
+    first = runner.invoke(app, base)
+    replay = runner.invoke(app, [*base, "--origin", ""])
+    conflict = runner.invoke(app, [*base, "--replacement", "", "--origin", ""])
+    assert first.exit_code == replay.exit_code == 0
+    assert json.loads(replay.stdout)["deduplicated"] is True
+    assert conflict.exit_code == 1
+    assert json.loads(conflict.stdout)["conflict"] == "idempotency_key_reused"
+
+    stored_ids = []
+    for target, value, key in (
+        (targets[1], "", "cli-empty"),
+        (targets[2], "   ", "cli-whitespace"),
+    ):
+        response = runner.invoke(
+            app,
+            [
+                "correct",
+                target.memory_id,
+                "--replacement",
+                value,
+                "--idempotency-key",
+                key,
+                "-n",
+                "default",
+            ],
+        )
+        assert response.exit_code == 0, response.output
+        stored_ids.append(json.loads(response.stdout)["replacement_memory_id"])
+    with Store("default") as st:
+        assert st.get_memory(stored_ids[0])["content"] == ""
+        assert st.get_memory(stored_ids[1])["content"] == "   "
+        invalid_target = st.observe("cli invalid metadata")
+    invalid = runner.invoke(
+        app,
+        [
+            "correct",
+            invalid_target.memory_id,
+            "--idempotency-key",
+            "cli-invalid",
+            "--origin",
+            "",
+            "-n",
+            "default",
+        ],
+    )
+    assert invalid.exit_code == 2
+    assert "origin" in invalid.output
+
+
+def test_mcp_preserves_null_empty_whitespace_and_replay_order(lineage_env, monkeypatch):
+    monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
+    from haunt.mcp_server import memory_contradict
+    from haunt.store import Store
+
+    with Store("default") as st:
+        targets = [st.observe(f"mcp canonical {i}") for i in range(3)]
+
+    first = json.loads(
+        memory_contradict(
+            targets[0].memory_id,
+            replacement=None,
+            namespace="default",
+            origin="first-origin",
+            session_id="first-session",
+            idempotency_key="mcp-null",
+        )
+    )
+    replay = json.loads(
+        memory_contradict(
+            targets[0].memory_id,
+            replacement=None,
+            namespace="default",
+            origin="",
+            session_id=object(),
+            idempotency_key="mcp-null",
+        )
+    )
+    conflict = json.loads(
+        memory_contradict(
+            targets[0].memory_id,
+            replacement="",
+            namespace="default",
+            origin="",
+            session_id=object(),
+            idempotency_key="mcp-null",
+        )
+    )
+    assert first["ok"] is True
+    assert replay["deduplicated"] is True
+    assert conflict["conflict"] == "idempotency_key_reused"
+
+    stored_ids = []
+    for target, value, key in (
+        (targets[1], "", "mcp-empty"),
+        (targets[2], "   ", "mcp-whitespace"),
+    ):
+        response = json.loads(
+            memory_contradict(
+                target.memory_id,
+                replacement=value,
+                namespace="default",
+                idempotency_key=key,
+            )
+        )
+        stored_ids.append(response["replacement_memory_id"])
+    with Store("default") as st:
+        assert st.get_memory(stored_ids[0])["content"] == ""
+        assert st.get_memory(stored_ids[1])["content"] == "   "
+        invalid_target = st.observe("mcp invalid metadata")
+    invalid = json.loads(
+        memory_contradict(
+            invalid_target.memory_id,
+            namespace="default",
+            origin="",
+            session_id=object(),
+            idempotency_key="mcp-invalid",
+        )
+    )
+    assert invalid["ok"] is False
+    assert "origin" in invalid["error"]

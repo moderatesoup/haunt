@@ -327,8 +327,10 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
     <h3>supersede memory</h3>
     <p>This marks the memory as superseded (sets valid_to = now). The original data is <b>kept</b> but excluded from current recall. This is NOT a delete.</p>
     <div style="margin-bottom:12px;">
-      <label style="font-size:11px;color:var(--mut);font-family:var(--mono);display:block;margin-bottom:4px;">optional replacement text</label>
-      <input id="contradictReplacement" style="width:100%;" placeholder="new corrected fact (leave blank to just supersede)"/>
+      <label style="font-size:11px;color:var(--mut);font-family:var(--mono);display:block;margin-bottom:4px;">
+        <input id="contradictHasReplacement" type="checkbox" onchange="toggleContradictReplacement()"/> attach a verbatim replacement
+      </label>
+      <textarea id="contradictReplacement" style="width:100%;" disabled placeholder="empty and whitespace-only text are intentional"></textarea>
     </div>
     <div class="actions">
       <button onclick="closeContradictModal()">cancel</button>
@@ -690,18 +692,25 @@ async function loadTimeline(){
 
 function confirmContradict(){
   if(!DETAIL_MID)return;
+  $("contradictHasReplacement").checked=false;
   $("contradictReplacement").value="";
+  $("contradictReplacement").disabled=true;
   $("contradictModal").classList.add('open');
 }
 function closeContradictModal(){$("contradictModal").classList.remove('open');}
+function toggleContradictReplacement(){
+  $("contradictReplacement").disabled=!$("contradictHasReplacement").checked;
+}
 
 async function doContradict(){
   if(!DETAIL_MID)return;
   const ns=DETAIL_NS||NS;
   if(!ns)return;
   closeContradictModal();
-  const replacement=$("contradictReplacement").value.trim()||null;
-  const body={replacement,idempotency_key:crypto.randomUUID()};
+  const body={idempotency_key:crypto.randomUUID()};
+  if($("contradictHasReplacement").checked){
+    body.replacement=$("contradictReplacement").value;
+  }
   const r=await j(`/api/namespace/${encodeURIComponent(ns)}/memory/${encodeURIComponent(DETAIL_MID)}/contradict`,{
     method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)
   });
@@ -1085,8 +1094,6 @@ async def api_contradict(request: Request) -> JSONResponse:
                 {"error": "replacement must be a string or null"},
                 status_code=400,
             )
-        if isinstance(replacement, str):
-            replacement = replacement.strip() or None
     else:
         replacement = None
     reason = body.get("reason")
@@ -1098,8 +1105,6 @@ async def api_contradict(request: Request) -> JSONResponse:
             {"error": "idempotency_key must be a string or null"}, status_code=400
         )
     session_id = body.get("session_id")
-    if session_id is not None and not isinstance(session_id, str):
-        return JSONResponse({"error": "session_id must be a string or null"}, status_code=400)
 
     name = resolve_namespace(request.path_params["name"])
     missing = _missing_namespace(name)

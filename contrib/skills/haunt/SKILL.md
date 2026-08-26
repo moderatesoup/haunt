@@ -43,7 +43,7 @@ Write only when the user wants a named how-to remembered. Do not auto-extract.
 
 ### `memory_contradict`
 `memory_id`, optional `replacement`, `reason`, `idempotency_key`
-Supersede a wrong fact (`valid_to=now`). Does not delete. Optional `replacement` is stored as semantic. Supply a stable caller idempotency key for safe retries.
+Supersede a wrong fact (`valid_to=now`). Does not delete. Optional `replacement` is stored verbatim as semantic: omitted/null means none, while empty or whitespace-only strings are intentional replacements. Supply a stable caller idempotency key for safe retries.
 
 ### `memory_trace`
 `memory_id`

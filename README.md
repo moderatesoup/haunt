@@ -178,7 +178,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt init [name] [--repo PATH]` | create a namespace |
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
 | `haunt recall QUERY [--as-of --since --until --clock --tier --k]` | hybrid recall (vec + FTS5 + RRF); query-time temporal compile |
-| `haunt correct MEMORY_ID [--replacement --reason --idempotency-key]` | atomically append a correction and optional replacement; caller keys make retries safe |
+| `haunt correct MEMORY_ID [--replacement --reason --idempotency-key]` | atomically append a correction and optional verbatim replacement; omitted/null, empty, and whitespace-only replacement values are distinct; caller keys make retries safe |
 | `haunt trace MEMORY_ID` | ordered correction chain from any surviving member, including erased-gap tombstones |
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |
 | `haunt timeline [--since --until --clock]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias) |
@@ -208,7 +208,7 @@ Every explicit recall hit includes `trusted` and `trust_reason`. Tool input/outp
 
 `haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
 
-Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_trace`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`. `memory_contradict` accepts an optional caller `idempotency_key`; supplying the same key and exact correction payload safely replays the original result.
+Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_trace`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`. `memory_contradict` accepts an optional caller `idempotency_key`; supplying the same key and exact correction payload safely replays the original result. Replacement strings are verbatim: omitted/null means no replacement, while empty and whitespace-only strings create replacements with those exact bytes.
 
 ## Environment variables
 

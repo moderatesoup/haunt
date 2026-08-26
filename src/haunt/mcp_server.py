@@ -465,16 +465,18 @@ def memory_purge(
 
 @server.tool(
     description=(
-        "Mark a memory superseded: sets valid_to=now on the old row. "
-        "Optionally store a replacement as a new semantic memory."
+        "Mark a memory superseded and append its correction record. "
+        "A replacement string is stored verbatim as a new semantic memory; "
+        "omit/null means no replacement, while empty and whitespace-only strings "
+        "are intentional. Supply idempotency_key for safe exact-payload retries."
     )
 )
 def memory_contradict(
     memory_id: str,
     replacement: Optional[str] = None,
     namespace: Optional[str] = None,
-    origin: str = "mcp",
-    session_id: Optional[str] = None,
+    origin: Any = "mcp",
+    session_id: Any = None,
     reason: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> str:

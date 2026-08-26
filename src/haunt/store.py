@@ -1878,8 +1878,6 @@ class Store:
             raise ValueError("replacement must be a string or null")
         if reason is not None and not isinstance(reason, str):
             raise ValueError("reason must be a string or null")
-        if not isinstance(origin, str) or not origin.strip():
-            raise ValueError("origin must be a non-empty string")
         if idempotency_key is not None and not isinstance(idempotency_key, str):
             raise ValueError("idempotency_key must be a string")
         key = new_id() if idempotency_key is None else idempotency_key
@@ -1890,14 +1888,18 @@ class Store:
                 f"idempotency_key must be {CORRECTION_KEY_MAX} characters or fewer"
             )
 
-        # Empty replacement has historically meant "supersede without replacing".
-        # All other bytes, including surrounding whitespace, remain verbatim.
-        replacement_text = None if replacement == "" else replacement
-        payload = _correction_request_payload(memory_id, replacement_text, reason)
+        # Null, empty, and whitespace-only replacements are distinct canonical
+        # requests. An explicitly supplied string is always stored verbatim.
+        payload = _correction_request_payload(memory_id, replacement, reason)
         request_identity = _correction_request_identity(payload)
         replay_result = self._correction_replay(key, payload)
         if replay_result is not None:
             return replay_result
+        if not isinstance(origin, str) or not origin.strip():
+            raise ValueError("origin must be a non-empty string")
+        if session_id is not None and not isinstance(session_id, str):
+            raise ValueError("session_id must be a string or null")
+        replacement_text = replacement
         if replacement_text is not None:
             self.ensure_current_embeddings()
             self.process_embedding_jobs(limit=32)
