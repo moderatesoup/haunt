@@ -97,7 +97,8 @@ class BootstrapError(SystemExit):
 
 
 def _drain_worth_reporting(drained: dict) -> bool:
-    """True when Store.drain_embedding_queue() found or touched anything.
+    """True when Store.drain_embedding_queue() found or touched anything
+    worth telling the operator about.
 
     Keeps reembed_report (and format_report's rendering of it) from
     growing one no-op entry per namespace on every `haunt bootstrap` call
@@ -105,7 +106,51 @@ def _drain_worth_reporting(drained: dict) -> bool:
     and drain_embedding_queue always makes at least one
     process_embedding_jobs() call (so `batches` alone is not a useful
     "was there ever a backlog" signal).
+
+    C-series follow-up: one deliberate exception. A permanently FTS-only
+    namespace -- HAUNT_FTS_ONLY=1 or HAUNT_EMBED_MODEL=off, both
+    first-class supported modes; the project's own CI runs FTS-only --
+    still queues embedding_jobs rows on every write (see observe()), but
+    process_embedding_jobs() returns `available=False` before it ever
+    touches a row's `attempts` (its `if not es.available` branch). That
+    means `remaining` never shrinks and drain_embedding_queue() reports
+    stop_reason="blocked" on *every single* `haunt bootstrap` call,
+    forever -- not a one-time event, since nothing about that namespace
+    is ever going to change on its own. Before the C4 out-of-band drain
+    existed, a namespace in this shape produced no report line at all;
+    this restores that silence for that specific shape rather than
+    printing "stopped early (blocked)" -- wording that reads as a fault --
+    for a condition that is normal, permanent, and not actionable by the
+    operator. The top-level report already says the embedding backend is
+    off once per run (`sqlite-vec skipped (FTS-only)` / the `embed`
+    block); repeating it per namespace on every run adds no information,
+    only alarm. Anyone who wants the raw per-namespace backlog count can
+    still get it from Store.stats()'s `embedding_pending` /
+    `embedding_exhausted` fields (also what the dashboard's per-namespace
+    JSON exposes) -- it is only this alarming, repeats-forever bootstrap
+    report line that is silenced, not the underlying data.
+
+    This checks the `available` flag itself rather than
+    `stop_reason == "blocked"`, and only silences when `processed`,
+    `failed`, and `exhausted` are *all* zero too -- so it stays narrowly
+    scoped to "nothing happened because there is no backend at all, and
+    there is no other signal (like pre-existing exhausted rows) either".
+    A block that happens while a backend IS available -- available=True --
+    never matches this branch and always falls through to the normal
+    reporting rule below; that is a real signal and must survive. Keying
+    off `available` rather than the derived stop_reason string also means
+    this stays correct even if a future change adds some other way to
+    reach stop_reason="blocked" -- the only thing silenced here is "no
+    backend, nothing else to say", never a block that happens with a
+    working backend.
     """
+    if (
+        drained.get("available") is False
+        and not drained.get("processed")
+        and not drained.get("failed")
+        and not drained.get("exhausted")
+    ):
+        return False
     return bool(
         drained.get("processed")
         or drained.get("failed")

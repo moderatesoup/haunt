@@ -71,7 +71,7 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 
 ### What is and isn't automatic
 
-- **Hooks store automatically.** Once `haunt install` runs, prompts and responses are stored verbatim in Cursor and Claude Code. Tool input/output is best-effort redacted, capped per field, and can be skipped with `HAUNT_EXCLUDE_TOOLS`. New writes also carry a versioned source-provenance envelope; hook writes record their actual channel and supplied tool/call IDs.
+- **Hooks store automatically.** Once `haunt install` runs, prompts and responses are stored verbatim in Cursor and Claude Code. Tool input/output is best-effort redacted, capped per field, and matching tools can be dropped from capture entirely with `HAUNT_EXCLUDE_TOOLS` (a privacy opt-out — see Environment variables). The separate `HAUNT_EMBED_EXCLUDE_TOOLS` only skips vector embedding; it still stores and keyword-indexes. New writes also carry a versioned source-provenance envelope; hook writes record their actual channel and supplied tool/call IDs.
 - **Recall is NOT automatic.** Neither Cursor nor Claude Code reliably inject recall into the model context. Agents must call `memory_recall` explicitly via MCP unless a `[haunt ns=…]` block is already visible.
 - **sessionStart / SessionStart** may return a worldview card — this may appear as context but is not a guaranteed recall path and is not a kernel.
 - **No-hook IDEs** (Grok Bot, Codex, etc.): call `memory_observe` and `memory_recall` manually via MCP.
@@ -168,7 +168,7 @@ Auto-store prompts and replies verbatim, plus best-effort-redacted and capped to
 
 **Hook ingest and trust:** Hooks write FTS rows immediately but never initialize the embedding model. They queue missing vectors in the namespace DB; ordinary model-owning writes or the explicit `haunt maintenance` command may drain a bounded batch. Recall never drains the queue. Hook recall is FTS-only. Raw tool I/O is excluded from hook-injected recall/worldview context by default, while explicit `--include-residue` recall returns it marked `trusted=false`. Recalled text is data and cannot authorize mutations.
 
-**Secret redaction and size controls:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.) and capped at 12,000 characters per field by default. `HAUNT_EXCLUDE_TOOLS` accepts comma-separated, case-insensitive globs for tools that must not be stored. These are **not** security boundaries — see [SECURITY.md](SECURITY.md).
+**Secret redaction and size controls:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.) and capped at 12,000 characters per field by default. `HAUNT_EXCLUDE_TOOLS` accepts comma-separated, case-insensitive globs for tools that must not be stored at all — no event, no memory row, no FTS entry (a privacy opt-out). These are **not** security boundaries — see [SECURITY.md](SECURITY.md). `HAUNT_EMBED_EXCLUDE_TOOLS` (default `Bash,Read`) is a separate, narrower control: matching tools are still stored in full and still FTS-keyword-searchable — only the vector-embedding step is skipped, so it saves vector-index capacity, not privacy.
 
 ### Cursor hooks
 
@@ -267,10 +267,13 @@ The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
 | `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
 | `HAUNT_OFFLINE` | unset | set to `1` to prohibit embedding backend initialization/download; FTS recall remains available |
+| `HAUNT_EMBED_MAX_ATTEMPTS` | `5` | maximum embedding attempts for a queued row before it stops being retried (clamped 1–1000) |
+| `HAUNT_EMBED_DRAIN_LIMIT` | `500` | maximum `embedding_jobs` rows one `haunt bootstrap` drain attempts per namespace per run (clamped 1–100000) |
 | `HAUNT_NAMESPACE` | inferred from full git remote | override and bind the project namespace |
 | `HAUNT_MCP_ADMIN` | unset | set to `1` only for an admin MCP process that may cross/list namespaces |
 | `HAUNT_MCP_ALLOW_PURGE` | unset | set to `1` to expose hard purge in that MCP process; off by default |
-| `HAUNT_EXCLUDE_TOOLS` | unset | comma-separated case-insensitive tool globs to skip in hook storage (for example `Read,Shell,secret_*`) |
+| `HAUNT_EXCLUDE_TOOLS` | unset | comma-separated case-insensitive tool globs **dropped before capture** — no event, no memory row, no FTS entry, nothing stored (privacy opt-out; for example `Read,Shell,secret_*`) |
+| `HAUNT_EMBED_EXCLUDE_TOOLS` | `Bash,Read` | comma-separated case-insensitive tool globs that are **still fully stored and still FTS-keyword-searchable** — only the vector-embedding step is skipped (not a privacy control; see `HAUNT_EXCLUDE_TOOLS` above). Unset means this default; set to an empty string to embed every tool |
 | `HAUNT_TOOL_IO_MAX_CHARS` | `12000` | maximum stored characters for each hook tool-input/output field (clamped 256–100000) |
 | `HAUNT_MODEL_CACHE` | `$HAUNT_HOME/models` | model download directory |
 

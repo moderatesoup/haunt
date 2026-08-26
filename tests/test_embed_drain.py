@@ -233,6 +233,41 @@ def test_drain_respects_bound_and_reports_remaining_honestly(drain_env, monkeypa
         assert still_queued == 7
 
 
+def test_drain_default_path_reads_HAUNT_EMBED_DRAIN_LIMIT(drain_env, monkeypatch):
+    """The max_rows=None default path -- what bootstrap.py actually calls
+    (`st.drain_embedding_queue()`, no explicit bound) -- must read
+    HAUNT_EMBED_DRAIN_LIMIT via _embed_drain_limit(). Every bound-related
+    test above this one passes max_rows explicitly, which short-circuits
+    the `max_rows if max_rows is not None else _embed_drain_limit()`
+    ternary in Store.drain_embedding_queue and never touches the env var
+    at all -- so none of them actually prove the env var takes effect
+    through the code path bootstrap.py relies on. Numbers are the
+    hand-verified case from the C-series review: bound=2, backlog=5 ->
+    processed=2, remaining=3.
+    """
+    monkeypatch.setenv("HAUNT_EMBED_DRAIN_LIMIT", "2")
+    from haunt.store import Store
+
+    with Store("drain-env-default-path") as store:
+        for i in range(5):
+            store.observe(f"deferred row {i}", defer_embedding=True)
+        _wire_fake_backend(store, monkeypatch)
+
+        result = store.drain_embedding_queue()  # no max_rows kwarg at all
+
+        assert result["bound"] == 2
+        assert result["processed"] == 2
+        assert result["failed"] == 0
+        assert result["remaining"] == 3
+        assert result["stop_reason"] == "bound"
+        assert result["stopped_early"] is True
+
+        still_queued = store.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs"
+        ).fetchone()[0]
+        assert still_queued == 3
+
+
 def test_drain_exhausted_row_excluded_and_does_not_spin(drain_env, monkeypatch):
     """A row that hits HAUNT_EMBED_MAX_ATTEMPTS must be reported via
     `exhausted`, not `remaining`, and must not make the drain spin toward
@@ -347,6 +382,138 @@ def test_bootstrap_reembed_report_omits_healthy_namespaces(drain_env):
     report = bootstrap("always-healthy")
     names = [r.get("namespace") for r in report["reembed"]]
     assert "always-healthy" not in names
+
+
+# ---------------------------------------------------------------------------
+# C-series item 1: a permanently-unavailable backend must not read as a
+# fault. Before this fix, a namespace with a real embedding_jobs backlog
+# but no embedding backend at all (permanent HAUNT_FTS_ONLY=1 /
+# HAUNT_EMBED_MODEL=off) rendered "stopped early (blocked)" -- alarming,
+# fault-sounding wording -- on every single `haunt bootstrap` call,
+# forever, because process_embedding_jobs's `if not es.available` branch
+# never advances `attempts` so `remaining` never shrinks. See
+# bootstrap._drain_worth_reporting's docstring for the full reasoning.
+# ---------------------------------------------------------------------------
+
+
+def test_drain_worth_reporting_silences_pure_backend_unavailable():
+    """A namespace whose only signal is "backend unavailable, backlog
+    sitting there" (available=False, remaining>0, nothing else) must not
+    be considered report-worthy."""
+    from haunt.bootstrap import _drain_worth_reporting
+
+    perma_fts_only = {
+        "processed": 0,
+        "failed": 0,
+        "batches": 1,
+        "remaining": 4,
+        "exhausted": 0,
+        "available": False,
+        "bound": 500,
+        "stop_reason": "blocked",
+        "stopped_early": True,
+    }
+    assert _drain_worth_reporting(perma_fts_only) is False
+
+
+def test_drain_worth_reporting_keeps_block_while_backend_available():
+    """Non-negotiable from the review: a genuine block that happens while
+    a backend IS available must still surface. The gate keys off
+    `available` rather than the stop_reason string precisely so a real
+    block is never accidentally silenced alongside the FTS-only one, even
+    though nothing in today's store.py can produce this combination --
+    see the docstring on _drain_worth_reporting for why that decoupling
+    matters anyway."""
+    from haunt.bootstrap import _drain_worth_reporting
+
+    blocked_but_available = {
+        "processed": 0,
+        "failed": 0,
+        "batches": 1,
+        "remaining": 4,
+        "exhausted": 0,
+        "available": True,
+        "bound": 500,
+        "stop_reason": "blocked",
+        "stopped_early": True,
+    }
+    assert _drain_worth_reporting(blocked_but_available) is True
+
+
+def test_drain_worth_reporting_keeps_exhausted_even_when_unavailable():
+    """Exhausted (permanently-failed) rows are a real, separate signal --
+    e.g. rows that failed back when a backend was available, before the
+    operator switched to FTS-only -- and must stay visible even though the
+    backend is unavailable right now."""
+    from haunt.bootstrap import _drain_worth_reporting
+
+    stale_failures_now_fts_only = {
+        "processed": 0,
+        "failed": 0,
+        "batches": 1,
+        "remaining": 4,
+        "exhausted": 2,
+        "available": False,
+        "bound": 500,
+        "stop_reason": "blocked",
+        "stopped_early": True,
+    }
+    assert _drain_worth_reporting(stale_failures_now_fts_only) is True
+
+
+def test_drain_worth_reporting_still_silences_healthy_namespace():
+    """Baseline unaffected by the new branch: nothing queued, nothing to
+    report, same as before this fix."""
+    from haunt.bootstrap import _drain_worth_reporting
+
+    healthy = {
+        "processed": 0,
+        "failed": 0,
+        "batches": 1,
+        "remaining": 0,
+        "exhausted": 0,
+        "available": True,
+        "bound": 500,
+        "stop_reason": "drained",
+        "stopped_early": False,
+    }
+    assert _drain_worth_reporting(healthy) is False
+
+
+def test_bootstrap_omits_permanently_fts_only_backlog_from_reembed_report(drain_env):
+    """End-to-end version of the fix: a namespace with a real
+    embedding_jobs backlog, stuck purely because the backend is
+    permanently unavailable (real HAUNT_FTS_ONLY=1 / HAUNT_EMBED_MODEL=off
+    -- no monkeypatching of embed_state, this is the genuine FTS-only path
+    also used by test_stats_no_vector_index_reports_honestly above), must
+    not appear in report["reembed"] -- neither on the first `haunt
+    bootstrap` call nor on a second one run right after, proving this is
+    not a one-time omission but stays quiet on every run. Nothing about
+    the backlog changes between the two calls: process_embedding_jobs's
+    `if not es.available` branch never touches `attempts`, so the same 4
+    rows are still queued -- and still silently so -- after both.
+    """
+    from haunt.bootstrap import bootstrap
+    from haunt.store import Store
+
+    with Store("perma-fts-only-backlog") as store:
+        for i in range(4):
+            store.observe(f"stuck row {i}", defer_embedding=True)
+        queued = store.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs"
+        ).fetchone()[0]
+        assert queued == 4
+
+    for _ in range(2):
+        report = bootstrap()
+        names = [r.get("namespace") for r in report["reembed"]]
+        assert "perma-fts-only-backlog" not in names
+
+    with Store("perma-fts-only-backlog", create=False) as store:
+        still_queued = store.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs"
+        ).fetchone()[0]
+        assert still_queued == 4  # untouched -- genuinely stuck, just quiet about it
 
 
 # ---------------------------------------------------------------------------
