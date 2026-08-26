@@ -1461,6 +1461,7 @@ def test_store_create_retries_only_recognized_initialize_handoff(
 
     cleanup_unsafe = NamespacePathError("SQLite configuration lock is unsafe")
     cleanup_calls = 0
+    partial_stores = []
 
     class UnclosableConnection:
         def close(self):
@@ -1469,6 +1470,7 @@ def test_store_create_retries_only_recognized_initialize_handoff(
     def transient_with_unclosable_connection(self, identity):
         nonlocal cleanup_calls
         cleanup_calls += 1
+        partial_stores.append(self)
         self.conn = UnclosableConnection()
         raise NamespacePathError(
             "SQLite sidecar appeared during safe open: init-cleanup.db-wal"
@@ -1481,6 +1483,7 @@ def test_store_create_retries_only_recognized_initialize_handoff(
         Store("init-cleanup-unsafe")
     assert caught.value is cleanup_unsafe
     assert cleanup_calls == 1
+    assert isinstance(partial_stores[0].conn, UnclosableConnection)
 
 
 def test_configured_writer_close_retries_the_configuration_lock_after_failure(

@@ -3888,10 +3888,8 @@ class Store:
         conn = getattr(self, "conn", None)
         if conn is None:
             return
-        try:
-            conn.close()
-        finally:
-            del self.conn
+        conn.close()
+        del self.conn
 
     @classmethod
     def _from_identity(cls, identity: dict[str, Any]) -> "Store":
