@@ -1363,6 +1363,15 @@ def test_mcp_recall_opens_selected_stable_id_after_label_reassignment(
 
     mcp._MCP_AUTHORITY = None
     mcp._MCP_AUTHORITY_HOME = None
+    real_planned_recall = mcp.planned_recall
+    planned_store_ids = []
+
+    def capture_planned_store(*args, store=None, **kwargs):
+        assert store is not None
+        planned_store_ids.append(store.namespace_id)
+        return real_planned_recall(*args, store=store, **kwargs)
+
+    monkeypatch.setattr(mcp, "planned_recall", capture_planned_store)
     selected = threading.Event()
     resume = threading.Event()
     selected_access = None
@@ -1402,6 +1411,7 @@ def test_mcp_recall_opens_selected_stable_id_after_label_reassignment(
         result = json.loads(pending.result(timeout=20))
 
     assert result["namespace"] == "mcp-race-original-renamed"
+    assert planned_store_ids == [original_id]
     contents = [hit["content"] for hit in result["hits"]]
     assert "MCP AUTHORITY RACE CANARY FROM ORIGINAL" in contents
     assert "MCP AUTHORITY RACE CANARY FROM REPLACEMENT" not in contents

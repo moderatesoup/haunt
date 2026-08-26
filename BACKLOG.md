@@ -314,7 +314,7 @@ that source metadata measures truth.
 
 ## E3 — Add namespace aliases and migration
 
-**Status:** Blocked
+**Status:** In progress
 
 **Depends on:** E0
 

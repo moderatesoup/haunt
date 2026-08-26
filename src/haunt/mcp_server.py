@@ -827,7 +827,8 @@ def memory_trace(
     except MCPAuthorityError as exc:
         return _authority_error(exc)
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             result = st.trace(memory_id)
     except UnknownNamespaceError as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
