@@ -314,7 +314,7 @@ that source metadata measures truth.
 
 ## E3 — Add namespace aliases and migration
 
-**Status:** In progress
+**Status:** Done
 
 **Depends on:** E0
 
@@ -366,6 +366,22 @@ broadening access.
   alias for namespace B cannot be used to read or mutate B.
 - Filesystem evidence shows migration does not duplicate or rename the
   namespace database unless a separately confirmed maintenance action says so.
+
+**Completion evidence (2026-08-26)**
+
+- E3 was integrated over E1/E2 at `fb9ab09`, preserving namespace database
+  schema v8, independent registry schema v5, correction/privacy invariants,
+  structured provenance, guarded SQLite opening, and stable-ID MCP authority.
+- The author integration run passed 308 conflict-focused tests, 274 E0–E3 tests
+  on both Python 3.10 and Python 3.12/SQLite 3.43 with MCP 2, and the exact
+  dependency-correct full profile with 692 passes, 1 skip, and 7 expected
+  failures.
+- A fresh independent GPT-5.6 Terra review of exact `fb9ab09` was CLEAN. Its
+  Python 3.10/MCP 2 and Python 3.12/SQLite 3.43/MCP 2 E0–E3 profiles each passed
+  274 tests; its alias/sidecar plus integration profiles each passed 125 tests.
+  Its separate Python 3.10 broad compatibility environment passed 688 tests
+  with 5 optional-model skips and 7 expected failures. Compile, diff, clean-tree,
+  frozen-E0, and manual E1/E2/E3 schema and surface audits were also clean.
 
 **Non-goals**
 
