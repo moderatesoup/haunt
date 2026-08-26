@@ -231,7 +231,11 @@ def test_contradict_raising_replacement_leaves_original_current(honesty_env, mon
 
         monkeypatch.setattr(Store, "observe", boom)
         with pytest.raises(RuntimeError, match="replacement exploded"):
-            st.contradict(r.memory_id, replacement="should not land")
+            st.contradict(
+                r.memory_id,
+                replacement="should not land",
+                idempotency_key="replacement-rollback",
+            )
         row = st.conn.execute(
             "SELECT valid_to, content FROM memories WHERE id=?", (r.memory_id,)
         ).fetchone()
@@ -244,7 +248,11 @@ def test_contradict_already_superseded_is_ok_false_and_keeps_valid_to(honesty_en
 
     with Store("default") as st:
         r = st.observe("first fact", role="system", tier="semantic")
-        first = st.contradict(r.memory_id, replacement="second fact")
+        first = st.contradict(
+            r.memory_id,
+            replacement="second fact",
+            idempotency_key="already-superseded-first",
+        )
         assert first["ok"] is True
         vt = first["valid_to"]
         stored = st.conn.execute(
@@ -252,7 +260,11 @@ def test_contradict_already_superseded_is_ok_false_and_keeps_valid_to(honesty_en
         ).fetchone()["valid_to"]
         assert stored == vt
 
-        again = st.contradict(r.memory_id, replacement="third fact")
+        again = st.contradict(
+            r.memory_id,
+            replacement="third fact",
+            idempotency_key="already-superseded-again",
+        )
         assert again["ok"] is False
         assert "superseded" in (again.get("error") or "")
         stored2 = st.conn.execute(
@@ -270,12 +282,17 @@ def test_dashboard_contradict_already_superseded_is_not_500(honesty_env):
     with Store("default") as st:
         r = st.observe("dash contradict once", role="system", tier="semantic")
         mid = r.memory_id
-        vt = st.contradict(mid)["valid_to"]
+        vt = st.contradict(mid, idempotency_key="dashboard-already-first")[
+            "valid_to"
+        ]
 
     client = make_dash_client()
     resp = client.post(
         f"/api/namespace/default/memory/{mid}/contradict",
-        json={"replacement": "must not apply"},
+        json={
+            "replacement": "must not apply",
+            "idempotency_key": "dashboard-already-again",
+        },
     )
     assert resp.status_code != 500
     data = resp.json()
@@ -315,8 +332,8 @@ def test_timeline_k_fills_current_after_recent_superseded(honesty_env):
             "superseded recent TWO",
             event_time="2026-08-21T12:00:00+00:00",
         )
-        st.contradict(recent1.memory_id)
-        st.contradict(recent2.memory_id)
+        st.contradict(recent1.memory_id, idempotency_key="timeline-recent-1")
+        st.contradict(recent2.memory_id, idempotency_key="timeline-recent-2")
 
         tq = TemporalQuery(
             temporal=True,
@@ -566,7 +583,11 @@ def test_contradict_graph_raise_leaves_original_current(honesty_env, monkeypatch
 
         monkeypatch.setattr(graph, "extract_and_store", boom)
         with pytest.raises(RuntimeError, match="graph exploded"):
-            st.contradict(r.memory_id, replacement="should not land")
+            st.contradict(
+                r.memory_id,
+                replacement="should not land",
+                idempotency_key="graph-rollback",
+            )
         row = st.conn.execute(
             "SELECT valid_to FROM memories WHERE id=?", (r.memory_id,)
         ).fetchone()
@@ -600,7 +621,11 @@ def test_contradict_ensure_vec_table_does_not_commit_supersede(honesty_env, monk
         monkeypatch.setattr(store_mod, "ensure_vec_table", tracking_vec)
         monkeypatch.setattr("haunt.graph.extract_and_store", boom_graph)
         with pytest.raises(RuntimeError, match="after vec"):
-            st.contradict(r.memory_id, replacement="should not land")
+            st.contradict(
+                r.memory_id,
+                replacement="should not land",
+                idempotency_key="vec-rollback",
+            )
         assert commits["n"] == 0
         row = st.conn.execute(
             "SELECT valid_to FROM memories WHERE id=?", (r.memory_id,)
@@ -635,7 +660,7 @@ def test_timeline_k_fills_past_events_limit_max(honesty_env):
             )
             recent_ids.append(rec.memory_id)
         for mid in recent_ids:
-            st.contradict(mid)
+            st.contradict(mid, idempotency_key=f"timeline-bulk-{mid}")
 
         tq = TemporalQuery(
             temporal=True,

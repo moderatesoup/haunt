@@ -437,10 +437,10 @@ def correct_cmd(
         help="Verbatim replacement; omit for none (empty/whitespace are intentional)",
     ),
     reason: Optional[str] = typer.Option(None, "--reason"),
-    idempotency_key: Optional[str] = typer.Option(
-        None,
+    idempotency_key: str = typer.Option(
+        ...,
         "--idempotency-key",
-        help="Stable caller key for safe retries (generated when omitted)",
+        help="Required stable caller key for safe retries",
     ),
     session_id: Optional[str] = typer.Option(None, "--session"),
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),

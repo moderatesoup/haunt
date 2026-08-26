@@ -329,7 +329,7 @@ def test_contradict_unknown_namespace_is_404_and_does_not_create(gate_env):
     assert not namespace_exists(mystery)
     r = client.post(
         f"/api/namespace/{mystery}/memory/does-not-exist/contradict",
-        json={},
+        json={"idempotency_key": "unknown-namespace"},
     )
     assert r.status_code == 404
     err = (r.json().get("error") or "")
@@ -367,7 +367,7 @@ def test_contradict_existing_ns_missing_memory_is_404_memory_not_found(gate_env)
     before = {ns["name"] for ns in list_namespaces()}
     r = client.post(
         "/api/namespace/default/memory/does-not-exist/contradict",
-        json={},
+        json={"idempotency_key": "unknown-memory"},
     )
     assert r.status_code == 404
     err = (r.json().get("error") or "")

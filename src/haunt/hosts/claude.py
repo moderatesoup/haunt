@@ -166,7 +166,7 @@ Default recall hides superseded rows unless you pass `as_of`.
 - `memory_observe` only if hooks are off. `text`, `tier`, `origin`, `session`. Never summarize.
 - `memory_worldview` if no `[haunt worldview ns=…]` card is in context.
 - `memory_procedure` `action`=`write`/`get`/`list`. Write needs `name`, `body`.
-- `memory_contradict` `memory_id`, optional `replacement`, `reason`, `idempotency_key`. Supersedes. Does not delete.
+- `memory_contradict` `memory_id`, required `idempotency_key`, optional `replacement`, `reason`. Supersedes. Does not delete.
 - `memory_trace` `memory_id`. Shows the ordered correction chain and erased gaps.
 - `memory_purge` `memory_id`. Hard delete; disabled unless the operator explicitly enabled MCP purge.
 - `memory_timeline` only with ISO `since`/`until` or `session`. No NL compile.

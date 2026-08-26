@@ -310,7 +310,11 @@ def test_mcp_recall_purge_contradict_unknown_ns(fts_env):
     assert "unknown namespace" in purged.get("error", "")
     _assert_no_typo(fts_env)
 
-    contradicted = json.loads(memory_contradict(memory_id="x", namespace=TYPO))
+    contradicted = json.loads(
+        memory_contradict(
+            memory_id="x", idempotency_key="unknown-namespace", namespace=TYPO
+        )
+    )
     assert contradicted.get("ok") is False
     assert "unknown namespace" in contradicted.get("error", "")
     _assert_no_typo(fts_env)

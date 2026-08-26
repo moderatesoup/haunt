@@ -145,7 +145,7 @@ def test_contradict_whitespace_replacement_is_stored_verbatim(leftover_env):
     r = _observe("whitespace replacement is intentional")
     resp = _post(
         f"/api/namespace/default/memory/{r.memory_id}/contradict",
-        json={"replacement": "   "},
+        json={"replacement": "   ", "idempotency_key": "whitespace-replacement"},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -168,7 +168,10 @@ def test_contradict_valid_after_bad_payloads_still_works(leftover_env):
     assert _post(url, json={"replacement": {"not": "a string"}}).status_code == 400
     assert _post(url, data={"replacement": "nope"}).status_code == 415
     assert _valid_to(r.memory_id) is None
-    ok = _post(url, json={"replacement": "corrected fact"})
+    ok = _post(
+        url,
+        json={"replacement": "corrected fact", "idempotency_key": "valid-after-bad"},
+    )
     assert ok.status_code == 200
     assert ok.json()["ok"] is True
     assert _valid_to(r.memory_id) is not None
@@ -180,7 +183,11 @@ def test_store_contradict_non_string_replacement_raises_and_keeps_valid_to(lefto
     with Store("default") as st:
         r = st.observe("store ValueError must not mutate", role="system", tier="semantic")
         with pytest.raises(ValueError, match="replacement must be a string or null"):
-            st.contradict(r.memory_id, replacement={"not": "a string"})
+            st.contradict(
+                r.memory_id,
+                replacement={"not": "a string"},
+                idempotency_key="invalid-replacement",
+            )
         row = st.conn.execute(
             "SELECT valid_to FROM memories WHERE id=?", (r.memory_id,)
         ).fetchone()

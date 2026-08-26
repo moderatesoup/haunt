@@ -457,8 +457,6 @@ def memory_purge(
             result = st.purge(memory_id)
     except UnknownNamespaceError as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
-    result.pop("memory_id", None)
-    result.pop("event_id", None)
     result["namespace"] = ns
     return _json(result)
 
@@ -468,17 +466,18 @@ def memory_purge(
         "Mark a memory superseded and append its correction record. "
         "A replacement string is stored verbatim as a new semantic memory; "
         "omit/null means no replacement, while empty and whitespace-only strings "
-        "are intentional. Supply idempotency_key for safe exact-payload retries."
+        "are intentional. A nonempty caller idempotency_key is required for "
+        "safe exact-payload retries."
     )
 )
 def memory_contradict(
     memory_id: str,
+    idempotency_key: str,
     replacement: Optional[str] = None,
     namespace: Optional[str] = None,
     origin: Any = "mcp",
     session_id: Any = None,
     reason: Optional[str] = None,
-    idempotency_key: Optional[str] = None,
 ) -> str:
     try:
         ns = _mcp_namespace(namespace)

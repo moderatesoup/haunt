@@ -1004,8 +1004,6 @@ async def api_memory_delete(request: Request) -> JSONResponse:
     memory_id = request.path_params["memory_id"]
     with Store(name, create=False) as st:
         result = st.purge(memory_id)
-    result.pop("memory_id", None)
-    result.pop("event_id", None)
     status = 200 if result.get("ok") else 404
     return JSONResponse(result, status_code=status)
 
@@ -1099,10 +1097,14 @@ async def api_contradict(request: Request) -> JSONResponse:
     reason = body.get("reason")
     if reason is not None and not isinstance(reason, str):
         return JSONResponse({"error": "reason must be a string or null"}, status_code=400)
-    idempotency_key = body.get("idempotency_key")
-    if idempotency_key is not None and not isinstance(idempotency_key, str):
+    if "idempotency_key" not in body:
         return JSONResponse(
-            {"error": "idempotency_key must be a string or null"}, status_code=400
+            {"error": "idempotency_key is required"}, status_code=400
+        )
+    idempotency_key = body["idempotency_key"]
+    if not isinstance(idempotency_key, str):
+        return JSONResponse(
+            {"error": "idempotency_key must be a string"}, status_code=400
         )
     session_id = body.get("session_id")
 
