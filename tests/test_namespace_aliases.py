@@ -1179,7 +1179,7 @@ def test_fresh_mcp_authority_pins_first_identity_concurrently(alias_home):
     def create_and_pin(_index):
         selected = authority.select(None)
         with Store(selected) as store:
-            return authority.pin_namespace(store.name), store.namespace_id
+            return authority.pin_open_store(store), store.namespace_id
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(create_and_pin, range(16)))
@@ -1230,6 +1230,64 @@ def test_fresh_mcp_process_pins_after_first_observe_and_survives_rename(
     denied = json.loads(mcp.memory_recall(query="secret", namespace="mcp-other"))
     assert denied["ok"] is False
     assert "denied" in denied["error"]
+
+
+def test_mcp_recall_opens_selected_stable_id_after_label_reassignment(
+    alias_home, monkeypatch
+):
+    with Store("mcp-race-original") as original:
+        original.observe("MCP AUTHORITY RACE CANARY FROM ORIGINAL")
+        original_id = original.namespace_id
+        original_db = original.db_path
+    _apply_change("mcp-race-original", "mcp-race-label", action="alias")
+    monkeypatch.setenv("HAUNT_NAMESPACE", "mcp-race-label")
+    monkeypatch.delenv("HAUNT_MCP_ADMIN", raising=False)
+    import haunt.mcp_server as mcp
+
+    mcp._MCP_AUTHORITY = None
+    mcp._MCP_AUTHORITY_HOME = None
+    selected = threading.Event()
+    resume = threading.Event()
+    selected_access = None
+
+    def pause_after_selection(access):
+        nonlocal selected_access
+        selected_access = access
+        selected.set()
+        assert resume.wait(timeout=15)
+
+    monkeypatch.setattr(mcp, "_mcp_after_selection_hook", pause_after_selection)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            mcp.memory_recall,
+            query="MCP AUTHORITY RACE CANARY",
+            namespace="mcp-race-label",
+        )
+        assert selected.wait(timeout=15)
+        assert selected_access.namespace_id == original_id
+        assert selected_access.db_path == str(original_db)
+
+        _apply_change("mcp-race-original", "mcp-race-original-renamed")
+        retire_namespace_alias("mcp-race-label", apply=True)
+        with Store("mcp-race-replacement") as replacement:
+            replacement.observe("MCP AUTHORITY RACE CANARY FROM REPLACEMENT")
+            replacement_id = replacement.namespace_id
+            replacement_db = replacement.db_path
+        _apply_change(
+            "mcp-race-replacement", "mcp-race-label", action="alias"
+        )
+        assert replacement_id != original_id
+        assert replacement_db != original_db
+        assert resolve_namespace_identity("mcp-race-label")["namespace_id"] == (
+            replacement_id
+        )
+        resume.set()
+        result = json.loads(pending.result(timeout=20))
+
+    assert result["namespace"] == "mcp-race-original-renamed"
+    contents = [hit["content"] for hit in result["hits"]]
+    assert "MCP AUTHORITY RACE CANARY FROM ORIGINAL" in contents
+    assert "MCP AUTHORITY RACE CANARY FROM REPLACEMENT" not in contents
 
 
 def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(

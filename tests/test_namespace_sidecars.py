@@ -160,6 +160,51 @@ def test_sidecar_swap_at_exact_open_boundary_fails_before_victim_use(
     _assert_victim_untouched(victim, content, mode)
 
 
+@pytest.mark.parametrize("surface", ["registry", "namespace"])
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_hardlink_swap_after_validation_fails_before_first_pragma(
+    tmp_path, monkeypatch, surface, suffix
+):
+    home = tmp_path / f"verified-hook-{surface}-{suffix[1:]}"
+    (home / "namespaces").mkdir(parents=True)
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    victim, content, mode = _victim(tmp_path)
+    victim_inode = int(victim.stat().st_ino)
+    import haunt.store as store_module
+
+    if surface == "registry":
+        target = registry_path()
+        action = init_registry
+    else:
+        init_registry()
+        target = register_namespace("verified-sidecar-owner")
+
+        def action():
+            return Store("verified-sidecar-owner", create=False)
+    attack = Path(str(target) + suffix)
+    fired = False
+
+    def replace_after_validation(path: Path) -> None:
+        nonlocal fired
+        if path != target or fired:
+            return
+        fired = True
+        assert store_module._sqlite_configuration_lock_held()
+        _redirect(attack, victim, "hardlink")
+
+    monkeypatch.setattr(
+        store_module, "_sqlite_sidecar_verified_hook", replace_after_validation
+    )
+    with pytest.raises(NamespacePathError, match="sidecar physical identity changed"):
+        action()
+    assert fired
+    assert attack.exists() and not attack.is_symlink()
+    assert int(victim.stat().st_ino) == victim_inode
+    _assert_victim_untouched(victim, content, mode)
+
+
 def test_live_wal_shm_and_rollback_journal_reopen_safely(sidecar_home):
     db = register_namespace("recovery")
     with Store("recovery", create=False) as writer:

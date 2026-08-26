@@ -52,6 +52,8 @@ This is not a security kernel. An ordinary MCP process is blast-radius-limited t
 
 Those process capabilities are guardrails, not operating-system authorization. The same local user can still open every SQLite file directly or use the CLI (`haunt recall -n …`, confirmed `haunt delete`). A compromised same-user process can do the same. Do not present namespace binding as protection from the local account that owns `HAUNT_HOME`.
 
+Haunt serializes its own writable SQLite opens across processes and brackets the first write-mode pragma with held primary/sidecar identity checks. This prevents cooperating Haunt writers from accidentally replacing WAL/SHM paths during configuration. The lock is advisory: an arbitrary same-user process can ignore it and rename filesystem entries in the remaining system-call-sized check/use interval. That case is outside Haunt's practical corruption guard and belongs to operating-system account isolation.
+
 ## Reporting a vulnerability
 
 Open an issue at <https://github.com/moderatesoup/haunt/issues> or email the maintainer directly. There is no bug bounty program.

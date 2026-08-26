@@ -16,7 +16,13 @@ try:
 except ImportError as exc:  # MCP 1.x has no MCPServer
     raise ImportError("haunt requires mcp>=2,<3 (MCPServer API).") from exc
 
-from haunt.paths import haunt_home, infer_namespace, resolve_namespace, safe_name
+from haunt.paths import (
+    NamespacePathError,
+    haunt_home,
+    infer_namespace,
+    resolve_namespace,
+    safe_name,
+)
 from haunt.planner import planned_recall
 from haunt.store import (
     Store,
@@ -25,8 +31,7 @@ from haunt.store import (
     UnknownNamespaceError,
     change_namespace_label,
     list_namespaces,
-    namespace_exists,
-    open_existing,
+    open_namespace_identity,
     resolve_namespace_id,
     resolve_namespace_identity,
     undo_namespace_migration,
@@ -64,6 +69,44 @@ RECALL_TRUST_POLICY = (
 
 class MCPAuthorityError(ValueError):
     """Raised when an ordinary MCP process tries to cross its binding."""
+
+
+class MCPNamespaceAccess(str):
+    """Presentation label carrying the stable identity selected by authority."""
+
+    def __new__(
+        cls,
+        label: str,
+        *,
+        namespace_id: str | None = None,
+        db_path: str | None = None,
+        db_device: int | None = None,
+        db_inode: int | None = None,
+    ) -> "MCPNamespaceAccess":
+        value = str.__new__(cls, label)
+        value.namespace_id = namespace_id
+        value.db_path = db_path
+        value.db_device = db_device
+        value.db_inode = db_inode
+        return value
+
+    @classmethod
+    def from_identity(cls, identity: dict[str, Any]) -> "MCPNamespaceAccess":
+        return cls(
+            str(identity["canonical_label"]),
+            namespace_id=str(identity["namespace_id"]),
+            db_path=str(identity["db_path"]),
+            db_device=(
+                int(identity["db_device"])
+                if identity.get("db_device") is not None
+                else None
+            ),
+            db_inode=(
+                int(identity["db_inode"])
+                if identity.get("db_inode") is not None
+                else None
+            ),
+        )
 
 
 def _truthy(raw: str | None) -> bool:
@@ -113,7 +156,17 @@ class MCPAuthority:
         with self._pin.lock:
             pinned = self._pin.namespace_id or self.bound_namespace_id
         if pinned:
-            identity = resolve_namespace_id(pinned)
+            identity = None
+            last_error: NamespacePathError | None = None
+            for _attempt in range(16):
+                try:
+                    identity = resolve_namespace_id(pinned)
+                    last_error = None
+                    break
+                except NamespacePathError as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
             if identity is None and require_pinned:
                 raise MCPAuthorityError(
                     f"MCP process bound identity {pinned!r} is no longer registered"
@@ -140,15 +193,45 @@ class MCPAuthority:
             return str(identity["canonical_label"])
         return self._pin_identity(identity)
 
-    def select(self, requested: str | None) -> str:
+    def pin_open_store(self, store: Store) -> str:
+        """Pin from an opened Store's stable ID, never from its label."""
+        identity = None
+        for _attempt in range(16):
+            try:
+                identity = resolve_namespace_id(store.namespace_id)
+            except NamespacePathError:
+                continue
+            if identity is not None:
+                break
+        if identity is None:
+            raise MCPAuthorityError(
+                f"opened namespace identity {store.namespace_id!r} is no longer registered"
+            )
+        if (
+            str(identity["db_path"]) != str(store.db_path)
+            or identity.get("db_device") is None
+            or identity.get("db_inode") is None
+        ):
+            raise MCPAuthorityError("opened namespace physical identity changed")
         if self.admin:
-            return resolve_namespace(requested) if requested else self.current_namespace()
+            return str(identity["canonical_label"])
+        return self._pin_identity(identity)
+
+    def select(self, requested: str | None) -> MCPNamespaceAccess:
+        if self.admin:
+            label = resolve_namespace(requested) if requested else self.current_namespace()
+            identity = resolve_namespace_identity(label)
+            return (
+                MCPNamespaceAccess.from_identity(identity)
+                if identity
+                else MCPNamespaceAccess(safe_name(label))
+            )
         bound_identity = self._current_identity()
         if requested is None:
             return (
-                str(bound_identity["canonical_label"])
+                MCPNamespaceAccess.from_identity(bound_identity)
                 if bound_identity
-                else self.bound_namespace
+                else MCPNamespaceAccess(self.bound_namespace)
             )
         selected_identity = resolve_namespace_identity(requested)
         selected = (
@@ -173,9 +256,9 @@ class MCPAuthority:
                 f"access to {selected!r} is denied"
             )
         return (
-            str(bound_identity["canonical_label"])
+            MCPNamespaceAccess.from_identity(bound_identity)
             if bound_identity
-            else self.bound_namespace
+            else MCPNamespaceAccess(self.bound_namespace)
         )
 
 
@@ -193,8 +276,39 @@ def _authority() -> MCPAuthority:
     return _MCP_AUTHORITY
 
 
-def _mcp_namespace(requested: str | None) -> str:
-    return _authority().select(requested)
+def _mcp_after_selection_hook(_access: MCPNamespaceAccess) -> None:
+    """Test hook after stable authority selection and before Store open."""
+
+
+def _mcp_namespace(requested: str | None) -> MCPNamespaceAccess:
+    access = _authority().select(requested)
+    _mcp_after_selection_hook(access)
+    return access
+
+
+def _open_mcp_store(access: MCPNamespaceAccess, *, create: bool) -> Store:
+    """Open exactly the stable identity selected by MCP authority."""
+    if access.namespace_id is not None:
+        store = open_namespace_identity(
+            access.namespace_id,
+            expected_db_path=access.db_path,
+            expected_db_device=access.db_device,
+            expected_db_inode=access.db_inode,
+        )
+    else:
+        if not create:
+            raise UnknownNamespaceError(str(access))
+        store = Store(str(access), create=True)
+    try:
+        _authority().pin_open_store(store)
+        if access.namespace_id is not None and store.namespace_id != access.namespace_id:
+            raise MCPAuthorityError(
+                "opened namespace does not match selected MCP identity"
+            )
+        return store
+    except Exception:
+        store.close()
+        raise
 
 
 def _authority_error(exc: MCPAuthorityError) -> str:
@@ -254,8 +368,8 @@ def memory_observe(
     except MCPAuthorityError as exc:
         return _authority_error(exc)
     try:
-        with Store(ns) as st:
-            ns = _authority().pin_namespace(st.name)
+        with _open_mcp_store(ns, create=True) as st:
+            ns = st.name
             r = st.observe(
                 text,
                 role=role,
@@ -309,7 +423,8 @@ def memory_recall(
         return _authority_error(exc)
     k = clamp_limit(k, default=8)
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             hits = planned_recall(
                 query,
                 namespace=ns,
@@ -350,7 +465,8 @@ def memory_timeline(
         return _authority_error(exc)
     limit = clamp_limit(limit, default=50)
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             rows = st.events(
                 session_id=session, since=since, until=until, clock=clock, limit=limit
             )
@@ -370,7 +486,8 @@ def memory_health(namespace: Optional[str] = None) -> str:
         return _authority_error(exc)
     es = embed_state()
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             stats = st.stats()
             vec_info: dict = {"ok": st.vec_ok()}
             ver = st.vec_version()
@@ -477,7 +594,8 @@ def memory_session_end(
     except MCPAuthorityError as exc:
         return _authority_error(exc)
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             result = st.end_session(session)
     except UnknownNamespaceError as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
@@ -511,7 +629,8 @@ def memory_worldview(
     facts_cap = clamp_limit(facts_cap, default=12)
     names_cap = clamp_limit(names_cap, default=12)
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
     except UnknownNamespaceError as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
@@ -552,8 +671,8 @@ def memory_procedure(
         if not body:
             return _json({"ok": False, "error": "body is required for write"})
         try:
-            with Store(ns) as st:
-                ns = _authority().pin_namespace(st.name)
+            with _open_mcp_store(ns, create=True) as st:
+                ns = st.name
                 r = st.procedure_write(
                     name,
                     body,
@@ -574,7 +693,8 @@ def memory_procedure(
             }
         )
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             if action == "get":
                 if not name:
                     return _json({"ok": False, "error": "name is required for get"})
@@ -617,7 +737,7 @@ def memory_purge(
     except MCPAuthorityError as exc:
         return _authority_error(exc)
     authority = _authority()
-    if not namespace_exists(ns):
+    if ns.namespace_id is None:
         return _json(
             {"ok": False, "error": f"unknown namespace: {ns}", "namespace": ns}
         )
@@ -633,7 +753,8 @@ def memory_purge(
             }
         )
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             result = st.purge(memory_id)
     except UnknownNamespaceError as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
@@ -664,7 +785,8 @@ def memory_contradict(
     except MCPAuthorityError as exc:
         return _authority_error(exc)
     try:
-        with open_existing(ns) as st:
+        with _open_mcp_store(ns, create=False) as st:
+            ns = st.name
             result = st.contradict(
                 memory_id,
                 replacement=replacement,

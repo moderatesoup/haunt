@@ -90,6 +90,8 @@ REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
 _NAMESPACE_DB_HANDLE_LOCK = SQLITE_OPEN_LOCK
 _NAMESPACE_MIGRATION_LOCK = threading.RLock()
+_SQLITE_CONFIGURATION_LOCK = threading.RLock()
+_SQLITE_CONFIGURATION_STATE = threading.local()
 
 
 @contextmanager
@@ -133,6 +135,72 @@ def _namespace_migration_lock() -> Iterator[None]:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+
+@contextmanager
+def _sqlite_configuration_lock() -> Iterator[None]:
+    """Serialize every Haunt RW sidecar claim/open/first-PRAGMA sequence.
+
+    The advisory lock closes accidental cross-process races between cooperating
+    Haunt writers. It is deliberately not presented as kernel isolation from an
+    arbitrary process running as the same account, which can ignore ``flock``.
+    """
+    with _SQLITE_CONFIGURATION_LOCK:
+        depth = int(getattr(_SQLITE_CONFIGURATION_STATE, "depth", 0))
+        if depth:
+            _SQLITE_CONFIGURATION_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _SQLITE_CONFIGURATION_STATE.depth = depth
+            return
+        root = haunt_home()
+        mkdir_private(root)
+        lock_path = root / ".sqlite-configuration.lock"
+        nofollow = required_o_nofollow()
+        flags = os.O_RDWR | nofollow | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            fd = os.open(lock_path, flags)
+        try:
+            held = os.fstat(fd)
+            current = lock_path.lstat()
+            identity = int(held.st_dev), int(held.st_ino)
+            if (
+                not stat.S_ISREG(held.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or int(held.st_nlink) != 1
+                or int(current.st_nlink) != 1
+                or stat.S_IMODE(held.st_mode) != 0o600
+                or identity != (int(current.st_dev), int(current.st_ino))
+            ):
+                raise NamespacePathError("SQLite configuration lock is unsafe")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            current = lock_path.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (int(current.st_dev), int(current.st_ino)) != identity
+            ):
+                raise NamespacePathError(
+                    "SQLite configuration lock changed while acquiring it"
+                )
+            _SQLITE_CONFIGURATION_STATE.depth = 1
+            try:
+                yield
+            finally:
+                _SQLITE_CONFIGURATION_STATE.depth = 0
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _sqlite_configuration_lock_held() -> bool:
+    return bool(getattr(_SQLITE_CONFIGURATION_STATE, "depth", 0))
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sessions", ("started_at", "ended_at")),
@@ -349,6 +417,10 @@ def _sqlite_sidecar_pragma_hook(_path: Path) -> None:
     """Test hook after SQLite open and before the first configuring PRAGMA."""
 
 
+def _sqlite_sidecar_verified_hook(_path: Path) -> None:
+    """Test hook after validation at the exact first-PRAGMA boundary."""
+
+
 def _open_readonly_connection(
     path: Path,
     *,
@@ -409,8 +481,18 @@ def _configure_connection(
     tighten: bool = True,
     sidecars: SQLiteSidecarGuard | None = None,
 ) -> sqlite3.Connection:
+    if not _sqlite_configuration_lock_held():
+        raise NamespacePathError(
+            "SQLite write configuration requires the serialized sidecar lock"
+        )
     _sqlite_sidecar_pragma_hook(path)
     if sidecars is not None:
+        sidecars.verify()
+    _sqlite_sidecar_verified_hook(path)
+    if sidecars is not None:
+        # The hook represents the exact scheduling boundary after the previous
+        # validation. Recheck while the cross-process writer lock is still held
+        # before SQLite receives its first write-mode pragma.
         sidecars.verify()
     conn.execute("PRAGMA journal_mode=WAL")
     validate_sqlite_sidecars(path)
@@ -436,6 +518,13 @@ def _configure_connection(
 
 
 def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
+    with _sqlite_configuration_lock():
+        return _connect_with_configuration_lock(path, create=create)
+
+
+def _connect_with_configuration_lock(
+    path: Path, *, create: bool = True
+) -> sqlite3.Connection:
     with _NAMESPACE_DB_HANDLE_LOCK:
         if create:
             mkdir_private(path.parent)
@@ -559,6 +648,15 @@ def _validate_all_registered_namespace_dbs_read_only() -> None:
 
 
 def _open_mapped_namespace_db(
+    path: Path, *, expected: tuple[int | None, int | None]
+) -> sqlite3.Connection:
+    with _sqlite_configuration_lock():
+        return _open_mapped_namespace_db_with_configuration_lock(
+            path, expected=expected
+        )
+
+
+def _open_mapped_namespace_db_with_configuration_lock(
     path: Path, *, expected: tuple[int | None, int | None]
 ) -> sqlite3.Connection:
     _validate_all_registered_namespace_dbs_read_only()
@@ -1384,6 +1482,14 @@ class _FreshNamespaceClaim:
 
 def _claim_fresh_namespace_db(target: Path) -> _FreshNamespaceClaim:
     """Initialize a fresh DB privately, then atomically claim its final path."""
+    with _sqlite_configuration_lock():
+        return _claim_fresh_namespace_db_with_configuration_lock(target)
+
+
+def _claim_fresh_namespace_db_with_configuration_lock(
+    target: Path,
+) -> _FreshNamespaceClaim:
+    """Initialize a fresh DB while holding serialized sidecar configuration."""
     _validate_unmapped_namespace_target(target)
     root = validate_namespace_root()
     claim_fd, raw_temporary = tempfile.mkstemp(
@@ -1827,22 +1933,29 @@ def namespace_exists(name: str) -> bool:
         conn.close()
 
 
-def touch_namespace(name: str) -> None:
+def touch_namespace(name: str, *, namespace_id: str | None = None) -> None:
     conn = _registry()
-    namespace_id: str | None = None
+    touched_namespace_id: str | None = None
     try:
-        row = _identity_row(conn, name)
+        row = (
+            conn.execute(
+                "SELECT * FROM namespace_identities WHERE namespace_id=?",
+                (namespace_id,),
+            ).fetchone()
+            if namespace_id is not None
+            else _identity_row(conn, name)
+        )
         if not row:
             return
-        namespace_id = str(row["namespace_id"])
+        touched_namespace_id = str(row["namespace_id"])
         now = now_iso()
         conn.execute("UPDATE namespace_identities SET updated_at=? WHERE namespace_id=?", (now, row["namespace_id"]))
         conn.execute("UPDATE namespaces SET updated_at=? WHERE db_path=?", (now, row["db_path"]))
         conn.commit()
     finally:
         conn.close()
-    if namespace_id:
-        resolve_namespace_id(namespace_id)
+    if touched_namespace_id:
+        resolve_namespace_id(touched_namespace_id)
 
 
 def list_namespace_rows() -> list[dict[str, Any]]:
@@ -3521,12 +3634,32 @@ class Store:
             register_namespace(requested, repo_path)
         identity = None
         attempts = 8 if create else 1
+        last_error: NamespacePathError | None = None
         for _attempt in range(attempts):
-            identity = resolve_namespace_identity(requested)
+            try:
+                identity = resolve_namespace_identity(requested)
+                last_error = None
+            except NamespacePathError as exc:
+                if not create or not _is_concurrent_registry_change(exc):
+                    raise
+                last_error = exc
+                continue
             if identity is not None:
                 break
+        if last_error is not None:
+            raise last_error
         if not identity:
             raise UnknownNamespaceError(requested)
+        self._initialize_identity(identity)
+
+    @classmethod
+    def _from_identity(cls, identity: dict[str, Any]) -> "Store":
+        """Open an already-resolved stable identity without resolving a label."""
+        store = cls.__new__(cls)
+        store._initialize_identity(identity)
+        return store
+
+    def _initialize_identity(self, identity: dict[str, Any]) -> None:
         self.namespace_id = str(identity["namespace_id"])
         self.name = str(identity["canonical_label"])
         self.db_path = Path(str(identity["db_path"]))
@@ -3801,7 +3934,7 @@ class Store:
             raise
         if commit:
             try:
-                touch_namespace(self.name)
+                touch_namespace(self.name, namespace_id=self.namespace_id)
             except Exception:
                 pass
         return ObserveResult(
@@ -4299,7 +4432,7 @@ class Store:
             raise
         if touch:
             try:
-                touch_namespace(self.name)
+                touch_namespace(self.name, namespace_id=self.namespace_id)
             except Exception:
                 pass
 
@@ -4583,7 +4716,7 @@ class Store:
         finally:
             self._privacy_purge_thread_id = None
         try:
-            touch_namespace(self.name)
+            touch_namespace(self.name, namespace_id=self.namespace_id)
         except Exception:
             pass
         return deleted
@@ -5410,7 +5543,7 @@ class Store:
             )
             self.conn.commit()
             try:
-                touch_namespace(self.name)
+                touch_namespace(self.name, namespace_id=self.namespace_id)
             except Exception:
                 pass
             return result
@@ -5427,6 +5560,70 @@ def open_existing(name: str, repo_path: str | None = None) -> Store:
         return Store(name, repo_path=repo_path, create=False)
     except FileNotFoundError as exc:
         raise UnknownNamespaceError(name) from exc
+
+
+def open_namespace_identity(
+    namespace_id: str,
+    *,
+    expected_db_path: str | None = None,
+    expected_db_device: int | None = None,
+    expected_db_inode: int | None = None,
+) -> Store:
+    """Open one stable registry identity without resolving any label again."""
+
+    def validate_selected(identity: dict[str, Any]) -> None:
+        if expected_db_path is not None and str(identity["db_path"]) != expected_db_path:
+            raise NamespacePathError(
+                "selected namespace database path changed before open"
+            )
+        actual_device = identity.get("db_device")
+        if expected_db_device is not None and (
+            actual_device is None
+            or int(actual_device) != int(expected_db_device)
+        ):
+            raise NamespacePathError(
+                "selected namespace database identity changed before open"
+            )
+        actual_inode = identity.get("db_inode")
+        if expected_db_inode is not None and (
+            actual_inode is None
+            or int(actual_inode) != int(expected_db_inode)
+        ):
+            raise NamespacePathError(
+                "selected namespace database identity changed before open"
+            )
+
+    with _namespace_migration_lock():
+        identity = resolve_namespace_id(namespace_id)
+        if identity is None:
+            raise UnknownNamespaceError(namespace_id)
+        validate_selected(identity)
+        store = Store._from_identity(identity)
+        try:
+            current = resolve_namespace_id(namespace_id)
+            if current is None:
+                raise UnknownNamespaceError(namespace_id)
+            validate_selected(current)
+            stable_fields = (
+                "namespace_id", "canonical_label", "canonical_label_norm",
+                "db_path", "db_device", "db_inode",
+            )
+            if any(current[field] != identity[field] for field in stable_fields):
+                raise NamespacePathError(
+                    "selected namespace identity changed while opening"
+                )
+            if store.namespace_id != namespace_id or str(store.db_path) != str(
+                current["db_path"]
+            ):
+                raise NamespacePathError(
+                    "opened namespace does not match selected stable identity"
+                )
+            if isinstance(store.conn, _SidecarGuardedConnection):
+                store.conn.verify_storage_guards()
+            return store
+        except Exception:
+            store.close()
+            raise
 
 
 def get_store(name: str | None = None, repo_path: str | None = None) -> Store:
