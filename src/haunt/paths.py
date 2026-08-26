@@ -180,15 +180,18 @@ def repository_identity(remote_url: str | None) -> str | None:
     host = ""
     path = ""
     if "://" in raw:
-        parsed = urlsplit(raw)
-        hostname = (parsed.hostname or "").lower()
+        try:
+            parsed = urlsplit(raw)
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+        except ValueError:
+            # urllib rejects malformed bracketed IPv6 hosts and invalid ports.
+            # A malformed remote must never collapse into a valid repository
+            # identity or escape into namespace inference as an exception.
+            return None
         if ":" in hostname:
             hostname = f"[{hostname}]"
         host = hostname
-        try:
-            port = parsed.port
-        except ValueError:
-            return None
         default_ports = {"http": 80, "https": 443, "ssh": 22, "git": 9418}
         if port is not None and port != default_ports.get(parsed.scheme.lower()):
             host = f"{host}:{port}"

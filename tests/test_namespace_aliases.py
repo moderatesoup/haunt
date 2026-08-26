@@ -140,6 +140,32 @@ def test_remote_identity_preserves_nondefault_ports_and_normalizes_defaults():
     assert first != second
 
 
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "https://[2001:db8::1/acme/api.git",
+        "https://2001:db8::1]/acme/api.git",
+        "https://[not-ipv6]/acme/api.git",
+        "ssh://git@[2001:db8::1]:not-a-port/acme/api.git",
+        "ssh://git@[2001:db8::1]:70000/acme/api.git",
+    ],
+)
+def test_remote_identity_rejects_malformed_ipv6_and_ports(remote):
+    assert repository_identity(remote) is None
+
+
+def test_remote_identity_normalizes_valid_ipv6_ports():
+    assert repository_identity(
+        "https://[2001:DB8::1]:443/acme/api.git"
+    ) == "[2001:db8::1]/acme/api"
+    assert repository_identity(
+        "ssh://git@[2001:DB8::1]:22/acme/api.git"
+    ) == "[2001:db8::1]/acme/api"
+    assert repository_identity(
+        "ssh://git@[2001:DB8::1]:2222/acme/api.git"
+    ) == "[2001:db8::1]:2222/acme/api"
+
+
 def test_repository_move_binding_and_inference(alias_home, tmp_path, monkeypatch):
     old_root = tmp_path / "old" / "repo"
     new_root = tmp_path / "new" / "repo"
@@ -212,6 +238,111 @@ def test_duplicate_legacy_paths_migrate_deterministically_and_quiesce(
     init_registry()
     assert not namespace_exists("middle")
     assert len(list_namespace_rows()) == 1
+
+
+def test_first_legacy_dry_run_is_byte_for_byte_read_only_then_apply_succeeds(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "legacy-dry-home"
+    namespaces = home / "namespaces"
+    namespaces.mkdir(parents=True)
+    legacy_db = namespaces / "Legacy.db"
+    other_db = namespaces / "Other.db"
+    orphan_db = namespaces / "orphan.db"
+    for path in (legacy_db, other_db, orphan_db):
+        path.touch()
+    registry = home / "registry.db"
+    conn = sqlite3.connect(registry)
+    conn.execute(
+        """CREATE TABLE namespaces(
+               name TEXT PRIMARY KEY,repo_path TEXT,db_path TEXT NOT NULL,
+               created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"""
+    )
+    conn.executemany(
+        "INSERT INTO namespaces VALUES (?,?,?,?,?)",
+        [
+            (
+                "Legacy",
+                "https://github.com/acme/legacy.git",
+                str(legacy_db),
+                "2025-01-01",
+                "2025-01-01",
+            ),
+            (
+                "Other",
+                "https://github.com/acme/other.git",
+                str(other_db),
+                "2025-01-02",
+                "2025-01-02",
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+
+    observer = sqlite3.connect(f"{registry.resolve().as_uri()}?mode=ro", uri=True)
+
+    def logical_snapshot():
+        schema = observer.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()
+        rows = observer.execute(
+            "SELECT name,repo_path,db_path,created_at,updated_at FROM namespaces "
+            "ORDER BY name"
+        ).fetchall()
+        return schema, rows, observer.execute("PRAGMA user_version").fetchone()[0]
+
+    def file_snapshot():
+        return {
+            str(path.relative_to(home)): path.read_bytes()
+            for path in sorted(home.rglob("*"))
+            if path.is_file()
+        }
+
+    before_files = file_snapshot()
+    before_logical = logical_snapshot()
+    before_version = observer.execute("PRAGMA data_version").fetchone()[0]
+
+    with pytest.raises(NamespaceCollisionError):
+        change_namespace_label("Legacy", "Other", apply=False)
+    with pytest.raises(NamespaceCollisionError):
+        change_namespace_label(
+            "Legacy",
+            "unused",
+            repository="git@github.com:acme/other.git",
+            apply=False,
+        )
+    with pytest.raises(NamespaceCollisionError):
+        change_namespace_label("Legacy", "orphan", apply=False)
+
+    plan = change_namespace_label("Legacy", "Renamed", apply=False)
+    assert plan["namespace_id"] is None
+    assert plan["requires_registry_upgrade"] is True
+    assert plan["canonical_before"] == "Legacy"
+    assert plan["db_path"] == str(legacy_db)
+    cli_plan = CliRunner().invoke(
+        app, ["namespace", "migrate", "Legacy", "Renamed"]
+    )
+    assert cli_plan.exit_code == 0, cli_plan.output
+    assert '"requires_registry_upgrade": true' in cli_plan.output
+
+    assert file_snapshot() == before_files
+    assert logical_snapshot() == before_logical
+    assert observer.execute("PRAGMA data_version").fetchone()[0] == before_version
+    observer.close()
+    assert not Path(str(registry) + "-wal").exists()
+    assert not Path(str(registry) + "-shm").exists()
+
+    applied = change_namespace_label("Legacy", "Renamed", apply=True)
+    assert applied["namespace_id"]
+    assert applied["db_path"] == str(legacy_db)
+    identity = resolve_namespace_identity("Renamed")
+    assert identity is not None
+    assert identity["namespace_id"] == applied["namespace_id"]
+    assert identity["db_path"] == str(legacy_db)
 
 
 def test_alias_and_repository_resolution_reads_committed_wal(
@@ -567,3 +698,41 @@ def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(
         assert response.json()["hits"][0]["namespace"] == "route-main"
     finally:
         reset_dashboard_security()
+
+
+def test_cli_dashboard_and_mcp_namespace_listings_are_portable(alias_home, monkeypatch):
+    with Store("listing-main") as store:
+        store.observe("LISTING-CANARY")
+        db_path = store.db_path
+    change_namespace_label("listing-main", "listing-alias", action="alias", apply=True)
+
+    rows = list_namespace_rows()
+    assert [(row["name"], row["db_path"]) for row in rows] == [
+        ("listing-main", str(db_path))
+    ]
+    cli = CliRunner().invoke(app, ["namespaces"])
+    assert cli.exit_code == 0, cli.output
+    assert "listing-main" in cli.output
+
+    from haunt.dashboard import configure_dashboard_security, reset_dashboard_security
+    from tests.dashutil import TEST_DASH_TOKEN, make_dash_client
+
+    configure_dashboard_security(token=TEST_DASH_TOKEN)
+    try:
+        response = make_dash_client().get("/api/namespaces")
+        assert response.status_code == 200
+        assert [row["name"] for row in response.json()["namespaces"]] == [
+            "listing-main"
+        ]
+    finally:
+        reset_dashboard_security()
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "listing-alias")
+    monkeypatch.delenv("HAUNT_MCP_ADMIN", raising=False)
+    import haunt.mcp_server as mcp
+
+    mcp._MCP_AUTHORITY = None
+    mcp._MCP_AUTHORITY_HOME = None
+    payload = json.loads(mcp.memory_namespaces())
+    assert payload["bound_namespace"] == "listing-main"
+    assert [row["name"] for row in payload["namespaces"]] == ["listing-main"]
