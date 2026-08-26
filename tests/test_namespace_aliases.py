@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -456,6 +457,26 @@ def test_dependent_alias_blocks_retirement(alias_home):
     assert {b["kind"] for b in check["blockers"]} == {"dependent-alias"}
 
 
+def test_rename_to_existing_alias_reroots_lineage_for_old_retirement(alias_home):
+    register_namespace("a")
+    change_namespace_label("a", "b", action="alias", apply=True)
+    before = resolve_namespace_identity("b")
+    assert next(
+        alias for alias in before["aliases"] if alias["normalized_label"] == "b"
+    )["source_alias_norm"] == "a"
+
+    change_namespace_label("a", "b", action="rename", apply=True)
+    after = resolve_namespace_identity("b")
+    assert after["canonical_label"] == "b"
+    assert next(
+        alias for alias in after["aliases"] if alias["normalized_label"] == "b"
+    )["source_alias_norm"] is None
+    assert retire_namespace_alias("a")["safe"] is True
+    assert retire_namespace_alias("a", apply=True)["retired"] is True
+    assert not namespace_exists("a")
+    assert namespace_exists("b")
+
+
 def test_typo_read_does_not_create_registry_alias_or_database(alias_home):
     register_namespace("known")
     before = list_namespace_rows()
@@ -463,6 +484,118 @@ def test_typo_read_does_not_create_registry_alias_or_database(alias_home):
         open_existing("knwon")
     assert list_namespace_rows() == before
     assert not (alias_home / "namespaces" / "knwon.db").exists()
+
+
+def test_unmapped_physical_targets_cannot_gain_identity_or_authority(
+    alias_home, tmp_path
+):
+    owner_remote = "https://github.com/acme/physical-owner.git"
+    with Store("physical-owner", repo_path=owner_remote) as store:
+        owner_db = store.db_path
+        owner_id = store.namespace_id
+
+    symlink_target = alias_home / "namespaces" / "symlink-target.db"
+    symlink_target.symlink_to(owner_db)
+    hardlink_target = alias_home / "namespaces" / "hardlink-target.db"
+    hardlink_target.hardlink_to(owner_db)
+    regular_target = alias_home / "namespaces" / "unmapped-target.db"
+    regular_target.touch()
+    outside_db = tmp_path / "outside.db"
+    outside_db.touch()
+    outside_target = alias_home / "namespaces" / "outside-target.db"
+    outside_target.symlink_to(outside_db)
+
+    for label in (
+        "symlink-target",
+        "hardlink-target",
+        "unmapped-target",
+        "outside-target",
+    ):
+        with pytest.raises(NamespaceCollisionError):
+            Store(label)
+        assert not namespace_exists(label)
+    with pytest.raises(NamespaceCollisionError):
+        register_namespace("symlink-target", owner_remote)
+
+    for label in ("symlink-target", "hardlink-target", "outside-target"):
+        cli = CliRunner().invoke(
+            app,
+            [
+                "namespace",
+                "alias",
+                "physical-owner",
+                label,
+                "--apply",
+            ],
+        )
+        assert cli.exit_code == 2, cli.output
+        assert "error:" in cli.output
+
+    from haunt.mcp_server import MCPAuthority, MCPAuthorityError
+
+    authority = MCPAuthority(
+        bound_namespace="physical-owner",
+        bound_namespace_id=owner_id,
+    )
+    assert authority.select("physical-owner") == "physical-owner"
+    for label in ("symlink-target", "hardlink-target", "outside-target"):
+        with pytest.raises(MCPAuthorityError):
+            authority.select(label)
+
+    conn = sqlite3.connect(registry_path())
+    assert conn.execute("SELECT COUNT(*) FROM namespace_identities").fetchone()[0] == 1
+    conn.close()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "equivalent"])
+def test_legacy_ambiguous_physical_database_paths_fail_closed(
+    tmp_path, monkeypatch, kind
+):
+    home = tmp_path / f"ambiguous-{kind}"
+    namespace_root = home / "namespaces"
+    namespace_root.mkdir(parents=True)
+    physical_db = namespace_root / "physical.db"
+    physical_db.touch()
+    if kind == "symlink":
+        alternate = namespace_root / "alternate.db"
+        alternate.symlink_to(physical_db)
+        alternate_value = str(alternate)
+    elif kind == "hardlink":
+        alternate = namespace_root / "alternate.db"
+        alternate.hardlink_to(physical_db)
+        alternate_value = str(alternate)
+    else:
+        (namespace_root / "nested").mkdir()
+        alternate_value = str(namespace_root / "nested" / ".." / "physical.db")
+
+    registry = home / "registry.db"
+    conn = sqlite3.connect(registry)
+    conn.execute(
+        """CREATE TABLE namespaces(
+               name TEXT PRIMARY KEY,repo_path TEXT,db_path TEXT NOT NULL,
+               created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"""
+    )
+    conn.executemany(
+        "INSERT INTO namespaces VALUES (?,?,?,?,?)",
+        [
+            ("first", None, str(physical_db), "2025-01-01", "2025-01-01"),
+            ("second", None, alternate_value, "2025-01-02", "2025-01-02"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+
+    with pytest.raises(NamespaceCollisionError, match="same file"):
+        change_namespace_label("first", "third", apply=False)
+    with pytest.raises(NamespaceCollisionError, match="same file"):
+        init_registry()
+    conn = sqlite3.connect(registry)
+    assert conn.execute("SELECT COUNT(*) FROM namespace_identities").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM namespace_aliases").fetchone()[0] == 0
+    conn.close()
 
 
 def test_registered_alias_beats_later_alias_shaped_database(alias_home):
@@ -531,6 +664,48 @@ def test_alias_cache_invalidates_when_registry_is_recreated(alias_home):
     assert second_path != first_path
     assert namespace_db_path("shared-label") == second_path
     assert resolve_namespace("shared-label") == "second-registry"
+
+
+def test_alias_cache_never_publishes_retired_then_reassigned_identity(
+    alias_home, monkeypatch
+):
+    first_db = register_namespace("race-first")
+    second_db = register_namespace("race-second")
+    change_namespace_label("race-first", "race-shared", action="alias", apply=True)
+
+    import haunt.paths as paths
+
+    with paths._NAMESPACE_ALIAS_CACHE_LOCK:
+        paths._NAMESPACE_ALIAS_CACHE.clear()
+    original_fingerprint = paths._registry_fingerprint
+    query_finished = threading.Event()
+    reassigned = threading.Event()
+    call_lock = threading.Lock()
+    calls = 0
+
+    def gated_fingerprint():
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            call = calls
+        if call == 2:
+            query_finished.set()
+            assert reassigned.wait(5), "registry reassignment did not complete"
+        return original_fingerprint()
+
+    monkeypatch.setattr(paths, "_registry_fingerprint", gated_fingerprint)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(paths._registered_alias, "race-shared")
+        assert query_finished.wait(5), "alias reader did not reach cache publication"
+        retire_namespace_alias("race-shared", apply=True)
+        change_namespace_label(
+            "race-second", "race-shared", action="alias", apply=True
+        )
+        reassigned.set()
+        assert future.result(timeout=5) == ("race-second", second_db)
+
+    assert paths._registered_alias("race-shared") == ("race-second", second_db)
+    assert paths._registered_alias("race-shared") != ("race-first", first_db)
 
 
 def test_concurrent_alias_apply_is_atomic_and_idempotent(alias_home):

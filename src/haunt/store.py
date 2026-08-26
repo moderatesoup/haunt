@@ -20,7 +20,6 @@ from haunt.embed import state as embed_state
 from haunt.paths import (
     _forget_registered_alias,
     _git_repo_context,
-    _remember_registered_alias,
     ensure_layout,
     haunt_home,
     mkdir_private,
@@ -104,6 +103,65 @@ class NamespaceCollisionError(ValueError):
 
 class AliasRetirementError(ValueError):
     """Raised when a live registry-owned reference blocks alias retirement."""
+
+
+def _physical_db_key(path_value: str | Path) -> tuple[str, int | str, int | None]:
+    """Identify an existing file by inode, otherwise by canonical path."""
+    path = Path(path_value).expanduser()
+    try:
+        resolved = str(path.resolve(strict=False))
+    except (OSError, RuntimeError):
+        resolved = str(path.absolute())
+    try:
+        stat = path.stat()
+    except OSError:
+        return "path", resolved, None
+    return "inode", int(stat.st_dev), int(stat.st_ino)
+
+
+def _assert_unambiguous_physical_db_paths(paths: list[str]) -> None:
+    """Refuse distinct registry paths that identify one physical database."""
+    seen: dict[tuple[str, int | str, int | None], str] = {}
+    for raw in paths:
+        key = _physical_db_key(raw)
+        previous = seen.get(key)
+        if previous is not None and previous != raw:
+            raise NamespaceCollisionError(
+                "ambiguous physical namespace database paths: "
+                f"{previous!r} and {raw!r} identify the same file"
+            )
+        seen[key] = raw
+
+
+def _validate_unmapped_namespace_target(
+    target: Path, *, mapped_db_path: Path | None = None
+) -> None:
+    """Refuse a new label path that exists, escapes the DB root, or aliases a file."""
+    root = namespaces_dir()
+    try:
+        root_resolved = root.resolve(strict=False)
+        target_resolved = target.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise NamespaceCollisionError(
+            f"cannot establish a safe database path for {target}"
+        ) from exc
+    if not target_resolved.is_relative_to(root_resolved):
+        raise NamespaceCollisionError(
+            f"namespace database target escapes {root}: {target}"
+        )
+    if mapped_db_path is not None and target == mapped_db_path:
+        return
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise NamespaceCollisionError(
+            f"cannot inspect namespace database target {target}"
+        ) from exc
+    raise NamespaceCollisionError(
+        f"target label has an unmapped filesystem entry at {target}"
+    )
 
 
 def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
@@ -221,6 +279,15 @@ def init_registry() -> None:
         legacy_rows = conn.execute(
             "SELECT name,repo_path,db_path,created_at,updated_at FROM namespaces"
         ).fetchall()
+        identity_paths = [
+            str(row["db_path"])
+            for row in conn.execute(
+                "SELECT db_path FROM namespace_identities"
+            ).fetchall()
+        ]
+        _assert_unambiguous_physical_db_paths(
+            [*identity_paths, *(str(row["db_path"]) for row in legacy_rows)]
+        )
         fully_projected = all(
             conn.execute(
                 """SELECT 1
@@ -780,13 +847,6 @@ def resolve_namespace_identity(name: str) -> dict[str, Any] | None:
             result = {**dict(row), "aliases": [dict(alias) for alias in aliases]}
     finally:
         conn.close()
-    if result:
-        for alias in result["aliases"]:
-            _remember_registered_alias(
-                str(alias["label"]),
-                str(result["canonical_label"]),
-                Path(str(result["db_path"])),
-            )
     return result
 
 
@@ -811,13 +871,6 @@ def resolve_namespace_id(namespace_id: str) -> dict[str, Any] | None:
             result = {**dict(row), "aliases": [dict(alias) for alias in aliases]}
     finally:
         conn.close()
-    if result:
-        for alias in result["aliases"]:
-            _remember_registered_alias(
-                str(alias["label"]),
-                str(result["canonical_label"]),
-                Path(str(result["db_path"])),
-            )
     return result
 
 
@@ -899,6 +952,10 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
                     "SELECT * FROM namespace_identities WHERE namespace_id=?",
                     (binding["namespace_id"],),
                 ).fetchone()
+                _validate_unmapped_namespace_target(
+                    namespaces_dir() / f"{label}.db",
+                    mapped_db_path=Path(str(row["db_path"])),
+                )
                 conn.execute(
                     """INSERT INTO namespace_aliases(
                            normalized_label,label,namespace_id,is_canonical,created_at
@@ -923,6 +980,7 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
                 raise NamespaceCollisionError(
                     f"database path {db} is already mapped to {path_owner['canonical_label']!r}"
                 )
+            _validate_unmapped_namespace_target(db)
             namespace_id = new_id()
             canonical = label
             conn.execute(
@@ -1111,6 +1169,20 @@ def _plan_namespace_label_read_only(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
+        physical_paths: list[str] = []
+        if "namespace_identities" in tables:
+            physical_paths.extend(
+                str(row["db_path"])
+                for row in conn.execute(
+                    "SELECT db_path FROM namespace_identities"
+                ).fetchall()
+            )
+        if "namespaces" in tables:
+            physical_paths.extend(
+                str(row["db_path"])
+                for row in conn.execute("SELECT db_path FROM namespaces").fetchall()
+            )
+        _assert_unambiguous_physical_db_paths(physical_paths)
         current_schema = {"namespace_aliases", "namespace_identities"} <= tables
         source = _identity_row(conn, old_display) if current_schema else None
         if source is not None:
@@ -1223,9 +1295,9 @@ def _plan_namespace_label_read_only(
             raise UnknownNamespaceError(old_display)
 
         target_path = namespaces_dir() / f"{new_display}.db"
-        if not target_exists and target_path != Path(db_path) and target_path.exists():
-            raise NamespaceCollisionError(
-                f"target label {new_display!r} has an unmapped database at {target_path}"
+        if not target_exists:
+            _validate_unmapped_namespace_target(
+                target_path, mapped_db_path=Path(db_path)
             )
         return {
             "action": action,
@@ -1312,9 +1384,9 @@ def change_namespace_label(
                 f"label {new_display!r} is already mapped to another namespace"
             )
         target_path = namespaces_dir() / f"{new_display}.db"
-        if not target and target_path != Path(str(source["db_path"])) and target_path.exists():
-            raise NamespaceCollisionError(
-                f"target label {new_display!r} has an unmapped database at {target_path}"
+        if not target:
+            _validate_unmapped_namespace_target(
+                target_path, mapped_db_path=Path(str(source["db_path"]))
             )
         if repo_identity:
             binding = conn.execute(
@@ -1388,8 +1460,9 @@ def change_namespace_label(
                 (new_display, new_norm, now, namespace_id),
             )
             conn.execute(
-                "UPDATE namespace_aliases SET source_alias_norm=NULL WHERE normalized_label=?",
-                (old_norm,),
+                """UPDATE namespace_aliases SET source_alias_norm=NULL
+                   WHERE normalized_label IN (?,?)""",
+                (old_norm, new_norm),
             )
             legacy_names = [
                 str(row["name"])

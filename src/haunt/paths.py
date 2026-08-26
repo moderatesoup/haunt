@@ -99,13 +99,23 @@ def _registry_fingerprint() -> _RegistryFingerprint:
     return _stat(base), _stat(Path(str(base) + "-wal"))
 
 
-def _remember_registered_alias(name: str, canonical: str, db_path: Path) -> None:
+def _remember_registered_alias(
+    name: str,
+    canonical: str,
+    db_path: Path,
+    *,
+    fingerprint: _RegistryFingerprint,
+) -> bool:
+    """Publish a query result only while its registry snapshot is unchanged."""
+    if fingerprint != _registry_fingerprint():
+        return False
     with _NAMESPACE_ALIAS_CACHE_LOCK:
         _NAMESPACE_ALIAS_CACHE[_alias_cache_key(name)] = (
-            _registry_fingerprint(),
+            fingerprint,
             canonical,
             db_path,
         )
+    return True
 
 
 def _forget_registered_alias(name: str) -> None:
@@ -119,50 +129,65 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
         cached = _NAMESPACE_ALIAS_CACHE.get(_alias_cache_key(name))
     if cached is not None and cached[0] == _registry_fingerprint():
         return cached[1], cached[2]
-    path = registry_path()
-    if not path.is_file():
-        _forget_registered_alias(name)
-        return None
-    conn: sqlite3.Connection | None = None
-    try:
-        # mode=ro is fail-closed for a missing registry and remains WAL-aware.
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        tables = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if {"namespace_aliases", "namespace_identities"} <= tables:
-            row = conn.execute(
-                """
-                SELECT i.canonical_label, i.db_path
-                FROM namespace_aliases a
-                JOIN namespace_identities i ON i.namespace_id=a.namespace_id
-                WHERE a.normalized_label=?
-                """,
-                (normalize_namespace_label(name),),
-            ).fetchone()
-            if row:
-                result = str(row["canonical_label"]), Path(str(row["db_path"]))
-                _remember_registered_alias(name, *result)
-                return result
+    # The fingerprint must bracket the query. Otherwise a retirement and
+    # reassignment between SELECT and cache publication can pin stale identity.
+    for _attempt in range(3):
+        before = _registry_fingerprint()
+        path = registry_path()
+        if before[0] is None or not path.is_file():
             _forget_registered_alias(name)
             return None
-        row = conn.execute(
-            "SELECT name, db_path FROM namespaces WHERE name=?",
-            (safe_name(name),),
-        ).fetchone()
-        if row:
-            result = str(row["name"]), Path(str(row["db_path"]))
-            _remember_registered_alias(name, *result)
+        conn: sqlite3.Connection | None = None
+        result: tuple[str, Path] | None = None
+        try:
+            # A quiescent registry can be opened immutable without creating
+            # WAL/SHM sidecars. If a writer appears, the bracket fingerprint
+            # changes and the retry uses the WAL-aware read-only mode.
+            immutable = "&immutable=1" if before[1] is None else ""
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro{immutable}", uri=True
+            )
+            conn.row_factory = sqlite3.Row
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if {"namespace_aliases", "namespace_identities"} <= tables:
+                row = conn.execute(
+                    """
+                    SELECT i.canonical_label, i.db_path
+                    FROM namespace_aliases a
+                    JOIN namespace_identities i ON i.namespace_id=a.namespace_id
+                    WHERE a.normalized_label=?
+                    """,
+                    (normalize_namespace_label(name),),
+                ).fetchone()
+                if row:
+                    result = str(row["canonical_label"]), Path(str(row["db_path"]))
+            else:
+                row = conn.execute(
+                    "SELECT name, db_path FROM namespaces WHERE name=?",
+                    (safe_name(name),),
+                ).fetchone()
+                if row:
+                    result = str(row["name"]), Path(str(row["db_path"]))
+        except sqlite3.Error:
+            _forget_registered_alias(name)
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+        if before != _registry_fingerprint():
+            continue
+        if result is None:
+            _forget_registered_alias(name)
+            return None
+        if _remember_registered_alias(name, *result, fingerprint=before):
             return result
-    except sqlite3.Error:
-        return None
-    finally:
-        if conn is not None:
-            conn.close()
+    # Repeated concurrent migrations: fail closed instead of caching or
+    # returning a value from a registry snapshot already known to be stale.
     _forget_registered_alias(name)
     return None
 
