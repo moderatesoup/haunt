@@ -167,7 +167,11 @@ def recall_cmd(
     ),
     tier: Optional[str] = typer.Option(None, "--tier"),
     k: int = typer.Option(8, "--k"),
-    json_out: bool = typer.Option(False, "--json", help="Output stable JSON"),
+    json_out: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit serialized recall hits, including additive ranking explanations.",
+    ),
 ) -> None:
     """Recall memories. Ranked hits show an RRF signal; timeline hits show time order.
 

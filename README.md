@@ -177,7 +177,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt bootstrap [--reembed]` | first-run setup; installs desktop shortcut; exits 1 if sqlite-vec fails (unless `HAUNT_FTS_ONLY=1`) |
 | `haunt init [name] [--repo PATH]` | create a namespace |
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
-| `haunt recall QUERY [--as-of --since --until --clock --tier --k]` | hybrid recall (vec + FTS5 + RRF); query-time temporal compile |
+| `haunt recall QUERY [--as-of --since --until --clock --tier --k] [--json]` | hybrid recall (vec + FTS5 + RRF); query-time temporal compile; `--json` emits serialized hit explanations |
 | `haunt correct MEMORY_ID --idempotency-key KEY [--replacement --reason]` | atomically append a correction and optional verbatim replacement; omitted/null, empty, and whitespace-only replacement values are distinct; a nonempty caller key is required for safe retries |
 | `haunt trace MEMORY_ID` | ordered correction chain from any surviving member, including erased-gap tombstones |
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |

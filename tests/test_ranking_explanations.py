@@ -131,6 +131,48 @@ def test_hybrid_explanation_reports_each_rrf_contribution(haunt_env, monkeypatch
     assert first_explanation["filters"]["include_untrusted"] is True
 
 
+def test_vector_only_explanation_reports_vector_evidence(haunt_env, monkeypatch):
+    """A vector-only hit says exactly that—there is no fabricated FTS evidence."""
+    stored = observe("EXPLAIN-VECTOR-ONLY", namespace="default")
+    recall_module = importlib.import_module("haunt.recall")
+
+    monkeypatch.setattr(Store, "ensure_current_embeddings", lambda self: None)
+    monkeypatch.setattr(
+        Store, "process_embedding_jobs", lambda self, *, limit=64: {"processed": 0}
+    )
+    monkeypatch.setattr(recall_module, "embed_available", lambda: True)
+    monkeypatch.setattr(recall_module, "embed_one", lambda query: [0.0])
+    monkeypatch.setattr(recall_module, "_fts_hits", lambda *args: [])
+    monkeypatch.setattr(
+        recall_module,
+        "_vec_hits",
+        lambda *args: [(stored.memory_id, 1, 0.25, "cosine_distance")],
+    )
+
+    hit = recall_module.recall("EXPLAIN-VECTOR", namespace="default", k=1)[0]
+    explanation = hit.as_dict()["explanation"]
+    assert explanation["retrieval_method"] == "vector_rrf"
+    assert explanation["fts"] is None
+    assert explanation["rrf_contributions"] == [
+        {"source": "vector", "rank": 1, "value": 1 / 61}
+    ]
+    assert explanation["vector"] == {
+        "rank": 1,
+        "distance": 0.25,
+        "metric": "cosine_distance",
+        "lower_is_better": True,
+    }
+
+
+def test_empty_token_query_returns_no_fabricated_hit_or_explanation(haunt_env):
+    """A query with no FTS tokens is an empty result, not a scored fallback."""
+    observe("EXPLAIN-NO-CANDIDATE", namespace="default")
+    recall_module = importlib.import_module("haunt.recall")
+
+    hits = recall_module.recall("!!!", namespace="default", use_vectors=False)
+    assert hits == []
+
+
 def test_rank_one_rrf_contributions_sum_to_serialized_score():
     """No independent rounding makes a pair of rank-one sources disagree."""
     hit = Hit(
@@ -250,3 +292,61 @@ def test_temporal_timeline_surfaces_not_ranked_and_cli_uses_time_order(haunt_env
     assert payload["hits"][0]["score"] == 0.0
     assert payload["hits"][0]["explanation"]["score_semantics"] == "not_ranked"
     assert payload["hits"][0]["explanation"]["rrf_score"] is None
+
+
+def test_cli_json_serializes_ranked_and_timeline_explanations(haunt_env, monkeypatch):
+    """--json exposes Hit.as_dict while default output remains human-readable."""
+    from haunt import cli
+
+    ranked = Hit(
+        memory_id="ranked-memory",
+        event_id="ranked-event",
+        score=1 / 61,
+        tier="episodic",
+        content="ranked content",
+        role="user",
+        event_time="2026-08-08T12:00:00+00:00",
+        valid_from="2026-08-08T12:00:00+00:00",
+        valid_to=None,
+        tool_name=None,
+        fts_rank=1,
+        fts_rank_raw=-1.0,
+        final_rank=1,
+    )
+    timeline = Hit(
+        memory_id="timeline-memory",
+        event_id="timeline-event",
+        score=0.0,
+        tier="episodic",
+        content="timeline content",
+        role="user",
+        event_time="2026-08-08T12:00:00+00:00",
+        valid_from="2026-08-08T12:00:00+00:00",
+        valid_to=None,
+        tool_name=None,
+        final_rank=1,
+    )
+    monkeypatch.setattr(cli, "_existing", lambda namespace: Store("default"))
+    runner = CliRunner()
+
+    monkeypatch.setattr(cli, "planned_recall", lambda *args, **kwargs: [ranked])
+    ranked_json = runner.invoke(cli.app, ["recall", "ranked", "--json"])
+    assert ranked_json.exit_code == 0
+    ranked_payload = json.loads(ranked_json.stdout)
+    assert ranked_payload["hits"][0]["memory_id"] == "ranked-memory"
+    assert ranked_payload["hits"][0]["explanation"]["retrieval_method"] == "fts_rrf"
+    assert ranked_payload["hits"][0]["explanation"]["rrf_score"] == 1 / 61
+
+    human = runner.invoke(cli.app, ["recall", "ranked"])
+    assert human.exit_code == 0
+    assert "signal" in human.stdout
+    assert not human.stdout.lstrip().startswith("{")
+
+    monkeypatch.setattr(cli, "planned_recall", lambda *args, **kwargs: [timeline])
+    timeline_json = runner.invoke(cli.app, ["recall", "what happened", "--json"])
+    assert timeline_json.exit_code == 0
+    timeline_payload = json.loads(timeline_json.stdout)
+    explanation = timeline_payload["hits"][0]["explanation"]
+    assert explanation["retrieval_method"] == "timeline"
+    assert explanation["score_semantics"] == "not_ranked"
+    assert explanation["rrf_score"] is None
