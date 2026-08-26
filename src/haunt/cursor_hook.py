@@ -15,7 +15,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
-from haunt.paths import infer_namespace, safe_name
+from haunt.paths import infer_namespace, infer_namespace_context, safe_name
 from haunt.recall import Hit, recall
 from haunt.store import Store
 from haunt.util import snippet
@@ -150,6 +150,18 @@ def hook_namespace(payload: dict[str, Any]) -> str:
     if env:
         return safe_name(env)
     return infer_namespace(hook_cwd(payload))
+
+
+def hook_namespace_context(payload: dict[str, Any]) -> tuple[str, str | None]:
+    """Like hook_namespace, but also returns the repository to register.
+
+    An explicit HAUNT_NAMESPACE is a deliberate override, not an inference,
+    so it never auto-binds a repository -- matching hook_namespace above.
+    """
+    env = os.environ.get("HAUNT_NAMESPACE")
+    if env:
+        return safe_name(env), None
+    return infer_namespace_context(hook_cwd(payload))
 
 
 def hook_session(payload: dict[str, Any]) -> str | None:
@@ -522,8 +534,8 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
         _truthy(os.environ.get(k)) for k in STORE_THOUGHTS_ENV
     ):
         return {}
-    ns = hook_namespace(payload)
-    with Store(ns) as store:
+    ns, repo_path = hook_namespace_context(payload)
+    with Store(ns, repo_path) as store:
         if event == "beforeSubmitPrompt":
             return _handle_before_submit(store, payload, ns)
         if event == "afterAgentResponse":

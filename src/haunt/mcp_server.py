@@ -20,7 +20,7 @@ except ImportError as exc:  # MCP 1.x has no MCPServer
 from haunt.paths import (
     NamespacePathError,
     haunt_home,
-    infer_namespace,
+    infer_namespace_context,
     resolve_namespace,
     safe_name,
 )
@@ -127,19 +127,21 @@ class _AuthorityPin:
 class MCPAuthority:
     bound_namespace: str
     bound_namespace_id: str | None = None
+    bound_repo_path: str | None = None
     admin: bool = False
     allow_purge: bool = False
     _pin: _AuthorityPin = field(default_factory=_AuthorityPin, compare=False, repr=False)
 
     @classmethod
     def from_environment(cls) -> "MCPAuthority":
-        inferred = infer_namespace()
+        inferred, repo_path = infer_namespace_context()
         identity = resolve_namespace_identity(inferred)
         return cls(
             bound_namespace=(
                 str(identity["canonical_label"]) if identity else safe_name(inferred)
             ),
             bound_namespace_id=(str(identity["namespace_id"]) if identity else None),
+            bound_repo_path=repo_path,
             admin=_truthy(os.environ.get("HAUNT_MCP_ADMIN")),
             allow_purge=_truthy(os.environ.get("HAUNT_MCP_ALLOW_PURGE")),
         )
@@ -311,7 +313,16 @@ def _open_mcp_store(access: MCPNamespaceAccess, *, create: bool) -> Store:
     else:
         if not create:
             raise UnknownNamespaceError(str(access))
-        store = Store(str(access), create=True)
+        authority = _authority()
+        # Only bind the repository the *process* was inferred from -- never
+        # for a namespace an admin explicitly requested by name, which may
+        # have nothing to do with this process's working directory.
+        repo_path = (
+            authority.bound_repo_path
+            if str(access) == authority.bound_namespace
+            else None
+        )
+        store = Store(str(access), repo_path, create=True)
     try:
         _authority().pin_open_store(store)
         if access.namespace_id is not None and store.namespace_id != access.namespace_id:

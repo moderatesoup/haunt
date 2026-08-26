@@ -13,7 +13,12 @@ import typer
 from haunt import __version__
 from haunt.bootstrap import bootstrap, format_report
 from haunt.embed import state as embed_state
-from haunt.paths import NamespacePathError, haunt_home, resolve_namespace
+from haunt.paths import (
+    NamespacePathError,
+    haunt_home,
+    infer_namespace_context,
+    resolve_namespace,
+)
 from haunt.planner import planned_recall
 from haunt.recall import BACKEND_ERROR_CODE, execution_metadata, is_retrieval_backend_error
 from haunt.store import (
@@ -113,9 +118,17 @@ def init_cmd(
     ),
 ) -> None:
     """Create a namespace (one SQLite file)."""
-    ns = name or resolve_namespace(None, cwd=repo)
+    if name:
+        # An explicit name is a deliberate override, not an inference, so
+        # (like HAUNT_NAMESPACE) it never auto-binds a repository unless
+        # --repo also says so explicitly.
+        ns = name
+        repo_path = str(repo) if repo else None
+    else:
+        ns, inferred_repo_path = infer_namespace_context(repo)
+        repo_path = str(repo) if repo else inferred_repo_path
     try:
-        db = register_namespace(ns, repo_path=str(repo) if repo else None)
+        db = register_namespace(ns, repo_path=repo_path)
         with Store(ns) as st:
             stats = st.stats()
     except (NamespaceCollisionError, NamespacePathError) as exc:
