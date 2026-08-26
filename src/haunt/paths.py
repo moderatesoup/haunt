@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 import ipaddress
 import re
+import secrets
 import sqlite3
 import stat
 import subprocess
-import tempfile
 import threading
 from dataclasses import dataclass
 from hashlib import sha256
@@ -562,33 +562,335 @@ def readonly_sqlite_mode(
     return not wal_active, snapshot
 
 
-def temporary_sqlite_shadow(
-    db_path: Path, snapshot: SQLiteStorageSnapshot
-) -> tuple[tempfile.TemporaryDirectory[str], Path]:
-    """Copy a stable main/WAL byte snapshot outside HAUNT_HOME for safe reading."""
-    temporary = tempfile.TemporaryDirectory(prefix="haunt-sqlite-read-")
-    root = Path(temporary.name)
-    shadow = root / db_path.name
-    nofollow = required_o_nofollow()
-    cloexec = getattr(os, "O_CLOEXEC", 0)
+def _temporary_shadow_hook(_phase: str, _temporary: "GuardedTemporaryDirectory") -> None:
+    """Test hook around private shadow creation and materialization."""
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
     try:
-        for source, destination in (
-            (db_path, shadow),
-            (Path(str(db_path) + "-wal"), Path(str(shadow) + "-wal")),
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _verify_trusted_temp_base(path: Path, fd: int) -> tuple[int, int]:
+    """Verify a fixed system temporary directory through its held descriptor."""
+    try:
+        held = os.fstat(fd)
+        current = path.lstat()
+    except OSError as exc:
+        raise NamespacePathError("trusted system temporary directory changed") from exc
+    identity = int(held.st_dev), int(held.st_ino)
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or identity != (int(current.st_dev), int(current.st_ino))
+    ):
+        raise NamespacePathError("trusted system temporary directory changed")
+    mode = stat.S_IMODE(held.st_mode)
+    if int(held.st_uid) != 0:
+        raise NamespacePathError("trusted system temporary directory has unsafe owner")
+    if mode & 0o022 and not mode & stat.S_ISVTX:
+        raise NamespacePathError("trusted system temporary directory is not sticky")
+    return identity
+
+
+def _open_trusted_temp_base() -> tuple[Path, int, tuple[int, int]]:
+    """Open a fixed POSIX system temp base, ignoring all temp environment vars."""
+    nofollow = required_o_nofollow()
+    flags = (
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    home = haunt_home().resolve()
+    errors: list[Exception] = []
+    for candidate in (Path("/private/tmp"), Path("/tmp")):
+        try:
+            # A trusted base is the literal fixed directory, not a symlink such as
+            # /tmp -> /private/tmp on Darwin.
+            current = candidate.lstat()
+            if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+                continue
+            resolved = candidate.resolve(strict=True)
+            if resolved != candidate or _path_is_within(resolved, home):
+                continue
+            fd = os.open(candidate, flags)
+            try:
+                identity = _verify_trusted_temp_base(candidate, fd)
+            except Exception:
+                os.close(fd)
+                raise
+            return candidate, fd, identity
+        except (OSError, NamespacePathError) as exc:
+            errors.append(exc)
+    raise NamespacePathError(
+        "no safe fixed system temporary directory is available outside HAUNT_HOME"
+    ) from (errors[-1] if errors else None)
+
+
+@dataclass
+class GuardedTemporaryDirectory:
+    """A private temp directory anchored to a held trusted-base descriptor."""
+
+    base_path: Path
+    base_fd: int
+    base_identity: tuple[int, int]
+    child_name: str
+    root_path: Path
+    root_fd: int
+    root_identity: tuple[int, int]
+    source_primary: SQLitePrimaryGuard
+    source_sidecars: SQLiteSidecarGuard
+    source_snapshot: SQLiteStorageSnapshot
+    shadow_name: str
+    _closed: bool = False
+
+    @property
+    def name(self) -> str:
+        return str(self.root_path)
+
+    def verify_directory(self) -> None:
+        if self._closed:
+            raise NamespacePathError("private SQLite snapshot directory is closed")
+        if _verify_trusted_temp_base(self.base_path, self.base_fd) != self.base_identity:
+            raise NamespacePathError("trusted system temporary directory changed")
+        try:
+            held = os.fstat(self.root_fd)
+            current = os.stat(
+                self.child_name, dir_fd=self.base_fd, follow_symlinks=False
+            )
+        except OSError as exc:
+            raise NamespacePathError(
+                "private SQLite snapshot directory changed"
+            ) from exc
+        identity = int(held.st_dev), int(held.st_ino)
+        if (
+            not stat.S_ISDIR(held.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or identity != self.root_identity
+            or (int(current.st_dev), int(current.st_ino)) != self.root_identity
+            or stat.S_IMODE(held.st_mode) != DIR_MODE
+            or stat.S_IMODE(current.st_mode) != DIR_MODE
         ):
-            expected = snapshot.get(str(source))
-            if expected is None:
+            raise NamespacePathError("private SQLite snapshot directory changed")
+
+    def verify_source(self) -> None:
+        self.source_primary.verify()
+        self.source_sidecars.verify()
+        current = sqlite_storage_snapshot(self.source_primary.path)
+        # WAL-index bytes are coordination state and can change when another
+        # read-only connection attaches.  The copied transaction state is the
+        # held main file plus WAL; the journal must also remain absent/empty.
+        stable_paths = (
+            str(self.source_primary.path),
+            str(self.source_primary.path) + "-wal",
+            str(self.source_primary.path) + "-journal",
+        )
+        if any(current[path] != self.source_snapshot[path] for path in stable_paths):
+            raise NamespacePathError(
+                "SQLite source changed while copying read snapshot"
+            )
+
+    def create_file(self, name: str) -> int:
+        if not name or name != Path(name).name:
+            raise NamespacePathError("invalid private SQLite snapshot filename")
+        self.verify_directory()
+        fd = os.open(
+            name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | required_o_nofollow()
+            | getattr(os, "O_CLOEXEC", 0),
+            FILE_MODE,
+            dir_fd=self.root_fd,
+        )
+        try:
+            os.fchmod(fd, FILE_MODE)
+            info = os.fstat(fd)
+            current = os.stat(name, dir_fd=self.root_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or int(info.st_nlink) != 1
+                or int(current.st_nlink) != 1
+                or (int(info.st_dev), int(info.st_ino))
+                != (int(current.st_dev), int(current.st_ino))
+                or stat.S_IMODE(info.st_mode) != FILE_MODE
+            ):
+                raise NamespacePathError("private SQLite snapshot file changed")
+            return fd
+        except Exception:
+            os.close(fd)
+            try:
+                os.unlink(name, dir_fd=self.root_fd)
+            except OSError:
+                pass
+            raise
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            # SQLite can create any of these known siblings while recovering WAL.
+            known = {
+                self.shadow_name,
+                *(self.shadow_name + suffix for suffix in SQLITE_SIDECAR_SUFFIXES),
+            }
+            try:
+                entries = os.listdir(self.root_fd)
+            except OSError:
+                entries = []
+            for name in entries:
+                if name not in known:
+                    continue
+                try:
+                    os.unlink(name, dir_fd=self.root_fd)
+                except FileNotFoundError:
+                    pass
+                except IsADirectoryError:
+                    try:
+                        os.rmdir(name, dir_fd=self.root_fd)
+                    except OSError:
+                        pass
+            try:
+                os.fsync(self.root_fd)
+            except OSError:
+                pass
+            try:
+                current = os.stat(
+                    self.child_name, dir_fd=self.base_fd, follow_symlinks=False
+                )
+            except OSError:
+                current = None
+            if current is not None and (
+                stat.S_ISDIR(current.st_mode)
+                and (int(current.st_dev), int(current.st_ino)) == self.root_identity
+            ):
+                try:
+                    os.rmdir(self.child_name, dir_fd=self.base_fd)
+                    os.fsync(self.base_fd)
+                except OSError:
+                    pass
+        finally:
+            self.source_sidecars.close(clean_unused_claims=False)
+            self.source_primary.close()
+            for fd in (self.root_fd, self.base_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def _new_guarded_temporary_directory(
+    primary: SQLitePrimaryGuard,
+    sidecars: SQLiteSidecarGuard,
+    snapshot: SQLiteStorageSnapshot,
+) -> GuardedTemporaryDirectory:
+    base_fd = -1
+    root_fd = -1
+    child_name = ""
+    try:
+        base_path, base_fd, base_identity = _open_trusted_temp_base()
+        nofollow = required_o_nofollow()
+        for _attempt in range(8):
+            child_name = f".haunt-sqlite-read-{secrets.token_hex(16)}"
+            if _path_is_within(base_path / child_name, haunt_home().resolve()):
                 continue
             try:
-                source_fd = os.open(source, os.O_RDONLY | nofollow | cloexec)
-            except FileNotFoundError as exc:
+                os.mkdir(child_name, DIR_MODE, dir_fd=base_fd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise NamespacePathError("cannot claim private SQLite snapshot directory")
+        root_fd = os.open(
+            child_name,
+            os.O_RDONLY
+            | nofollow
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=base_fd,
+        )
+        os.fchmod(root_fd, DIR_MODE)
+        held = os.fstat(root_fd)
+        temporary = GuardedTemporaryDirectory(
+            base_path=base_path,
+            base_fd=base_fd,
+            base_identity=base_identity,
+            child_name=child_name,
+            root_path=base_path / child_name,
+            root_fd=root_fd,
+            root_identity=(int(held.st_dev), int(held.st_ino)),
+            source_primary=primary,
+            source_sidecars=sidecars,
+            source_snapshot=snapshot,
+            shadow_name=primary.path.name,
+        )
+        temporary.verify_directory()
+        os.fsync(base_fd)
+        return temporary
+    except Exception:
+        if root_fd >= 0:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+        if child_name:
+            try:
+                os.rmdir(child_name, dir_fd=base_fd)
+            except OSError:
+                pass
+        if base_fd >= 0:
+            os.close(base_fd)
+        primary.close()
+        sidecars.close(clean_unused_claims=False)
+        raise
+
+
+def temporary_sqlite_shadow(
+    db_path: Path, snapshot: SQLiteStorageSnapshot
+) -> tuple[GuardedTemporaryDirectory, Path]:
+    """Copy a stable main/WAL byte snapshot outside HAUNT_HOME for safe reading."""
+    primary = SQLitePrimaryGuard.acquire(db_path, create_missing=False)
+    try:
+        sidecars = SQLiteSidecarGuard.acquire(db_path, claim_missing=False)
+    except Exception:
+        primary.close()
+        raise
+    temporary = _new_guarded_temporary_directory(
+        primary, sidecars, snapshot
+    )
+    shadow = temporary.root_path / db_path.name
+    try:
+        temporary.verify_source()
+        _temporary_shadow_hook("created", temporary)
+        sources: list[tuple[int, Path, str]] = [
+            (primary.fd, db_path, db_path.name)
+        ]
+        wal_path = Path(str(db_path) + "-wal")
+        wal_entry = next(
+            entry for entry in sidecars.entries if entry.path == wal_path
+        )
+        if snapshot.get(str(wal_path)) is not None:
+            if wal_entry.fd is None:
+                raise NamespacePathError(
+                    f"SQLite source changed while copying read snapshot: {wal_path}"
+                )
+            sources.append((wal_entry.fd, wal_path, db_path.name + "-wal"))
+        for held_fd, source, destination_name in sources:
+            expected = snapshot.get(str(source))
+            if expected is None:
                 raise NamespacePathError(
                     f"SQLite source changed while copying read snapshot: {source}"
-                ) from exc
-            except OSError as exc:
-                raise NamespacePathError(
-                    f"cannot safely copy SQLite read snapshot: {source}"
-                ) from exc
+                )
+            source_fd = os.dup(held_fd)
+            os.lseek(source_fd, 0, os.SEEK_SET)
             try:
                 opened = os.fstat(source_fd)
                 if (
@@ -600,11 +902,7 @@ def temporary_sqlite_shadow(
                     raise NamespacePathError(
                         f"SQLite source changed while copying read snapshot: {source}"
                     )
-                destination_fd = os.open(
-                    destination,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
-                    FILE_MODE,
-                )
+                destination_fd = temporary.create_file(destination_name)
                 try:
                     digest = sha256()
                     copied = 0
@@ -635,14 +933,28 @@ def temporary_sqlite_shadow(
                     os.close(destination_fd)
             finally:
                 os.close(source_fd)
+        os.fsync(temporary.root_fd)
+        temporary.verify_source()
+        temporary.verify_directory()
+        _temporary_shadow_hook("copied", temporary)
+        temporary.verify_source()
+        temporary.verify_directory()
         return temporary, shadow
     except Exception:
         temporary.cleanup()
         raise
 
 
-def materialize_sqlite_shadow(db_path: Path) -> None:
+def materialize_sqlite_shadow(
+    db_path: Path, temporary: GuardedTemporaryDirectory | None = None
+) -> None:
     """Recover a private WAL snapshot into its main file through guarded opens."""
+    if temporary is not None:
+        temporary.verify_source()
+        temporary.verify_directory()
+        _temporary_shadow_hook("before_materialize", temporary)
+        temporary.verify_source()
+        temporary.verify_directory()
     primary = SQLitePrimaryGuard.acquire(db_path, create_missing=False)
     try:
         sidecars = SQLiteSidecarGuard.acquire(db_path, claim_missing=True)
@@ -675,6 +987,12 @@ def materialize_sqlite_shadow(db_path: Path) -> None:
             )
         primary.verify()
         sidecars.verify()
+        if temporary is not None:
+            temporary.verify_source()
+            temporary.verify_directory()
+            _temporary_shadow_hook("after_materialize", temporary)
+            temporary.verify_source()
+            temporary.verify_directory()
     finally:
         if conn is not None:
             conn.close()
@@ -933,7 +1251,7 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
         sidecars: SQLiteSidecarGuard | None = None
         read_primary: SQLitePrimaryGuard | None = None
         read_sidecars: SQLiteSidecarGuard | None = None
-        temporary: tempfile.TemporaryDirectory[str] | None = None
+        temporary: GuardedTemporaryDirectory | None = None
         locked = False
         storage_before: SQLiteStorageSnapshot | None = None
         storage_changed = False
@@ -955,7 +1273,7 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
                     raise NamespacePathError(
                         "registry changed while creating a zero-write read snapshot"
                     )
-                materialize_sqlite_shadow(read_path)
+                materialize_sqlite_shadow(read_path, temporary)
                 read_primary = SQLitePrimaryGuard.acquire(
                     read_path, create_missing=False
                 )
@@ -1134,7 +1452,7 @@ def _registered_namespace_for_repo(
     sidecars: SQLiteSidecarGuard | None = None
     read_primary: SQLitePrimaryGuard | None = None
     read_sidecars: SQLiteSidecarGuard | None = None
-    temporary: tempfile.TemporaryDirectory[str] | None = None
+    temporary: GuardedTemporaryDirectory | None = None
     locked = False
     storage_before: SQLiteStorageSnapshot | None = None
     candidate: str | None = None
@@ -1155,7 +1473,7 @@ def _registered_namespace_for_repo(
                 raise NamespacePathError(
                     "registry changed while creating a zero-write read snapshot"
                 )
-            materialize_sqlite_shadow(read_path)
+            materialize_sqlite_shadow(read_path, temporary)
             read_primary = SQLitePrimaryGuard.acquire(
                 read_path, create_missing=False
             )

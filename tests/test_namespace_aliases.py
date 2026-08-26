@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
@@ -1690,6 +1691,105 @@ def test_live_wal_dry_run_sees_commit_without_touching_registry_files(
         writer.close()
 
 
+def test_live_wal_shadow_ignores_temp_environment_and_cleans_every_path(
+    alias_home, monkeypatch
+):
+    register_namespace("trusted-temp-old")
+    identity = resolve_namespace_identity("trusted-temp-old")
+    writer = sqlite3.connect(registry_path())
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute(
+        """INSERT INTO namespace_aliases(
+               normalized_label,label,namespace_id,is_canonical,created_at
+           ) VALUES (?,?,?,?,?)""",
+        (
+            "trusted-temp-alias", "trusted-temp-alias",
+            identity["namespace_id"], 0, "t",
+        ),
+    )
+    writer.commit()
+    for variable in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(variable, str(alias_home))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    import haunt.paths as paths_module
+
+    before_home = _exact_home_snapshot(alias_home)
+    roots: list[Path] = []
+    audit_active = False
+    home_mutations: list[tuple[str, str]] = []
+
+    def filesystem_audit(event, arguments):
+        if not audit_active:
+            return
+        if event == "open":
+            flags = arguments[2] if len(arguments) > 2 else 0
+            if not isinstance(flags, int) or not flags & (
+                os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+            ):
+                return
+        elif event not in {
+            "os.mkdir", "os.rmdir", "os.remove", "os.rename", "os.link",
+            "os.symlink", "os.chmod",
+        }:
+            return
+        for argument in arguments:
+            if not isinstance(argument, (str, bytes, os.PathLike)):
+                continue
+            candidate = Path(os.fsdecode(argument))
+            if not candidate.is_absolute():
+                continue
+            if candidate.resolve().is_relative_to(alias_home.resolve()):
+                home_mutations.append((event, str(candidate)))
+
+    sys.addaudithook(filesystem_audit)
+
+    def audit_shadow(phase, temporary):
+        root = Path(temporary.name)
+        roots.append(root)
+        assert not root.resolve().is_relative_to(alias_home.resolve())
+        assert root.parent in {Path("/private/tmp"), Path("/tmp")}
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        for entry in root.iterdir():
+            assert entry.is_file() and not entry.is_symlink()
+            assert stat.S_IMODE(entry.stat().st_mode) == 0o600
+        assert _exact_home_snapshot(alias_home) == before_home
+
+    monkeypatch.setattr(paths_module, "_temporary_shadow_hook", audit_shadow)
+    try:
+        audit_active = True
+        plan = change_namespace_label("trusted-temp-alias", "trusted-temp-new")
+        audit_active = False
+        assert plan["namespace_id"] == identity["namespace_id"]
+        assert roots
+        assert all(not root.exists() for root in roots)
+        assert _exact_home_snapshot(alias_home) == before_home
+        assert home_mutations == []
+
+        failed_roots: list[Path] = []
+
+        def fail_after_copy(phase, temporary):
+            failed_roots.append(Path(temporary.name))
+            audit_shadow(phase, temporary)
+            if phase == "copied":
+                raise RuntimeError("forced private snapshot failure")
+
+        monkeypatch.setattr(
+            paths_module, "_temporary_shadow_hook", fail_after_copy
+        )
+        audit_active = True
+        with pytest.raises(RuntimeError, match="forced private snapshot failure"):
+            change_namespace_label("trusted-temp-alias", "trusted-temp-new")
+        audit_active = False
+        assert failed_roots
+        assert all(not root.exists() for root in failed_roots)
+        assert _exact_home_snapshot(alias_home) == before_home
+        assert home_mutations == []
+    finally:
+        audit_active = False
+        writer.close()
+
+
 def test_incomplete_live_wal_dry_run_fails_without_touching_registry_files(
     alias_home,
 ):
@@ -1822,3 +1922,70 @@ def test_missing_o_nofollow_fails_closed_at_every_safe_open(
     }[entry]
     with pytest.raises(NamespacePathError, match="O_NOFOLLOW is required"):
         action()
+
+
+@pytest.mark.parametrize(
+    "phase", ["before_create", "before_link", "before_final_verify", "before_record"]
+)
+def test_registry_backup_directory_swap_fails_without_publication_or_mutation(
+    alias_home, monkeypatch, phase
+):
+    register_namespace(f"backup-race-{phase}-old")
+    plan = change_namespace_label(
+        f"backup-race-{phase}-old", f"backup-race-{phase}-new"
+    )
+    import haunt.store as store_module
+
+    moved = alias_home / f"held-backups-{phase}"
+    replacement_snapshot = None
+    fired = False
+
+    def swap_backup_root(current_phase, backup_root):
+        nonlocal fired, replacement_snapshot
+        if fired or current_phase != phase:
+            return
+        fired = True
+        backup_root.rename(moved)
+        backup_root.mkdir(mode=0o700)
+        victim = backup_root / "victim.txt"
+        victim.write_bytes(b"replacement must remain untouched")
+        victim.chmod(0o640)
+        replacement_snapshot = (
+            victim.read_bytes(),
+            stat.S_IMODE(victim.stat().st_mode),
+            int(victim.stat().st_dev),
+            int(victim.stat().st_ino),
+            stat.S_IMODE(backup_root.stat().st_mode),
+            tuple(sorted(entry.name for entry in backup_root.iterdir())),
+        )
+
+    monkeypatch.setattr(store_module, "_registry_backup_hook", swap_backup_root)
+    with pytest.raises(NamespaceMigrationError, match="backup directory changed"):
+        change_namespace_label(
+            f"backup-race-{phase}-old", f"backup-race-{phase}-new",
+            apply=True, plan_digest=plan["plan_digest"],
+        )
+
+    assert fired and replacement_snapshot is not None
+    backup_root = alias_home / "backups"
+    victim = backup_root / "victim.txt"
+    assert (
+        victim.read_bytes(),
+        stat.S_IMODE(victim.stat().st_mode),
+        int(victim.stat().st_dev),
+        int(victim.stat().st_ino),
+        stat.S_IMODE(backup_root.stat().st_mode),
+        tuple(sorted(entry.name for entry in backup_root.iterdir())),
+    ) == replacement_snapshot
+    assert list(moved.iterdir()) == []
+    assert resolve_namespace_identity(
+        f"backup-race-{phase}-old"
+    )["canonical_label"] == f"backup-race-{phase}-old"
+    assert resolve_namespace_identity(f"backup-race-{phase}-new") is None
+    conn = sqlite3.connect(registry_path())
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM namespace_migrations"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()

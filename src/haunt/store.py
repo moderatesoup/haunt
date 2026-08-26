@@ -1999,7 +1999,7 @@ def _readonly_registry() -> sqlite3.Connection:
                 if sqlite_storage_snapshot(path) != snapshot:
                     temporary.cleanup()
                     continue
-                materialize_sqlite_shadow(shadow)
+                materialize_sqlite_shadow(shadow, temporary)
                 conn = _open_readonly_connection(
                     shadow, immutable=True, claim_missing=False
                 )
@@ -2138,97 +2138,308 @@ def _private_backup_root() -> tuple[Path, int]:
             raise NamespaceMigrationError(
                 "registry backup directory cannot be opened safely"
             ) from exc
-        held = os.fstat(fd)
-        current = backup_root.lstat()
-        if (
-            not stat.S_ISDIR(held.st_mode)
-            or stat.S_ISLNK(current.st_mode)
-            or not stat.S_ISDIR(current.st_mode)
-            or (int(held.st_dev), int(held.st_ino))
-            != (int(current.st_dev), int(current.st_ino))
-        ):
+        try:
+            os.fchmod(fd, 0o700)
+            _verify_private_backup_root(backup_root, fd)
+        except Exception:
             os.close(fd)
-            raise NamespaceMigrationError("registry backup directory changed")
-        os.fchmod(fd, 0o700)
-        current = backup_root.lstat()
-        if (
-            stat.S_IMODE(os.fstat(fd).st_mode) != 0o700
-            or (int(current.st_dev), int(current.st_ino))
-            != (int(held.st_dev), int(held.st_ino))
-        ):
-            os.close(fd)
-            raise NamespaceMigrationError("registry backup directory changed")
+            raise
         return backup_root, fd
     raise NamespaceMigrationError("registry backup directory changed repeatedly")
 
 
-def _backup_registry(*, purpose: str) -> dict[str, str]:
+def _verify_private_backup_root(backup_root: Path, fd: int) -> tuple[int, int]:
+    """Reverify the private backup directory without releasing its descriptor."""
+    try:
+        held = os.fstat(fd)
+        current = backup_root.lstat()
+    except OSError as exc:
+        raise NamespaceMigrationError("registry backup directory changed") from exc
+    identity = int(held.st_dev), int(held.st_ino)
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or identity != (int(current.st_dev), int(current.st_ino))
+        or stat.S_IMODE(held.st_mode) != 0o700
+        or stat.S_IMODE(current.st_mode) != 0o700
+        or int(held.st_uid) != os.geteuid()
+        or int(current.st_uid) != os.geteuid()
+    ):
+        raise NamespaceMigrationError("registry backup directory changed")
+    return identity
+
+
+def _registry_backup_hook(_phase: str, _backup_root: Path) -> None:
+    """Test hook around descriptor-relative registry backup publication."""
+
+
+def _relative_regular_file(
+    directory_fd: int, name: str, held_fd: int
+) -> tuple[int, int]:
+    """Verify a private single-link regular file through a held directory."""
+    if not name or name != Path(name).name:
+        raise NamespaceMigrationError("registry backup filename is unsafe")
+    try:
+        held = os.fstat(held_fd)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise NamespaceMigrationError("registry backup changed") from exc
+    identity = int(held.st_dev), int(held.st_ino)
+    if (
+        not stat.S_ISREG(held.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or int(held.st_nlink) != 1
+        or int(current.st_nlink) != 1
+        or identity != (int(current.st_dev), int(current.st_ino))
+        or stat.S_IMODE(held.st_mode) != 0o600
+        or stat.S_IMODE(current.st_mode) != 0o600
+    ):
+        raise NamespaceMigrationError("registry backup is not a private regular file")
+    return identity
+
+
+def _held_file_sha256(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _held_sqlite_integrity(fd: int, identity: tuple[int, int]) -> str:
+    """Run immutable integrity_check through the already-held file descriptor."""
+    errors: list[Exception] = []
+    for directory in (Path("/proc/self/fd"), Path("/dev/fd")):
+        descriptor_path = directory / str(fd)
+        try:
+            current = descriptor_path.stat()
+            # Darwin's Python 3.10 reports the /dev/fd proxy device with a
+            # different signed representation; the kernel-controlled proxy
+            # inode still matches the held descriptor exactly.
+            if not stat.S_ISREG(current.st_mode) or int(current.st_ino) != identity[1]:
+                continue
+            conn = sqlite3.connect(
+                f"{descriptor_path.as_uri()}?mode=ro&immutable=1", uri=True
+            )
+            try:
+                row = conn.execute("PRAGMA integrity_check").fetchone()
+                result = str(row[0]) if row else "missing"
+            finally:
+                conn.close()
+            held = os.fstat(fd)
+            current = descriptor_path.stat()
+            if (
+                (int(held.st_dev), int(held.st_ino)) != identity
+                or not stat.S_ISREG(current.st_mode)
+                or int(current.st_ino) != identity[1]
+            ):
+                raise NamespaceMigrationError(
+                    "registry backup descriptor changed during verification"
+                )
+            return result
+        except (OSError, sqlite3.Error, NamespaceMigrationError) as exc:
+            errors.append(exc)
+    raise NamespaceMigrationError(
+        "registry backup cannot be verified through its held descriptor"
+    ) from (errors[-1] if errors else None)
+
+
+def _unlink_relative_identity(
+    directory_fd: int, name: str | None, identity: tuple[int, int] | None
+) -> None:
+    if not name or identity is None:
+        return
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if (
+        stat.S_ISREG(current.st_mode)
+        and (int(current.st_dev), int(current.st_ino)) == identity
+    ):
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError:
+            pass
+
+
+class _VerifiedRegistryBackup(dict[str, str]):
+    """Backup report retaining its parent and file identity until registry commit."""
+
+    def __init__(
+        self,
+        report: dict[str, str],
+        *,
+        backup_root: Path,
+        backup_root_fd: int,
+        final_name: str,
+        final_fd: int,
+        identity: tuple[int, int],
+    ) -> None:
+        super().__init__(report)
+        self._backup_root = backup_root
+        self._backup_root_fd = backup_root_fd
+        self._final_name = final_name
+        self._final_fd = final_fd
+        self._identity = identity
+        self._closed = False
+
+    def verify_for_record(self) -> None:
+        if self._closed:
+            raise NamespaceMigrationError("registry backup guard is closed")
+        _registry_backup_hook("before_record", self._backup_root)
+        _verify_private_backup_root(self._backup_root, self._backup_root_fd)
+        if (
+            _relative_regular_file(
+                self._backup_root_fd, self._final_name, self._final_fd
+            )
+            != self._identity
+            or _held_file_sha256(self._final_fd) != self["sha256"]
+        ):
+            raise NamespaceMigrationError("registry backup changed before recording")
+        os.fsync(self._final_fd)
+        os.fsync(self._backup_root_fd)
+        _verify_private_backup_root(self._backup_root, self._backup_root_fd)
+        if (
+            _relative_regular_file(
+                self._backup_root_fd, self._final_name, self._final_fd
+            )
+            != self._identity
+        ):
+            raise NamespaceMigrationError("registry backup changed before recording")
+
+    def discard(self) -> None:
+        if self._closed:
+            return
+        _unlink_relative_identity(
+            self._backup_root_fd, self._final_name, self._identity
+        )
+        try:
+            os.fsync(self._backup_root_fd)
+        except OSError:
+            pass
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for fd in (self._final_fd, self._backup_root_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _backup_registry(*, purpose: str) -> _VerifiedRegistryBackup:
     """Create and verify a consistent private backup of registry.db only."""
     backup_root, backup_root_fd = _private_backup_root()
-    try:
-        fd, raw_temp = tempfile.mkstemp(
-            prefix=".registry-backup-", suffix=".db", dir=backup_root
-        )
-    except Exception:
-        os.close(backup_root_fd)
-        raise
-    temp = Path(raw_temp)
-    os.fchmod(fd, 0o600)
-    final = backup_root / f"registry-{purpose}-{new_id()}.db"
+    fd = -1
+    final_fd = -1
+    temp_name: str | None = None
+    final_name: str | None = None
+    backup_identity: tuple[int, int] | None = None
     source: sqlite3.Connection | None = None
     try:
+        _registry_backup_hook("before_create", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        temp_name = f".registry-backup-{new_id()}.db"
+        fd = os.open(
+            temp_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | required_o_nofollow()
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=backup_root_fd,
+        )
+        os.fchmod(fd, 0o600)
+        created = os.fstat(fd)
+        backup_identity = int(created.st_dev), int(created.st_ino)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
         source = _readonly_registry()
         assert isinstance(source, _SidecarGuardedConnection)
         source.copy_primary_to_fd(fd)
         source.close()
         source = None
-        held = os.fstat(fd)
-        info = temp.lstat()
-        if (
-            not stat.S_ISREG(held.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or int(held.st_nlink) != 1
-            or int(info.st_nlink) != 1
-            or (int(held.st_dev), int(held.st_ino))
-            != (int(info.st_dev), int(info.st_ino))
-        ):
-            raise NamespaceMigrationError("registry backup is not a private regular file")
-        if (
-            stat.S_IMODE(held.st_mode) != 0o600
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise NamespaceMigrationError("registry backup mode changed during creation")
-        os.close(fd)
-        fd = -1
-        os.link(temp, final, follow_symlinks=False)
-        temp.unlink()
-        final_state = sqlite_storage_snapshot(final)[str(final)]
-        if final_state is None:
-            raise NamespaceMigrationError("registry backup disappeared")
-        digest = final_state[-1]
-        verify = _open_readonly_connection(final, immutable=True, claim_missing=False)
-        try:
-            verified_row = verify.execute("PRAGMA integrity_check").fetchone()
-            verified = str(verified_row[0]) if verified_row else "missing"
-        finally:
-            verify.close()
-        verified_state = sqlite_storage_snapshot(final)[str(final)]
-        if verified != "ok" or verified_state is None or verified_state[-1] != digest:
+        os.fsync(fd)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
+        _registry_backup_hook("before_link", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
+        final_name = f"registry-{purpose}-{new_id()}.db"
+        os.link(
+            temp_name,
+            final_name,
+            src_dir_fd=backup_root_fd,
+            dst_dir_fd=backup_root_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temp_name, dir_fd=backup_root_fd)
+        temp_name = None
+        os.fsync(backup_root_fd)
+        final_fd = os.open(
+            final_name,
+            os.O_RDONLY
+            | required_o_nofollow()
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=backup_root_fd,
+        )
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("registry backup identity changed")
+        digest = _held_file_sha256(final_fd)
+        os.fsync(final_fd)
+        _registry_backup_hook("before_final_verify", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("registry backup identity changed")
+        final = backup_root / final_name
+        verified = _held_sqlite_integrity(final_fd, backup_identity)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("registry backup identity changed")
+        if verified != "ok" or _held_file_sha256(final_fd) != digest:
             raise NamespaceMigrationError("registry backup verification failed")
-        return {
-            "path": str(final),
-            "sha256": digest,
-            "integrity": verified,
-        }
+        os.fsync(final_fd)
+        os.fsync(backup_root_fd)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("registry backup identity changed")
+        return _VerifiedRegistryBackup(
+            {
+                "path": str(final),
+                "sha256": digest,
+                "integrity": verified,
+            },
+            backup_root=backup_root,
+            backup_root_fd=os.dup(backup_root_fd),
+            final_name=final_name,
+            final_fd=os.dup(final_fd),
+            identity=backup_identity,
+        )
     except Exception:
-        for candidate in (temp, final):
-            try:
-                candidate.unlink()
-            except FileNotFoundError:
-                pass
+        _unlink_relative_identity(
+            backup_root_fd, temp_name, backup_identity
+        )
+        _unlink_relative_identity(
+            backup_root_fd, final_name, backup_identity
+        )
+        try:
+            os.fsync(backup_root_fd)
+        except OSError:
+            pass
         raise
     finally:
+        if final_fd >= 0:
+            os.close(final_fd)
         if fd >= 0:
             os.close(fd)
         if source is not None:
@@ -2620,8 +2831,10 @@ def _change_namespace_label(
             replay_conn.close()
     backup = _backup_registry(purpose="apply")
     now = now_iso()
-    conn = _registry()
+    conn: sqlite3.Connection | None = None
+    committed = False
     try:
+        conn = _registry()
         conn.execute("BEGIN IMMEDIATE")
         current_state = _registry_state(
             conn,
@@ -2800,16 +3013,23 @@ def _change_namespace_label(
                     backup["integrity"],
                 ),
             )
+        backup.verify_for_record()
         conn.commit()
+        committed = True
         result["applied"] = True
         result["idempotent"] = existing_migration is not None
         result["migration_id"] = migration_id
         return result
     except Exception:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
+        if not committed:
+            backup.discard()
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+        backup.close()
 
 
 def change_namespace_label(
@@ -3016,8 +3236,10 @@ def _undo_namespace_migration(
         finally:
             conn.close()
     backup = _backup_registry(purpose="undo")
-    conn = _registry()
+    conn: sqlite3.Connection | None = None
+    committed = False
     try:
+        conn = _registry()
         conn.execute("BEGIN IMMEDIATE")
         if _state_digest(_registry_state(conn)) != plan["registry_state_digest"]:
             raise NamespaceMigrationError(
@@ -3048,7 +3270,9 @@ def _undo_namespace_migration(
                 backup["integrity"], migration_id,
             ),
         )
+        backup.verify_for_record()
         conn.commit()
+        committed = True
         return {
             **plan,
             "mode": "apply",
@@ -3058,10 +3282,15 @@ def _undo_namespace_migration(
             "undone_at": undone_at,
         }
     except Exception:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
+        if not committed:
+            backup.discard()
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+        backup.close()
 
 
 def undo_namespace_migration(
