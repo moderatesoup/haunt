@@ -41,6 +41,12 @@ Canonical export digests detect corruption and make exact import replay
 identifiable. They are unkeyed hashes, not signatures or authenticity claims.
 Export excludes local paths, embeddings, indexes, and previously purged bytes,
 but anyone who can read a bundle can read its surviving plaintext content.
+An opaque namespace history head rotates in the hard-purge transaction, so an
+older or independently diverged bundle cannot be replayed into that namespace
+to restore erased rows. The head is not a secret, signature, or defense against
+a same-user attacker who can directly rewrite Haunt's files. Interrupted fresh
+imports recover only files still matching the fsynced intent's exact token,
+digest, device, and inode ownership; replacement links fail closed.
 MCP export/import therefore require `HAUNT_MCP_ADMIN=1`; the dashboard launch
 token similarly grants administrative transfer access to every namespace.
 

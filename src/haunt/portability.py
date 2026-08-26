@@ -13,16 +13,23 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
+import stat
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from haunt.paths import (
     NamespacePathError,
+    SQLITE_SIDECAR_SUFFIXES,
+    haunt_home,
+    mkdir_private,
     normalize_namespace_label,
     repository_identity,
+    required_o_nofollow,
     safe_name,
 )
 from haunt.provenance import validate_provenance
@@ -30,6 +37,7 @@ from haunt.graph import _refresh_relation
 from haunt.store import (
     RECALL_CLASSES,
     SCHEMA_VERSION,
+    PRIVACY_LINEAGE_KEY,
     _claim_fresh_namespace_db_with_configuration_lock,
     _ensure_namespace_schema,
     _init_namespace_schema,
@@ -39,9 +47,10 @@ from haunt.store import (
     _sqlite_configuration_lock,
     _validate_unmapped_namespace_target,
     is_concurrent_registry_change,
+    namespace_privacy_lineage_head,
     namespaces_dir,
-    open_namespace_identity,
     open_namespace_identity_readonly,
+    _open_namespace_identity_unmaintained,
     resolve_namespace_id,
     resolve_namespace_identity,
 )
@@ -54,6 +63,8 @@ MEDIA_TYPE = "application/vnd.haunt.namespace-export+json;version=1"
 
 _DIGEST_PREFIX = "sha256:"
 _RECEIPT_PREFIX = "import_receipt:"
+_INTENT_VERSION = 1
+_INTENT_DIRECTORY = "import-intents"
 
 
 class ExportError(ValueError):
@@ -582,6 +593,9 @@ def _build_namespace_export_snapshot(
                     if cut is not None
                     else _default_temporal_cut(store.conn)
                 )
+                privacy_lineage_head = namespace_privacy_lineage_head(
+                    store.conn, namespace_id
+                )
                 _export_after_cut_hook()
                 records = _select_export_records(store.conn, resolved_cut)
             finally:
@@ -609,7 +623,11 @@ def _build_namespace_export_snapshot(
             identity_before[field] != identity_after[field] for field in stable_fields
         ) or registry_before != registry_after:
             raise ExportError("namespace registry identity changed during export")
-        return resolved_cut, registry_before, records
+        return (
+            resolved_cut,
+            {**registry_before, "privacy_lineage_head": privacy_lineage_head},
+            records,
+        )
 
 
 def build_namespace_export(
@@ -966,7 +984,13 @@ def _validate_bundle(
         raise ImportBundleError("namespace must be an object")
     _require_keys(
         namespace,
-        {"namespace_id", "canonical_label", "aliases", "repository_identities"},
+        {
+            "namespace_id",
+            "canonical_label",
+            "aliases",
+            "repository_identities",
+            "privacy_lineage_head",
+        },
         "namespace",
     )
     namespace_id = namespace["namespace_id"]
@@ -975,6 +999,14 @@ def _validate_bundle(
         raise ImportBundleError("namespace_id must be nonempty and at most 256 UTF-8 bytes")
     if not isinstance(canonical, str) or canonical != safe_name(canonical):
         raise ImportBundleError("canonical_label is not a safe exact namespace label")
+    privacy_head = namespace["privacy_lineage_head"]
+    if (
+        not isinstance(privacy_head, str)
+        or len(privacy_head) != 71
+        or not privacy_head.startswith(_DIGEST_PREFIX)
+        or any(ch not in "0123456789abcdef" for ch in privacy_head[7:])
+    ):
+        raise ImportBundleError("privacy_lineage_head must be a sha256 digest")
     aliases = namespace["aliases"]
     if not isinstance(aliases, list) or not aliases:
         raise ImportBundleError("namespace aliases must be a nonempty array")
@@ -1095,7 +1127,27 @@ def _validate_bundle(
         raise ImportBundleError("manifest must be an object")
     _require_keys(manifest, {"semantic_digest", "record_counts", "total_records"}, "manifest")
     counts = {table: len(records[table]) for table in _IMPORT_ORDER}
-    if manifest["record_counts"] != counts or manifest["total_records"] != total:
+    supplied_counts = manifest["record_counts"]
+    if not isinstance(supplied_counts, dict):
+        raise ImportBundleError("manifest record_counts must be an object")
+    _require_keys(supplied_counts, set(_IMPORT_ORDER), "manifest record_counts")
+    for table in _IMPORT_ORDER:
+        value = supplied_counts[table]
+        if type(value) is not int or value < 0 or value > limits.records:
+            raise ImportBundleError(
+                f"manifest record_counts.{table} must be a bounded nonnegative integer"
+            )
+    supplied_total = manifest["total_records"]
+    if (
+        type(supplied_total) is not int
+        or supplied_total < 0
+        or supplied_total > limits.records
+        or supplied_total != sum(supplied_counts.values())
+    ):
+        raise ImportBundleError(
+            "manifest total_records must be the exact bounded count sum"
+        )
+    if supplied_counts != counts or supplied_total != total:
         raise ImportBundleError("manifest record counts do not match actual records")
     expected_digest = _digest_with_deadline(
         _semantic_from_bundle(bundle), check_deadline
@@ -1300,6 +1352,32 @@ def _same_sqlite_value(left: Any, right: Any) -> bool:
         return False
 
 
+@contextmanager
+def _sqlite_deadline(
+    conn: sqlite3.Connection, check_deadline: Callable[[], None]
+) -> Iterator[None]:
+    """Convert SQLite progress cancellation back to the resolved timeout error."""
+    deadline_error: list[ImportLimitError] = []
+
+    def progress() -> int:
+        try:
+            check_deadline()
+        except ImportLimitError as exc:
+            deadline_error.append(exc)
+            return 1
+        return 0
+
+    conn.set_progress_handler(progress, 1_000)
+    try:
+        yield
+    except sqlite3.OperationalError:
+        if deadline_error:
+            raise deadline_error[0]
+        raise
+    finally:
+        conn.set_progress_handler(None, 0)
+
+
 def _existing_row_matches(
     conn: sqlite3.Connection, table: str, record: Mapping[str, Any]
 ) -> bool | None:
@@ -1321,37 +1399,21 @@ def _apply_records(
     semantic_digest: str | None,
     check_deadline: Callable[[], None],
 ) -> dict[str, int]:
+    has_receipt, missing = _preflight_record_state(
+        conn,
+        records,
+        semantic_digest=semantic_digest,
+        check_deadline=check_deadline,
+    )
+    if has_receipt:
+        return {table: 0 for table in _IMPORT_ORDER}
+
     receipt_key = None if semantic_digest is None else _RECEIPT_PREFIX + semantic_digest
     receipt_value = None if semantic_digest is None else json.dumps(
         {"format": FORMAT_NAME, "semantic_digest": semantic_digest},
         sort_keys=True,
         separators=(",", ":"),
     )
-    has_receipt = False
-    if receipt_key is not None:
-        receipt = conn.execute("SELECT value FROM meta WHERE key=?", (receipt_key,)).fetchone()
-        if receipt is not None:
-            if str(receipt["value"]) != receipt_value:
-                raise ImportConflictError("import receipt conflicts with bundle identity")
-            has_receipt = True
-
-    missing: dict[str, list[dict[str, Any]]] = {table: [] for table in _IMPORT_ORDER}
-    for table in _IMPORT_ORDER:
-        for record in records[table]:
-            check_deadline()
-            match = _existing_row_matches(conn, table, record)
-            if match is False:
-                key = tuple(record[field] for field in _PRIMARY_KEYS[table])
-                raise ImportConflictError(f"records.{table} identity conflicts: {key!r}")
-            if match is None:
-                missing[table].append(record)
-
-    if has_receipt:
-        if any(missing.values()):
-            raise ImportConflictError(
-                "import receipt exists but durable bundle records are missing"
-            )
-        return {table: 0 for table in _IMPORT_ORDER}
 
     for table in _IMPORT_ORDER:
         fields = _TABLE_FIELDS[table]
@@ -1396,6 +1458,62 @@ def _apply_records(
             "INSERT INTO meta(key,value) VALUES (?,?)", (receipt_key, receipt_value)
         )
     return {table: len(missing[table]) for table in _IMPORT_ORDER}
+
+
+def _preflight_record_state(
+    conn: sqlite3.Connection,
+    records: dict[str, list[dict[str, Any]]],
+    *,
+    semantic_digest: str | None,
+    check_deadline: Callable[[], None],
+) -> tuple[bool, dict[str, list[dict[str, Any]]]]:
+    """Check receipts and every durable row without changing the connection."""
+    receipt_key = None if semantic_digest is None else _RECEIPT_PREFIX + semantic_digest
+    receipt_value = None if semantic_digest is None else json.dumps(
+        {"format": FORMAT_NAME, "semantic_digest": semantic_digest},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    has_receipt = False
+    if receipt_key is not None:
+        receipt = conn.execute("SELECT value FROM meta WHERE key=?", (receipt_key,)).fetchone()
+        if receipt is not None:
+            if str(receipt["value"]) != receipt_value:
+                raise ImportConflictError("import receipt conflicts with bundle identity")
+            has_receipt = True
+
+    missing: dict[str, list[dict[str, Any]]] = {table: [] for table in _IMPORT_ORDER}
+    for table in _IMPORT_ORDER:
+        for record in records[table]:
+            check_deadline()
+            match = _existing_row_matches(conn, table, record)
+            if match is False:
+                key = tuple(record[field] for field in _PRIMARY_KEYS[table])
+                raise ImportConflictError(f"records.{table} identity conflicts: {key!r}")
+            if match is None:
+                missing[table].append(record)
+
+    if has_receipt:
+        if any(missing.values()):
+            raise ImportConflictError(
+                "import receipt exists but durable bundle records are missing"
+            )
+    return has_receipt, missing
+
+
+def _require_privacy_lineage_match(
+    conn: sqlite3.Connection,
+    namespace: Mapping[str, Any],
+) -> None:
+    namespace_id = str(namespace["namespace_id"])
+    try:
+        current = namespace_privacy_lineage_head(conn, namespace_id)
+    except NamespacePathError as exc:
+        raise ImportConflictError("existing privacy lineage head is malformed") from exc
+    if current != str(namespace["privacy_lineage_head"]):
+        raise ImportConflictError(
+            "bundle privacy lineage does not match the destination"
+        )
 
 
 def _registry_preflight(
@@ -1461,6 +1579,422 @@ def _existing_import_after_preflight_hook(_existing: Mapping[str, Any]) -> None:
     """Deterministic concurrency-test hook before exact-identity writer open."""
 
 
+def _import_publication_phase_hook(
+    _phase: str, _intent: Mapping[str, Any]
+) -> None:
+    """Deterministic crash-test hook; production behavior is intentionally empty."""
+
+
+def _intent_directory(*, create: bool) -> Path:
+    root = haunt_home()
+    if create:
+        mkdir_private(root)
+    directory = root / _INTENT_DIRECTORY
+    if create:
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        if not create:
+            return directory
+        raise ImportBundleError("cannot create import-intent directory")
+    except OSError as exc:
+        raise ImportBundleError(f"cannot inspect import-intent directory: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ImportBundleError("import-intent path must be a real directory")
+    if create:
+        os.chmod(directory, 0o700, follow_symlinks=False)
+    return directory
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | required_o_nofollow()
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_exact_owned_file(path: Path, *, max_bytes: int = 64 * 1024) -> bytes:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise ImportBundleError(f"cannot inspect import intent {path.name}: {exc}") from exc
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or int(before.st_nlink) != 1
+        or int(before.st_size) > max_bytes
+    ):
+        raise ImportBundleError("import intent is not an owned bounded regular file")
+    fd = os.open(
+        path,
+        os.O_RDONLY | required_o_nofollow() | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(opened.st_nlink) != 1
+            or (int(opened.st_dev), int(opened.st_ino))
+            != (int(before.st_dev), int(before.st_ino))
+        ):
+            raise ImportBundleError("import intent changed while opening")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(8192, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ImportBundleError("import intent exceeds its internal budget")
+        after = os.fstat(fd)
+        current = path.lstat()
+        identity = (int(opened.st_dev), int(opened.st_ino))
+        if (
+            (int(after.st_dev), int(after.st_ino)) != identity
+            or (int(current.st_dev), int(current.st_ino)) != identity
+            or int(after.st_nlink) != 1
+            or int(current.st_nlink) != 1
+        ):
+            raise ImportBundleError("import intent changed while reading")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _decode_import_intent(path: Path) -> dict[str, Any]:
+    raw = _read_exact_owned_file(path)
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"nonfinite JSON number: {value}")
+
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="strict"), parse_constant=reject_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ImportBundleError("import intent is malformed") from exc
+    if not isinstance(parsed, dict) or raw != _canonical_bytes(parsed):
+        raise ImportBundleError("import intent is not canonical")
+    _require_keys(
+        parsed,
+        {
+            "version",
+            "token",
+            "semantic_digest",
+            "namespace_id",
+            "canonical_label",
+            "privacy_lineage_head",
+            "target_name",
+            "temporary_name",
+            "primary",
+            "sidecars",
+        },
+        "import intent",
+    )
+    token = parsed["token"]
+    digest = parsed["semantic_digest"]
+    namespace_id = parsed["namespace_id"]
+    label = parsed["canonical_label"]
+    head = parsed["privacy_lineage_head"]
+    if type(parsed["version"]) is not int or parsed["version"] != _INTENT_VERSION:
+        raise ImportBundleError("import intent version is unsupported")
+    if (
+        not isinstance(token, str)
+        or len(token) != 64
+        or any(ch not in "0123456789abcdef" for ch in token)
+        or path.name != f"{token}.json"
+    ):
+        raise ImportBundleError("import intent token is invalid")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 71
+        or not digest.startswith(_DIGEST_PREFIX)
+        or any(ch not in "0123456789abcdef" for ch in digest[7:])
+    ):
+        raise ImportBundleError("import intent digest is invalid")
+    if not isinstance(namespace_id, str) or not namespace_id:
+        raise ImportBundleError("import intent namespace ID is invalid")
+    if not isinstance(label, str) or label != safe_name(label):
+        raise ImportBundleError("import intent namespace label is invalid")
+    if (
+        not isinstance(head, str)
+        or len(head) != 71
+        or not head.startswith(_DIGEST_PREFIX)
+        or any(ch not in "0123456789abcdef" for ch in head[7:])
+    ):
+        raise ImportBundleError("import intent privacy lineage is invalid")
+    target_name = parsed["target_name"]
+    temporary_name = parsed["temporary_name"]
+    if target_name != f"{label}.db":
+        raise ImportBundleError("import intent target does not match its label")
+    if (
+        not isinstance(temporary_name, str)
+        or Path(temporary_name).name != temporary_name
+        or not temporary_name.startswith(".haunt-claim-")
+        or not temporary_name.endswith(".db")
+    ):
+        raise ImportBundleError("import intent temporary name is invalid")
+
+    def identity(value: Any, field: str) -> tuple[int, int]:
+        if not isinstance(value, dict):
+            raise ImportBundleError(f"import intent {field} identity is invalid")
+        _require_keys(value, {"device", "inode"}, f"import intent {field}")
+        device, inode = value["device"], value["inode"]
+        if type(device) is not int or type(inode) is not int or device < 0 or inode <= 0:
+            raise ImportBundleError(f"import intent {field} identity is invalid")
+        return device, inode
+
+    identity(parsed["primary"], "primary")
+    sidecars = parsed["sidecars"]
+    if not isinstance(sidecars, list) or len(sidecars) != len(SQLITE_SIDECAR_SUFFIXES):
+        raise ImportBundleError("import intent sidecar identities are invalid")
+    seen: set[str] = set()
+    for sidecar in sidecars:
+        if not isinstance(sidecar, dict):
+            raise ImportBundleError("import intent sidecar identity is invalid")
+        _require_keys(sidecar, {"name", "device", "inode"}, "import intent sidecar")
+        name = sidecar["name"]
+        if not isinstance(name, str) or name in seen:
+            raise ImportBundleError("import intent sidecar name is invalid")
+        seen.add(name)
+        identity(
+            {"device": sidecar["device"], "inode": sidecar["inode"]},
+            "sidecar",
+        )
+    expected_names = {temporary_name + suffix for suffix in SQLITE_SIDECAR_SUFFIXES}
+    if seen != expected_names:
+        raise ImportBundleError("import intent sidecar names do not match the claim")
+    return parsed
+
+
+def _create_import_intent(intent: Mapping[str, Any]) -> Path:
+    directory = _intent_directory(create=True)
+    token = str(intent["token"])
+    final = directory / f"{token}.json"
+    pending = directory / f".{token}.{secrets.token_hex(16)}.pending"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | required_o_nofollow()
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = os.open(pending, flags, 0o600)
+    try:
+        raw = _canonical_bytes(intent)
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.link(pending, final, follow_symlinks=False)
+        pending.unlink()
+        _fsync_directory(directory)
+    except Exception:
+        pending.unlink(missing_ok=True)
+        raise
+    return final
+
+
+def _file_identity(
+    path: Path,
+    expected: tuple[int, int],
+    *,
+    allowed_links: set[int],
+) -> os.stat_result | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ImportBundleError(f"cannot inspect recovery-owned file: {path.name}") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or int(info.st_nlink) not in allowed_links
+        or (int(info.st_dev), int(info.st_ino)) != expected
+    ):
+        raise ImportBundleError(
+            f"refusing to remove changed or unrelated recovery file: {path.name}"
+        )
+    return info
+
+
+def _unlink_exact(path: Path, expected: tuple[int, int], *, allowed_links: set[int]) -> None:
+    info = _file_identity(path, expected, allowed_links=allowed_links)
+    if info is None:
+        return
+    fd = os.open(
+        path,
+        os.O_RDONLY | required_o_nofollow() | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        opened = os.fstat(fd)
+        current = path.lstat()
+        if (
+            (int(opened.st_dev), int(opened.st_ino)) != expected
+            or (int(current.st_dev), int(current.st_ino)) != expected
+            or int(opened.st_nlink) not in allowed_links
+            or int(current.st_nlink) not in allowed_links
+        ):
+            raise ImportBundleError(
+                f"refusing to remove changed recovery file: {path.name}"
+            )
+        path.unlink()
+    finally:
+        os.close(fd)
+
+
+def _verify_staged_receipt(
+    path: Path,
+    intent: Mapping[str, Any],
+    check_deadline: Callable[[], None],
+) -> None:
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)
+        conn.row_factory = sqlite3.Row
+        with _sqlite_deadline(conn, check_deadline):
+            receipt = conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (_RECEIPT_PREFIX + str(intent["semantic_digest"]),),
+            ).fetchone()
+            schema = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            privacy = conn.execute(
+                "SELECT value FROM meta WHERE key=?", (PRIVACY_LINEAGE_KEY,)
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise ImportBundleError("cannot verify recovery-owned staged database") from exc
+    finally:
+        if "conn" in locals():
+            conn.close()
+    expected_receipt = json.dumps(
+        {"format": FORMAT_NAME, "semantic_digest": intent["semantic_digest"]},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if (
+        receipt is None
+        or receipt["value"] != expected_receipt
+        or schema is None
+        or str(schema["value"]) != str(SCHEMA_VERSION)
+        or privacy is None
+        or privacy["value"] != intent["privacy_lineage_head"]
+    ):
+        raise ImportBundleError("recovery-owned staged database does not match its intent")
+
+
+def _remove_import_intent(path: Path, intent: Mapping[str, Any]) -> None:
+    current = _decode_import_intent(path)
+    if current != intent:
+        raise ImportBundleError("import intent changed before cleanup")
+    info = path.lstat()
+    _unlink_exact(
+        path,
+        (int(info.st_dev), int(info.st_ino)),
+        allowed_links={1},
+    )
+    _fsync_directory(path.parent)
+
+
+def _recover_one_import_intent(path: Path, check_deadline: Callable[[], None]) -> None:
+    check_deadline()
+    intent = _decode_import_intent(path)
+    root = namespaces_dir()
+    temporary = root / str(intent["temporary_name"])
+    target = root / str(intent["target_name"])
+    primary = (
+        int(intent["primary"]["device"]),
+        int(intent["primary"]["inode"]),
+    )
+    temp_info = _file_identity(temporary, primary, allowed_links={1, 2})
+    target_info = _file_identity(target, primary, allowed_links={1, 2})
+    if temp_info is not None and target_info is not None:
+        if int(temp_info.st_nlink) != 2 or int(target_info.st_nlink) != 2:
+            raise ImportBundleError("recovery-owned primary has unsafe link topology")
+    elif temp_info is not None and int(temp_info.st_nlink) != 1:
+        raise ImportBundleError("recovery-owned temporary has an unexpected hardlink")
+    elif target_info is not None and int(target_info.st_nlink) != 1:
+        raise ImportBundleError("recovery-owned target has an unexpected hardlink")
+    sidecar_paths: list[tuple[Path, tuple[int, int]]] = []
+    for sidecar in intent["sidecars"]:
+        check_deadline()
+        sidecar_path = root / str(sidecar["name"])
+        expected = int(sidecar["device"]), int(sidecar["inode"])
+        _file_identity(sidecar_path, expected, allowed_links={1})
+        sidecar_paths.append((sidecar_path, expected))
+
+    mapped: sqlite3.Row | None = None
+    registry_file = haunt_home() / "registry.db"
+    if registry_file.is_file():
+        registry = _readonly_registry()
+        try:
+            with _sqlite_deadline(registry, check_deadline):
+                mapped = registry.execute(
+                    "SELECT namespace_id,canonical_label,db_path,db_device,db_inode "
+                    "FROM namespace_identities WHERE namespace_id=?",
+                    (intent["namespace_id"],),
+                ).fetchone()
+                by_target = registry.execute(
+                    "SELECT namespace_id FROM namespace_identities WHERE db_path=?",
+                    (str(target),),
+                ).fetchone()
+        finally:
+            registry.close()
+        if by_target is not None and str(by_target["namespace_id"]) != str(
+            intent["namespace_id"]
+        ):
+            raise ImportBundleError("recovery target belongs to another namespace")
+
+    committed = mapped is not None
+    if committed:
+        if (
+            str(mapped["canonical_label"]) != str(intent["canonical_label"])
+            or str(mapped["db_path"]) != str(target)
+            or int(mapped["db_device"]) != primary[0]
+            or int(mapped["db_inode"]) != primary[1]
+            or target_info is None
+        ):
+            raise ImportBundleError("committed import intent does not match registry identity")
+        _verify_staged_receipt(target, intent, check_deadline)
+
+    # Validate every owned name before the first unlink. Unknown replacements,
+    # symlinks, and hardlinks fail closed and are never removed.
+    check_deadline()
+    if not committed and target_info is not None:
+        _unlink_exact(target, primary, allowed_links={1, 2})
+    if temp_info is not None:
+        _unlink_exact(temporary, primary, allowed_links={1, 2})
+    for sidecar_path, expected in sidecar_paths:
+        _unlink_exact(sidecar_path, expected, allowed_links={1})
+    if committed:
+        _file_identity(target, primary, allowed_links={1})
+    _fsync_directory(root)
+    _remove_import_intent(path, intent)
+
+
+def _recover_import_intents(check_deadline: Callable[[], None]) -> None:
+    directory = _intent_directory(create=False)
+    if not directory.exists():
+        return
+    with _namespace_migration_lock():
+        with _sqlite_configuration_lock():
+            for path in sorted(directory.iterdir(), key=lambda item: item.name):
+                check_deadline()
+                if path.name.endswith(".json"):
+                    _recover_one_import_intent(path, check_deadline)
+
+
 def _publish_new_import(
     validated: _ValidatedBundle, check_deadline: Callable[[], None]
 ) -> dict[str, Any]:
@@ -1469,6 +2003,42 @@ def _publish_new_import(
     namespace_id = str(namespace["namespace_id"])
     target = namespaces_dir() / f"{label}.db"
     now = now_iso()
+    intent_token = secrets.token_hex(32)
+    intent_path: Path | None = None
+    intent_data: dict[str, Any] | None = None
+
+    def publication_hook(
+        phase: str,
+        temporary: Path,
+        identity: tuple[int, int],
+        sidecars: list[tuple[str, int, int]],
+    ) -> None:
+        nonlocal intent_path, intent_data
+        check_deadline()
+        if phase == "claimed":
+            intent_data = {
+                "version": _INTENT_VERSION,
+                "token": intent_token,
+                "semantic_digest": validated.semantic_digest,
+                "namespace_id": namespace_id,
+                "canonical_label": label,
+                "privacy_lineage_head": namespace["privacy_lineage_head"],
+                "target_name": target.name,
+                "temporary_name": temporary.name,
+                "primary": {"device": identity[0], "inode": identity[1]},
+                "sidecars": [
+                    {"name": name, "device": device, "inode": inode}
+                    for name, device, inode in sorted(sidecars)
+                ],
+            }
+            intent_path = _create_import_intent(intent_data)
+            _import_publication_phase_hook("intent-created", intent_data)
+        else:
+            if intent_data is None:
+                raise ImportBundleError("fresh import publication has no recovery intent")
+            _import_publication_phase_hook(phase, intent_data)
+        check_deadline()
+
     with _namespace_migration_lock():
         with _sqlite_configuration_lock():
             # Repeat every collision check while holding both writer locks.
@@ -1476,6 +2046,7 @@ def _publish_new_import(
                 raise ImportConflictError("namespace appeared during import")
             registry = _registry()
             claim = None
+            registry_committed = False
             try:
                 registry.execute("BEGIN IMMEDIATE")
                 _validate_unmapped_namespace_target(target)
@@ -1502,6 +2073,13 @@ def _publish_new_import(
                     _ensure_namespace_schema(staged)
                     staged.execute("BEGIN IMMEDIATE")
                     try:
+                        staged.execute(
+                            "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                            (
+                                PRIVACY_LINEAGE_KEY,
+                                namespace["privacy_lineage_head"],
+                            ),
+                        )
                         inserted = _apply_records(
                             staged,
                             validated.decoded,
@@ -1515,7 +2093,9 @@ def _publish_new_import(
                         raise
 
                 claim = _claim_fresh_namespace_db_with_configuration_lock(
-                    target, prepare=prepare
+                    target,
+                    prepare=prepare,
+                    publication_hook=publication_hook,
                 )
                 claim.verify_for_publication()
                 registry.execute(
@@ -1571,16 +2151,24 @@ def _publish_new_import(
                         ),
                     )
                 check_deadline()
+                assert intent_data is not None
+                _import_publication_phase_hook("registry-precommit", intent_data)
                 registry.commit()
+                registry_committed = True
+                _import_publication_phase_hook("registry-committed", intent_data)
             except Exception:
                 registry.rollback()
                 if claim is not None:
-                    claim.close(remove_target=True)
+                    claim.close(remove_target=not registry_committed)
+                if intent_path is not None and intent_data is not None:
+                    _remove_import_intent(intent_path, intent_data)
                 raise
             finally:
                 registry.close()
             assert claim is not None
             claim.close(remove_target=False)
+            assert intent_path is not None and intent_data is not None
+            _remove_import_intent(intent_path, intent_data)
     return {
         "namespace": label,
         "namespace_id": namespace_id,
@@ -1601,41 +2189,90 @@ def _apply_existing_import(
         if current is None:
             raise ImportConflictError("existing namespace disappeared during import")
         _require_same_selected_storage(current, existing)
-        # open_namespace_identity re-enters the already-held migration lock and
-        # selects only the stable ID/path/device/inode; no presentation label
-        # is re-resolved between preflight and the writer transaction.
-        store = open_namespace_identity(
+        # Complete the conflict/receipt/privacy check through a physically
+        # read-only exact-ID handle. A rejected bundle therefore cannot run
+        # schema migration, graph repair, or writer configuration first.
+        readonly = open_namespace_identity_readonly(
             namespace_id,
             expected_db_path=str(existing["db_path"]),
             expected_db_device=int(existing["db_device"]),
             expected_db_inode=int(existing["db_inode"]),
         )
         try:
-            store.conn.execute("BEGIN IMMEDIATE")
-            receipt_key = _RECEIPT_PREFIX + validated.semantic_digest
-            already = store.conn.execute(
-                "SELECT value FROM meta WHERE key=?", (receipt_key,)
-            ).fetchone()
-            try:
-                inserted = _apply_records(
-                    store.conn,
-                    validated.decoded,
-                    semantic_digest=validated.semantic_digest,
-                    check_deadline=check_deadline,
+            if readonly.schema_version != SCHEMA_VERSION:
+                raise ImportConflictError(
+                    f"existing namespace must already be schema {SCHEMA_VERSION}"
                 )
-                check_deadline()
-                current_after = _registry_preflight(
-                    validated.namespace, check_deadline
-                )
-                if current_after is None:
-                    raise ImportConflictError(
-                        "existing namespace disappeared during import"
+            with _sqlite_deadline(readonly.conn, check_deadline):
+                readonly.conn.execute("BEGIN")
+                try:
+                    _require_privacy_lineage_match(
+                        readonly.conn, validated.namespace
                     )
-                _require_same_selected_storage(current_after, existing)
-                store.conn.commit()
-            except Exception:
-                store.conn.rollback()
-                raise
+                    _preflight_record_state(
+                        readonly.conn,
+                        validated.decoded,
+                        semantic_digest=validated.semantic_digest,
+                        check_deadline=check_deadline,
+                    )
+                finally:
+                    readonly.conn.rollback()
+        finally:
+            readonly.close()
+
+        # The exact-ID writer deliberately skips schema/projection maintenance.
+        # Recheck all preflight facts inside its transaction to close the gap
+        # between the read-only snapshot and the write lock.
+        store = _open_namespace_identity_unmaintained(
+            namespace_id,
+            expected_db_path=str(existing["db_path"]),
+            expected_db_device=int(existing["db_device"]),
+            expected_db_inode=int(existing["db_inode"]),
+        )
+        try:
+            with _sqlite_deadline(store.conn, check_deadline):
+                store.conn.execute("BEGIN IMMEDIATE")
+                receipt_key = _RECEIPT_PREFIX + validated.semantic_digest
+                already = store.conn.execute(
+                    "SELECT value FROM meta WHERE key=?", (receipt_key,)
+                ).fetchone()
+                try:
+                    schema = store.conn.execute(
+                        "SELECT value FROM meta WHERE key='schema_version'"
+                    ).fetchone()
+                    if schema is None or str(schema["value"]) != str(SCHEMA_VERSION):
+                        raise ImportConflictError(
+                            f"existing namespace must remain schema {SCHEMA_VERSION}"
+                        )
+                    _require_privacy_lineage_match(
+                        store.conn, validated.namespace
+                    )
+                    store.conn.execute(
+                        "INSERT OR IGNORE INTO meta(key,value) VALUES (?,?)",
+                        (
+                            PRIVACY_LINEAGE_KEY,
+                            validated.namespace["privacy_lineage_head"],
+                        ),
+                    )
+                    inserted = _apply_records(
+                        store.conn,
+                        validated.decoded,
+                        semantic_digest=validated.semantic_digest,
+                        check_deadline=check_deadline,
+                    )
+                    check_deadline()
+                    current_after = _registry_preflight(
+                        validated.namespace, check_deadline
+                    )
+                    if current_after is None:
+                        raise ImportConflictError(
+                            "existing namespace disappeared during import"
+                        )
+                    _require_same_selected_storage(current_after, existing)
+                    store.conn.commit()
+                except Exception:
+                    store.conn.rollback()
+                    raise
         finally:
             store.close()
     return {
@@ -1669,6 +2306,8 @@ def _import_namespace_bytes_with_deadline(
 ) -> dict[str, Any]:
     bundle = _load_json(raw, resolved, check_deadline)
     validated = _validate_bundle(bundle, resolved, check_deadline)
+    check_deadline()
+    _recover_import_intents(check_deadline)
     check_deadline()
     existing = _registry_preflight(validated.namespace, check_deadline)
     check_deadline()

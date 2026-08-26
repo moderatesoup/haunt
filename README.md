@@ -249,6 +249,13 @@ exports and a fresh import/re-export retain the same semantic digest. Use
 publication, is idempotent for an exact replay, and rejects identity/alias or
 record conflicts rather than merging ambiguously.
 
+Each bundle also carries an opaque privacy-lineage head. Hard purge rotates it
+atomically without retaining erased IDs or bytes, so a pre-purge bundle or a
+diverged post-purge fork is rejected by that existing namespace; a fresh home
+still imports the bundle exactly. Fresh publication uses a private fsynced
+intent bound to the exact claimed database identities, so an interrupted import
+is safely recovered on retry without deleting replaced or unrelated files.
+
 The file contains potentially sensitive verbatim history. The digest detects
 transfer corruption; it is not encryption or proof of authorship. MCP transfer
 tools require `HAUNT_MCP_ADMIN=1`. Dashboard transfer uses the launch-token

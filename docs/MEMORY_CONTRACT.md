@@ -274,6 +274,16 @@ required schema migration may change file bytes. The proof compares namespace,
 alias, session, event, memory, correction, provenance, graph/index, vector, and
 embedding-job state immediately before and after the rejected import.
 
+Canonical namespace identity **MUST** include an opaque privacy-lineage head.
+Every successful hard purge rotates that head atomically without retaining
+erased identifiers, identifier hashes, content, or provenance. Existing import
+requires an exact head match before any repair or write; fresh import preserves
+the head. Fresh publication **MUST** be crash-recoverable from a durable intent
+bound to bundle digest, stable namespace ID, unpredictable token, and exact
+claimed file identities. Recovery may remove only those still-owned files and
+must fail closed for replacements, symlinks, unrelated files, or unsafe
+hardlinks.
+
 Embeddings **MUST NOT** appear in canonical export. Neither may vector tables,
 FTS tables, embedding jobs, absolute machine-local paths, WAL/SHM state, or
 other rebuildable indexes/caches. Embeddings depend on local model identity and

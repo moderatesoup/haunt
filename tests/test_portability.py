@@ -5,7 +5,10 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import os
 import stat
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -15,6 +18,7 @@ from typer.testing import CliRunner
 from tests.dashutil import make_dash_client
 
 from haunt.cli import app
+from haunt.paths import NamespacePathError
 from haunt.portability import (
     FORMAT_MAJOR,
     FORMAT_MINOR,
@@ -35,11 +39,13 @@ from haunt.portability import (
 )
 from haunt.recall import recall
 from haunt.store import (
+    PRIVACY_LINEAGE_KEY,
     SCHEMA_VERSION,
     Store,
     change_namespace_label,
     namespace_exists_readonly,
     open_existing,
+    privacy_lineage_genesis,
     retire_namespace_alias,
     resolve_namespace_identity,
 )
@@ -79,6 +85,7 @@ def _redigest(bundle: dict) -> bytes:
 
 def _durable_snapshot(store: Store) -> dict[str, list[tuple]]:
     tables = (
+        "meta",
         "sessions",
         "events",
         "memories",
@@ -97,6 +104,20 @@ def _durable_snapshot(store: Store) -> dict[str, list[tuple]]:
             key=repr,
         )
         for table in tables
+    }
+
+
+def _rejection_snapshot(store: Store) -> dict[str, object]:
+    return {
+        "durable": _durable_snapshot(store),
+        "schema": sorted(
+            tuple(row)
+            for row in store.conn.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+            )
+        ),
+        "data_version": store.conn.execute("PRAGMA data_version").fetchone()[0],
+        "schema_version": store.conn.execute("PRAGMA schema_version").fetchone()[0],
     }
 
 
@@ -231,6 +252,7 @@ def test_alias_and_remote_identity_round_trip_without_local_repository_paths(
             {"label": "Old-Label", "is_canonical": False, "source_alias_norm": None},
         ],
         "repository_identities": ["github.com/example/portable"],
+        "privacy_lineage_head": privacy_lineage_genesis(original_id),
     }
     assert str(tmp_path) not in canonical_export_bytes(bundle).decode()
 
@@ -1235,3 +1257,456 @@ def test_session_without_events_is_portable_and_keeps_default_digest(
     import_namespace_bytes(canonical_export_bytes(bundle))
     reexport = build_namespace_export("session-only")
     assert reexport["manifest"]["semantic_digest"] == bundle["manifest"]["semantic_digest"]
+
+
+def test_pre_purge_bundle_cannot_resurrect_raw_or_blob_canaries_after_restart(
+    portable_home, tmp_path, monkeypatch
+):
+    raw_canary = "RAW-PURGE-CANARY-7fbe2dd3"
+    blob_canary = b"\x00BLOB-PURGE-CANARY-9a5c\xff"
+    blob_token = base64.b64encode(blob_canary).decode("ascii")
+    with Store("purge-watermark") as store:
+        observed = store.observe(raw_canary, defer_embedding=True)
+        store.conn.execute(
+            "UPDATE events SET tool_output=? WHERE id=?",
+            (blob_canary, observed.event_id),
+        )
+        store.conn.commit()
+    stale = build_namespace_export("purge-watermark")
+    stale_raw = canonical_export_bytes(stale)
+    assert raw_canary.encode() in stale_raw
+    assert blob_token.encode() in stale_raw
+
+    with open_existing("purge-watermark") as store:
+        purged = store.purge(observed.memory_id)
+        assert purged["ok"] is True
+        assert "privacy_lineage_head" not in purged
+    current = build_namespace_export("purge-watermark")
+    current_raw = canonical_export_bytes(current)
+    assert current["namespace"]["privacy_lineage_head"] != stale["namespace"][
+        "privacy_lineage_head"
+    ]
+    assert raw_canary.encode() not in current_raw
+    assert blob_token.encode() not in current_raw
+
+    # A bundle at the current privacy head is valid and exactly idempotent.
+    first = import_namespace_bytes(current_raw)
+    second = import_namespace_bytes(current_raw)
+    assert first["created_namespace"] is False
+    assert second["deduplicated"] is True
+    with open_existing("purge-watermark") as store:
+        before = _rejection_snapshot(store)
+    with pytest.raises(ImportConflictError, match="privacy lineage"):
+        import_namespace_bytes(stale_raw)
+    with open_existing("purge-watermark") as store:
+        assert _rejection_snapshot(store) == before
+        assert store.get_memory(observed.memory_id) is None
+
+    # The same old bundle remains valid for a genuinely fresh home, where its
+    # opaque lineage head is preserved exactly.
+    _switch_home(monkeypatch, tmp_path / "fresh-pre-purge")
+    imported = import_namespace_bytes(stale_raw)
+    assert imported["created_namespace"] is True
+    reexport = build_namespace_export("purge-watermark")
+    assert reexport["manifest"]["semantic_digest"] == stale["manifest"][
+        "semantic_digest"
+    ]
+    with open_existing("purge-watermark") as store:
+        event = store.conn.execute(
+            "SELECT tool_output FROM events WHERE id=?", (observed.event_id,)
+        ).fetchone()
+        assert event["tool_output"] == blob_canary
+
+
+@pytest.mark.parametrize("purged_member", ["first", "middle", "last", "all"])
+def test_stale_bundle_cannot_restore_any_purged_correction_chain_member(
+    portable_home, monkeypatch, purged_member
+):
+    contents = {
+        "first": "CHAIN-PURGE-FIRST-4e21",
+        "middle": "CHAIN-PURGE-MIDDLE-5f32",
+        "last": "CHAIN-PURGE-LAST-6a43",
+    }
+    with Store("purge-chain") as store:
+        first = store.observe(contents["first"], defer_embedding=True)
+        second = store.contradict(
+            first.memory_id,
+            replacement=contents["middle"],
+            idempotency_key="purge-chain-second",
+        )
+        third = store.contradict(
+            second["replacement_memory_id"],
+            replacement=contents["last"],
+            idempotency_key="purge-chain-third",
+        )
+    memory_ids = {
+        "first": first.memory_id,
+        "middle": second["replacement_memory_id"],
+        "last": third["replacement_memory_id"],
+    }
+    stale_raw = canonical_export_bytes(build_namespace_export("purge-chain"))
+    targets = list(memory_ids) if purged_member == "all" else [purged_member]
+    with open_existing("purge-chain") as store:
+        for target in targets:
+            assert store.purge(memory_ids[target])["ok"] is True
+
+    after_raw = canonical_export_bytes(build_namespace_export("purge-chain"))
+    for target in targets:
+        assert contents[target].encode() not in after_raw
+    # Close/reopen before replay so the lineage protection is demonstrably
+    # durable rather than process-local.
+    with open_existing("purge-chain") as store:
+        before = _rejection_snapshot(store)
+    with pytest.raises(ImportConflictError, match="privacy lineage"):
+        import_namespace_bytes(stale_raw)
+    with open_existing("purge-chain") as store:
+        assert _rejection_snapshot(store) == before
+        for target in targets:
+            assert store.get_memory(memory_ids[target]) is None
+
+
+def test_privacy_lineage_forks_diverge_and_post_purge_bundle_round_trips_fresh(
+    portable_home, tmp_path, monkeypatch
+):
+    bundle, memory_id = _seed_bundle()
+    raw = canonical_export_bytes(bundle)
+    heads: dict[str, str] = {}
+    post_bundle: dict | None = None
+    for fork in ("a", "b"):
+        _switch_home(monkeypatch, tmp_path / f"fork-{fork}")
+        import_namespace_bytes(raw)
+        with open_existing("portable") as store:
+            assert store.purge(memory_id)["ok"] is True
+        exported = build_namespace_export("portable")
+        heads[fork] = exported["namespace"]["privacy_lineage_head"]
+        if fork == "a":
+            post_bundle = exported
+    assert heads["a"] != heads["b"]
+    assert post_bundle is not None
+
+    _switch_home(monkeypatch, tmp_path / "fork-b")
+    with open_existing("portable") as store:
+        before = _rejection_snapshot(store)
+    with pytest.raises(ImportConflictError, match="privacy lineage"):
+        import_namespace_bytes(canonical_export_bytes(post_bundle))
+    with open_existing("portable") as store:
+        assert _rejection_snapshot(store) == before
+
+    _switch_home(monkeypatch, tmp_path / "fork-fresh")
+    import_namespace_bytes(canonical_export_bytes(post_bundle))
+    reexport = build_namespace_export("portable")
+    assert reexport["manifest"]["semantic_digest"] == post_bundle["manifest"][
+        "semantic_digest"
+    ]
+    assert reexport["namespace"]["privacy_lineage_head"] == heads["a"]
+
+
+def test_malformed_privacy_head_fails_closed_and_purge_rolls_back(
+    portable_home
+):
+    with Store("bad-privacy-head") as store:
+        observed = store.observe("must survive failed purge", defer_embedding=True)
+        store.conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+            (PRIVACY_LINEAGE_KEY, "malformed-private-state"),
+        )
+        store.conn.commit()
+        before = _rejection_snapshot(store)
+        with pytest.raises(NamespacePathError, match="privacy lineage head is malformed"):
+            store.purge(observed.memory_id)
+        assert _rejection_snapshot(store) == before
+        assert store.get_memory(observed.memory_id) is not None
+    with pytest.raises(NamespacePathError, match="privacy lineage head is malformed"):
+        build_namespace_export("bad-privacy-head")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "count-bool",
+        "count-float",
+        "count-string",
+        "count-negative",
+        "count-huge",
+        "total-bool",
+        "total-float",
+        "total-string",
+        "total-negative",
+        "total-huge",
+        "total-sum",
+        "missing-key",
+        "extra-key",
+    ],
+)
+def test_manifest_counts_require_exact_bounded_nonnegative_integers(
+    portable_home, tmp_path, monkeypatch, mutation
+):
+    bundle, _ = _seed_bundle()
+    counts = bundle["manifest"]["record_counts"]
+    if mutation.startswith("count-"):
+        counts["sessions"] = {
+            "count-bool": True,
+            "count-float": 1.0,
+            "count-string": "1",
+            "count-negative": -1,
+            "count-huge": 100_001,
+        }[mutation]
+    elif mutation == "missing-key":
+        counts.pop("sessions")
+    elif mutation == "extra-key":
+        counts["derived_jobs"] = 0
+    elif mutation == "total-sum":
+        bundle["manifest"]["total_records"] += 1
+    else:
+        bundle["manifest"]["total_records"] = {
+            "total-bool": True,
+            "total-float": float(bundle["manifest"]["total_records"]),
+            "total-string": str(bundle["manifest"]["total_records"]),
+            "total-negative": -1,
+            "total-huge": 100_001,
+        }[mutation]
+    destination = tmp_path / f"manifest-{mutation}"
+    _switch_home(monkeypatch, destination)
+    with pytest.raises(ImportBundleError, match="manifest"):
+        import_namespace_bytes(canonical_export_bytes(bundle))
+    assert not namespace_exists_readonly("portable")
+    root = destination / "namespaces"
+    assert not root.exists() or not list(root.glob("*.db"))
+
+
+def test_rejected_existing_conflict_runs_no_schema_graph_or_meta_maintenance(
+    portable_home, tmp_path, monkeypatch
+):
+    bundle, memory_id = _seed_bundle()
+    raw = canonical_export_bytes(bundle)
+    _switch_home(monkeypatch, tmp_path / "zero-write-existing-conflict")
+    import_namespace_bytes(raw)
+    with open_existing("portable") as store:
+        # Recreate the state that the old normal Store opener repaired before
+        # discovering a conflict.
+        store.conn.execute("DELETE FROM meta WHERE key='graph_evidence_version'")
+        store.conn.execute("DELETE FROM relations")
+        store.conn.execute(
+            "UPDATE memories SET content='destination conflict' WHERE id=?",
+            (memory_id,),
+        )
+        store.conn.commit()
+        before = _rejection_snapshot(store)
+        with pytest.raises(ImportConflictError, match="memories identity conflicts"):
+            import_namespace_bytes(raw)
+        assert _rejection_snapshot(store) == before
+
+
+def test_existing_zero_write_preflight_sqlite_timeout_preserves_every_state(
+    portable_home, tmp_path, monkeypatch
+):
+    import haunt.portability as portability
+
+    bundle, _ = _seed_bundle()
+    raw = canonical_export_bytes(bundle)
+    _switch_home(monkeypatch, tmp_path / "existing-progress-timeout")
+    import_namespace_bytes(raw)
+    with open_existing("portable") as store:
+        before = _rejection_snapshot(store)
+
+    in_sqlite = False
+    original_match = portability._existing_row_matches
+
+    def slow_match(conn, table, record):
+        nonlocal in_sqlite
+        in_sqlite = True
+        try:
+            conn.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL "
+                "SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n"
+            ).fetchone()
+        finally:
+            in_sqlite = False
+        return original_match(conn, table, record)
+
+    def arm_after_validation(_existing):
+        monkeypatch.setattr(portability, "_existing_row_matches", slow_match)
+
+    monkeypatch.setattr(
+        portability, "_existing_import_after_preflight_hook", arm_after_validation
+    )
+
+    def clock() -> float:
+        return 31.0 if in_sqlite else 0.0
+
+    with pytest.raises(ImportLimitError, match="timeout"):
+        import_namespace_bytes(raw, _clock=clock)
+    with open_existing("portable") as store:
+        assert _rejection_snapshot(store) == before
+
+
+def test_existing_import_requires_current_schema_without_running_migration(
+    portable_home, tmp_path, monkeypatch
+):
+    bundle, _ = _seed_bundle()
+    raw = canonical_export_bytes(bundle)
+    _switch_home(monkeypatch, tmp_path / "existing-old-schema")
+    import_namespace_bytes(raw)
+    with open_existing("portable") as store:
+        store.conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'",
+            (str(SCHEMA_VERSION - 1),),
+        )
+        store.conn.commit()
+        before = _rejection_snapshot(store)
+        with pytest.raises(ImportConflictError, match="already be schema"):
+            import_namespace_bytes(raw)
+        assert _rejection_snapshot(store) == before
+
+
+def test_valid_existing_import_still_rebuilds_destination_projections(
+    portable_home, tmp_path, monkeypatch
+):
+    with Store("existing-rebuild") as store:
+        observed = store.observe(
+            "AlphaService works with BetaService", defer_embedding=True
+        )
+    empty = build_namespace_export(
+        "existing-rebuild", cut="1970-01-01T00:00:00Z"
+    )
+    full = build_namespace_export("existing-rebuild")
+    _switch_home(monkeypatch, tmp_path / "existing-rebuild-destination")
+    import_namespace_bytes(canonical_export_bytes(empty))
+    report = import_namespace_bytes(canonical_export_bytes(full))
+    assert report["created_namespace"] is False
+    assert report["inserted"]["memories"] == 1
+    with open_existing("existing-rebuild") as store:
+        assert store.get_memory(observed.memory_id) is not None
+        assert store.conn.execute(
+            "SELECT content FROM memories_fts WHERE id=?", (observed.memory_id,)
+        ).fetchone()[0] == "AlphaService works with BetaService"
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs WHERE memory_id=?",
+            (observed.memory_id,),
+        ).fetchone()[0] == 1
+        assert store.conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0] > 0
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "intent-created",
+        "staged",
+        "linked",
+        "named",
+        "registry-precommit",
+        "registry-committed",
+    ],
+)
+def test_fresh_import_crash_recovery_has_no_orphan_and_retry_succeeds(
+    portable_home, tmp_path, monkeypatch, phase
+):
+    bundle, memory_id = _seed_bundle()
+    bundle_path = tmp_path / f"crash-{phase}.json"
+    bundle_path.write_bytes(canonical_export_bytes(bundle))
+    destination = tmp_path / f"crash-{phase}-home"
+    script = """
+import os
+from pathlib import Path
+import haunt.portability as portability
+
+phase = os.environ["HAUNT_TEST_CRASH_PHASE"]
+def crash(actual, _intent):
+    if actual == phase:
+        os._exit(73)
+portability._import_publication_phase_hook = crash
+portability.import_namespace_bytes(Path(os.environ["HAUNT_TEST_BUNDLE"]).read_bytes())
+"""
+    env = os.environ.copy()
+    env.update(
+        {
+            "HAUNT_HOME": str(destination),
+            "HAUNT_FTS_ONLY": "1",
+            "HAUNT_EMBED_MODEL": "off",
+            "HAUNT_TEST_CRASH_PHASE": phase,
+            "HAUNT_TEST_BUNDLE": str(bundle_path),
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src")
+            + os.pathsep
+            + env.get("PYTHONPATH", ""),
+        }
+    )
+    crashed = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True
+    )
+    assert crashed.returncode == 73, crashed.stderr
+    crashed_intent_dir = destination / "import-intents"
+    crashed_intents = list(crashed_intent_dir.glob("*.json"))
+    assert len(crashed_intents) == 1
+    assert stat.S_IMODE(crashed_intent_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(crashed_intents[0].stat().st_mode) == 0o600
+
+    _switch_home(monkeypatch, destination)
+    report = import_namespace_bytes(bundle_path.read_bytes())
+    assert report["semantic_digest"] == bundle["manifest"]["semantic_digest"]
+    with open_existing("portable") as store:
+        assert store.get_memory(memory_id) is not None
+    intent_dir = destination / "import-intents"
+    assert intent_dir.is_dir()
+    assert list(intent_dir.iterdir()) == []
+    namespace_files = list((destination / "namespaces").iterdir())
+    assert [path.name for path in namespace_files if path.suffix == ".db"] == [
+        "portable.db"
+    ]
+    assert not [path for path in destination.rglob("*") if ".haunt-claim-" in path.name]
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "hardlink", "owned-hardlink"])
+def test_crash_recovery_never_deletes_replaced_or_unrelated_target(
+    portable_home, tmp_path, monkeypatch, replacement
+):
+    bundle, _ = _seed_bundle()
+    raw_path = tmp_path / f"attacker-{replacement}.json"
+    raw_path.write_bytes(canonical_export_bytes(bundle))
+    destination = tmp_path / f"attacker-{replacement}-home"
+    script = """
+import os
+from pathlib import Path
+import haunt.portability as portability
+def crash(actual, _intent):
+    if actual == "named":
+        os._exit(74)
+portability._import_publication_phase_hook = crash
+portability.import_namespace_bytes(Path(os.environ["HAUNT_TEST_BUNDLE"]).read_bytes())
+"""
+    env = os.environ.copy()
+    env.update(
+        {
+            "HAUNT_HOME": str(destination),
+            "HAUNT_FTS_ONLY": "1",
+            "HAUNT_EMBED_MODEL": "off",
+            "HAUNT_TEST_BUNDLE": str(raw_path),
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src")
+            + os.pathsep
+            + env.get("PYTHONPATH", ""),
+        }
+    )
+    crashed = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True
+    )
+    assert crashed.returncode == 74, crashed.stderr
+    target = destination / "namespaces" / "portable.db"
+    owned = target.with_name("owned-import-primary.db")
+    unrelated = tmp_path / f"unrelated-{replacement}.txt"
+    unrelated.write_bytes(b"UNRELATED-RECOVERY-CANARY")
+    if replacement == "owned-hardlink":
+        os.link(target, owned)
+    else:
+        target.rename(owned)
+    if replacement == "symlink":
+        target.symlink_to(unrelated)
+    elif replacement == "hardlink":
+        os.link(unrelated, target)
+
+    _switch_home(monkeypatch, destination)
+    with pytest.raises(
+        ImportBundleError, match="refusing to remove|unexpected hardlink"
+    ):
+        import_namespace_bytes(raw_path.read_bytes())
+    assert unrelated.read_bytes() == b"UNRELATED-RECOVERY-CANARY"
+    assert target.exists()
+    assert owned.exists()

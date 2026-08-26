@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import stat
 import struct
@@ -86,6 +87,7 @@ RECALL_CLASSES = ("tool", "task")
 # 9: explicit recall-residue classification on new events only.
 SCHEMA_VERSION = 9
 SCHEMA_VERSION_KEY = "schema_version"
+PRIVACY_LINEAGE_KEY = "privacy_lineage_head"
 REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
 _NAMESPACE_DB_HANDLE_LOCK = SQLITE_OPEN_LOCK
@@ -93,6 +95,50 @@ _NAMESPACE_MIGRATION_LOCK = threading.RLock()
 _NAMESPACE_MIGRATION_STATE = threading.local()
 _SQLITE_CONFIGURATION_LOCK = threading.RLock()
 _SQLITE_CONFIGURATION_STATE = threading.local()
+
+
+def privacy_lineage_genesis(namespace_id: str) -> str:
+    """Return the deterministic pre-purge lineage head for one stable ID."""
+    payload = b"haunt-privacy-lineage-v1\0" + namespace_id.encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def namespace_privacy_lineage_head(
+    conn: sqlite3.Connection, namespace_id: str
+) -> str:
+    """Read the opaque purge lineage head without creating legacy metadata."""
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (PRIVACY_LINEAGE_KEY,)
+    ).fetchone()
+    if row is None:
+        return privacy_lineage_genesis(namespace_id)
+    value = row["value"]
+    if (
+        not isinstance(value, str)
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(ch not in "0123456789abcdef" for ch in value[7:])
+    ):
+        raise NamespacePathError("namespace privacy lineage head is malformed")
+    return value
+
+
+def _rotate_privacy_lineage_head(
+    conn: sqlite3.Connection, namespace_id: str
+) -> str:
+    """Atomically make every pre-purge bundle stale without retaining erased data."""
+    previous = namespace_privacy_lineage_head(conn, namespace_id)
+    material = (
+        b"haunt-privacy-lineage-rotate-v1\0"
+        + previous.encode("ascii")
+        + secrets.token_bytes(32)
+    )
+    current = "sha256:" + hashlib.sha256(material).hexdigest()
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+        (PRIVACY_LINEAGE_KEY, current),
+    )
+    return current
 
 
 @contextmanager
@@ -695,8 +741,21 @@ def _open_mapped_namespace_db(
         )
 
 
-def _open_mapped_namespace_db_with_configuration_lock(
+def _open_mapped_namespace_db_unmaintained(
     path: Path, *, expected: tuple[int | None, int | None]
+) -> sqlite3.Connection:
+    """Open an exact mapped writer without persistent setup or maintenance."""
+    with _sqlite_configuration_lock():
+        return _open_mapped_namespace_db_with_configuration_lock(
+            path, expected=expected, configure=False
+        )
+
+
+def _open_mapped_namespace_db_with_configuration_lock(
+    path: Path,
+    *,
+    expected: tuple[int | None, int | None],
+    configure: bool = True,
 ) -> sqlite3.Connection:
     _validate_all_registered_namespace_dbs_read_only()
     expected_map = {str(path): expected}
@@ -731,10 +790,20 @@ def _open_mapped_namespace_db_with_configuration_lock(
                 [str(path)], expected={str(path): actual}
             )
             _validate_all_registered_namespace_dbs_read_only()
-            result = _configure_connection(
-                conn, path, tighten=False, sidecars=sidecars
-            )
-            conn.preserve_sidecar_claims()
+            if configure:
+                result = _configure_connection(
+                    conn, path, tighten=False, sidecars=sidecars
+                )
+            else:
+                # Import has already completed an exact read-only conflict
+                # preflight. These connection-local controls do not migrate,
+                # rebuild, checkpoint, or alter durable metadata.
+                conn.mark_configured_writer()
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA busy_timeout=5000")
+                result = conn
+            if configure:
+                conn.preserve_sidecar_claims()
             return result
         except Exception:
             if conn is not None:
@@ -1597,6 +1666,10 @@ def _claim_fresh_namespace_db_with_configuration_lock(
     target: Path,
     *,
     prepare: Callable[[sqlite3.Connection], None] | None = None,
+    publication_hook: Callable[
+        [str, Path, tuple[int, int], list[tuple[str, int, int]]], None
+    ]
+    | None = None,
 ) -> _FreshNamespaceClaim:
     """Initialize a fresh DB while holding serialized sidecar configuration.
 
@@ -1604,6 +1677,8 @@ def _claim_fresh_namespace_db_with_configuration_lock(
     temporary pathname.  WAL sidecars belong to that pathname, so publishing
     the hard link only after preparation prevents committed staged data from
     being stranded in a temporary WAL when the final name becomes visible.
+    ``publication_hook`` exposes claimed physical identities at the durable
+    intent, staged, linked, and final-name boundaries; it must not mutate them.
     """
     _validate_unmapped_namespace_target(target)
     root = validate_namespace_root()
@@ -1623,6 +1698,17 @@ def _claim_fresh_namespace_db_with_configuration_lock(
     linked = False
     try:
         sidecars = SQLiteSidecarGuard.acquire(temporary, claim_missing=True)
+        if publication_hook is not None:
+            publication_hook(
+                "claimed",
+                temporary,
+                identity,
+                [
+                    (entry.path.name, entry.identity[0], entry.identity[1])
+                    for entry in sidecars.entries
+                    if entry.identity is not None
+                ],
+            )
         _sqlite_sidecar_open_hook(temporary)
         sidecars.verify()
         conn = _raw_connect(temporary, create=False)
@@ -1649,6 +1735,13 @@ def _claim_fresh_namespace_db_with_configuration_lock(
                 raise NamespacePathError(
                     "fresh namespace preparation could not checkpoint staged data"
                 )
+        sidecar_identities = [
+            (entry.path.name, entry.identity[0], entry.identity[1])
+            for entry in sidecars.entries
+            if entry.identity is not None
+        ]
+        if publication_hook is not None:
+            publication_hook("staged", temporary, identity, sidecar_identities)
         try:
             os.link(temporary, target, follow_symlinks=False)
         except FileExistsError as exc:
@@ -1656,7 +1749,11 @@ def _claim_fresh_namespace_db_with_configuration_lock(
                 f"target label has an unmapped filesystem entry at {target}"
             ) from exc
         linked = True
+        if publication_hook is not None:
+            publication_hook("linked", temporary, identity, sidecar_identities)
         temporary.unlink()
+        if publication_hook is not None:
+            publication_hook("named", temporary, identity, sidecar_identities)
         _fresh_namespace_claim_hook(target)
         validate_namespace_db_paths(
             [str(target)], expected={str(target): identity}
@@ -3932,6 +4029,34 @@ class Store:
         store._initialize_identity(identity)
         return store
 
+    @classmethod
+    def _from_identity_unmaintained(cls, identity: dict[str, Any]) -> "Store":
+        """Open a current-schema writer without migration or projection repair."""
+        store = cls.__new__(cls)
+        store.namespace_id = str(identity["namespace_id"])
+        store.name = str(identity["canonical_label"])
+        store.db_path = Path(str(identity["db_path"]))
+        store._privacy_purge_thread_id = None
+        store.conn = _open_mapped_namespace_db_unmaintained(
+            store.db_path,
+            expected=(identity.get("db_device"), identity.get("db_inode")),
+        )
+        try:
+            store.conn.create_function(
+                "haunt_privacy_purge_authorized",
+                0,
+                lambda: int(
+                    store._privacy_purge_thread_id == get_ident()
+                    and store.conn.in_transaction
+                ),
+            )
+            store.recall_class_available = True
+            store.read_only = False
+            return store
+        except Exception:
+            store.conn.close()
+            raise
+
     def _initialize_identity(self, identity: dict[str, Any]) -> None:
         """Open and finish writer initialization in one sidecar lifecycle.
 
@@ -5040,6 +5165,11 @@ class Store:
                 deleted["lineage_tombstone"] = tombstone
 
             self._prune_erased_only_lineage()
+
+            # A hard purge invalidates every bundle made from the preceding
+            # privacy history. The opaque head retains neither erased IDs nor
+            # erased bytes and rotates in the same transaction as deletion.
+            _rotate_privacy_lineage_head(self.conn, self.namespace_id)
 
             self.conn.commit()
         except Exception:
@@ -6302,6 +6432,52 @@ def open_namespace_identity(
             ):
                 raise NamespacePathError(
                     "opened namespace does not match selected stable identity"
+                )
+            if isinstance(store.conn, _SidecarGuardedConnection):
+                store.conn.verify_storage_guards()
+            return store
+        except Exception:
+            store.close()
+            raise
+
+
+def _open_namespace_identity_unmaintained(
+    namespace_id: str,
+    *,
+    expected_db_path: str | None = None,
+    expected_db_device: int | None = None,
+    expected_db_inode: int | None = None,
+) -> Store:
+    """Open an exact current-schema writer with no migration or graph repair."""
+
+    with _namespace_migration_lock():
+        identity = resolve_namespace_id(namespace_id)
+        if identity is None:
+            raise UnknownNamespaceError(namespace_id)
+        _validate_selected_readonly_identity(
+            identity,
+            expected_db_path=expected_db_path,
+            expected_db_device=expected_db_device,
+            expected_db_inode=expected_db_inode,
+        )
+        store = Store._from_identity_unmaintained(identity)
+        try:
+            current = resolve_namespace_id(namespace_id)
+            if current is None:
+                raise UnknownNamespaceError(namespace_id)
+            _validate_selected_readonly_identity(
+                current,
+                expected_db_path=expected_db_path,
+                expected_db_device=expected_db_device,
+                expected_db_inode=expected_db_inode,
+            )
+            stable_fields = (
+                "namespace_id", "canonical_label", "canonical_label_norm",
+                "db_path", "db_device", "db_inode",
+            )
+            if any(current[field] != identity[field] for field in stable_fields):
+                raise NamespacePathError(
+                    "selected namespace identity changed while opening"
                 )
             if isinstance(store.conn, _SidecarGuardedConnection):
                 store.conn.verify_storage_guards()

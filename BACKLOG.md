@@ -466,6 +466,28 @@ and retain the canonical memory semantics and audit information.
   rejects affinity/type coercion and signed-64 overflow. Legitimate BLOB and
   non-finite REAL values round-trip exactly; BLOB memory content gets neither a
   fake FTS row nor an embedding job.
+- The security-review remediation adds an opaque privacy-lineage head to the
+  semantic namespace identity. Legacy state has a stable-ID-derived genesis;
+  each successful hard purge rotates the head with cryptographic randomness in
+  the erasure transaction. Existing imports require an exact match before any
+  receipt/record merge, while fresh import preserves the head. Standalone and
+  first/middle/last/all correction-chain tests prove raw/base64 canaries cannot
+  be restored after purge/restart, independently purged forks diverge, malformed
+  heads fail closed, and purge failure rolls back.
+- Fresh publication now fsyncs a mode-0600 recovery intent binding the stable
+  namespace ID, bundle digest/head, unpredictable token, and exact claimed
+  primary/sidecar identities. Subprocess exits at intent, staging, both link
+  states, registry precommit, and registry postcommit recover on retry without
+  staged database/sidecar/intent residue. Replaced symlink/hardlink targets are
+  rejected without deleting unrelated bytes.
+- Existing import completes an exact-ID zero-write schema/head/receipt/record
+  preflight before opening a maintenance-free guarded writer, then repeats the
+  checks inside its write transaction. Rejected conflicts preserve durable,
+  projection, job, meta, schema, and SQLite data-version state; a valid existing
+  import still rebuilds destination projections.
+- Manifest counts now require the exact record-table key set and bounded
+  nonnegative JSON integers (booleans forbidden) for each count and total, plus
+  an exact sum and equality with actual parser-charged records.
 - Token-level parsing enforces actual UTF-8, duplicate-key, input/decompressed
   byte, record/count, depth/item, and timeout budgets. Injected whitespace,
   scratch-validation, and SQLite-progress timeouts clean up without a
@@ -485,6 +507,16 @@ and retain the canonical memory semantics and audit information.
   3.10; portability plus E3 alias/sidecar integration passed 182/182 on exact
   Python 3.12/SQLite 3.43/MCP2; diff check was clean. E4 remains **In progress**
   until a fresh independent GPT-5.6 Terra review approves the exact commit.
+- Security-review remediation author evidence on the review-candidate tree:
+  portability, including purge-head/publication-crash/count/preflight attacks,
+  passed 83/83 on Python 3.10 and 3.12; the native purge, correction-lineage,
+  namespace-sidecar/alias, E3, and #48-#52/#67-#68 selection passed 237/237 on
+  both runtimes. The full Python 3.10 suite passed 837 with 1 optional skip and
+  7 expected temporal-generalization failures. Python 3.12 reached 100% of the
+  same native tests, then the embedding runtime aborted during interpreter
+  teardown (`recursive_mutex lock failed`), so that full process is explicitly
+  not counted green; the exact 83- and 237-test Python 3.12 matrices are the
+  cross-version evidence pending fresh independent security/correctness review.
 
 **Non-goals**
 

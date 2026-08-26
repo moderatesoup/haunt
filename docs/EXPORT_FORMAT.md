@@ -43,6 +43,7 @@ The root object has exactly these fields:
   "namespace": {
     "namespace_id": "stable-id",
     "canonical_label": "project",
+    "privacy_lineage_head": "sha256:...",
     "aliases": [
       {"label": "project", "is_canonical": true, "source_alias_norm": null}
     ],
@@ -66,6 +67,15 @@ The namespace identity includes no database path, local repository path,
 device/inode identity, registry migration history, or backup path. Alias source
 references are normalized labels within the same included alias set; missing,
 self-referential, cyclic, or canonical-label dependencies are invalid.
+
+`privacy_lineage_head` is an opaque, privacy-safe history head. A legacy
+namespace with no stored head has a deterministic genesis derived only from its
+already-public stable namespace ID. Every successful hard purge rotates the
+head with cryptographic randomness in the same SQLite transaction as erasure;
+the value retains no erased ID, ID hash, content, or provenance. Existing
+imports require an exact head match before considering records or receipts, so
+a pre-purge or independently purged fork cannot restore erased rows. A fresh
+home preserves the bundle head exactly.
 
 ## Durable record classes
 
@@ -157,6 +167,10 @@ allowed beyond the resolved byte budget, and token consumption enforces actual
 depth, collection items, record count, record bytes, UTF-8 validity, duplicate
 keys, and the monotonic deadline before semantic validation. Manifest counts
 are checked only after actual usage has already been charged.
+Every table count and `total_records` is nevertheless an exact bounded
+nonnegative JSON integer: booleans, floats, strings, negatives, missing/extra
+table keys, a wrong sum, and values above the resolved record budget are
+rejected.
 
 | Budget | Default | Maximum clamp |
 |---|---:|---:|
@@ -180,15 +194,31 @@ byte-semantically identical. A receipt permits an exact replay to write
 nothing, but is never trusted without rechecking every durable record; deleted
 or changed rows cause a conflict.
 
+Fresh publication is restart-recoverable. Before staging can become visible,
+Haunt fsyncs a private mode-0600 intent that binds an unpredictable token and
+the bundle digest/head to the exact namespace ID, target name, and claimed
+primary/sidecar device+inode identities. Recovery runs under the namespace
+migration and SQLite configuration locks. An uncommitted intent removes only
+names that still match those recorded identities; a committed intent must also
+match the registry identity and staged receipt before cleanup. Replaced,
+unrelated, symlinked, or unexpected-hardlink files fail closed and are never
+deleted. A crash before, during, or immediately after registry publication can
+therefore be retried without an exposed unmapped database or leftover staged
+WAL/SHM/journal files.
+
 Any parse, limit, timeout, validation, collision, constraint, or write failure
 rolls back and closes scratch/staged resources. The guarantee is zero committed
 logical namespace, registry, durable record, graph/FTS, vector, or job changes;
 it is not byte-identical SQLite allocation or WAL files.
 
-For an existing destination, the importer opens the selected stable namespace
-ID with the preflighted database path/device/inode while holding the migration
-lock, then revalidates identity, aliases, remotes, and storage before commit.
-A concurrent label retirement/reassignment cannot retarget the write.
+For an existing destination, the importer first opens the selected stable
+namespace ID through the guarded zero-write reader and checks current schema,
+privacy head, receipt, and every durable row. A rejected conflict therefore
+cannot run schema migration, graph repair, or writer configuration. Only a
+clean preflight opens an exact path/device/inode guarded writer that deliberately
+skips maintenance, then repeats the checks inside `BEGIN IMMEDIATE` and
+revalidates identity, aliases, remotes, and storage before commit. A concurrent
+label retirement/reassignment cannot retarget the write.
 
 ## Public surfaces
 
