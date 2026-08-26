@@ -231,6 +231,16 @@ PURGE_SAFE_PROVENANCE = provenance_json(
 # retry forever.
 EMBED_MAX_ATTEMPTS_DEFAULT = 5
 
+# C4: rows-per-namespace bound on Store.drain_embedding_queue() (see
+# _embed_drain_limit). Hook writes always queue with defer_embedding=True
+# and nothing upstream of `haunt bootstrap` drains that queue except read
+# traffic hitting recall() -- a namespace that is written to but rarely
+# searched can grow an unbounded backlog. 500 is enough to clear a normal
+# session's worth of deferred writes in one `haunt bootstrap` call without
+# risking an operator's terminal hanging on a pathological backlog (real
+# dogfooded example: 1363 queued rows in one namespace).
+EMBED_DRAIN_LIMIT_DEFAULT = 500
+
 
 class UnknownNamespaceError(ValueError):
     """Raised when a read/mutation targets a namespace that does not exist."""
@@ -827,6 +837,26 @@ def _embed_max_attempts() -> int:
     except ValueError:
         value = EMBED_MAX_ATTEMPTS_DEFAULT
     return max(1, min(value, 1000))
+
+
+def _embed_drain_limit() -> int:
+    """HAUNT_EMBED_DRAIN_LIMIT, clamped. Same parse/fallback/clamp style as
+    _embed_max_attempts / HAUNT_TOOL_IO_MAX_CHARS (cursor_hook._tool_io_cap).
+
+    C4: bounds Store.drain_embedding_queue(), the out-of-band backlog drain
+    that runs from `haunt bootstrap` (see bootstrap.py) independently of
+    read/recall traffic. It must never block indefinitely on a huge
+    backlog, so this is the max number of rows one drain call will attempt
+    per namespace before it reports back and stops -- see `stopped_early`
+    / `remaining` in that method's return value for how a caller tells
+    "fully drained" from "drained N, M still queued".
+    """
+    raw = (os.environ.get("HAUNT_EMBED_DRAIN_LIMIT") or "").strip()
+    try:
+        value = int(raw) if raw else EMBED_DRAIN_LIMIT_DEFAULT
+    except ValueError:
+        value = EMBED_DRAIN_LIMIT_DEFAULT
+    return max(1, min(value, 100_000))
 
 
 def init_registry() -> None:
@@ -4559,6 +4589,123 @@ class Store:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def _pending_embedding_jobs(self, max_attempts: int) -> int:
+        """Count rows still eligible for process_embedding_jobs's SELECT
+        (attempts < max_attempts) -- the complement of
+        _exhausted_embedding_jobs. The pre-existing `embedding_jobs` count
+        in stats() (raw COUNT(*) over the whole table) always equals this
+        plus _exhausted_embedding_jobs.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs WHERE attempts < ?",
+            (max_attempts,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def _vec_memories_count(self) -> int | None:
+        """Rows in vec_memories, or None when there is no usable vector
+        index to count.
+
+        None covers two situations stats() must not conflate with "zero
+        embedded, otherwise healthy": (a) this connection has no sqlite-vec
+        extension loaded at all (real FTS-only mode -- HAUNT_FTS_ONLY=1 or
+        HAUNT_EMBED_MODEL=off), and (b) the extension is loaded but
+        ensure_vec_table() has never run successfully, so the vec0 virtual
+        table does not exist yet. (b) is the C4 bug report's second
+        namespace: 313/313 rows unembedded, no vec_memories table at all,
+        yet still answering recall as though it were healthy -- silently
+        degraded to FTS-only with no signal to the caller.
+        """
+        if not self.vec_ok():
+            return None
+        try:
+            row = self.conn.execute("SELECT COUNT(*) FROM vec_memories").fetchone()
+        except sqlite3.Error:
+            return None
+        return int(row[0]) if row else 0
+
+    def drain_embedding_queue(
+        self, *, max_rows: int | None = None, batch_size: int = 64
+    ) -> dict[str, Any]:
+        """Bounded, synchronous drain of this namespace's embedding_jobs
+        backlog: calls process_embedding_jobs in a loop until the queue is
+        actually empty, a row bound is hit, or a call makes no progress.
+
+        C4 defect this closes: hook writes always pass defer_embedding=True
+        (see observe()), so a hook-driven write never reaches the
+        `commit and not defer_embedding` drain inside observe(). Before
+        this method, the only other caller of process_embedding_jobs was
+        recall() -- so the queue shrank only as a side effect of read
+        traffic, and a namespace that is written to but rarely searched
+        grew an unbounded backlog (see EMBED_DRAIN_LIMIT_DEFAULT's
+        docstring for real numbers from the dogfooded corpus). This method
+        is the out-of-band drain entry point: bootstrap.py calls it once
+        per namespace from `haunt bootstrap`, independent of any recall.
+
+        HARD CONSTRAINT: never call this from a hook's synchronous path.
+        Hooks run under a watchdog with a short timeout and embedding is
+        slow; this loop can legitimately run for a while against a real
+        backlog. It exists to be invoked from an explicit, out-of-band
+        operator command only.
+
+        Bounded by HAUNT_EMBED_DRAIN_LIMIT rows per call (see
+        _embed_drain_limit) so it cannot block indefinitely on a huge
+        backlog -- the return value's `stopped_early` / `remaining` let a
+        caller tell "fully drained" from "drained 500, 863 still queued".
+        The loop also stops the instant a batch makes zero progress
+        (processed == failed == 0 while rows are still queued): that is
+        what process_embedding_jobs reports when no embed backend is
+        available at all, which happens without HAUNT_FTS_ONLY ever being
+        set -- observe() still enqueues embedding_jobs rows whenever
+        embedding comes back empty, so a namespace can have a real backlog
+        with nothing able to drain it. Those rows never get their
+        `attempts` touched in that branch, so re-selecting them on another
+        iteration would just spin without changing anything.
+        """
+        bound = max(0, int(max_rows if max_rows is not None else _embed_drain_limit()))
+        batch = max(1, int(batch_size))
+        max_attempts = _embed_max_attempts()
+        processed = 0
+        failed = 0
+        batches = 0
+        available = True
+        while processed + failed < bound:
+            budget = bound - (processed + failed)
+            report = self.process_embedding_jobs(limit=min(batch, budget))
+            batches += 1
+            available = report.get("available", available)
+            if not report.get("queued"):
+                # SELECT came back empty: nothing left under the attempts
+                # cap. Fully drained (modulo whatever is exhausted).
+                break
+            processed += report.get("processed", 0)
+            failed += report.get("failed", 0)
+            if not report.get("processed") and not report.get("failed"):
+                # No progress possible right now -- e.g. no embed backend
+                # available, the one branch of process_embedding_jobs that
+                # returns without touching `attempts`. Looping again would
+                # just re-select the same rows forever.
+                break
+        remaining = self._pending_embedding_jobs(max_attempts)
+        exhausted = self._exhausted_embedding_jobs(max_attempts)
+        if remaining == 0:
+            stop_reason = "drained"
+        elif not available:
+            stop_reason = "blocked"
+        else:
+            stop_reason = "bound"
+        return {
+            "processed": processed,
+            "failed": failed,
+            "batches": batches,
+            "remaining": remaining,
+            "exhausted": exhausted,
+            "available": available,
+            "bound": bound,
+            "stop_reason": stop_reason,
+            "stopped_early": remaining > 0,
+        }
+
     def embeddings_stale(self) -> bool:
         """True when stored vectors do not match the currently loaded model."""
         es = embed_state()
@@ -4716,6 +4863,17 @@ class Store:
         wal = db.with_suffix(db.suffix + "-wal")
         if wal.exists():
             size += wal.stat().st_size
+        # C4 embedding-coverage fields. `embedding_jobs` above is the raw
+        # table count and is left exactly as-is (existing consumers depend
+        # on it); embedding_pending + embedding_exhausted always sum to it.
+        # vector_index is the "is there anything usable to search" signal:
+        # False both for real FTS-only namespaces (no sqlite-vec extension
+        # loaded) and for a namespace where the extension is loaded but
+        # vec_memories was never created (nothing has ever embedded
+        # successfully yet) -- see _vec_memories_count. Without this flag,
+        # both of those look identical to "fully embedded, nothing queued".
+        max_attempts = _embed_max_attempts()
+        vec_count = self._vec_memories_count()
         return json_safe_sqlite(
             {
                 "namespace": self.name,
@@ -4733,6 +4891,11 @@ class Store:
                 "last_write": last["ts"] if last else None,
                 "last_event_time": last["event_time"] if last else None,
                 "wal": True,
+                "memories_embedded": vec_count if vec_count is not None else 0,
+                "embedding_pending": self._pending_embedding_jobs(max_attempts),
+                "embedding_exhausted": self._exhausted_embedding_jobs(max_attempts),
+                "vector_index": vec_count is not None,
+                "vector_index_version": self.vec_version(),
             }
         )
 

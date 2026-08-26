@@ -96,6 +96,24 @@ class BootstrapError(SystemExit):
         super().__init__(1)
 
 
+def _drain_worth_reporting(drained: dict) -> bool:
+    """True when Store.drain_embedding_queue() found or touched anything.
+
+    Keeps reembed_report (and format_report's rendering of it) from
+    growing one no-op entry per namespace on every `haunt bootstrap` call
+    -- most namespaces most of the time have an empty embedding_jobs queue,
+    and drain_embedding_queue always makes at least one
+    process_embedding_jobs() call (so `batches` alone is not a useful
+    "was there ever a backlog" signal).
+    """
+    return bool(
+        drained.get("processed")
+        or drained.get("failed")
+        or drained.get("remaining")
+        or drained.get("exhausted")
+    )
+
+
 def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict:
     home = ensure_layout()
     repair_private_modes(home)
@@ -136,10 +154,22 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
         for row in list_namespace_rows():
             with _S(row["name"], create=False) as st:
                 changed = st.ensure_current_embeddings()
-                if changed:
-                    changed["namespace"] = row["name"]
-                    changed["auto"] = True
-                    reembed_report.append(changed)
+                # C4: hook writes always defer embedding (defer_embedding=True),
+                # so a hook-driven write never reaches the drain gated on
+                # `commit and not defer_embedding` inside Store.observe().
+                # Before this, the only other caller of process_embedding_jobs
+                # was recall() -- so a namespace that is written to but rarely
+                # searched grew an unbounded backlog. This out-of-band call
+                # drains it, bounded by HAUNT_EMBED_DRAIN_LIMIT per namespace
+                # per bootstrap run so a huge backlog cannot block `haunt
+                # bootstrap` indefinitely -- see Store.drain_embedding_queue.
+                drained = st.drain_embedding_queue()
+                entry = dict(changed) if changed else {}
+                if changed or _drain_worth_reporting(drained):
+                    entry["drain"] = drained
+                    entry["namespace"] = row["name"]
+                    entry["auto"] = True
+                    reembed_report.append(entry)
     from haunt.desktop import install_desktop_icon
     icon_result = install_desktop_icon()
 
@@ -221,10 +251,30 @@ def format_report(report: dict) -> str:
         lines.append(f"embed bytes   {report['download_bytes']}")
     lines.append(f"namespace     {report['default_namespace']} → {report['default_db']}")
     for row in report.get("reembed") or []:
-        lines.append(
-            f"reembed       ns={row.get('namespace')} updated={row.get('updated')}/"
-            f"{row.get('total')} dim={row.get('dim')} model={row.get('model')}"
-        )
+        # Full-reembed entries (auto, stale model/dim, or --reembed) carry
+        # updated/total/dim/model. C4-only drain entries (nothing stale,
+        # just a backlog to clear) may carry only `drain` -- render each
+        # part only when present so a drain-only row doesn't print
+        # "updated=None/None".
+        line = f"reembed       ns={row.get('namespace')}"
+        if "updated" in row:
+            line += (
+                f" updated={row.get('updated')}/{row.get('total')}"
+                f" dim={row.get('dim')} model={row.get('model')}"
+            )
+        drain = row.get("drain")
+        if drain:
+            status = (
+                "fully drained"
+                if not drain.get("stopped_early")
+                else f"stopped early ({drain.get('stop_reason')})"
+            )
+            line += (
+                f" drain processed={drain.get('processed')} failed={drain.get('failed')}"
+                f" remaining={drain.get('remaining')} exhausted={drain.get('exhausted')}"
+                f" [{status}]"
+            )
+        lines.append(line)
     embed = report.get("embed", {})
     if embed.get("available") and not embed.get("fallback"):
         model_id = embed.get("loaded", "")
