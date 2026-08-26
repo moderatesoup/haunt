@@ -553,7 +553,10 @@ def test_purge_derived_delete_failure_rolls_back_everything(
             with pytest.raises(sqlite3.DatabaseError):
                 st.purge(target.memory_id)
         finally:
-            st.conn.set_authorizer(None)
+            # Python 3.10 does not reliably clear an authorizer with None.
+            # Install an explicit permissive callback so the rollback snapshot
+            # below tests Haunt's state instead of the test hook itself.
+            st.conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK)
 
         assert _all_table_snapshot(st) == before
         assert st.get_memory(target.memory_id)["content"] == canary
