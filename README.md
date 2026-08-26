@@ -205,6 +205,8 @@ By default, one `haunt-mcp` process is bound immutably to one canonical namespac
 
 Namespace labels are registry aliases for one stable identity and one existing SQLite file. `namespace migrate` changes the canonical display label while retaining the old label; `namespace alias` leaves the canonical label unchanged. Both commands are dry-run unless `--apply` is supplied, refuse normalized-label/repository/database collisions, and record the old/new labels plus any supplied normalized repository identity. They never copy, rename, or move memory databases. Repeating the same apply is safe.
 
+When upgrading a legacy registry that contains several labels for the same database path, Haunt preserves every label as an alias and deterministically selects the canonical label by earliest `created_at`, then normalized label, then display label.
+
 `namespace retire-alias` checks only references Haunt owns in its registry: the canonical-label record, repository bindings, and dependent aliases. Editor, MCP-host, hook, and other external configuration cannot be verified from the registry; inspect and update those settings before applying retirement. Missing or stale external configuration is an operator caveat, not an automatic blocker.
 
 `memory_purge` is marked destructive and is off for MCP by default. Use the confirmed `haunt delete` CLI flow, or explicitly launch a process with `HAUNT_MCP_ALLOW_PURGE=1`. Admin mode alone does not enable purge.

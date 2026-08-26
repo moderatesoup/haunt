@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -14,6 +15,15 @@ SAFE_NS = re.compile(r"[^a-zA-Z0-9._-]+")
 
 DIR_MODE = 0o700
 FILE_MODE = 0o600
+
+_RegistryFingerprint = tuple[
+    tuple[int, int, int, int, int] | None,
+    tuple[int, int, int, int, int] | None,
+]
+_NAMESPACE_ALIAS_CACHE: dict[
+    tuple[str, str], tuple[_RegistryFingerprint, str, Path]
+] = {}
+_NAMESPACE_ALIAS_CACHE_LOCK = threading.Lock()
 
 
 def haunt_home() -> Path:
@@ -43,13 +53,10 @@ def bin_dir() -> Path:
 
 
 def namespace_db_path(name: str) -> Path:
-    legacy_path = namespaces_dir() / f"{safe_name(name)}.db"
-    if legacy_path.exists():
-        return legacy_path
     registered = _registered_db_path(name)
     if registered is not None:
         return registered
-    return legacy_path
+    return namespaces_dir() / f"{safe_name(name)}.db"
 
 
 def safe_name(name: str) -> str:
@@ -69,10 +76,52 @@ def normalize_namespace_label(name: str) -> str:
     return safe_name(name).casefold()
 
 
+def _alias_cache_key(name: str) -> tuple[str, str]:
+    return str(registry_path()), normalize_namespace_label(name)
+
+
+def _registry_fingerprint() -> _RegistryFingerprint:
+    base = registry_path()
+
+    def _stat(path: Path) -> tuple[int, int, int, int, int] | None:
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+            int(info.st_ctime_ns),
+        )
+
+    return _stat(base), _stat(Path(str(base) + "-wal"))
+
+
+def _remember_registered_alias(name: str, canonical: str, db_path: Path) -> None:
+    with _NAMESPACE_ALIAS_CACHE_LOCK:
+        _NAMESPACE_ALIAS_CACHE[_alias_cache_key(name)] = (
+            _registry_fingerprint(),
+            canonical,
+            db_path,
+        )
+
+
+def _forget_registered_alias(name: str) -> None:
+    with _NAMESPACE_ALIAS_CACHE_LOCK:
+        _NAMESPACE_ALIAS_CACHE.pop(_alias_cache_key(name), None)
+
+
 def _registered_alias(name: str) -> tuple[str, Path] | None:
     """Read an alias mapping without initializing or mutating the registry."""
+    with _NAMESPACE_ALIAS_CACHE_LOCK:
+        cached = _NAMESPACE_ALIAS_CACHE.get(_alias_cache_key(name))
+    if cached is not None and cached[0] == _registry_fingerprint():
+        return cached[1], cached[2]
     path = registry_path()
     if not path.is_file():
+        _forget_registered_alias(name)
         return None
     conn: sqlite3.Connection | None = None
     try:
@@ -96,19 +145,25 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
                 (normalize_namespace_label(name),),
             ).fetchone()
             if row:
-                return str(row["canonical_label"]), Path(str(row["db_path"]))
+                result = str(row["canonical_label"]), Path(str(row["db_path"]))
+                _remember_registered_alias(name, *result)
+                return result
+            _forget_registered_alias(name)
             return None
         row = conn.execute(
             "SELECT name, db_path FROM namespaces WHERE name=?",
             (safe_name(name),),
         ).fetchone()
         if row:
-            return str(row["name"]), Path(str(row["db_path"]))
+            result = str(row["name"]), Path(str(row["db_path"]))
+            _remember_registered_alias(name, *result)
+            return result
     except sqlite3.Error:
         return None
     finally:
         if conn is not None:
             conn.close()
+    _forget_registered_alias(name)
     return None
 
 
@@ -126,7 +181,17 @@ def repository_identity(remote_url: str | None) -> str | None:
     path = ""
     if "://" in raw:
         parsed = urlsplit(raw)
-        host = (parsed.hostname or "").lower()
+        hostname = (parsed.hostname or "").lower()
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        host = hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        default_ports = {"http": 80, "https": 443, "ssh": 22, "git": 9418}
+        if port is not None and port != default_ports.get(parsed.scheme.lower()):
+            host = f"{host}:{port}"
         path = parsed.path
     else:
         scp = re.match(r"^(?:[^@/\s]+@)?([^:/\s]+):(.+)$", raw)
@@ -297,7 +362,8 @@ def tighten_db_files(path: Path) -> None:
     """chmod 0600 on a sqlite db and sibling WAL/SHM, if they exist."""
     for extra in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
         if extra.is_file() and not _is_user_home(extra):
-            extra.chmod(FILE_MODE)
+            if (extra.stat().st_mode & 0o777) != FILE_MODE:
+                extra.chmod(FILE_MODE)
 
 
 def repair_private_modes(root: Path | None = None) -> list[str]:

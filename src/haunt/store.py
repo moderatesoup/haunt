@@ -18,7 +18,9 @@ from haunt.embed import embed_one
 from haunt.embed import embed_texts
 from haunt.embed import state as embed_state
 from haunt.paths import (
+    _forget_registered_alias,
     _git_repo_context,
+    _remember_registered_alias,
     ensure_layout,
     haunt_home,
     mkdir_private,
@@ -63,7 +65,7 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 8: validated, versioned source provenance on events.
 SCHEMA_VERSION = 8
 SCHEMA_VERSION_KEY = "schema_version"
-REGISTRY_SCHEMA_VERSION = 2
+REGISTRY_SCHEMA_VERSION = 3
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -216,48 +218,58 @@ def init_registry() -> None:
             "SELECT value FROM registry_meta WHERE key=?",
             (REGISTRY_SCHEMA_VERSION_KEY,),
         ).fetchone()
-        legacy_count = int(conn.execute("SELECT COUNT(*) FROM namespaces").fetchone()[0])
-        identity_count = int(
-            conn.execute("SELECT COUNT(*) FROM namespace_identities").fetchone()[0]
+        legacy_rows = conn.execute(
+            "SELECT name,repo_path,db_path,created_at,updated_at FROM namespaces"
+        ).fetchall()
+        fully_projected = all(
+            conn.execute(
+                """SELECT 1
+                   FROM namespace_aliases a
+                   JOIN namespace_identities i ON i.namespace_id=a.namespace_id
+                   WHERE a.normalized_label=? AND i.db_path=?""",
+                (normalize_namespace_label(str(row["name"])), str(row["db_path"])),
+            ).fetchone()
+            is not None
+            for row in legacy_rows
         )
         if (
             version_row
             and str(version_row["value"]) == str(REGISTRY_SCHEMA_VERSION)
-            and identity_count >= legacy_count
+            and fully_projected
         ):
             return
         # Additively project every legacy registry row into the identity model.
         # The legacy table and its database paths remain the compatibility view.
         conn.execute("BEGIN IMMEDIATE")
         try:
-            for row in conn.execute(
-                "SELECT name, repo_path, db_path, created_at, updated_at FROM namespaces"
-            ).fetchall():
-                label = str(row["name"])
-                norm = normalize_namespace_label(label)
-                by_alias = conn.execute(
-                    "SELECT namespace_id FROM namespace_aliases WHERE normalized_label=?",
-                    (norm,),
-                ).fetchone()
+            by_db: dict[str, list[sqlite3.Row]] = {}
+            for row in legacy_rows:
+                by_db.setdefault(str(row["db_path"]), []).append(row)
+            for db_path in sorted(by_db):
+                # A legacy registry can contain several labels for one file.
+                # The earliest created_at wins; normalized/display labels break ties.
+                group = sorted(
+                    by_db[db_path],
+                    key=lambda item: (
+                        str(item["created_at"]),
+                        normalize_namespace_label(str(item["name"])),
+                        str(item["name"]),
+                    ),
+                )
+                canonical_row = group[0]
+                canonical_label = str(canonical_row["name"])
+                canonical_norm = normalize_namespace_label(canonical_label)
                 by_path = conn.execute(
-                    "SELECT namespace_id FROM namespace_identities WHERE db_path=?",
-                    (str(row["db_path"]),),
+                    """SELECT namespace_id,canonical_label_norm
+                       FROM namespace_identities WHERE db_path=?""",
+                    (db_path,),
                 ).fetchone()
-                if by_alias and (not by_path or by_alias["namespace_id"] != by_path["namespace_id"]):
-                    raise NamespaceCollisionError(
-                        f"legacy namespace label collision after normalization: {label!r}"
-                    )
                 if by_path:
                     namespace_id = str(by_path["namespace_id"])
-                    if not by_alias:
-                        conn.execute(
-                            """INSERT INTO namespace_aliases(
-                                   normalized_label,label,namespace_id,is_canonical,created_at
-                               ) VALUES (?,?,?,?,?)""",
-                            (norm, label, namespace_id, 0, str(row["created_at"])),
-                        )
+                    effective_canonical_norm = str(by_path["canonical_label_norm"])
                 else:
                     namespace_id = new_id()
+                    effective_canonical_norm = canonical_norm
                     conn.execute(
                         """INSERT INTO namespace_identities(
                                namespace_id,canonical_label,canonical_label_norm,db_path,
@@ -265,30 +277,51 @@ def init_registry() -> None:
                            ) VALUES (?,?,?,?,?,?)""",
                         (
                             namespace_id,
-                            label,
-                            norm,
-                            str(row["db_path"]),
-                            str(row["created_at"]),
-                            str(row["updated_at"]),
+                            canonical_label,
+                            canonical_norm,
+                            db_path,
+                            str(canonical_row["created_at"]),
+                            str(canonical_row["updated_at"]),
                         ),
                     )
+                for row in group:
+                    label = str(row["name"])
+                    norm = normalize_namespace_label(label)
+                    by_alias = conn.execute(
+                        "SELECT namespace_id FROM namespace_aliases WHERE normalized_label=?",
+                        (norm,),
+                    ).fetchone()
+                    if by_alias and by_alias["namespace_id"] != namespace_id:
+                        raise NamespaceCollisionError(
+                            f"legacy namespace label collision after normalization: {label!r}"
+                        )
+                    if by_alias:
+                        continue
                     conn.execute(
                         """INSERT INTO namespace_aliases(
                                normalized_label,label,namespace_id,is_canonical,created_at
                            ) VALUES (?,?,?,?,?)""",
-                        (norm, label, namespace_id, 1, str(row["created_at"])),
+                        (
+                            norm,
+                            label,
+                            namespace_id,
+                            int(norm == effective_canonical_norm),
+                            str(row["created_at"]),
+                        ),
                     )
-                legacy_repo = str(row["repo_path"] or "").strip()
-                if legacy_repo:
-                    remote_identity, local_path = _repository_context(legacy_repo)
-                    _bind_repository(
-                        conn,
-                        namespace_id=namespace_id,
-                        label_norm=norm,
-                        repo_identity=remote_identity,
-                        repo_path=local_path,
-                        now=str(row["updated_at"]),
-                    )
+                binding_rows = [*group[1:], canonical_row]
+                for row in binding_rows:
+                    legacy_repo = str(row["repo_path"] or "").strip()
+                    if legacy_repo:
+                        remote_identity, local_path = _repository_context(legacy_repo)
+                        _bind_repository(
+                            conn,
+                            namespace_id=namespace_id,
+                            label_norm=normalize_namespace_label(str(row["name"])),
+                            repo_identity=remote_identity,
+                            repo_path=local_path,
+                            now=str(row["updated_at"]),
+                        )
             conn.execute(
                 "INSERT OR REPLACE INTO registry_meta(key,value) VALUES (?,?)",
                 (REGISTRY_SCHEMA_VERSION_KEY, str(REGISTRY_SCHEMA_VERSION)),
@@ -732,19 +765,60 @@ def _identity_row(conn: sqlite3.Connection, label: str) -> sqlite3.Row | None:
 def resolve_namespace_identity(name: str) -> dict[str, Any] | None:
     """Resolve a label to its canonical identity without creating a namespace."""
     conn = _registry()
+    result: dict[str, Any] | None = None
     try:
         row = _identity_row(conn, name)
         if not row:
-            return None
-        aliases = conn.execute(
-            """SELECT label, normalized_label, is_canonical, source_alias_norm
-               FROM namespace_aliases WHERE namespace_id=?
-               ORDER BY is_canonical DESC, normalized_label""",
-            (row["namespace_id"],),
-        ).fetchall()
-        return {**dict(row), "aliases": [dict(alias) for alias in aliases]}
+            result = None
+        else:
+            aliases = conn.execute(
+                """SELECT label, normalized_label, is_canonical, source_alias_norm
+                   FROM namespace_aliases WHERE namespace_id=?
+                   ORDER BY is_canonical DESC, normalized_label""",
+                (row["namespace_id"],),
+            ).fetchall()
+            result = {**dict(row), "aliases": [dict(alias) for alias in aliases]}
     finally:
         conn.close()
+    if result:
+        for alias in result["aliases"]:
+            _remember_registered_alias(
+                str(alias["label"]),
+                str(result["canonical_label"]),
+                Path(str(result["db_path"])),
+            )
+    return result
+
+
+def resolve_namespace_id(namespace_id: str) -> dict[str, Any] | None:
+    """Resolve a stable namespace ID to its current canonical record."""
+    conn = _registry()
+    result: dict[str, Any] | None = None
+    try:
+        row = conn.execute(
+            "SELECT * FROM namespace_identities WHERE namespace_id=?",
+            (namespace_id,),
+        ).fetchone()
+        if not row:
+            result = None
+        else:
+            aliases = conn.execute(
+                """SELECT label,normalized_label,is_canonical,source_alias_norm
+                   FROM namespace_aliases WHERE namespace_id=?
+                   ORDER BY is_canonical DESC,normalized_label""",
+                (namespace_id,),
+            ).fetchall()
+            result = {**dict(row), "aliases": [dict(alias) for alias in aliases]}
+    finally:
+        conn.close()
+    if result:
+        for alias in result["aliases"]:
+            _remember_registered_alias(
+                str(alias["label"]),
+                str(result["canonical_label"]),
+                Path(str(result["db_path"])),
+            )
+    return result
 
 
 def _bind_repository(
@@ -899,6 +973,7 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
             ns.commit()
     finally:
         ns.close()
+    resolve_namespace_identity(label)
     return db
 
 
@@ -912,16 +987,20 @@ def namespace_exists(name: str) -> bool:
 
 def touch_namespace(name: str) -> None:
     conn = _registry()
+    namespace_id: str | None = None
     try:
         row = _identity_row(conn, name)
         if not row:
             return
+        namespace_id = str(row["namespace_id"])
         now = now_iso()
         conn.execute("UPDATE namespace_identities SET updated_at=? WHERE namespace_id=?", (now, row["namespace_id"]))
         conn.execute("UPDATE namespaces SET updated_at=? WHERE db_path=?", (now, row["db_path"]))
         conn.commit()
     finally:
         conn.close()
+    if namespace_id:
+        resolve_namespace_id(namespace_id)
 
 
 def list_namespace_rows() -> list[dict[str, Any]]:
@@ -930,9 +1009,15 @@ def list_namespace_rows() -> list[dict[str, Any]]:
     try:
         rows = conn.execute(
             """SELECT i.namespace_id,i.canonical_label AS name,
-                      n.repo_path,i.db_path,i.created_at,i.updated_at
+                      (
+                          SELECT n.repo_path FROM namespaces n
+                          WHERE n.db_path=i.db_path
+                          ORDER BY CASE WHEN n.name=i.canonical_label THEN 0 ELSE 1 END,
+                                   n.created_at,n.name
+                          LIMIT 1
+                      ) AS repo_path,
+                      i.db_path,i.created_at,i.updated_at
                FROM namespace_identities i
-               LEFT JOIN namespaces n ON n.db_path=i.db_path
                ORDER BY i.canonical_label_norm"""
         ).fetchall()
         out: list[dict[str, Any]] = []
@@ -976,6 +1061,8 @@ def change_namespace_label(
         if not source:
             raise UnknownNamespaceError(old_display)
         namespace_id = str(source["namespace_id"])
+        previous_canonical_label = str(source["canonical_label"])
+        previous_canonical_norm = str(source["canonical_label_norm"])
         recorded_repo_identity = repo_identity or (f"path:{repo}" if repo else None)
         if recorded_repo_identity is None:
             existing_binding = conn.execute(
@@ -1022,8 +1109,8 @@ def change_namespace_label(
             "action": action,
             "mode": "apply" if apply else "dry-run",
             "namespace_id": namespace_id,
-            "canonical_before": str(source["canonical_label"]),
-            "canonical_after": new_display if action == "rename" else str(source["canonical_label"]),
+            "canonical_before": previous_canonical_label,
+            "canonical_after": new_display if action == "rename" else previous_canonical_label,
             "old_label": old_display,
             "old_normalized": old_norm,
             "new_label": new_display,
@@ -1075,12 +1162,34 @@ def change_namespace_label(
                 (new_display, new_norm, now, namespace_id),
             )
             conn.execute(
-                "UPDATE namespaces SET name=?,updated_at=? WHERE db_path=?",
-                (new_display, now, source["db_path"]),
+                "UPDATE namespace_aliases SET source_alias_norm=NULL WHERE normalized_label=?",
+                (old_norm,),
             )
+            legacy_names = [
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT name FROM namespaces WHERE db_path=?",
+                    (source["db_path"],),
+                ).fetchall()
+            ]
+            has_new_legacy = any(
+                normalize_namespace_label(name) == new_norm for name in legacy_names
+            )
+            for legacy_name in legacy_names:
+                if normalize_namespace_label(legacy_name) != previous_canonical_norm:
+                    continue
+                if has_new_legacy:
+                    conn.execute("DELETE FROM namespaces WHERE name=?", (legacy_name,))
+                else:
+                    conn.execute(
+                        "UPDATE namespaces SET name=?,updated_at=? WHERE name=?",
+                        (new_display, now, legacy_name),
+                    )
+                    has_new_legacy = True
             conn.execute(
-                "UPDATE repository_bindings SET label_norm=?,updated_at=? WHERE namespace_id=? AND label_norm=?",
-                (new_norm, now, namespace_id, old_norm),
+                """UPDATE repository_bindings SET label_norm=?,updated_at=?
+                   WHERE namespace_id=? AND label_norm IN (?,?)""",
+                (new_norm, now, namespace_id, old_norm, previous_canonical_norm),
             )
         repo_key = recorded_repo_identity or ""
         before = conn.total_changes
@@ -1172,11 +1281,19 @@ def retire_namespace_alias(label: str, *, apply: bool = False) -> dict[str, Any]
                 )
             return result
         if apply:
+            for legacy in conn.execute(
+                "SELECT name FROM namespaces WHERE db_path=?",
+                (row["db_path"],),
+            ).fetchall():
+                legacy_name = str(legacy["name"])
+                if normalize_namespace_label(legacy_name) == norm:
+                    conn.execute("DELETE FROM namespaces WHERE name=?", (legacy_name,))
             conn.execute(
                 "DELETE FROM namespace_aliases WHERE normalized_label=?",
                 (norm,),
             )
             conn.commit()
+            _forget_registered_alias(display)
             result["retired"] = True
         else:
             conn.rollback()

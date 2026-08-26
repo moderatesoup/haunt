@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from typing import Any, Optional
 
@@ -23,6 +24,7 @@ from haunt.store import (
     list_namespaces,
     namespace_exists,
     open_existing,
+    resolve_namespace_id,
     resolve_namespace_identity,
 )
 from haunt.temporal import TemporalParseError
@@ -64,12 +66,19 @@ def _truthy(raw: str | None) -> bool:
     return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+class _AuthorityPin:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.namespace_id: str | None = None
+
+
 @dataclass(frozen=True)
 class MCPAuthority:
     bound_namespace: str
     bound_namespace_id: str | None = None
     admin: bool = False
     allow_purge: bool = False
+    _pin: _AuthorityPin = field(default_factory=_AuthorityPin, compare=False, repr=False)
 
     @classmethod
     def from_environment(cls) -> "MCPAuthority":
@@ -84,28 +93,82 @@ class MCPAuthority:
             allow_purge=_truthy(os.environ.get("HAUNT_MCP_ALLOW_PURGE")),
         )
 
+    def _pin_identity(self, identity: dict[str, Any]) -> str:
+        namespace_id = str(identity["namespace_id"])
+        with self._pin.lock:
+            pinned = self._pin.namespace_id or self.bound_namespace_id
+            if pinned and pinned != namespace_id:
+                raise MCPAuthorityError(
+                    f"MCP process is bound to namespace {self.bound_namespace!r}; "
+                    f"access to {identity['canonical_label']!r} is denied"
+                )
+            self._pin.namespace_id = namespace_id
+        return str(identity["canonical_label"])
+
+    def _current_identity(self, *, require_pinned: bool = True) -> dict[str, Any] | None:
+        with self._pin.lock:
+            pinned = self._pin.namespace_id or self.bound_namespace_id
+        if pinned:
+            identity = resolve_namespace_id(pinned)
+            if identity is None and require_pinned:
+                raise MCPAuthorityError(
+                    f"MCP process bound identity {pinned!r} is no longer registered"
+                )
+            return identity
+        identity = resolve_namespace_identity(self.bound_namespace)
+        if identity:
+            self._pin_identity(identity)
+        return identity
+
+    def current_namespace(self) -> str:
+        identity = self._current_identity(require_pinned=False)
+        return str(identity["canonical_label"]) if identity else self.bound_namespace
+
+    def pin_namespace(self, namespace: str) -> str:
+        identity = resolve_namespace_identity(namespace)
+        if not identity:
+            raise MCPAuthorityError(f"unknown namespace after creation: {namespace}")
+        if self.admin:
+            return str(identity["canonical_label"])
+        return self._pin_identity(identity)
+
     def select(self, requested: str | None) -> str:
         if self.admin:
-            return resolve_namespace(requested) if requested else self.bound_namespace
+            return resolve_namespace(requested) if requested else self.current_namespace()
+        bound_identity = self._current_identity()
         if requested is None:
-            return self.bound_namespace
+            return (
+                str(bound_identity["canonical_label"])
+                if bound_identity
+                else self.bound_namespace
+            )
         selected_identity = resolve_namespace_identity(requested)
         selected = (
             str(selected_identity["canonical_label"])
             if selected_identity
             else safe_name(requested)
         )
-        same_identity = bool(
-            selected_identity
-            and self.bound_namespace_id
-            and selected_identity["namespace_id"] == self.bound_namespace_id
-        )
-        if not same_identity and selected != self.bound_namespace:
+        if bound_identity:
+            same_identity = bool(
+                selected_identity
+                and selected_identity["namespace_id"] == bound_identity["namespace_id"]
+            )
+        else:
+            same_identity = (
+                selected_identity is None
+                and safe_name(requested).casefold()
+                == safe_name(self.bound_namespace).casefold()
+            )
+        if not same_identity:
             raise MCPAuthorityError(
-                f"MCP process is bound to namespace {self.bound_namespace!r}; "
+                f"MCP process is bound to namespace {self.current_namespace()!r}; "
                 f"access to {selected!r} is denied"
             )
-        return self.bound_namespace
+        return (
+            str(bound_identity["canonical_label"])
+            if bound_identity
+            else self.bound_namespace
+        )
 
 
 _MCP_AUTHORITY: MCPAuthority | None = None
@@ -132,7 +195,7 @@ def _authority_error(exc: MCPAuthorityError) -> str:
         {
             "ok": False,
             "error": str(exc),
-            "namespace": authority.bound_namespace,
+            "namespace": authority.current_namespace(),
             "admin": authority.admin,
         }
     )
@@ -184,6 +247,7 @@ def memory_observe(
         return _authority_error(exc)
     try:
         with Store(ns) as st:
+            ns = _authority().pin_namespace(st.name)
             r = st.observe(
                 text,
                 role=role,
@@ -329,11 +393,13 @@ def memory_health(namespace: Optional[str] = None) -> str:
 )
 def memory_namespaces() -> str:
     authority = _authority()
-    rows = list_namespaces(only=None if authority.admin else authority.bound_namespace)
+    rows = list_namespaces(
+        only=None if authority.admin else authority.current_namespace()
+    )
     return _json(
         {
             "namespaces": rows,
-            "bound_namespace": authority.bound_namespace,
+            "bound_namespace": authority.current_namespace(),
             "admin": authority.admin,
         }
     )
@@ -425,6 +491,7 @@ def memory_procedure(
             return _json({"ok": False, "error": "body is required for write"})
         try:
             with Store(ns) as st:
+                ns = _authority().pin_namespace(st.name)
                 r = st.procedure_write(
                     name,
                     body,
