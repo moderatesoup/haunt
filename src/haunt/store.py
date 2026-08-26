@@ -3805,6 +3805,542 @@ def retire_namespace_alias(label: str, *, apply: bool = False) -> dict[str, Any]
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Backlog C3: reconcile namespaces that are already split.
+#
+# E3 (above) deliberately refuses to let a rename/alias repoint an existing,
+# independently populated namespace onto a different one's identity --
+# `_change_namespace_label` raises NamespaceCollisionError the moment
+# `new_label` already resolves to a different namespace_id. That refusal is
+# correct and this code does not weaken it. C3 solves a different problem:
+# two namespaces that already hold real, disjoint content for the same
+# repository (see `_registered_namespace_for_repo` in paths.py for why C1/C2
+# do not auto-heal this).
+#
+# Scope, stated explicitly (see the C3 task/report for the full reasoning):
+#   - One-directional. SOURCE is opened read-only for this call's entire
+#     lifetime and is never written to, never migrated, never backed up
+#     *over*. TARGET gains every SOURCE row it does not already have; TARGET
+#     keeps everything it already had. The registry (labels/aliases/
+#     identities/repository_bindings) is never modified -- both labels
+#     remain independently resolvable after apply, exactly as before, except
+#     TARGET's database now holds the union.
+#   - Embeddings are dropped and re-queued, never copied: `memories.embedding`
+#     is forced NULL on every inserted row and a fresh `embedding_jobs` row
+#     takes its place, so a copied memory is always keyword-searchable
+#     immediately and vector-searchable again once the next drain runs under
+#     TARGET's own configured model. `vec_memories` (the vec0 virtual table)
+#     is never read or written.
+#   - `meta` (per-database schema_version/embed_dim/... configuration) is
+#     never copied; TARGET keeps its own.
+#   - Every other content-bearing table (sessions, events, memories,
+#     entities, relations, entity_mentions, relation_evidence, corrections,
+#     lineage_tombstones) is copied verbatim by primary key, preserving IDs,
+#     timestamps, and correction/provenance lineage exactly. A primary key
+#     present on both sides with byte-identical content (ignoring
+#     `embedding`) is a no-op; present on both sides with *different*
+#     content is a hard, whole-operation refusal -- never a guess, never a
+#     partial merge. Graph rows (entities/relations/mentions/evidence) are
+#     copied by the same id-preserving rule; this does not attempt to
+#     resolve two differently-`id`'d entities that merely share a name --
+#     that is entity resolution, a different and harder problem this does
+#     not claim to solve.
+# ---------------------------------------------------------------------------
+
+_RECONCILE_TABLES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
+    ("sessions", ("id",), frozenset()),
+    ("events", ("id",), frozenset()),
+    ("memories", ("id",), frozenset({"embedding"})),
+    ("entities", ("id",), frozenset()),
+    ("relations", ("id",), frozenset()),
+    ("entity_mentions", ("event_id", "entity_id"), frozenset()),
+    ("relation_evidence", ("event_id", "src_entity", "rel", "dst_entity"), frozenset()),
+    ("lineage_tombstones", ("tombstone_id",), frozenset()),
+    ("corrections", ("id",), frozenset()),
+)
+
+# Columns outside the primary key that are also required to be globally
+# unique (enforced by a partial UNIQUE index). A SOURCE row queued for
+# insertion whose value collides with a *different* TARGET row on one of
+# these is exactly as unsafe as a primary-key collision and refuses the
+# whole operation rather than letting SQLite's own constraint fail mid-write.
+_RECONCILE_SECONDARY_UNIQUE_KEYS: dict[str, tuple[str, ...]] = {
+    "events": ("idempotency_key",),
+    "corrections": (
+        "idempotency_key",
+        "target_memory_id",
+        "target_tombstone_id",
+        "replacement_memory_id",
+        "replacement_tombstone_id",
+    ),
+}
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [
+        str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    ]
+
+
+def _reconcile_sort_key(pk: tuple[Any, ...]) -> tuple[str, ...]:
+    return tuple("" if value is None else str(value) for value in pk)
+
+
+def _fetch_rows_by_pk(
+    conn: sqlite3.Connection, table: str, pk_columns: tuple[str, ...]
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    columns = _table_columns(conn, table)
+    rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+    result: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        record = {column: row[column] for column in columns}
+        pk = tuple(record[column] for column in pk_columns)
+        result[pk] = record
+    return result
+
+
+def _json_safe_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: json_safe_sqlite(value) for key, value in row.items()}
+
+
+def _rows_equal(
+    a: dict[str, Any], b: dict[str, Any], ignore_columns: frozenset[str]
+) -> bool:
+    keys = set(a) | set(b)
+    return all(
+        column in ignore_columns or a.get(column) == b.get(column) for column in keys
+    )
+
+
+@dataclass
+class _TableDiff:
+    table: str
+    to_insert: list[dict[str, Any]]
+    already_present: int
+    colliding_pks: list[tuple[Any, ...]]
+    secondary_collisions: list[tuple[str, Any]]
+
+
+def _diff_reconcile_table(
+    table: str,
+    ignore_columns: frozenset[str],
+    secondary_keys: tuple[str, ...],
+    source_rows: dict[tuple[Any, ...], dict[str, Any]],
+    target_rows: dict[tuple[Any, ...], dict[str, Any]],
+) -> _TableDiff:
+    to_insert: list[dict[str, Any]] = []
+    already_present = 0
+    colliding: list[tuple[Any, ...]] = []
+    for pk in sorted(source_rows, key=_reconcile_sort_key):
+        row = source_rows[pk]
+        existing = target_rows.get(pk)
+        if existing is None:
+            to_insert.append(row)
+        elif _rows_equal(row, existing, ignore_columns):
+            already_present += 1
+        else:
+            colliding.append(pk)
+    secondary_collisions: list[tuple[str, Any]] = []
+    for column in secondary_keys:
+        target_values = {
+            row[column] for row in target_rows.values() if row.get(column) is not None
+        }
+        for row in to_insert:
+            value = row.get(column)
+            if value is not None and value in target_values:
+                secondary_collisions.append((column, value))
+    return _TableDiff(table, to_insert, already_present, colliding, secondary_collisions)
+
+
+def _reconcile_content_state_digest(
+    source_conn: sqlite3.Connection, target_conn: sqlite3.Connection
+) -> tuple[str, dict[str, _TableDiff]]:
+    """Diff every mergeable table and return a digest bound to every row read.
+
+    The digest covers full row content (JSON-safe-encoded, so BLOB columns
+    such as ``corrections.request_payload`` hash safely) on both sides, not
+    just the rows that would move -- any change to either namespace's
+    existing content between a dry-run and its apply must be detected, not
+    only a change to what would be inserted.
+    """
+    diffs: dict[str, _TableDiff] = {}
+    per_table_digest: dict[str, Any] = {}
+    for table, pk_columns, ignore_columns in _RECONCILE_TABLES:
+        source_columns = _table_columns(source_conn, table)
+        target_columns = _table_columns(target_conn, table)
+        if source_columns != target_columns:
+            raise NamespaceMigrationError(
+                f"{table!r} column layout differs between the two namespaces "
+                "even though both report the current schema version; "
+                "refusing to guess a mapping"
+            )
+        source_rows = _fetch_rows_by_pk(source_conn, table, pk_columns)
+        target_rows = _fetch_rows_by_pk(target_conn, table, pk_columns)
+        diffs[table] = _diff_reconcile_table(
+            table,
+            ignore_columns,
+            _RECONCILE_SECONDARY_UNIQUE_KEYS.get(table, ()),
+            source_rows,
+            target_rows,
+        )
+        per_table_digest[table] = {
+            "source": sorted(
+                _canonical_json({"pk": list(pk), "row": _json_safe_row(row)})
+                for pk, row in source_rows.items()
+            ),
+            "target": sorted(
+                _canonical_json({"pk": list(pk), "row": _json_safe_row(row)})
+                for pk, row in target_rows.items()
+            ),
+        }
+    return _state_digest(per_table_digest), diffs
+
+
+def _reconcile_unsafe_reasons(diffs: dict[str, _TableDiff]) -> list[str]:
+    reasons: list[str] = []
+    for table, diff in diffs.items():
+        if diff.colliding_pks:
+            reasons.append(
+                f"{table}: {len(diff.colliding_pks)} row(s) share an id with "
+                "different content"
+            )
+        if diff.secondary_collisions:
+            reasons.append(
+                f"{table}: {len(diff.secondary_collisions)} row(s) collide on a "
+                "unique column other than id"
+            )
+    return reasons
+
+
+def _plan_namespace_reconciliation(source_label: str, target_label: str) -> dict[str, Any]:
+    """Plan a one-directional SOURCE-into-TARGET content reconciliation.
+
+    Strictly read-only: opens both namespaces through the same zero-write
+    snapshot path ordinary recall uses and never writes anything, including
+    no backup. Raises UnknownNamespaceError, NamespaceCollisionError, or
+    NamespaceMigrationError instead of ever returning an unsafe plan --
+    apply() cannot be reached without a plan_digest, and dry-run never
+    manufactures one for an unsafe state.
+    """
+    source_display = safe_name(source_label)
+    target_display = safe_name(target_label)
+    source_store = open_existing_readonly(source_display)
+    try:
+        target_store = open_existing_readonly(target_display)
+        try:
+            if source_store.namespace_id == target_store.namespace_id:
+                raise NamespaceMigrationError(
+                    f"{source_display!r} and {target_display!r} already resolve to "
+                    "the same namespace; nothing to reconcile"
+                )
+            for role, store in (("source", source_store), ("target", target_store)):
+                if store.schema_version != SCHEMA_VERSION:
+                    raise NamespaceMigrationError(
+                        f"{role} namespace {store.name!r} is at schema version "
+                        f"{store.schema_version}, expected {SCHEMA_VERSION}; open it "
+                        "normally (for example `haunt namespaces`) to complete its "
+                        "pending migration before reconciling"
+                    )
+            content_digest, diffs = _reconcile_content_state_digest(
+                source_store.conn, target_store.conn
+            )
+            unsafe_reasons = _reconcile_unsafe_reasons(diffs)
+            if unsafe_reasons:
+                raise NamespaceCollisionError(
+                    f"cannot safely reconcile {source_display!r} into "
+                    f"{target_display!r}: " + "; ".join(unsafe_reasons)
+                )
+            report: dict[str, Any] = {
+                "action": "reconcile",
+                "mode": "dry-run",
+                "source": source_display,
+                "target": target_display,
+                "source_namespace_id": source_store.namespace_id,
+                "target_namespace_id": target_store.namespace_id,
+                "source_db_path": str(source_store.db_path),
+                "target_db_path": str(target_store.db_path),
+                "schema_version": SCHEMA_VERSION,
+                "tables": {
+                    table: {
+                        "insert_into_target": len(diff.to_insert),
+                        "already_consistent": diff.already_present,
+                        "colliding_ids": [list(pk) for pk in diff.colliding_pks],
+                        "secondary_collisions": [
+                            {"column": column, "value": json_safe_sqlite(value)}
+                            for column, value in diff.secondary_collisions
+                        ],
+                    }
+                    for table, diff in diffs.items()
+                },
+                "total_rows_to_insert": sum(
+                    len(diff.to_insert) for diff in diffs.values()
+                ),
+            }
+            report["content_state_digest"] = content_digest
+            operation = {key: value for key, value in report.items() if key != "mode"}
+            report["plan_digest"] = _state_digest(
+                {"protocol": "haunt-namespace-reconcile-v1", "operation": operation}
+            )
+            return report
+        finally:
+            target_store.close()
+    finally:
+        source_store.close()
+
+
+def _backup_namespace_database(store: "ReadOnlyStore", *, purpose: str) -> _VerifiedRegistryBackup:
+    """Create and verify a private backup of one namespace database file.
+
+    Mirrors `_backup_registry`'s descriptor-relative verification exactly,
+    applied to a full namespace database instead of the small registry file.
+    Reads through the caller's already-open zero-write snapshot connection
+    (see `open_existing_readonly`), so a live WAL writer can never produce a
+    torn copy. The backup lands under the same private `<HAUNT_HOME>/backups`
+    directory `_backup_registry` uses, mode 0600, alongside a sha256 and a
+    verified `PRAGMA integrity_check` result.
+    """
+    backup_root, backup_root_fd = _private_backup_root()
+    fd = -1
+    final_fd = -1
+    temp_name: str | None = None
+    final_name: str | None = None
+    backup_identity: tuple[int, int] | None = None
+    try:
+        _registry_backup_hook("before_create", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        temp_name = f".namespace-backup-{new_id()}.db"
+        fd = os.open(
+            temp_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | required_o_nofollow()
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=backup_root_fd,
+        )
+        os.fchmod(fd, 0o600)
+        created = os.fstat(fd)
+        backup_identity = int(created.st_dev), int(created.st_ino)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
+        assert isinstance(store.conn, _SidecarGuardedConnection)
+        store.conn.copy_primary_to_fd(fd)
+        os.fsync(fd)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
+        _registry_backup_hook("before_link", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
+        final_name = f"namespace-{safe_name(store.name)}-{purpose}-{new_id()}.db"
+        os.link(
+            temp_name,
+            final_name,
+            src_dir_fd=backup_root_fd,
+            dst_dir_fd=backup_root_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temp_name, dir_fd=backup_root_fd)
+        temp_name = None
+        os.fsync(backup_root_fd)
+        final_fd = os.open(
+            final_name,
+            os.O_RDONLY | required_o_nofollow() | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=backup_root_fd,
+        )
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("namespace backup identity changed")
+        digest = _held_file_sha256(final_fd)
+        os.fsync(final_fd)
+        _registry_backup_hook("before_final_verify", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("namespace backup identity changed")
+        final = backup_root / final_name
+        verified = _held_sqlite_integrity(final_fd, backup_identity)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("namespace backup identity changed")
+        if verified != "ok" or _held_file_sha256(final_fd) != digest:
+            raise NamespaceMigrationError("namespace backup verification failed")
+        os.fsync(final_fd)
+        os.fsync(backup_root_fd)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("namespace backup identity changed")
+        return _VerifiedRegistryBackup(
+            {
+                "path": str(final),
+                "sha256": digest,
+                "integrity": verified,
+                "namespace": store.name,
+            },
+            backup_root=backup_root,
+            backup_root_fd=os.dup(backup_root_fd),
+            final_name=final_name,
+            final_fd=os.dup(final_fd),
+            identity=backup_identity,
+        )
+    except Exception:
+        _unlink_relative_identity(backup_root_fd, temp_name, backup_identity)
+        _unlink_relative_identity(backup_root_fd, final_name, backup_identity)
+        try:
+            os.fsync(backup_root_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if final_fd >= 0:
+            os.close(final_fd)
+        if fd >= 0:
+            os.close(fd)
+        os.close(backup_root_fd)
+
+
+def _execute_reconciliation_writes(
+    source_conn: sqlite3.Connection, target_conn: sqlite3.Connection
+) -> dict[str, dict[str, int]]:
+    """Diff every table fresh, one last time, and copy SOURCE's new rows.
+
+    The caller must already hold TARGET inside a write transaction
+    (``BEGIN IMMEDIATE`` .. commit/rollback). This is the final safety gate:
+    it never trusts an earlier plan's row-level conclusions, only its own
+    fresh read of both databases at this exact moment. Raises
+    NamespaceCollisionError/NamespaceMigrationError and writes nothing if any
+    table still has an unresolved collision right now, even though an
+    earlier dry-run reported none.
+    """
+    _content_digest, diffs = _reconcile_content_state_digest(source_conn, target_conn)
+    unsafe_reasons = _reconcile_unsafe_reasons(diffs)
+    if unsafe_reasons:
+        raise NamespaceCollisionError(
+            "cannot safely reconcile: " + "; ".join(unsafe_reasons)
+        )
+    table_results: dict[str, dict[str, int]] = {}
+    for table, _pk_columns, _ignore in _RECONCILE_TABLES:
+        diff = diffs[table]
+        columns = _table_columns(target_conn, table)
+        placeholders = ",".join("?" for _ in columns)
+        column_list = ",".join(columns)
+        inserted = 0
+        for row in diff.to_insert:
+            values = dict(row)
+            if table == "memories":
+                values["embedding"] = None
+            target_conn.execute(
+                f"INSERT INTO {table}({column_list}) VALUES ({placeholders})",
+                tuple(values[column] for column in columns),
+            )
+            inserted += 1
+            if table == "memories":
+                target_conn.execute(
+                    "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
+                    (values["id"], values["content"]),
+                )
+                target_conn.execute(
+                    """
+                    INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
+                    VALUES (?, ?)
+                    """,
+                    (values["id"], values["created_at"]),
+                )
+        table_results[table] = {
+            "inserted": inserted,
+            "already_consistent": diff.already_present,
+        }
+    return table_results
+
+
+def _apply_namespace_reconciliation(
+    source_label: str, target_label: str, *, plan_digest: str
+) -> dict[str, Any]:
+    plan = _plan_namespace_reconciliation(source_label, target_label)
+    if plan_digest != plan["plan_digest"]:
+        raise NamespaceMigrationError(
+            "reconciliation plan digest does not match the current state of "
+            "either namespace; run the dry-run again"
+        )
+    source_display = str(plan["source"])
+    target_display = str(plan["target"])
+    source_ro = open_existing_readonly(source_display)
+    source_backup: _VerifiedRegistryBackup | None = None
+    target_backup: _VerifiedRegistryBackup | None = None
+    committed = False
+    table_results: dict[str, dict[str, int]] = {}
+    try:
+        source_backup = _backup_namespace_database(source_ro, purpose="reconcile-source")
+        target_ro = open_existing_readonly(target_display)
+        try:
+            target_backup = _backup_namespace_database(target_ro, purpose="reconcile-target")
+        finally:
+            target_ro.close()
+        target_store = open_existing(target_display)
+        try:
+            target_store.conn.execute("BEGIN IMMEDIATE")
+            try:
+                table_results = _execute_reconciliation_writes(
+                    source_ro.conn, target_store.conn
+                )
+            except Exception:
+                target_store.conn.rollback()
+                raise
+            target_store.conn.commit()
+            committed = True
+        finally:
+            target_store.close()
+        source_backup.verify_for_record()
+        target_backup.verify_for_record()
+        return {
+            **plan,
+            "mode": "apply",
+            "applied": True,
+            "source_backup": dict(source_backup),
+            "target_backup": dict(target_backup),
+            "rows_inserted": table_results,
+        }
+    except Exception:
+        if not committed:
+            if source_backup is not None:
+                source_backup.discard()
+            if target_backup is not None:
+                target_backup.discard()
+        raise
+    finally:
+        source_ro.close()
+        if source_backup is not None:
+            source_backup.close()
+        if target_backup is not None:
+            target_backup.close()
+
+
+def reconcile_namespaces(
+    source: str,
+    target: str,
+    *,
+    apply: bool = False,
+    plan_digest: str | None = None,
+) -> dict[str, Any]:
+    """Plan or apply backlog C3: copy SOURCE's content into TARGET.
+
+    Operator-invoked only -- nothing in hooks, MCP, or bootstrap calls this.
+    Dry-run (``apply=False``, the default) performs zero writes and returns a
+    plan with a ``plan_digest`` bound to the exact current content of both
+    namespaces. ``apply=True`` requires that exact digest and refuses
+    (``NamespaceMigrationError``) if either namespace's content has changed
+    since, including a change caused by an earlier apply of this same
+    digest: a completed reconciliation is idempotent when the whole
+    dry-run-then-apply cycle is repeated, but literally replaying one
+    already-applied digest is refused rather than silently treated as a
+    no-op, consistent with `change_namespace_label`'s digest contract.
+    """
+    if not apply:
+        return _plan_namespace_reconciliation(source, target)
+    if not plan_digest:
+        raise NamespaceMigrationError(
+            "apply requires the plan_digest returned by a preceding dry-run"
+        )
+    with _namespace_migration_lock():
+        return _apply_namespace_reconciliation(source, target, plan_digest=plan_digest)
+
+
 def verbatim_text(
     content: str = "",
     tool_name: str | None = None,
