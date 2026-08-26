@@ -216,6 +216,41 @@ def _tool_excluded(name: str) -> bool:
     return any(fnmatchcase(candidate, pattern) for pattern in patterns)
 
 
+# C6 capture policy: EMBED_EXCLUDE_TOOLS is a *separate* control from
+# HAUNT_EXCLUDE_TOOLS / _tool_excluded above. HAUNT_EXCLUDE_TOOLS is a
+# privacy opt-out -- matching tools are dropped before observe() is ever
+# called, so there is no event, no memory row, no FTS entry, nothing. That
+# is deliberate: users exclude a tool because its output holds something
+# they do not want persisted at all, and this code must never soften that
+# into "persisted but not embedded".
+#
+# HAUNT_EMBED_EXCLUDE_TOOLS controls something narrower: matching tool rows
+# are still captured in full (event + memory + FTS, via Store.observe's
+# skip_embedding=True), just never embedded or enqueued into
+# embedding_jobs. The record stays complete and keyword-searchable; only
+# vector-index capacity is saved.
+EMBED_EXCLUDE_TOOLS_DEFAULT = "Bash,Read"
+
+
+def _embed_excluded(name: str) -> bool:
+    """Match comma-separated, case-insensitive tool globs deciding embed policy.
+
+    Same glob syntax as _tool_excluded, but a different default: an unset
+    HAUNT_EMBED_EXCLUDE_TOOLS means "use EMBED_EXCLUDE_TOOLS_DEFAULT", not
+    "exclude nothing" -- a user has to set it to "" explicitly to embed
+    every tool. The default excludes Bash and Read because, measured on a
+    dogfooded corpus, tool rows are ~80% of all memory and Bash alone is
+    ~76% of those (Read ~14%) -- almost entirely raw shell/file output that
+    FTS keyword search already covers as well as a vector index would.
+    """
+    raw = os.environ.get("HAUNT_EMBED_EXCLUDE_TOOLS")
+    if raw is None:
+        raw = EMBED_EXCLUDE_TOOLS_DEFAULT
+    patterns = [part.strip().casefold() for part in raw.split(",") if part.strip()]
+    candidate = (name or "").strip().casefold()
+    return any(fnmatchcase(candidate, pattern) for pattern in patterns)
+
+
 def _tool_io_cap() -> int:
     raw = (os.environ.get("HAUNT_TOOL_IO_MAX_CHARS") or "").strip()
     try:
@@ -367,6 +402,7 @@ def _handle_post_tool(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         tool_name=name,
         tool_input=tool_input,
         tool_output=tool_output,
+        skip_embedding=_embed_excluded(name),
     )
     return {}
 
@@ -387,6 +423,7 @@ def _handle_after_shell(store: Store, payload: dict[str, Any]) -> dict[str, Any]
         tool_name="Shell",
         tool_input=tool_input,
         tool_output=tool_output,
+        skip_embedding=_embed_excluded("Shell"),
     )
     return {}
 
@@ -408,6 +445,7 @@ def _handle_after_mcp(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
         tool_name=name or "mcp",
         tool_input=tool_input,
         tool_output=tool_output,
+        skip_embedding=_embed_excluded(name or "mcp"),
     )
     return {}
 
@@ -449,6 +487,14 @@ def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dic
         # This entry point is lifecycle residue by definition; do not classify
         # ordinary prompts/replies from their text.
         recall_class="task",
+        # Fixed ceremony row, not user content: keyed on role/tier (both
+        # already literal right above) rather than matching the "haunt
+        # session start" string, so a future wording tweak to this message
+        # can't silently start embedding it again -- and so this decision
+        # can't accidentally fire on unrelated content that happens to
+        # share the same text. One real namespace held 58 of these rows,
+        # all byte-identical, 55 embedded: pure vector-index waste.
+        skip_embedding=True,
     )
     wv = store.worldview()
     card = format_worldview_card(wv)

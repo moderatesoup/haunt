@@ -19,6 +19,7 @@ from typing import Any
 
 from haunt.cursor_hook import (
     _as_text,
+    _embed_excluded,
     _is_memory_tool,
     _prepare_tool_io,
     _tool_excluded,
@@ -159,6 +160,11 @@ def _handle_session_start(
         tier="coordinate",
         # SessionStart is host lifecycle residue, not a text-derived guess.
         recall_class="task",
+        # Fixed ceremony row, not user content: keyed on role/tier (both
+        # already literal right above), not the "haunt session start"
+        # string -- see cursor_hook._handle_session_start for the full
+        # rationale (same policy, same shape, mirrored across both hosts).
+        skip_embedding=True,
     )
     wv = store.worldview()
     card = format_worldview_card(wv)
@@ -205,6 +211,7 @@ def _handle_post_tool_use(store: Store, payload: dict[str, Any]) -> dict[str, An
         tool_name=name,
         tool_input=tool_input,
         tool_output=tool_output,
+        skip_embedding=_embed_excluded(name),
     )
     return {}
 

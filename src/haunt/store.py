@@ -223,6 +223,14 @@ PURGE_SAFE_PROVENANCE = provenance_json(
     }
 )
 
+# C5: cap retries on a permanently-failing embedding_jobs row (see
+# _embed_max_attempts / process_embedding_jobs). Embedding runs locally with
+# no network hop, so most failures are deterministic (malformed content, a
+# dimension mismatch) rather than transient -- a handful of attempts is
+# enough to ride out a genuine transient blip without letting a poison row
+# retry forever.
+EMBED_MAX_ATTEMPTS_DEFAULT = 5
+
 
 class UnknownNamespaceError(ValueError):
     """Raised when a read/mutation targets a namespace that does not exist."""
@@ -803,6 +811,22 @@ def _vec_loaded(conn: sqlite3.Connection) -> bool:
         return True
     except sqlite3.Error:
         return False
+
+
+def _embed_max_attempts() -> int:
+    """HAUNT_EMBED_MAX_ATTEMPTS, clamped. Same style as HAUNT_TOOL_IO_MAX_CHARS
+    (cursor_hook._tool_io_cap) and HAUNT_EMBED_MAX_LEN (embed._max_len): parse,
+    fall back to the default on anything unparsable, then clamp so a bad env
+    value can't disable the cap (<=0, which would make every row selectable
+    forever) or set it so low a single transient failure is treated as
+    permanent.
+    """
+    raw = (os.environ.get("HAUNT_EMBED_MAX_ATTEMPTS") or "").strip()
+    try:
+        value = int(raw) if raw else EMBED_MAX_ATTEMPTS_DEFAULT
+    except ValueError:
+        value = EMBED_MAX_ATTEMPTS_DEFAULT
+    return max(1, min(value, 1000))
 
 
 def init_registry() -> None:
@@ -4072,6 +4096,35 @@ class Store:
         valid_to: str | None = None,
         idempotency_key: str | None = None,
         defer_embedding: bool = False,
+        # C6 capture policy: the row is still written in full (event +
+        # memory + FTS) but is never embedded and never enqueued into
+        # embedding_jobs -- see the two sites gated on this flag below.
+        #
+        # Placement: observe() is the single entry point shared by the CLI,
+        # the MCP memory_observe tool, and both hooks, so this is a
+        # capability observe() exposes rather than a policy it decides for
+        # itself. Deriving "skip this" from tool_name/role/tier *inside*
+        # observe() would apply to every caller uniformly, including a
+        # direct memory_observe MCP call -- a user who explicitly asks to
+        # store something with tool_name="Bash" would then be silently
+        # opted out of embedding it, with no way to tell from the MCP
+        # response alone why. Requiring an explicit, caller-supplied flag
+        # keeps that decision with the caller that actually knows the
+        # policy context (today: HAUNT_EXCLUDE_TOOLS's sibling
+        # HAUNT_EMBED_EXCLUDE_TOOLS and the fixed session-start ceremony
+        # row, both applied in claude_hook.py / cursor_hook.py) and leaves
+        # every other caller's behavior, including MCP and CLI, unchanged
+        # by default.
+        #
+        # Reversibility: a skip_embedding row is never added to
+        # embedding_jobs, so process_embedding_jobs's queue drain can never
+        # pick it up -- excluded stays excluded under normal operation.
+        # Store.reembed() (a full, explicit, operator-triggered rebuild) is
+        # the deliberate exception: it re-embeds every row in `memories`
+        # regardless of embedding_jobs membership, so it also covers
+        # previously-excluded rows. That is the escape hatch today; there
+        # is no per-row "un-exclude just this one" command.
+        skip_embedding: bool = False,
         commit: bool = True,
     ) -> ObserveResult:
         # Provenance is validated before sessions, events, embedding jobs, or
@@ -4144,8 +4197,17 @@ class Store:
             )
             blob = None
             embedded = False
+            # skip_embedding forces the same "no vector" path as
+            # defer_embedding below, but -- unlike defer_embedding, which
+            # only *delays* embedding to the background queue -- it also
+            # suppresses the embedding_jobs enqueue a few lines down
+            # (embedding_queued). A deferred row is picked up by the next
+            # drain; a skip_embedding row is not queued at all, so it stays
+            # excluded until something explicitly re-embeds it.
             vec = (
-                None if defer_embedding else (embed_one(text) if text.strip() else None)
+                None
+                if (defer_embedding or skip_embedding)
+                else (embed_one(text) if text.strip() else None)
             )
             if vec is not None:
                 blob = sqlite_vec.serialize_float32(vec)
@@ -4167,11 +4229,17 @@ class Store:
                 """,
                 (memory_id, event_id, tier, text, blob, vf, vt, ts),
             )
+            # Unconditional -- runs regardless of skip_embedding (or
+            # defer_embedding, or blob). This is what makes a capture-policy
+            # exclusion reversible in practice: the row stays fully
+            # keyword-searchable even though it is never vector-searchable.
             self.conn.execute(
                 "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
                 (memory_id, text),
             )
-            embedding_queued = bool(blob is None and text.strip())
+            embedding_queued = bool(
+                blob is None and text.strip() and not skip_embedding
+            )
             if embedding_queued:
                 self.conn.execute(
                     """
@@ -4301,20 +4369,47 @@ class Store:
         )
 
     def process_embedding_jobs(self, *, limit: int = 64) -> dict[str, Any]:
-        """Embed queued hook writes in a persistent, model-owning process."""
+        """Embed queued hook writes in a persistent, model-owning process.
+
+        C5: two failure-isolation guarantees on top of the historical
+        behavior, both required because this queue is unattended -- nothing
+        upstream retries a call that comes back empty-handed.
+
+        - A row at or over HAUNT_EMBED_MAX_ATTEMPTS is excluded by the
+          SELECT below, so a permanently-failing row can no longer sit at
+          the head of the queue (ordered by queued_at) and block every job
+          behind it forever. It is still counted via `exhausted` in the
+          return value so the backlog stays discoverable instead of
+          silently stuck -- see one real namespace that had 1363 of 1491
+          rows wedged this way.
+        - embed_texts() is tried once for the whole batch first (the fast,
+          common path: one model call for up to `limit` rows). Only if that
+          raises, or returns something that doesn't line up 1:1 with the
+          batch, do we fall back to embedding each row with its own model
+          call (_embed_rows_individually). That isolates one poison row to
+          its own attempts/last_error instead of failing every row queued
+          alongside it, without paying the per-row cost on the common path.
+        """
         cap = clamp_limit(limit, default=64)
+        max_attempts = _embed_max_attempts()
         queued = self.conn.execute(
             """
             SELECT j.memory_id, m.content
             FROM embedding_jobs j
             JOIN memories m ON m.id=j.memory_id
+            WHERE j.attempts < ?
             ORDER BY j.queued_at ASC, j.rowid ASC
             LIMIT ?
             """,
-            (cap,),
+            (max_attempts, cap),
         ).fetchall()
         if not queued:
-            return {"queued": 0, "processed": 0, "failed": 0}
+            return {
+                "queued": 0,
+                "processed": 0,
+                "failed": 0,
+                "exhausted": self._exhausted_embedding_jobs(max_attempts),
+            }
         es = embed_state()
         if not es.available:
             return {
@@ -4322,49 +4417,57 @@ class Store:
                 "processed": 0,
                 "failed": 0,
                 "available": False,
+                "exhausted": self._exhausted_embedding_jobs(max_attempts),
             }
+
+        batch_error: str | None = None
+        vectors: dict[str, list[float]] = {}
+        errors: dict[str, str] = {}
         try:
-            vectors = embed_texts(
+            batch = embed_texts(
                 [row["content"] if row["content"] else " " for row in queued]
             )
         except Exception as exc:
-            message = str(exc)[:1000]
-            self.conn.executemany(
-                """
-                UPDATE embedding_jobs
-                SET attempts=attempts+1, last_error=? WHERE memory_id=?
-                """,
-                [(message, row["memory_id"]) for row in queued],
-            )
-            self.conn.commit()
-            return {
-                "queued": len(queued),
-                "processed": 0,
-                "failed": len(queued),
-                "error": message,
-            }
-        if not vectors:
-            message = "embedding backend returned no vectors"
-            self.conn.executemany(
-                """
-                UPDATE embedding_jobs
-                SET attempts=attempts+1, last_error=? WHERE memory_id=?
-                """,
-                [(message, row["memory_id"]) for row in queued],
-            )
-            self.conn.commit()
-            return {
-                "queued": len(queued),
-                "processed": 0,
-                "failed": len(queued),
-                "error": message,
-            }
+            batch = None
+            batch_error = str(exc)[:1000]
+        if batch is not None and len(batch) == len(queued):
+            vectors = {row["memory_id"]: vec for row, vec in zip(queued, batch)}
+        else:
+            if batch_error is None:
+                batch_error = (
+                    "embedding backend returned no vectors"
+                    if not batch
+                    else (
+                        f"embedding backend returned {len(batch)} vectors "
+                        f"for {len(queued)} inputs"
+                    )
+                )
+            # The batch call failed as a whole (raised, returned nothing, or
+            # returned a mismatched count -- any of which makes positional
+            # zip() pairing unsafe). Fall back to one embed call per row so
+            # a single poison row cannot fail its batch-mates too.
+            vectors, errors = self._embed_rows_individually(queued)
 
         ensure_vec_table(self.conn, es.dim, commit=False)
         processed = 0
         failed = 0
-        for row, vec in zip(queued, vectors):
+        for row in queued:
             memory_id = row["memory_id"]
+            vec = vectors.get(memory_id)
+            if vec is None:
+                message = errors.get(
+                    memory_id,
+                    batch_error or "embedding backend returned no vector",
+                )
+                self.conn.execute(
+                    """
+                    UPDATE embedding_jobs
+                    SET attempts=attempts+1, last_error=? WHERE memory_id=?
+                    """,
+                    (message[:1000], memory_id),
+                )
+                failed += 1
+                continue
             try:
                 if len(vec) != es.dim:
                     raise ValueError(
@@ -4394,17 +4497,6 @@ class Store:
                     (str(exc)[:1000], memory_id),
                 )
                 failed += 1
-        if len(vectors) < len(queued):
-            missing = queued[len(vectors) :]
-            message = "embedding backend returned fewer vectors than inputs"
-            self.conn.executemany(
-                """
-                UPDATE embedding_jobs
-                SET attempts=attempts+1, last_error=? WHERE memory_id=?
-                """,
-                [(message, row["memory_id"]) for row in missing],
-            )
-            failed += len(missing)
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_model', ?)",
             (es.model_id,),
@@ -4414,12 +4506,58 @@ class Store:
             (str(es.dim),),
         )
         self.conn.commit()
-        return {
+        result: dict[str, Any] = {
             "queued": len(queued),
             "processed": processed,
             "failed": failed,
             "available": True,
+            "exhausted": self._exhausted_embedding_jobs(max_attempts),
         }
+        if batch_error is not None and processed == 0 and failed == len(queued):
+            result["error"] = batch_error
+        return result
+
+    def _embed_rows_individually(
+        self, queued: list[sqlite3.Row]
+    ) -> tuple[dict[str, list[float]], dict[str, str]]:
+        """Embed each queued row with its own embed_texts() call.
+
+        Fallback only: process_embedding_jobs tries the whole batch in one
+        call first and only reaches here when that failed outright. One
+        model call per row is slower, but it means a single malformed row
+        raises (and gets attempts+1 / last_error) without taking its
+        batch-mates down with it. Returns (memory_id -> vector for rows that
+        embedded, memory_id -> error message for rows that did not); every
+        input row lands in exactly one of the two.
+        """
+        vectors: dict[str, list[float]] = {}
+        errors: dict[str, str] = {}
+        for row in queued:
+            content = row["content"] if row["content"] else " "
+            try:
+                one = embed_texts([content])
+            except Exception as exc:
+                errors[row["memory_id"]] = str(exc)[:1000]
+                continue
+            if not one:
+                errors[row["memory_id"]] = "embedding backend returned no vectors"
+                continue
+            vectors[row["memory_id"]] = one[0]
+        return vectors, errors
+
+    def _exhausted_embedding_jobs(self, max_attempts: int) -> int:
+        """Count rows parked at/over the attempts cap.
+
+        These are excluded from process_embedding_jobs's SELECT, so this
+        count is how a permanently-failed row stays discoverable (e.g. via
+        `haunt doctor` or a health check) instead of just silently vanishing
+        from the queue's view.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs WHERE attempts >= ?",
+            (max_attempts,),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def embeddings_stale(self) -> bool:
         """True when stored vectors do not match the currently loaded model."""
