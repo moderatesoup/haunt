@@ -16,6 +16,7 @@ from haunt.planner import planned_recall
 from haunt.store import (
     AliasRetirementError,
     NamespaceCollisionError,
+    NamespaceMigrationError,
     Store,
     UnknownNamespaceError,
     change_namespace_label,
@@ -23,6 +24,7 @@ from haunt.store import (
     open_existing,
     register_namespace,
     retire_namespace_alias,
+    undo_namespace_migration,
 )
 from haunt.temporal import TemporalParseError
 from haunt.util import clamp_limit, dumps, format_iso, human_display, snippet
@@ -350,6 +352,7 @@ def _namespace_change(
     repository: str | None,
     action: str,
     apply: bool,
+    plan_digest: str | None,
 ) -> None:
     try:
         report = change_namespace_label(
@@ -358,8 +361,9 @@ def _namespace_change(
             repository=repository,
             action=action,
             apply=apply,
+            plan_digest=plan_digest,
         )
-    except (UnknownNamespaceError, NamespaceCollisionError, ValueError) as exc:
+    except (UnknownNamespaceError, NamespaceCollisionError, NamespaceMigrationError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
@@ -373,10 +377,14 @@ def namespace_migrate_cmd(
         None, "--repo", "--repository", help="Local repo path or git remote URL to bind"
     ),
     apply: bool = typer.Option(False, "--apply", help="Apply atomically (default is dry-run)"),
+    plan_digest: Optional[str] = typer.Option(
+        None, "--plan-digest", help="Digest printed by the matching dry-run"
+    ),
 ) -> None:
     """Rename a canonical label, retaining the old label as an alias."""
     _namespace_change(
-        old_label, new_label, repository=repository, action="rename", apply=apply
+        old_label, new_label, repository=repository, action="rename", apply=apply,
+        plan_digest=plan_digest,
     )
 
 
@@ -388,11 +396,34 @@ def namespace_alias_cmd(
         None, "--repo", "--repository", help="Local repo path or git remote URL to bind"
     ),
     apply: bool = typer.Option(False, "--apply", help="Apply atomically (default is dry-run)"),
+    plan_digest: Optional[str] = typer.Option(
+        None, "--plan-digest", help="Digest printed by the matching dry-run"
+    ),
 ) -> None:
     """Add a unique alias to an existing canonical namespace."""
     _namespace_change(
-        source_label, alias, repository=repository, action="alias", apply=apply
+        source_label, alias, repository=repository, action="alias", apply=apply,
+        plan_digest=plan_digest,
     )
+
+
+@namespace_app.command("undo")
+def namespace_undo_cmd(
+    migration_id: str = typer.Argument(..., help="Applied migration identifier"),
+    apply: bool = typer.Option(False, "--apply", help="Apply the reversal"),
+    plan_digest: Optional[str] = typer.Option(
+        None, "--plan-digest", help="Digest printed by the matching undo dry-run"
+    ),
+) -> None:
+    """Reverse a recorded alias/rename after an exact-state dry-run."""
+    try:
+        report = undo_namespace_migration(
+            migration_id, apply=apply, plan_digest=plan_digest
+        )
+    except (NamespaceMigrationError, UnknownNamespaceError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
 
 @namespace_app.command("retire-alias")

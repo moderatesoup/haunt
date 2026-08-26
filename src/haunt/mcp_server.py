@@ -20,12 +20,16 @@ from haunt.paths import haunt_home, infer_namespace, resolve_namespace, safe_nam
 from haunt.planner import planned_recall
 from haunt.store import (
     Store,
+    NamespaceCollisionError,
+    NamespaceMigrationError,
     UnknownNamespaceError,
+    change_namespace_label,
     list_namespaces,
     namespace_exists,
     open_existing,
     resolve_namespace_id,
     resolve_namespace_identity,
+    undo_namespace_migration,
 )
 from haunt.temporal import TemporalParseError
 from haunt.util import clamp_limit
@@ -405,6 +409,60 @@ def memory_namespaces() -> str:
     )
 
 
+@server.tool(
+    description=(
+        "Admin-only namespace alias/rename planner and digest-gated apply. "
+        "Dry-run first; namespace database bytes are never copied or moved."
+    )
+)
+def memory_namespace_migrate(
+    old_label: str,
+    new_label: str,
+    action: str = "rename",
+    repository: Optional[str] = None,
+    apply: bool = False,
+    plan_digest: Optional[str] = None,
+) -> str:
+    authority = _authority()
+    if not authority.admin:
+        return _authority_error(
+            MCPAuthorityError("namespace migration requires HAUNT_MCP_ADMIN=1")
+        )
+    try:
+        report = change_namespace_label(
+            old_label,
+            new_label,
+            action=action,
+            repository=repository,
+            apply=apply,
+            plan_digest=plan_digest,
+        )
+        return _json(report)
+    except (UnknownNamespaceError, NamespaceCollisionError, NamespaceMigrationError, ValueError) as exc:
+        return _json({"ok": False, "error": str(exc), "admin": True})
+
+
+@server.tool(
+    description="Admin-only digest-gated reversal of a recorded namespace migration."
+)
+def memory_namespace_undo(
+    migration_id: str,
+    apply: bool = False,
+    plan_digest: Optional[str] = None,
+) -> str:
+    authority = _authority()
+    if not authority.admin:
+        return _authority_error(
+            MCPAuthorityError("namespace migration undo requires HAUNT_MCP_ADMIN=1")
+        )
+    try:
+        return _json(
+            undo_namespace_migration(
+                migration_id, apply=apply, plan_digest=plan_digest
+            )
+        )
+    except (UnknownNamespaceError, NamespaceMigrationError, ValueError) as exc:
+        return _json({"ok": False, "error": str(exc), "admin": True})
 @server.tool(description="Mark a session ended. No distillation — just close it.")
 def memory_session_end(
     namespace: Optional[str] = None,

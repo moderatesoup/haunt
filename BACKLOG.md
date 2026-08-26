@@ -329,9 +329,18 @@ broadening access.
   names become canonical labels without moving their database files.
 - Resolve aliases to the same registered database for CLI, hooks, dashboard,
   and MCP. Alias resolution must occur without creating a typo namespace.
-- Provide a migration command with dry-run and apply modes. Apply is atomic and
-  idempotent, records old/new labels and repository identity, and refuses
-  alias collisions or a target mapped to another database.
+- Provide a dry-run-first migration command. Dry-run is zero-write and emits a
+  deterministic plan digest bound to the exact registry state and operation;
+  apply requires that caller-supplied digest and fails on drift. Before apply,
+  Haunt creates and verifies a mode-0600 registry-only backup under its private
+  home (never a namespace database copy). Apply is atomic and idempotent,
+  records old/new labels, repository identity, plan, and backup evidence, and
+  refuses alias collisions or a target mapped to another database.
+- Every applied migration records enough prior registry state for an explicit
+  undo-by-migration-ID workflow. Undo is itself dry-run-first, digest-gated,
+  backed up, atomic, and idempotent. It fails closed after alias retirement or
+  any other affected alias/canonical/repository-binding drift; audit history is
+  retained rather than erased.
 - Preserve the immutable MCP process boundary: authorization is checked against
   the process's canonical namespace identity, not granted by possession of an
   alias string. Admin status and purge permission remain separate controls
@@ -348,7 +357,8 @@ broadening access.
 **Tests/evidence**
 
 - Fresh, upgraded, rename, move, remote URL form, truncation/hash, collision,
-  retirement, typo-read, and concurrent-migration tests.
+  retirement, typo-read, concurrent-migration, plan-tamper/drift, backup
+  integrity/restore, restart, and undo tests.
 - Retirement tests cover every registry-owned reference class and prove a
   missing/unreadable external host configuration can only produce the caveat,
   not a false registry reference or permanent refusal.

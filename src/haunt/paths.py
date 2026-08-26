@@ -35,6 +35,190 @@ class NamespacePathError(ValueError):
 
 
 @dataclass
+class SQLitePrimaryGuard:
+    """Hold a SQLite main-file descriptor and its pathname identity.
+
+    SQLite still opens the pathname through its VFS.  The caller must bracket
+    that open with :meth:`verify` and verify the VFS descriptor identity; this
+    guard prevents a validated name from silently becoming a different file.
+    """
+
+    path: Path
+    fd: int
+    identity: tuple[int, int]
+    claimed: bool = False
+    _closed: bool = False
+
+    @classmethod
+    def acquire(cls, path: Path, *, create_missing: bool) -> "SQLitePrimaryGuard":
+        path = Path(path)
+        lexical = Path(os.path.abspath(os.path.normpath(str(path))))
+        if not path.is_absolute() or path != lexical:
+            raise NamespacePathError(
+                f"SQLite database path must be canonical and absolute: {path}"
+            )
+        try:
+            parent = path.parent.lstat()
+        except OSError as exc:
+            raise NamespacePathError(
+                f"SQLite database directory is missing or unreadable: {path.parent}"
+            ) from exc
+        if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+            raise NamespacePathError(
+                "SQLite database directory must be a real non-symlink directory: "
+                f"{path.parent}"
+            )
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow:
+            raise NamespacePathError("O_NOFOLLOW is required for safe SQLite opens")
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        for _attempt in range(3):
+            claimed = False
+            try:
+                before = path.lstat()
+            except FileNotFoundError:
+                if not create_missing:
+                    raise
+                try:
+                    fd = os.open(
+                        path,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                        FILE_MODE,
+                    )
+                    claimed = True
+                except FileExistsError:
+                    continue
+            except OSError as exc:
+                raise NamespacePathError(
+                    f"cannot inspect SQLite database: {path}"
+                ) from exc
+            else:
+                if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+                    raise NamespacePathError(
+                        f"SQLite database must be a regular non-symlink file: {path}"
+                    )
+                if int(before.st_nlink) != 1:
+                    raise NamespacePathError(
+                        f"SQLite database must have exactly one filesystem link: {path}"
+                    )
+                try:
+                    fd = os.open(path, os.O_RDONLY | nofollow | cloexec)
+                except OSError as exc:
+                    raise NamespacePathError(
+                        f"cannot safely open SQLite database: {path}"
+                    ) from exc
+            info = os.fstat(fd)
+            identity = int(info.st_dev), int(info.st_ino)
+            try:
+                current = path.lstat()
+            except OSError as exc:
+                os.close(fd)
+                raise NamespacePathError(
+                    f"SQLite database disappeared while opening: {path}"
+                ) from exc
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or int(info.st_nlink) != 1
+                or int(current.st_nlink) != 1
+                or identity != (int(current.st_dev), int(current.st_ino))
+            ):
+                os.close(fd)
+                raise NamespacePathError(
+                    f"SQLite database physical identity changed while opening: {path}"
+                )
+            if claimed:
+                os.fchmod(fd, FILE_MODE)
+            return cls(path, fd, identity, claimed)
+        raise NamespacePathError(
+            f"SQLite database changed repeatedly while claiming its name: {path}"
+        )
+
+    def verify(self) -> None:
+        info = os.fstat(self.fd)
+        try:
+            current = self.path.lstat()
+        except OSError as exc:
+            raise NamespacePathError(
+                f"SQLite database disappeared during safe open: {self.path}"
+            ) from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or int(info.st_nlink) != 1
+            or int(current.st_nlink) != 1
+            or (int(info.st_dev), int(info.st_ino)) != self.identity
+            or (int(current.st_dev), int(current.st_ino)) != self.identity
+        ):
+            raise NamespacePathError(
+                f"SQLite database physical identity changed: {self.path}"
+            )
+
+    def close(self, *, clean_claim: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if clean_claim and self.claimed:
+            try:
+                current = self.path.lstat()
+            except OSError:
+                current = None
+            if current is not None and (
+                stat.S_ISREG(current.st_mode)
+                and not stat.S_ISLNK(current.st_mode)
+                and (int(current.st_dev), int(current.st_ino)) == self.identity
+            ):
+                try:
+                    self.path.unlink()
+                except OSError:
+                    pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def _descriptor_identities() -> dict[int, tuple[int, int]]:
+    for directory in (Path("/proc/self/fd"), Path("/dev/fd")):
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        result: dict[int, tuple[int, int]] = {}
+        for entry in entries:
+            try:
+                fd = int(entry.name)
+                info = os.fstat(fd)
+            except (OSError, ValueError):
+                continue
+            result[fd] = int(info.st_dev), int(info.st_ino)
+        return result
+    raise NamespacePathError("cannot verify the physical file opened by SQLite")
+
+
+def _verify_sqlite_primary_open(
+    before: dict[int, tuple[int, int]],
+    primary: SQLitePrimaryGuard,
+    sidecars: "SQLiteSidecarGuard",
+) -> None:
+    after = _descriptor_identities()
+    before_count = sum(
+        identity == primary.identity for identity in before.values()
+    )
+    after_count = sum(
+        identity == primary.identity for identity in after.values()
+    )
+    if after_count > before_count:
+        return
+    if before_count >= 2 and after_count >= 2:
+        # SQLite may reuse its already-verified unix VFS descriptor.
+        return
+    raise NamespacePathError("SQLite did not open the claimed registry identity")
+
+
+@dataclass
 class _SQLiteSidecarEntry:
     path: Path
     fd: int | None
@@ -498,13 +682,16 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
             _forget_registered_alias(name)
             return None
         conn: sqlite3.Connection | None = None
+        primary: SQLitePrimaryGuard | None = None
         sidecars: SQLiteSidecarGuard | None = None
         locked = False
         result: tuple[str, Path, int, int] | None = None
         try:
             SQLITE_OPEN_LOCK.acquire()
             locked = True
+            primary = SQLitePrimaryGuard.acquire(path, create_missing=False)
             sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=False)
+            descriptors_before = _descriptor_identities()
             # A quiescent registry can be opened immutable without creating
             # WAL/SHM sidecars. If a writer appears, the bracket fingerprint
             # changes and the retry uses the WAL-aware read-only mode.
@@ -513,6 +700,8 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
                 f"{path.resolve().as_uri()}?mode=ro{immutable}", uri=True
             )
             conn.row_factory = sqlite3.Row
+            _verify_sqlite_primary_open(descriptors_before, primary, sidecars)
+            primary.verify()
             sidecars.verify()
             tables = {
                 str(row[0])
@@ -570,6 +759,8 @@ def _registered_alias(name: str) -> tuple[str, Path] | None:
                 conn.close()
             if sidecars is not None:
                 sidecars.close(clean_unused_claims=False)
+            if primary is not None:
+                primary.close()
             if locked:
                 SQLITE_OPEN_LOCK.release()
         if before != _registry_fingerprint():
@@ -645,14 +836,19 @@ def _registered_namespace_for_repo(
     if not path.is_file():
         return None
     conn: sqlite3.Connection | None = None
+    primary: SQLitePrimaryGuard | None = None
     sidecars: SQLiteSidecarGuard | None = None
     locked = False
     try:
         SQLITE_OPEN_LOCK.acquire()
         locked = True
+        primary = SQLitePrimaryGuard.acquire(path, create_missing=False)
         sidecars = SQLiteSidecarGuard.acquire(path, claim_missing=False)
+        descriptors_before = _descriptor_identities()
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        _verify_sqlite_primary_open(descriptors_before, primary, sidecars)
+        primary.verify()
         sidecars.verify()
         tables = {
             str(row[0])
@@ -694,6 +890,8 @@ def _registered_namespace_for_repo(
             conn.close()
         if sidecars is not None:
             sidecars.close(clean_unused_claims=False)
+        if primary is not None:
+            primary.close()
         if locked:
             SQLITE_OPEN_LOCK.release()
     resolved_root = repo_root.resolve() if repo_root else None

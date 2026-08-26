@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -27,6 +29,7 @@ from haunt.paths import (
 from haunt.store import (
     AliasRetirementError,
     NamespaceCollisionError,
+    NamespaceMigrationError,
     Store,
     UnknownNamespaceError,
     change_namespace_label,
@@ -37,6 +40,7 @@ from haunt.store import (
     register_namespace,
     resolve_namespace_identity,
     retire_namespace_alias,
+    undo_namespace_migration,
 )
 
 
@@ -55,6 +59,18 @@ def alias_home(tmp_path, monkeypatch):
     embed.reset()
 
 
+def _apply_change(old_label, new_label, **kwargs):
+    kwargs.pop("apply", None)
+    plan = change_namespace_label(old_label, new_label, apply=False, **kwargs)
+    return change_namespace_label(
+        old_label,
+        new_label,
+        apply=True,
+        plan_digest=plan["plan_digest"],
+        **kwargs,
+    )
+
+
 def test_fresh_identity_alias_rename_reuses_exact_database(alias_home):
     with Store("Original Name") as store:
         memory = store.observe("rename canary")
@@ -66,8 +82,8 @@ def test_fresh_identity_alias_rename_reuses_exact_database(alias_home):
     assert dry["database_operation"] == "none"
     assert not namespace_exists("Moved Name")
 
-    applied = change_namespace_label("Original Name", "Moved Name", apply=True)
-    replay = change_namespace_label("Original Name", "Moved Name", apply=True)
+    applied = _apply_change("Original Name", "Moved Name")
+    replay = _apply_change("Original Name", "Moved Name")
     assert applied["db_path"] == replay["db_path"] == str(original_db)
     assert replay["idempotent"] is True
     assert namespace_db_path("Original Name") == original_db
@@ -167,7 +183,7 @@ def test_v3_identity_upgrade_records_physical_database_identity(tmp_path, monkey
     ).fetchone()[0]
     conn.close()
     assert row == (db.stat().st_dev, db.stat().st_ino)
-    assert version == "4"
+    assert version == "5"
     with Store("v3", create=False) as store:
         assert store.namespace_id == "v3-id"
 
@@ -235,7 +251,7 @@ def test_repository_move_binding_and_inference(alias_home, tmp_path, monkeypatch
     old_root.mkdir(parents=True)
     new_root.mkdir(parents=True)
     register_namespace("before", str(old_root))
-    change_namespace_label("before", "after", repository=str(new_root), apply=True)
+    _apply_change("before", "after", repository=str(new_root))
 
     import haunt.paths as paths
 
@@ -294,7 +310,7 @@ def test_duplicate_legacy_paths_migrate_deterministically_and_quiesce(
     observer.close()
     assert after == before, "a completed registry migration must not write again"
 
-    change_namespace_label("late", "renamed", apply=True)
+    _apply_change("late", "renamed")
     assert resolve_namespace_identity("middle")["canonical_label"] == "renamed"
     retired = retire_namespace_alias("middle", apply=True)
     assert retired["retired"] is True
@@ -399,7 +415,9 @@ def test_first_legacy_dry_run_is_byte_for_byte_read_only_then_apply_succeeds(
     assert not Path(str(registry) + "-wal").exists()
     assert not Path(str(registry) + "-shm").exists()
 
-    applied = change_namespace_label("Legacy", "Renamed", apply=True)
+    applied = change_namespace_label(
+        "Legacy", "Renamed", apply=True, plan_digest=plan["plan_digest"]
+    )
     assert applied["namespace_id"]
     assert applied["db_path"] == str(legacy_db)
     identity = resolve_namespace_identity("Renamed")
@@ -461,24 +479,22 @@ def test_collision_truncation_and_orphan_target_refused(alias_home):
     register_namespace("alpha")
     register_namespace("beta")
     with pytest.raises(NamespaceCollisionError):
-        change_namespace_label("alpha", "BETA", action="alias", apply=True)
+        _apply_change("alpha", "BETA", action="alias")
 
     prefix = "x" * 80
-    change_namespace_label("alpha", prefix + "one", action="alias", apply=True)
+    _apply_change("alpha", prefix + "one", action="alias")
     with pytest.raises(NamespaceCollisionError):
-        change_namespace_label("beta", prefix + "two", action="alias", apply=True)
+        _apply_change("beta", prefix + "two", action="alias")
 
     orphan = alias_home / "namespaces" / "orphan.db"
     orphan.touch()
     with pytest.raises(NamespaceCollisionError):
-        change_namespace_label("alpha", "orphan", action="alias", apply=True)
+        _apply_change("alpha", "orphan", action="alias")
 
 
 def test_retirement_checks_only_recorded_references_and_reports_caveat(alias_home):
     register_namespace("old", "https://github.com/acme/retire.git")
-    change_namespace_label(
-        "old", "new", repository="git@github.com:acme/retire.git", apply=True
-    )
+    _apply_change("old", "new", repository="git@github.com:acme/retire.git")
     check = retire_namespace_alias("old")
     assert check["safe"] is True
     assert "External editor/host" in check["operator_caveat"]
@@ -492,8 +508,8 @@ def test_retirement_checks_only_recorded_references_and_reports_caveat(alias_hom
 
 def test_rename_through_alias_rebinds_previous_canonical(alias_home, tmp_path, monkeypatch):
     register_namespace("old", "https://github.com/acme/through-alias.git")
-    change_namespace_label("old", "bridge", action="alias", apply=True)
-    change_namespace_label("bridge", "new", action="rename", apply=True)
+    _apply_change("old", "bridge", action="alias")
+    _apply_change("bridge", "new", action="rename")
     check = retire_namespace_alias("old")
     assert check["safe"] is True
     retire_namespace_alias("old", apply=True)
@@ -512,8 +528,8 @@ def test_rename_through_alias_rebinds_previous_canonical(alias_home, tmp_path, m
 
 def test_dependent_alias_blocks_retirement(alias_home):
     register_namespace("canonical")
-    change_namespace_label("canonical", "bridge", action="alias", apply=True)
-    change_namespace_label("bridge", "dependent", action="alias", apply=True)
+    _apply_change("canonical", "bridge", action="alias")
+    _apply_change("bridge", "dependent", action="alias")
     check = retire_namespace_alias("bridge")
     assert check["safe"] is False
     assert {b["kind"] for b in check["blockers"]} == {"dependent-alias"}
@@ -521,13 +537,13 @@ def test_dependent_alias_blocks_retirement(alias_home):
 
 def test_rename_to_existing_alias_reroots_lineage_for_old_retirement(alias_home):
     register_namespace("a")
-    change_namespace_label("a", "b", action="alias", apply=True)
+    _apply_change("a", "b", action="alias")
     before = resolve_namespace_identity("b")
     assert next(
         alias for alias in before["aliases"] if alias["normalized_label"] == "b"
     )["source_alias_norm"] == "a"
 
-    change_namespace_label("a", "b", action="rename", apply=True)
+    _apply_change("a", "b", action="rename")
     after = resolve_namespace_identity("b")
     assert after["canonical_label"] == "b"
     assert next(
@@ -843,8 +859,13 @@ def test_mapped_open_verifies_handle_when_replacement_is_swapped_back(
         store_module, "_mapped_namespace_open_hook", replace_before_open
     )
     monkeypatch.setattr(store_module, "_raw_connect", connect_then_restore)
-    with pytest.raises(NamespacePathError, match="SQLite did not open"):
+    with pytest.raises(
+        NamespacePathError, match="physical identity changed|SQLite did not open"
+    ):
         Store("handle-owner", create=False)
+    if backup.exists():
+        owner_db.unlink()
+        backup.rename(owner_db)
     assert owner_db.stat().st_ino != redirect_db.stat().st_ino
     assert redirect_db.read_bytes() == redirect_before
 
@@ -928,7 +949,7 @@ def test_current_registry_rejects_symlinked_namespace_root_everywhere(
 def test_registered_alias_beats_later_alias_shaped_database(alias_home):
     register_namespace("split-original")
     original = namespace_db_path("split-original")
-    change_namespace_label("split-original", "split-new", apply=True)
+    _apply_change("split-original", "split-new")
     impostor = alias_home / "namespaces" / "split-new.db"
     impostor.touch()
 
@@ -952,7 +973,8 @@ def test_alias_cache_observes_cross_process_rename_and_retirement(alias_home):
             "-c",
             (
                 "from haunt.store import change_namespace_label; "
-                "change_namespace_label('cross-old','cross-new',apply=True)"
+                "p=change_namespace_label('cross-old','cross-new'); "
+                "change_namespace_label('cross-old','cross-new',apply=True,plan_digest=p['plan_digest'])"
             ),
         ],
         env=env,
@@ -978,7 +1000,7 @@ def test_alias_cache_observes_cross_process_rename_and_retirement(alias_home):
 
 def test_alias_cache_invalidates_when_registry_is_recreated(alias_home):
     first_path = register_namespace("first-registry")
-    change_namespace_label("first-registry", "shared-label", action="alias", apply=True)
+    _apply_change("first-registry", "shared-label", action="alias")
     assert namespace_db_path("shared-label") == first_path
     for suffix in ("", "-wal", "-shm"):
         candidate = Path(str(registry_path()) + suffix)
@@ -987,7 +1009,7 @@ def test_alias_cache_invalidates_when_registry_is_recreated(alias_home):
 
     init_registry()
     second_path = register_namespace("second-registry")
-    change_namespace_label("second-registry", "shared-label", action="alias", apply=True)
+    _apply_change("second-registry", "shared-label", action="alias")
     assert second_path != first_path
     assert namespace_db_path("shared-label") == second_path
     assert resolve_namespace("shared-label") == "second-registry"
@@ -998,7 +1020,7 @@ def test_alias_cache_never_publishes_retired_then_reassigned_identity(
 ):
     first_db = register_namespace("race-first")
     second_db = register_namespace("race-second")
-    change_namespace_label("race-first", "race-shared", action="alias", apply=True)
+    _apply_change("race-first", "race-shared", action="alias")
 
     import haunt.paths as paths
 
@@ -1025,9 +1047,7 @@ def test_alias_cache_never_publishes_retired_then_reassigned_identity(
         future = pool.submit(paths._registered_alias, "race-shared")
         assert query_finished.wait(5), "alias reader did not reach cache publication"
         retire_namespace_alias("race-shared", apply=True)
-        change_namespace_label(
-            "race-second", "race-shared", action="alias", apply=True
-        )
+        _apply_change("race-second", "race-shared", action="alias")
         reassigned.set()
         assert future.result(timeout=5) == ("race-second", second_db)
 
@@ -1037,9 +1057,13 @@ def test_alias_cache_never_publishes_retired_then_reassigned_identity(
 
 def test_concurrent_alias_apply_is_atomic_and_idempotent(alias_home):
     register_namespace("race")
+    plan = change_namespace_label("race", "raced", action="alias")
 
     def apply_once(_index):
-        return change_namespace_label("race", "raced", action="alias", apply=True)
+        return change_namespace_label(
+            "race", "raced", action="alias", apply=True,
+            plan_digest=plan["plan_digest"],
+        )
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         reports = list(pool.map(apply_once, range(16)))
@@ -1055,18 +1079,56 @@ def test_concurrent_alias_apply_is_atomic_and_idempotent(alias_home):
     assert any(report["idempotent"] is True for report in reports)
 
 
+def test_cross_process_apply_reuses_dry_plan_after_restart(alias_home):
+    register_namespace("process-race")
+    plan = change_namespace_label("process-race", "process-raced", action="alias")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; from haunt.store import change_namespace_label; "
+            "r=change_namespace_label('process-race','process-raced',action='alias',"
+            "apply=True,plan_digest=sys.argv[1]); print(r['migration_id'])"
+        ),
+        plan["plan_digest"],
+    ]
+    processes = [
+        subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for _ in range(2)
+    ]
+    outputs = [process.communicate(timeout=20) for process in processes]
+    assert all(process.returncode == 0 for process in processes), outputs
+    migration_ids = {stdout.decode().strip() for stdout, _stderr in outputs}
+    assert len(migration_ids) == 1
+    conn = sqlite3.connect(registry_path())
+    assert conn.execute(
+        "SELECT COUNT(*) FROM namespace_migrations WHERE new_label_norm='process-raced'"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
 def test_cli_defaults_to_dry_run_and_apply_records_history(alias_home):
     register_namespace("cli-old")
     runner = CliRunner()
-    dry = runner.invoke(app, ["namespace", "migrate", "cli-old", "cli-new"])
+    dry = runner.invoke(
+        app,
+        [
+            "namespace", "migrate", "cli-old", "cli-new",
+            "--repo", "https://github.com/acme/cli.git",
+        ],
+    )
     assert dry.exit_code == 0, dry.output
     assert '"mode": "dry-run"' in dry.output
     assert not namespace_exists("cli-new")
+    digest = json.loads(dry.output)["plan_digest"]
     applied = runner.invoke(
         app,
         [
             "namespace", "migrate", "cli-old", "cli-new",
-            "--repo", "https://github.com/acme/cli.git", "--apply",
+            "--repo", "https://github.com/acme/cli.git",
+            "--apply", "--plan-digest", digest,
         ],
     )
     assert applied.exit_code == 0, applied.output
@@ -1084,8 +1146,8 @@ def test_ordinary_mcp_accepts_own_alias_but_denies_other_identity(alias_home):
 
     register_namespace("alpha")
     register_namespace("beta")
-    change_namespace_label("alpha", "alpha-old", action="alias", apply=True)
-    change_namespace_label("beta", "beta-old", action="alias", apply=True)
+    _apply_change("alpha", "alpha-old", action="alias")
+    _apply_change("beta", "beta-old", action="alias")
     alpha = resolve_namespace_identity("alpha")
     authority = MCPAuthority(
         bound_namespace="alpha",
@@ -1119,8 +1181,8 @@ def test_fresh_mcp_authority_pins_first_identity_concurrently(alias_home):
     assert {namespace for namespace, _identity in results} == {"fresh-bound"}
     assert len({identity for _namespace, identity in results}) == 1
 
-    change_namespace_label("fresh-bound", "fresh-renamed", apply=True)
-    change_namespace_label("fresh-renamed", "fresh-alias", action="alias", apply=True)
+    _apply_change("fresh-bound", "fresh-renamed")
+    _apply_change("fresh-renamed", "fresh-alias", action="alias")
     register_namespace("other-identity")
     assert authority.select(None) == "fresh-renamed"
     assert authority.select("fresh-bound") == "fresh-renamed"
@@ -1151,8 +1213,8 @@ def test_fresh_mcp_process_pins_after_first_observe_and_survives_rename(
     pinned = mcp._authority()._pin.namespace_id
     assert pinned == resolve_namespace_identity("mcp-fresh")["namespace_id"]
 
-    change_namespace_label("mcp-fresh", "mcp-renamed", apply=True)
-    change_namespace_label("mcp-renamed", "mcp-alias", action="alias", apply=True)
+    _apply_change("mcp-fresh", "mcp-renamed")
+    _apply_change("mcp-renamed", "mcp-alias", action="alias")
     with Store("mcp-other"):
         pass
     own = json.loads(
@@ -1171,7 +1233,7 @@ def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(
     with Store("route-main") as store:
         store.observe("ROUTE-ALIAS-CANARY")
         db_path = store.db_path
-    change_namespace_label("route-main", "route-alias", action="alias", apply=True)
+    _apply_change("route-main", "route-alias", action="alias")
 
     cli = CliRunner().invoke(
         app, ["recall", "ROUTE-ALIAS-CANARY", "--namespace", "route-alias"]
@@ -1206,7 +1268,7 @@ def test_cli_dashboard_and_mcp_namespace_listings_are_portable(alias_home, monke
     with Store("listing-main") as store:
         store.observe("LISTING-CANARY")
         db_path = store.db_path
-    change_namespace_label("listing-main", "listing-alias", action="alias", apply=True)
+    _apply_change("listing-main", "listing-alias", action="alias")
 
     rows = list_namespace_rows()
     assert [(row["name"], row["db_path"]) for row in rows] == [
@@ -1238,3 +1300,206 @@ def test_cli_dashboard_and_mcp_namespace_listings_are_portable(alias_home, monke
     payload = json.loads(mcp.memory_namespaces())
     assert payload["bound_namespace"] == "listing-main"
     assert [row["name"] for row in payload["namespaces"]] == ["listing-main"]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_registry_primary_rejects_unsafe_file_without_touching_victim(
+    tmp_path, monkeypatch, kind
+):
+    home = tmp_path / f"registry-{kind}"
+    (home / "namespaces").mkdir(parents=True)
+    victim = tmp_path / f"registry-{kind}-victim"
+    victim.write_bytes(b"REGISTRY-PRIMARY-VICTIM")
+    victim.chmod(0o640)
+    target = home / "registry.db"
+    target.symlink_to(victim) if kind == "symlink" else target.hardlink_to(victim)
+    before = victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode)
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    with pytest.raises(NamespacePathError):
+        init_registry()
+    assert (victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode)) == before
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_registry_primary_swap_before_open_preserves_victim(
+    alias_home, tmp_path, monkeypatch, kind
+):
+    victim = tmp_path / f"registry-swap-{kind}-victim"
+    victim.write_bytes(b"REGISTRY-SWAP-VICTIM")
+    victim.chmod(0o640)
+    before = victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode)
+    registry = registry_path()
+    saved = tmp_path / f"saved-registry-{kind}.db"
+    import haunt.store as store_module
+
+    def swap(path):
+        if path == registry:
+            registry.rename(saved)
+            registry.symlink_to(victim) if kind == "symlink" else registry.hardlink_to(victim)
+
+    monkeypatch.setattr(store_module, "_sqlite_sidecar_open_hook", swap)
+    try:
+        with pytest.raises(NamespacePathError, match="physical identity changed"):
+            store_module._connect(registry, create=False)
+    finally:
+        if registry.exists() or registry.is_symlink():
+            registry.unlink()
+        saved.rename(registry)
+    assert (victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode)) == before
+
+
+def test_migration_requires_exact_plan_and_verified_backup(alias_home):
+    db = register_namespace("digest-old")
+    before_db = db.read_bytes()
+    plan = change_namespace_label("digest-old", "digest-new")
+    assert plan["plan_digest"] == change_namespace_label(
+        "digest-old", "digest-new"
+    )["plan_digest"]
+    with pytest.raises(NamespaceMigrationError, match="preceding dry-run"):
+        change_namespace_label("digest-old", "digest-new", apply=True)
+    with pytest.raises(NamespaceMigrationError, match="does not match"):
+        change_namespace_label(
+            "digest-old", "digest-new", apply=True, plan_digest="0" * 64
+        )
+    applied = change_namespace_label(
+        "digest-old", "digest-new", apply=True,
+        plan_digest=plan["plan_digest"],
+    )
+    backup = Path(applied["backup"]["path"])
+    assert backup.parent == alias_home / "backups"
+    assert stat.S_IMODE(backup.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == applied["backup"]["sha256"]
+    check = sqlite3.connect(f"{backup.as_uri()}?mode=ro&immutable=1", uri=True)
+    assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert check.execute(
+        "SELECT canonical_label FROM namespace_identities"
+    ).fetchone()[0] == "digest-old"
+    check.close()
+    assert db.read_bytes() == before_db
+    conn = sqlite3.connect(registry_path())
+    history = conn.execute(
+        """SELECT plan_digest,backup_path,backup_sha256,backup_integrity
+           FROM namespace_migrations WHERE migration_id=?""",
+        (applied["migration_id"],),
+    ).fetchone()
+    conn.close()
+    assert history == (
+        plan["plan_digest"], str(backup), applied["backup"]["sha256"], "ok"
+    )
+
+
+def test_plan_drift_and_backup_failure_do_not_change_namespace(alias_home, monkeypatch):
+    register_namespace("drift-old")
+    stale = change_namespace_label("drift-old", "drift-new")
+    register_namespace("unrelated-drift")
+    with pytest.raises(NamespaceMigrationError, match="does not match"):
+        change_namespace_label(
+            "drift-old", "drift-new", apply=True,
+            plan_digest=stale["plan_digest"],
+        )
+    fresh = change_namespace_label("drift-old", "drift-new")
+    import haunt.store as store_module
+
+    def fail_backup(*, purpose):
+        raise NamespaceMigrationError(f"forced {purpose} backup failure")
+
+    monkeypatch.setattr(store_module, "_backup_registry", fail_backup)
+    with pytest.raises(NamespaceMigrationError, match="backup failure"):
+        change_namespace_label(
+            "drift-old", "drift-new", apply=True,
+            plan_digest=fresh["plan_digest"],
+        )
+    assert resolve_namespace_identity("drift-old")["canonical_label"] == "drift-old"
+    assert resolve_namespace_identity("drift-new") is None
+
+
+def test_digest_gated_undo_restores_exact_state_and_keeps_history(alias_home):
+    register_namespace("undo-old", "https://github.com/acme/undo.git")
+    plan = change_namespace_label(
+        "undo-old", "undo-new", repository="git@github.com:acme/undo.git"
+    )
+    applied = change_namespace_label(
+        "undo-old", "undo-new", repository="git@github.com:acme/undo.git",
+        apply=True, plan_digest=plan["plan_digest"],
+    )
+    undo_plan = undo_namespace_migration(applied["migration_id"])
+    with pytest.raises(NamespaceMigrationError, match="does not match"):
+        undo_namespace_migration(applied["migration_id"], apply=True, plan_digest="bad")
+    undone = undo_namespace_migration(
+        applied["migration_id"], apply=True, plan_digest=undo_plan["plan_digest"]
+    )
+    assert undone["backup"]["integrity"] == "ok"
+    assert resolve_namespace_identity("undo-old")["canonical_label"] == "undo-old"
+    assert resolve_namespace_identity("undo-new") is None
+    replay = undo_namespace_migration(
+        applied["migration_id"], apply=True, plan_digest=undo_plan["plan_digest"]
+    )
+    assert replay["idempotent"] is True
+    conn = sqlite3.connect(registry_path())
+    row = conn.execute(
+        "SELECT undone_at,undo_plan_digest FROM namespace_migrations WHERE migration_id=?",
+        (applied["migration_id"],),
+    ).fetchone()
+    conn.close()
+    assert row[0] and row[1] == undo_plan["plan_digest"]
+
+
+def test_undo_refuses_after_alias_retirement(alias_home):
+    register_namespace("retire-undo-old")
+    applied = _apply_change("retire-undo-old", "retire-undo-new")
+    retire_namespace_alias("retire-undo-old", apply=True)
+    with pytest.raises(NamespaceMigrationError, match="retired alias"):
+        undo_namespace_migration(applied["migration_id"])
+
+
+def test_cli_and_mcp_admin_share_digest_gated_workflow(alias_home, monkeypatch):
+    register_namespace("surface-old")
+    runner = CliRunner()
+    dry = runner.invoke(app, ["namespace", "migrate", "surface-old", "surface-new"])
+    assert dry.exit_code == 0
+    digest = json.loads(dry.output)["plan_digest"]
+    rejected = runner.invoke(
+        app, ["namespace", "migrate", "surface-old", "surface-new", "--apply"]
+    )
+    assert rejected.exit_code == 2
+    applied = runner.invoke(
+        app,
+        [
+            "namespace", "migrate", "surface-old", "surface-new", "--apply",
+            "--plan-digest", digest,
+        ],
+    )
+    assert applied.exit_code == 0, applied.output
+
+    import haunt.mcp_server as mcp
+
+    monkeypatch.delenv("HAUNT_MCP_ADMIN", raising=False)
+    mcp._MCP_AUTHORITY = None
+    mcp._MCP_AUTHORITY_HOME = None
+    denied = json.loads(
+        mcp.memory_namespace_migrate("surface-new", "surface-alias")
+    )
+    assert denied["ok"] is False
+    monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
+    mcp._MCP_AUTHORITY = None
+    mcp._MCP_AUTHORITY_HOME = None
+    mcp_plan = json.loads(
+        mcp.memory_namespace_migrate("surface-new", "surface-alias", action="alias")
+    )
+    mcp_apply = json.loads(
+        mcp.memory_namespace_migrate(
+            "surface-new", "surface-alias", action="alias", apply=True,
+            plan_digest=mcp_plan["plan_digest"],
+        )
+    )
+    assert mcp_apply["applied"] is True
+    undo_plan = json.loads(mcp.memory_namespace_undo(mcp_apply["migration_id"]))
+    undone = json.loads(
+        mcp.memory_namespace_undo(
+            mcp_apply["migration_id"], apply=True,
+            plan_digest=undo_plan["plan_digest"],
+        )
+    )
+    assert undone["applied"] is True

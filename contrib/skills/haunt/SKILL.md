@@ -68,6 +68,14 @@ Counts, sqlite-vec, embed status.
 ### `memory_namespaces`
 No args. List the process-bound namespace; all namespaces only in explicit admin mode.
 
+### `memory_namespace_migrate`
+`old_label`, `new_label`, optional `action`, `repository`, `apply`, `plan_digest`
+Admin-only. Dry-run first, then pass its exact digest to apply an alias or rename.
+
+### `memory_namespace_undo`
+`migration_id`, optional `apply`, `plan_digest`
+Admin-only. Dry-run first, then pass its exact digest to reverse recorded namespace state.
+
 ## Observe skip list
 
 - Secrets, tokens, API keys, passwords
