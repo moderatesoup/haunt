@@ -4251,8 +4251,14 @@ class Store:
             sql += f" AND {col}<=?"
             params.append(iso_or_now(until))
         if normalize_clock(clock) == "storage_time":
+            # Exact selected-clock ties are settled by event ID before LIMIT.
+            # The planner may then materialize and order equal-time memories
+            # independently; keep this stable selection rule explicit.
             sql += " ORDER BY ts DESC, id ASC LIMIT ? OFFSET ?"
         else:
+            # Exact selected-clock ties are settled by event ID before LIMIT.
+            # The planner may then materialize and order equal-time memories
+            # independently; keep this stable selection rule explicit.
             sql += " ORDER BY event_time DESC, id ASC LIMIT ? OFFSET ?"
         params.append(clamp_limit(limit, default=100))
         try:

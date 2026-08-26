@@ -54,6 +54,7 @@ def test_fts_only_explanation_preserves_legacy_fields_and_marks_tool_io(haunt_en
         "rrf_contributions": [
             {"source": "fts", "rank": 1, "value": 1 / 61}
         ],
+        "ordering": {"primary": "rrf_score_desc", "ties": "memory_id_asc"},
         "vector": {
             "state": "not_run",
             "reason": "disabled_by_caller",

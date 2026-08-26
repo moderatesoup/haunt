@@ -969,28 +969,18 @@ async def api_recall_all(request: Request) -> JSONResponse:
         )
     except (TemporalParseError, ValueError) as exc:
         return _recall_error(exc, query=q)
-    if not q.strip():
-        return JSONResponse(
-            {
-                "query": q,
-                "ranking_scope": "per_namespace",
-                "k_per_namespace": k,
-                "namespace_groups": [],
-                "hits": [],
-                "errors": [],
-            }
-        )
-
     ns_rows = sorted(list_namespace_rows(), key=lambda row: row["name"])
     namespace_groups: list[dict[str, Any]] = []
     flattened: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for row in ns_rows:
         ns_name = row["name"]
+        # Every registered namespace gets a deterministic group, even if it
+        # has no events. A corrupt namespace cannot honestly expose execution
+        # evidence, so its group carries the same structured error as errors.
+        group: dict[str, Any] = {"namespace": ns_name, "hits": []}
         try:
             with Store(ns_name, create=False) as st:
-                if st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0:
-                    continue
                 hits = planned_recall(
                     q,
                     namespace=ns_name,
@@ -1007,24 +997,24 @@ async def api_recall_all(request: Request) -> JSONResponse:
                     result = h.as_dict()
                     result["namespace"] = ns_name
                     results.append(result)
-                group: dict[str, Any] = {"namespace": ns_name, "hits": results}
+                group["hits"] = results
                 execution = execution_metadata(hits)
                 if execution is not None:
                     group["execution"] = execution
-                namespace_groups.append(group)
                 flattened.extend(results)
         except Exception as exc:
-            errors.append(
-                {
-                    "namespace": ns_name,
-                    "code": (
-                        BACKEND_ERROR_CODE
-                        if is_retrieval_backend_error(exc)
-                        else "retrieval_namespace_error"
-                    ),
-                    "error": str(exc),
-                }
-            )
+            error = {
+                "namespace": ns_name,
+                "code": (
+                    BACKEND_ERROR_CODE
+                    if is_retrieval_backend_error(exc)
+                    else "retrieval_namespace_error"
+                ),
+                "error": str(exc),
+            }
+            errors.append(error)
+            group["error"] = error
+        namespace_groups.append(group)
 
     return JSONResponse(
         {

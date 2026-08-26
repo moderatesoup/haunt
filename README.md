@@ -218,7 +218,7 @@ Every recall response that ran a known planner path also has an additive, versio
 
 `haunt recall --json`, MCP `memory_recall`, and dashboard recall endpoints return a nonzero/structured `retrieval_backend_error` response when SQLite or the vector backend fails. Human CLI output and Python calls still fail loudly rather than converting backend errors into empty recall results.
 
-Equal ranked scores are ordered by stable memory ID. Dashboard all-namespace results are grouped in namespace order and preserve those local ranks rather than inventing a global RRF order. Timeline results remain ordered by the selected clock; only exact timestamp ties use stable memory IDs.
+Equal ranked scores are ordered by stable memory ID. Dashboard all-namespace results are grouped in namespace order and preserve those local ranks rather than inventing a global RRF order. Timeline results remain ordered by the selected clock. When tied events exceed a bounded timeline page, SQLite selects the tied events by stable event ID before the limit; after one memory per selected event is materialized, equal-time hits are ordered by stable memory ID. The timeline `explanation.ordering` field records that two-step tie rule.
 
 `haunt install` (or `haunt bootstrap`) automatically registers the MCP server in both Cursor (`~/.cursor/mcp.json`) and Claude Code (`~/.claude.json`). Merge only — other servers are kept. No manual JSON paste required.
 

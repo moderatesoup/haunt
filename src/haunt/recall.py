@@ -179,6 +179,7 @@ class Hit:
             ),
             "rrf_k": RRF_K if is_rrf else None,
             "rrf_contributions": contributions,
+            "ordering": _ordering_explanation(self, is_rrf=is_rrf),
             "vector": vector,
             "fts": fts,
             "filters": self.filter_context,
@@ -218,6 +219,26 @@ class Hit:
 def _stage(state: str, reason: str) -> dict[str, str]:
     """Build one of the explicit per-modality execution states."""
     return {"state": state, "reason": reason}
+
+
+def _ordering_explanation(hit: Hit, *, is_rrf: bool) -> dict[str, str]:
+    """Describe only ordering evidence this Hit actually carries."""
+    if is_rrf:
+        return {"primary": "rrf_score_desc", "ties": "memory_id_asc"}
+    if (
+        hit.vector_stage is not None
+        and hit.fts_stage is not None
+        and hit.vector_stage.get("reason") == "timeline_time_order"
+        and hit.fts_stage.get("reason") == "timeline_time_order"
+    ):
+        return {
+            "primary": "selected_clock_desc",
+            "ties": (
+                "event_id_asc_at_bounded_event_selection_then_"
+                "memory_id_asc_after_materialization"
+            ),
+        }
+    return {"primary": "not_recorded", "ties": "not_recorded_legacy"}
 
 
 def _modality_explanation(

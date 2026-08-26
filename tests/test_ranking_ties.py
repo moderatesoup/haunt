@@ -100,13 +100,24 @@ def test_union_ties_sort_ranked_hits_but_keep_timeline_order(monkeypatch):
     assert [hit.final_rank for hit in hits] == [1, 2, 3, 4]
 
 
-def test_dashboard_all_namespace_groups_preserve_local_ranks(haunt_env, monkeypatch):
+def test_dashboard_all_namespace_groups_preserve_local_ranks(tmp_path, monkeypatch):
     """Namespace groups are deterministic without claiming cross-namespace RRF."""
     from haunt import dashboard
+    from haunt import embed
+    from haunt.paths import ensure_layout
+    from haunt.store import init_registry
     from tests.dashutil import make_dash_client
 
-    observe("DASHBOARD-TIE-ALPHA", namespace="alpha")
-    observe("DASHBOARD-TIE-BETA", namespace="beta")
+    monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunt-home"))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    embed.reset()
+    ensure_layout()
+    init_registry()
+    with Store("alpha") as store:
+        store.observe("DASHBOARD-TIE-ALPHA", defer_embedding=True)
+    with Store("beta") as store:
+        store.observe("DASHBOARD-TIE-BETA", defer_embedding=True)
     alpha_z = _hit("alpha-z", score=1 / 61, fts_rank=1)
     alpha_a = _hit("alpha-a", score=1 / 61, fts_rank=1)
     beta_a = _hit("beta-a", score=9 / 61, fts_rank=1)
@@ -143,3 +154,4 @@ def test_dashboard_all_namespace_groups_preserve_local_ranks(haunt_env, monkeypa
     assert [hit["explanation"]["final_rank"] for hit in hits] == [1, 2, 1]
     # beta's larger local score does not move it ahead of the alpha group.
     assert hits[-1]["score"] > hits[0]["score"]
+    embed.reset()

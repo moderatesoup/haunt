@@ -121,6 +121,12 @@ def test_execution_metadata_survives_zero_and_nonzero_recall_surfaces(fts_recall
             == {"state": "not_run", "reason": "timeline_time_order"}
             for execution in executions
         )
+        if query == "PRESENT-EXECUTION-CANARY":
+            assert all(
+                payload["hits"][0]["explanation"]["ordering"]
+                == {"primary": "rrf_score_desc", "ties": "memory_id_asc"}
+                for payload in payloads
+            )
 
 
 def test_execution_metadata_covers_disabled_vectors_and_legacy_lists(fts_recall_env):
@@ -172,18 +178,22 @@ def test_union_execution_is_explicit_and_keeps_component_evidence(fts_recall_env
 
 
 def test_all_namespace_groups_keep_per_namespace_execution(fts_recall_env):
-    """All-namespace grouping preserves each local zero-hit execution record."""
+    """Every registered namespace gets local zero-hit execution evidence."""
     from tests.dashutil import make_dash_client
 
     with Store("alpha") as store:
         store.observe("ALPHA-EXECUTION-CANARY", defer_embedding=True)
     with Store("beta") as store:
         store.observe("BETA-EXECUTION-CANARY", defer_embedding=True)
+    # Register a namespace with no events. It still runs the planned path and
+    # therefore has a truthful v1 execution record rather than being skipped.
+    with Store("empty"):
+        pass
 
     response = make_dash_client().get("/api/recall?q=MISSING-EXECUTION-CANARY")
     assert response.status_code == 200
     groups = response.json()["namespace_groups"]
-    assert [group["namespace"] for group in groups] == ["alpha", "beta"]
+    assert [group["namespace"] for group in groups] == ["alpha", "beta", "empty"]
     for group in groups:
         assert group["hits"] == []
         assert group["execution"]["version"] == 1
@@ -191,6 +201,46 @@ def test_all_namespace_groups_keep_per_namespace_execution(fts_recall_env):
             "state": "ran_not_candidate",
             "reason": "no_fts_candidates",
         }
+
+
+def test_timeline_bounded_ties_select_events_then_order_materialized_memories(
+    fts_recall_env,
+):
+    """A bounded equal-time page cannot claim it chose all ties by memory ID."""
+    from haunt.planner import run_timeline
+    from haunt.temporal import compile as compile_temporal
+
+    with Store("default") as store:
+        tied = [
+            store.observe(
+                f"bounded tie {index}",
+                event_time="2026-08-08T12:00:00+00:00",
+                defer_embedding=True,
+            )
+            for index in range(5)
+        ]
+        later = store.observe(
+            "bounded later",
+            event_time="2026-08-08T13:00:00+00:00",
+            defer_embedding=True,
+        )
+        hits = run_timeline(
+            compile_temporal("what happened on 2026-08-08"), store, limit=3
+        )
+
+    # The SQL event page contains the later event plus the first two event IDs
+    # among the five equal-time events. Only that selected set is subsequently
+    # sorted by memory ID after materialization.
+    selected_ties = sorted(tied, key=lambda result: result.event_id)[:2]
+    assert [hit.memory_id for hit in hits] == [
+        later.memory_id,
+        *sorted(result.memory_id for result in selected_ties),
+    ]
+    ordering = hits[1].as_dict()["explanation"]["ordering"]
+    assert ordering == {
+        "primary": "selected_clock_desc",
+        "ties": "event_id_asc_at_bounded_event_selection_then_memory_id_asc_after_materialization",
+    }
 
 
 def _prepare_dimension_mismatch(monkeypatch) -> None:
