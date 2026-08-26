@@ -1459,6 +1459,29 @@ def test_store_create_retries_only_recognized_initialize_handoff(
     assert caught.value is exhausted
     assert exhausted_attempts == 8
 
+    cleanup_unsafe = NamespacePathError("SQLite configuration lock is unsafe")
+    cleanup_calls = 0
+
+    class UnclosableConnection:
+        def close(self):
+            raise cleanup_unsafe
+
+    def transient_with_unclosable_connection(self, identity):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        self.conn = UnclosableConnection()
+        raise NamespacePathError(
+            "SQLite sidecar appeared during safe open: init-cleanup.db-wal"
+        )
+
+    monkeypatch.setattr(
+        Store, "_initialize_identity", transient_with_unclosable_connection
+    )
+    with pytest.raises(NamespacePathError) as caught:
+        Store("init-cleanup-unsafe")
+    assert caught.value is cleanup_unsafe
+    assert cleanup_calls == 1
+
 
 def test_configured_writer_close_retries_the_configuration_lock_after_failure(
     alias_home, monkeypatch,

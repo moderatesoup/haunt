@@ -3890,10 +3890,6 @@ class Store:
             return
         try:
             conn.close()
-        except Exception:
-            # The original classified race is the useful failure; a best-effort
-            # close must not replace it or retain a stale connection for retry.
-            pass
         finally:
             del self.conn
 
