@@ -1674,7 +1674,8 @@ _CONCURRENT_REGISTRY_CHANGE_MARKERS = (
 )
 
 
-def _is_concurrent_registry_change(exc: NamespacePathError) -> bool:
+def is_concurrent_registry_change(exc: NamespacePathError) -> bool:
+    """Return whether a read can be retried after observed registry drift."""
     message = str(exc)
     return any(marker in message for marker in _CONCURRENT_REGISTRY_CHANGE_MARKERS)
 
@@ -1685,7 +1686,7 @@ def resolve_namespace_identity(name: str) -> dict[str, Any] | None:
         try:
             return _resolve_namespace_identity_once(name)
         except NamespacePathError as exc:
-            if not _is_concurrent_registry_change(exc) or attempt == 31:
+            if not is_concurrent_registry_change(exc) or attempt == 31:
                 raise
     return None
 
@@ -1731,7 +1732,7 @@ def resolve_namespace_id(namespace_id: str) -> dict[str, Any] | None:
         try:
             return _resolve_namespace_id_once(namespace_id)
         except NamespacePathError as exc:
-            if not _is_concurrent_registry_change(exc) or attempt == 31:
+            if not is_concurrent_registry_change(exc) or attempt == 31:
                 raise
     return None
 
@@ -3640,7 +3641,7 @@ class Store:
                 identity = resolve_namespace_identity(requested)
                 last_error = None
             except NamespacePathError as exc:
-                if not create or not _is_concurrent_registry_change(exc):
+                if not create or not is_concurrent_registry_change(exc):
                     raise
                 last_error = exc
                 continue

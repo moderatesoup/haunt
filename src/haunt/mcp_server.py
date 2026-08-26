@@ -30,6 +30,7 @@ from haunt.store import (
     NamespaceMigrationError,
     UnknownNamespaceError,
     change_namespace_label,
+    is_concurrent_registry_change,
     list_namespaces,
     open_namespace_identity,
     resolve_namespace_id,
@@ -164,6 +165,8 @@ class MCPAuthority:
                     last_error = None
                     break
                 except NamespacePathError as exc:
+                    if not is_concurrent_registry_change(exc):
+                        raise
                     last_error = exc
             if last_error is not None:
                 raise last_error
@@ -199,7 +202,9 @@ class MCPAuthority:
         for _attempt in range(16):
             try:
                 identity = resolve_namespace_id(store.namespace_id)
-            except NamespacePathError:
+            except NamespacePathError as exc:
+                if not is_concurrent_registry_change(exc):
+                    raise
                 continue
             if identity is not None:
                 break

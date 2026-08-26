@@ -1204,6 +1204,87 @@ def test_fresh_mcp_authority_pins_first_identity_concurrently(alias_home):
     assert not namespace_exists("fresh-bound")
 
 
+@pytest.mark.parametrize("surface", ["current", "pin"])
+def test_mcp_identity_retry_accepts_only_recognized_registry_drift(
+    alias_home, monkeypatch, surface
+):
+    import haunt.mcp_server as mcp
+
+    with Store("mcp-retry-bound") as store:
+        identity = resolve_namespace_identity("mcp-retry-bound")
+        assert identity is not None
+        authority = mcp.MCPAuthority(
+            bound_namespace="mcp-retry-bound",
+            bound_namespace_id=(
+                identity["namespace_id"] if surface == "current" else None
+            ),
+        )
+        responses = [
+            NamespacePathError(
+                "SQLite zero-write read observed storage drift: registry.db"
+            ),
+            identity,
+        ]
+        calls = 0
+
+        def transient_then_identity(_namespace_id):
+            nonlocal calls
+            calls += 1
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        monkeypatch.setattr(mcp, "resolve_namespace_id", transient_then_identity)
+        result = (
+            authority._current_identity()
+            if surface == "current"
+            else authority.pin_open_store(store)
+        )
+
+    assert calls == 2
+    if surface == "current":
+        assert result["namespace_id"] == identity["namespace_id"]
+    else:
+        assert result == "mcp-retry-bound"
+
+
+@pytest.mark.parametrize("surface", ["current", "pin"])
+def test_mcp_identity_retry_fails_immediately_on_unsafe_path_error(
+    alias_home, monkeypatch, surface
+):
+    import haunt.mcp_server as mcp
+
+    with Store("mcp-unsafe-bound") as store:
+        identity = resolve_namespace_identity("mcp-unsafe-bound")
+        assert identity is not None
+        authority = mcp.MCPAuthority(
+            bound_namespace="mcp-unsafe-bound",
+            bound_namespace_id=(
+                identity["namespace_id"] if surface == "current" else None
+            ),
+        )
+        calls = 0
+
+        def unsafe_then_identity(_namespace_id):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise NamespacePathError("registry primary path is unsafe")
+            return identity
+
+        monkeypatch.setattr(mcp, "resolve_namespace_id", unsafe_then_identity)
+        with pytest.raises(
+            NamespacePathError, match="registry primary path is unsafe"
+        ):
+            if surface == "current":
+                authority._current_identity()
+            else:
+                authority.pin_open_store(store)
+
+    assert calls == 1
+
+
 def test_fresh_mcp_process_pins_after_first_observe_and_survives_rename(
     alias_home, monkeypatch
 ):
