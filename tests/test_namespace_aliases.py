@@ -1412,9 +1412,21 @@ def test_mcp_recall_opens_selected_stable_id_after_label_reassignment(
 
     assert result["namespace"] == "mcp-race-original-renamed"
     assert planned_store_ids == [original_id]
+    assert result["execution"]["version"] == 1
+    assert result["execution"]["modalities"]["fts"] == {
+        "state": "candidate",
+        "reason": "returned_fts_candidates",
+    }
     contents = [hit["content"] for hit in result["hits"]]
     assert "MCP AUTHORITY RACE CANARY FROM ORIGINAL" in contents
     assert "MCP AUTHORITY RACE CANARY FROM REPLACEMENT" not in contents
+    original_hit = next(
+        hit
+        for hit in result["hits"]
+        if hit["content"] == "MCP AUTHORITY RACE CANARY FROM ORIGINAL"
+    )
+    assert original_hit["explanation"]["final_rank"] == 1
+    assert original_hit["explanation"]["references"]["provenance_status"] == "native"
 
 
 def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(
@@ -1430,6 +1442,15 @@ def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(
     )
     assert cli.exit_code == 0, cli.output
     assert "ROUTE-ALIAS-CANARY" in cli.output
+    cli_json = CliRunner().invoke(
+        app,
+        ["recall", "ROUTE-ALIAS-CANARY", "--namespace", "route-alias", "--json"],
+    )
+    assert cli_json.exit_code == 0, cli_json.output
+    cli_payload = json.loads(cli_json.stdout)
+    assert cli_payload["namespace"] == "route-main"
+    assert cli_payload["execution"]["version"] == 1
+    assert cli_payload["hits"][0]["explanation"]["final_rank"] == 1
 
     monkeypatch.setenv("HAUNT_NAMESPACE", "route-alias")
     from haunt.claude_hook import _hook_namespace
@@ -1449,9 +1470,124 @@ def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(
             "/api/namespace/route-alias/recall?q=ROUTE-ALIAS-CANARY"
         )
         assert response.status_code == 200
-        assert response.json()["hits"][0]["namespace"] == "route-main"
+        dashboard_payload = response.json()
+        assert dashboard_payload["hits"][0]["namespace"] == "route-main"
+        assert dashboard_payload["execution"]["version"] == 1
+        assert dashboard_payload["hits"][0]["explanation"]["final_rank"] == 1
     finally:
         reset_dashboard_security()
+
+
+def test_e5_references_and_execution_survive_e3_rename_without_purge_leaks(
+    alias_home, monkeypatch
+):
+    """Alias-routed E5 output keeps E1/E2 evidence, never erased bytes."""
+    imported_provenance = {
+        "schema_version": 1,
+        "kind": "import",
+        "channel": "python",
+        "origin": "python",
+        "source_platform": "e5-e3-test",
+        "source_native_id": "safe-import-id",
+        "source_format": "json",
+        "parser_version": "v1",
+        "imported_at": "2026-08-08T12:00:00+00:00",
+        "fidelity": "lossless",
+        "original_blob_sha256": "sha256:" + "ab" * 32,
+        "transforms": ["parse"],
+    }
+    erased_canary = "E5-E3-ERASED-PRIVATE-CANARY"
+    with Store("e5-e3-old") as store:
+        imported = store.observe(
+            "E5E3ALIAS imported provenance evidence",
+            provenance=imported_provenance,
+            defer_embedding=True,
+        )
+        first = store.observe("E5E3ALIAS first lineage member", defer_embedding=True)
+        erased = store.contradict(
+            first.memory_id,
+            replacement=f"E5E3ALIAS {erased_canary}",
+            idempotency_key="e5-e3-purge-first",
+        )
+        erased_id = erased["replacement_memory_id"]
+        erased_event_id = erased["replacement_event_id"]
+        survivor = store.contradict(
+            erased_id,
+            replacement="E5E3ALIAS surviving lineage member",
+            idempotency_key="e5-e3-purge-second",
+        )["replacement_memory_id"]
+        assert store.purge(erased_id)["ok"] is True
+        assert store.conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0] == "8"
+
+    _apply_change("e5-e3-old", "e5-e3-new")
+    conn = sqlite3.connect(registry_path())
+    assert conn.execute(
+        "SELECT value FROM registry_meta WHERE key='schema_version'"
+    ).fetchone()[0] == "5"
+    conn.close()
+
+    cli = CliRunner().invoke(
+        app, ["recall", "E5E3ALIAS", "--namespace", "e5-e3-old", "--json"]
+    )
+    assert cli.exit_code == 0, cli.output
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "e5-e3-old")
+    monkeypatch.delenv("HAUNT_MCP_ADMIN", raising=False)
+    import haunt.mcp_server as mcp
+
+    monkeypatch.setattr(mcp, "_MCP_AUTHORITY", None)
+    monkeypatch.setattr(mcp, "_MCP_AUTHORITY_HOME", None)
+    mcp_payload = json.loads(mcp.memory_recall("E5E3ALIAS", namespace="e5-e3-old"))
+
+    from tests.dashutil import make_dash_client
+
+    dashboard = make_dash_client().get(
+        "/api/namespace/e5-e3-old/recall?q=E5E3ALIAS"
+    )
+    assert dashboard.status_code == 200, dashboard.text
+
+    for payload in (json.loads(cli.stdout), mcp_payload, dashboard.json()):
+        assert payload["namespace"] == "e5-e3-new"
+        assert payload["execution"]["version"] == 1
+        hits = {hit["memory_id"]: hit for hit in payload["hits"]}
+        assert hits[imported.memory_id]["explanation"]["references"][
+            "provenance_status"
+        ] == "import"
+        assert hits[survivor]["explanation"]["references"][
+            "correction_lineage"
+        ] == {"status": "privacy_tombstone"}
+        serialized = json.dumps(payload, sort_keys=True)
+        assert erased_canary not in serialized
+        assert erased_id not in serialized
+        assert erased_event_id not in serialized
+
+
+def test_dashboard_all_namespace_groups_use_e3_canonical_labels(alias_home):
+    """All-namespace E5 groups are canonical and retain local execution/ranks."""
+    with Store("e5-group-old") as store:
+        store.observe("E5E3GROUP alpha result", defer_embedding=True)
+    _apply_change("e5-group-old", "e5-group-new")
+    with Store("e5-group-beta") as store:
+        store.observe("E5E3GROUP beta result", defer_embedding=True)
+
+    from tests.dashutil import make_dash_client
+
+    response = make_dash_client().get("/api/recall?q=E5E3GROUP")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ranking_scope"] == "per_namespace"
+    assert [group["namespace"] for group in payload["namespace_groups"]] == [
+        "e5-group-beta",
+        "e5-group-new",
+    ]
+    assert "e5-group-old" not in [
+        group["namespace"] for group in payload["namespace_groups"]
+    ]
+    for group in payload["namespace_groups"]:
+        assert group["execution"]["version"] == 1
+        assert group["hits"][0]["explanation"]["final_rank"] == 1
 
 
 def test_cli_dashboard_and_mcp_namespace_listings_are_portable(alias_home, monkeypatch):

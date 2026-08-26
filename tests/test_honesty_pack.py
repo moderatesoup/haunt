@@ -702,7 +702,10 @@ def test_direct_timeline_limit_clamps_and_refills_past_full_superseded_page(hone
             )
             superseded_ids.append(rec.memory_id)
         for memory_id in superseded_ids:
-            st.contradict(memory_id)
+            st.contradict(
+                memory_id,
+                idempotency_key=f"direct-timeline-supersede-{memory_id}",
+            )
 
         active = [
             st.observe(
