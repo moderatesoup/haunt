@@ -309,9 +309,9 @@ def test_v1_database_migrates_idempotency_and_graph_evidence(graph_env):
 
     register_namespace("legacy-v1")
     path = namespace_db_path("legacy-v1")
-    path.unlink()
-    conn = sqlite3.connect(path)
-    conn.executescript(
+    original_identity = (path.stat().st_dev, path.stat().st_ino)
+    legacy = sqlite3.connect(":memory:")
+    legacy.executescript(
         """
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         INSERT INTO meta(key, value) VALUES ('schema_version', '1');
@@ -331,8 +331,12 @@ def test_v1_database_migrates_idempotency_and_graph_evidence(graph_env):
         );
         """
     )
+    conn = sqlite3.connect(path)
+    legacy.backup(conn)
     conn.commit()
     conn.close()
+    legacy.close()
+    assert (path.stat().st_dev, path.stat().st_ino) == original_identity
 
     with Store("legacy-v1", create=False) as store:
         columns = {

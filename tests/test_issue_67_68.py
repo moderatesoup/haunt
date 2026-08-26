@@ -403,7 +403,7 @@ def test_observe_and_init_still_create(fts_env):
     assert namespace_exists("mcp-new-proc")
 
 
-def test_mcp_cli_read_paths_use_open_existing_not_create():
+def test_mcp_cli_read_paths_use_identity_openers_not_create():
     import haunt.cli as cli
     import haunt.mcp_server as mcp
 
@@ -417,16 +417,16 @@ def test_mcp_cli_read_paths_use_open_existing_not_create():
         mcp.memory_contradict,
     ):
         src = inspect.getsource(fn)
-        assert "open_existing" in src, fn.__name__
+        assert "_open_mcp_store" in src, fn.__name__
         assert "with Store(ns)" not in src, fn.__name__
 
     proc_src = inspect.getsource(mcp.memory_procedure)
-    assert "open_existing" in proc_src
-    assert "with Store(ns)" in proc_src
+    assert "_open_mcp_store" in proc_src
+    assert "with Store(ns)" not in proc_src
 
     obs_src = inspect.getsource(mcp.memory_observe)
-    assert "open_existing" not in obs_src
-    assert "with Store(ns)" in obs_src
+    assert "_open_mcp_store" in obs_src
+    assert "with Store(ns)" not in obs_src
 
     for fn in (
         cli.recall_cmd,

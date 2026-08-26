@@ -314,7 +314,7 @@ that source metadata measures truth.
 
 ## E3 — Add namespace aliases and migration
 
-**Status:** Blocked
+**Status:** Done
 
 **Depends on:** E0
 
@@ -329,9 +329,18 @@ broadening access.
   names become canonical labels without moving their database files.
 - Resolve aliases to the same registered database for CLI, hooks, dashboard,
   and MCP. Alias resolution must occur without creating a typo namespace.
-- Provide a migration command with dry-run and apply modes. Apply is atomic and
-  idempotent, records old/new labels and repository identity, and refuses
-  alias collisions or a target mapped to another database.
+- Provide a dry-run-first migration command. Dry-run is zero-write and emits a
+  deterministic plan digest bound to the exact registry state and operation;
+  apply requires that caller-supplied digest and fails on drift. Before apply,
+  Haunt creates and verifies a mode-0600 registry-only backup under its private
+  home (never a namespace database copy). Apply is atomic and idempotent,
+  records old/new labels, repository identity, plan, and backup evidence, and
+  refuses alias collisions or a target mapped to another database.
+- Every applied migration records enough prior registry state for an explicit
+  undo-by-migration-ID workflow. Undo is itself dry-run-first, digest-gated,
+  backed up, atomic, and idempotent. It fails closed after alias retirement or
+  any other affected alias/canonical/repository-binding drift; audit history is
+  retained rather than erased.
 - Preserve the immutable MCP process boundary: authorization is checked against
   the process's canonical namespace identity, not granted by possession of an
   alias string. Admin status and purge permission remain separate controls
@@ -348,7 +357,8 @@ broadening access.
 **Tests/evidence**
 
 - Fresh, upgraded, rename, move, remote URL form, truncation/hash, collision,
-  retirement, typo-read, and concurrent-migration tests.
+  retirement, typo-read, concurrent-migration, plan-tamper/drift, backup
+  integrity/restore, restart, and undo tests.
 - Retirement tests cover every registry-owned reference class and prove a
   missing/unreadable external host configuration can only produce the caveat,
   not a false registry reference or permanent refusal.
@@ -356,6 +366,22 @@ broadening access.
   alias for namespace B cannot be used to read or mutate B.
 - Filesystem evidence shows migration does not duplicate or rename the
   namespace database unless a separately confirmed maintenance action says so.
+
+**Completion evidence (2026-08-26)**
+
+- E3 was integrated over E1/E2 at `fb9ab09`, preserving namespace database
+  schema v8, independent registry schema v5, correction/privacy invariants,
+  structured provenance, guarded SQLite opening, and stable-ID MCP authority.
+- The author integration run passed 308 conflict-focused tests, 274 E0–E3 tests
+  on both Python 3.10 and Python 3.12/SQLite 3.43 with MCP 2, and the exact
+  dependency-correct full profile with 692 passes, 1 skip, and 7 expected
+  failures.
+- A fresh independent GPT-5.6 Terra review of exact `fb9ab09` was CLEAN. Its
+  Python 3.10/MCP 2 and Python 3.12/SQLite 3.43/MCP 2 E0–E3 profiles each passed
+  274 tests; its alias/sidecar plus integration profiles each passed 125 tests.
+  Its separate Python 3.10 broad compatibility environment passed 688 tests
+  with 5 optional-model skips and 7 expected failures. Compile, diff, clean-tree,
+  frozen-E0, and manual E1/E2/E3 schema and surface audits were also clean.
 
 **Non-goals**
 

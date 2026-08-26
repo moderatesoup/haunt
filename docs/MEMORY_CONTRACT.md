@@ -266,10 +266,23 @@ explicit and independent (`src/haunt/mcp_server.py:70-113`; `README.md:199-201`)
 The README's existing warning remains governing: namespaces are storage
 isolation, not authorization (`README.md:85`; `SECURITY.md:49-51`).
 
-Alias migration **MUST** be atomic and idempotent, retain the old label until an
-explicit safe retirement, and never copy memory bytes merely to rename a store.
-Aliases may help select the right existing database; they do not turn Haunt
-into MP's hierarchical scope model.
+Alias migration **MUST** be dry-run-first. Dry-run is zero-write and returns a
+deterministic plan digest bound to the exact registry state and requested
+operation. Apply **MUST** require that caller-supplied digest, recompute it, and
+fail closed on drift. Before apply, Haunt **MUST** create a consistent,
+integrity-verified mode-0600 backup of the registry inside a private mode-0700
+Haunt backup directory. It **MUST NOT** copy a namespace database as part of a
+label migration.
+
+Each applied migration **MUST** retain its audit record and the exact affected
+canonical, alias, legacy-label, and repository-binding state needed for an
+explicit undo keyed by migration ID. Undo follows the same dry-run, digest,
+drift-check, and verified-backup protocol; it is atomic and idempotent. If an
+alias was retired or any affected recorded state changed after apply, undo
+**MUST** refuse rather than guess or recreate unproven state. A successful
+rename retains the old label until explicit safe retirement. Aliases may help
+select the right existing database; they do not turn Haunt into MP's
+hierarchical scope model.
 
 Automatic retirement checks are limited to registry-owned recorded references:
 repository bindings, canonical-label records, and dependent aliases. A recorded
