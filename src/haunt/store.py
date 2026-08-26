@@ -611,8 +611,8 @@ def _erasure_context_values(*raw_values: object) -> set[str]:
 
     Keep target event fields routed through this hook so future provenance
     fields can extend purge sanitization without scattering privacy logic.
-    JSON field names describe structure rather than erased cross-object values,
-    so only mapping values participate in session-context sanitization.
+    Target metadata keys may themselves contain user-controlled private bytes,
+    so both mapping keys and values participate in session sanitization.
     """
     values: set[str] = set()
     not_json = object()
@@ -621,7 +621,8 @@ def _erasure_context_values(*raw_values: object) -> set[str]:
         if value is None:
             return
         if isinstance(value, dict):
-            for child in value.values():
+            for key, child in value.items():
+                add(key)
                 add(child)
             return
         if isinstance(value, (list, tuple, set)):

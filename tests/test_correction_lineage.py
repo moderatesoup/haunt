@@ -1006,12 +1006,22 @@ def test_purge_drops_opaque_non_utf8_meta_from_affected_shared_session(lineage_e
         _assert_tokens_absent_from_payload(st.trace(unrelated.memory_id), absent)
 
 
-def test_purge_preserves_clean_session_json_keys_and_exact_utf8_blob(lineage_env):
+def test_purge_scrubs_target_metadata_key_and_preserves_unrelated_fields(
+    lineage_env, monkeypatch
+):
+    monkeypatch.setenv("HAUNT_MCP_ADMIN", "1")
+    from haunt.mcp_server import memory_trace
     from haunt.store import Store
+    from tests.dashutil import make_dash_client
 
     session_id = "shared-json-key-target-session"
+    secret_key = "TARGET-META-PRIVATE-KEY-CANARY"
     private_value = "TARGET-META-PRIVATE-VALUE-CANARY"
-    clean_meta = b'{"shared_key":"innocent","other":"preserved"}'
+    clean_meta = (
+        b'{"'
+        + secret_key.encode("utf-8")
+        + b'":"innocent","other":"preserved"}'
+    )
     with Store("default") as st:
         unrelated = st.observe(
             "shared key unrelated survivor",
@@ -1022,7 +1032,7 @@ def test_purge_preserves_clean_session_json_keys_and_exact_utf8_blob(lineage_env
             "shared key purge target",
             origin="shared-key-target-origin",
             session_id=session_id,
-            meta={"shared_key": private_value},
+            meta={secret_key: private_value},
         )
         st.conn.execute(
             "UPDATE sessions SET meta=? WHERE id=?",
@@ -1040,9 +1050,12 @@ def test_purge_preserves_clean_session_json_keys_and_exact_utf8_blob(lineage_env
             (survivor["session_id"],),
         ).fetchone()
         assert session["source"] == "safe-shared-key-origin"
-        assert session["meta_type"] == "blob"
-        assert session["meta"] == clean_meta
+        assert session["meta_type"] == "text"
+        assert json.loads(session["meta"]) == {"other": "preserved"}
+        assert b"other" in session["meta"].encode("utf-8")
+        assert b"preserved" in session["meta"].encode("utf-8")
         absent = (
+            secret_key,
             private_value,
             session_id,
             target.memory_id,
@@ -1052,6 +1065,15 @@ def test_purge_preserves_clean_session_json_keys_and_exact_utf8_blob(lineage_env
         )
         _assert_tokens_absent_from_tables(st, absent)
         _assert_tokens_absent_from_payload(st.trace(unrelated.memory_id), absent)
+
+    detail = make_dash_client().get(
+        f"/api/namespace/default/memory/{unrelated.memory_id}"
+    )
+    assert detail.status_code == 200
+    _assert_tokens_absent_from_payload(detail.json(), absent)
+    _assert_tokens_absent_from_payload(
+        json.loads(memory_trace(unrelated.memory_id, namespace="default")), absent
+    )
 
 
 def test_purge_rekeys_target_shared_session_and_scrubs_full_event_context(

@@ -103,6 +103,10 @@ erased content; memory, event, session, tool-call, import, or native-source IDs;
 hashes of those IDs; blob hashes/references; origin/provenance; or correction
 and erasure reasons. Tests must plant canaries in every forbidden class and
 prove they are absent from all surviving logical rows and serialized surfaces.
+When an erased target's user-controlled metadata is copied into an affected
+shared-session metadata object, purge conservatively treats exact metadata keys
+as erased context as well as values. A coincidentally identical session key may
+therefore be removed even if its value differs; unrelated session fields remain.
 
 This reconciles the user-visible distinction already documented between
 supersede and delete (`README.md:95-96`) with a durable correction audit trail.
