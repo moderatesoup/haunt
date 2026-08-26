@@ -81,7 +81,7 @@ def test_v3_migration_is_additive_idempotent_and_survives_restart(lineage_env):
         assert st.get_meta("schema_version") == str(SCHEMA_VERSION)
 
 
-def test_v5_upgrade_installs_correction_invariants_and_survives_restart(lineage_env):
+def test_v6_upgrade_installs_correction_guards_and_survives_restart(lineage_env):
     from haunt.store import SCHEMA_VERSION, Store
     from haunt.util import new_id, now_iso
 
@@ -94,7 +94,9 @@ def test_v5_upgrade_installs_correction_invariants_and_survives_restart(lineage_
         )
         st.conn.execute("DROP TRIGGER corrections_invariant_insert")
         st.conn.execute("DROP TRIGGER corrections_invariant_update")
-        st.conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        st.conn.execute("DROP TRIGGER corrections_append_only_update")
+        st.conn.execute("DROP TRIGGER corrections_append_only_delete")
+        st.conn.execute("UPDATE meta SET value='6' WHERE key='schema_version'")
         st.conn.commit()
 
     with Store("default") as st:
@@ -109,6 +111,8 @@ def test_v5_upgrade_installs_correction_invariants_and_survives_restart(lineage_
         assert {
             "corrections_invariant_insert",
             "corrections_invariant_update",
+            "corrections_append_only_update",
+            "corrections_append_only_delete",
         } <= triggers
         with pytest.raises(sqlite3.IntegrityError, match="correction invariant"):
             st.conn.execute(
@@ -130,6 +134,8 @@ def test_v5_upgrade_installs_correction_invariants_and_survives_restart(lineage_
                     "{}",
                 ),
             )
+
+
 def test_three_link_trace_from_middle_and_restart(lineage_env):
     from haunt.store import Store
 
@@ -529,6 +535,12 @@ def test_purge_derived_delete_failure_rolls_back_everything(
                 (target.memory_id, canary.encode("utf-8")),
             )
             st.conn.commit()
+        correction = st.contradict(
+            target.memory_id,
+            replacement=canary + "-SURVIVING-REPLACEMENT",
+            reason=canary + "-REASON",
+            idempotency_key=canary + "-KEY",
+        )
         before = _all_table_snapshot(st)
 
         def deny_delete(action, arg1, _arg2, _db, _trigger):
@@ -551,6 +563,12 @@ def test_purge_derived_delete_failure_rolls_back_everything(
         assert st.conn.execute(
             "SELECT COUNT(*) FROM lineage_tombstones"
         ).fetchone()[0] == 0
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            st.conn.execute(
+                "UPDATE corrections SET reason='unauthorized-after-rollback' WHERE id=?",
+                (correction["correction_id"],),
+            )
+        st.conn.rollback()
 
 
 def test_purge_allows_deliberately_missing_derived_tables(lineage_env):
@@ -943,6 +961,99 @@ def test_purge_rekeys_preexisting_shared_correction_session_and_preserves_clean_
         assert st.get_meta("current_session") == replacement["session_id"]
 
 
+def test_purge_drops_opaque_non_utf8_meta_from_affected_shared_session(lineage_env):
+    from haunt.store import Store
+
+    opaque_canary = "OPAQUE-SESSION-BLOB-PRIVATE-CANARY"
+    session_id = "opaque-session-target-id"
+    with Store("default") as st:
+        unrelated = st.observe(
+            "opaque session unrelated survivor",
+            origin="safe-opaque-session-origin",
+            session_id=session_id,
+        )
+        target = st.observe(
+            "opaque metadata purge target",
+            origin="opaque-target-origin",
+            session_id=session_id,
+        )
+        opaque_meta = sqlite3.Binary(
+            b"\xff\xfe\x00opaque:" + opaque_canary.encode("utf-8")
+        )
+        st.conn.execute(
+            "UPDATE sessions SET meta=? WHERE id=?", (opaque_meta, session_id)
+        )
+        st.conn.commit()
+
+        st.purge(target.memory_id)
+
+        survivor = st.get_memory(unrelated.memory_id)
+        assert survivor["content"] == "opaque session unrelated survivor"
+        assert survivor["session_id"] != session_id
+        safe_meta = st.conn.execute(
+            "SELECT meta FROM sessions WHERE id=?", (survivor["session_id"],)
+        ).fetchone()["meta"]
+        assert safe_meta == "{}"
+        absent = (
+            opaque_canary,
+            session_id,
+            target.memory_id,
+            target.event_id,
+            "opaque metadata purge target",
+            "opaque-target-origin",
+        )
+        _assert_tokens_absent_from_tables(st, absent)
+        _assert_tokens_absent_from_payload(st.trace(unrelated.memory_id), absent)
+
+
+def test_purge_preserves_clean_session_json_keys_and_exact_utf8_blob(lineage_env):
+    from haunt.store import Store
+
+    session_id = "shared-json-key-target-session"
+    private_value = "TARGET-META-PRIVATE-VALUE-CANARY"
+    clean_meta = b'{"shared_key":"innocent","other":"preserved"}'
+    with Store("default") as st:
+        unrelated = st.observe(
+            "shared key unrelated survivor",
+            origin="safe-shared-key-origin",
+            session_id=session_id,
+        )
+        target = st.observe(
+            "shared key purge target",
+            origin="shared-key-target-origin",
+            session_id=session_id,
+            meta={"shared_key": private_value},
+        )
+        st.conn.execute(
+            "UPDATE sessions SET meta=? WHERE id=?",
+            (sqlite3.Binary(clean_meta), session_id),
+        )
+        st.conn.commit()
+
+        st.purge(target.memory_id)
+
+        survivor = st.get_memory(unrelated.memory_id)
+        assert survivor["content"] == "shared key unrelated survivor"
+        assert survivor["session_id"] != session_id
+        session = st.conn.execute(
+            "SELECT source, meta, typeof(meta) AS meta_type FROM sessions WHERE id=?",
+            (survivor["session_id"],),
+        ).fetchone()
+        assert session["source"] == "safe-shared-key-origin"
+        assert session["meta_type"] == "blob"
+        assert session["meta"] == clean_meta
+        absent = (
+            private_value,
+            session_id,
+            target.memory_id,
+            target.event_id,
+            "shared key purge target",
+            "shared-key-target-origin",
+        )
+        _assert_tokens_absent_from_tables(st, absent)
+        _assert_tokens_absent_from_payload(st.trace(unrelated.memory_id), absent)
+
+
 def test_purge_rekeys_target_shared_session_and_scrubs_full_event_context(
     lineage_env, monkeypatch
 ):
@@ -1195,6 +1306,92 @@ def test_schema_enforces_key_uniqueness_and_allows_scrubbed_tombstones(lineage_e
                 """,
                 (new_id(), invalid_tombstone_id, now_iso(), "must-be-scrubbed"),
             )
+
+
+def test_schema_rejects_normal_correction_updates_and_deletes(lineage_env):
+    from haunt.store import Store
+    from haunt.util import new_id
+
+    with Store("default") as st:
+        target = st.observe("append-only SQL target")
+        correction = st.contradict(
+            target.memory_id,
+            replacement="append-only SQL replacement",
+            reason="original reason",
+            idempotency_key="append-only-sql-key",
+        )
+        correction_id = correction["correction_id"]
+        before = tuple(
+            st.conn.execute(
+                "SELECT * FROM corrections WHERE id=?", (correction_id,)
+            ).fetchone()
+        )
+        attacks = {
+            "id": new_id(),
+            "target_memory_id": new_id(),
+            "replacement_memory_id": new_id(),
+            "reason": "rewritten reason",
+            "idempotency_key": "rewritten-key",
+            "request_identity": "sha256:" + "f" * 64,
+            "request_payload": sqlite3.Binary(b"rewritten payload"),
+            "response_json": '{"ok":false}',
+        }
+        for column, value in attacks.items():
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                st.conn.execute(
+                    f'UPDATE corrections SET "{column}"=? WHERE id=?',
+                    (value, correction_id),
+                )
+            st.conn.rollback()
+            assert tuple(
+                st.conn.execute(
+                    "SELECT * FROM corrections WHERE id=?", (correction_id,)
+                ).fetchone()
+            ) == before
+
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            st.conn.execute("DELETE FROM corrections WHERE id=?", (correction_id,))
+        st.conn.rollback()
+        assert tuple(
+            st.conn.execute(
+                "SELECT * FROM corrections WHERE id=?", (correction_id,)
+            ).fetchone()
+        ) == before
+
+
+def test_external_sqlite_connection_fails_closed_on_correction_mutation(lineage_env):
+    from haunt.store import Store
+
+    with Store("default") as st:
+        target = st.observe("external SQL append-only target")
+        correction = st.contradict(
+            target.memory_id,
+            replacement="external SQL replacement",
+            idempotency_key="external-sql-append-only",
+        )
+        correction_id = correction["correction_id"]
+        db_path = st.db_path
+
+    conn = sqlite3.connect(db_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="no such function"):
+            conn.execute(
+                "UPDATE corrections SET reason='external rewrite' WHERE id=?",
+                (correction_id,),
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.OperationalError, match="no such function"):
+            conn.execute("DELETE FROM corrections WHERE id=?", (correction_id,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+    with Store("default") as st:
+        row = st.conn.execute(
+            "SELECT reason, idempotency_key FROM corrections WHERE id=?",
+            (correction_id,),
+        ).fetchone()
+        assert tuple(row) == (None, "external-sql-append-only")
 
 
 def test_idempotency_key_omission_is_rejected_without_writes_on_all_surfaces(

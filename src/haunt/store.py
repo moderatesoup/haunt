@@ -7,6 +7,7 @@ import sqlite3
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import get_ident
 from typing import Any, Iterator
 
 import sqlite_vec
@@ -46,7 +47,8 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 4: append-only correction lineage plus privacy-erasure tombstones.
 # 5: privacy-safe rekeying for erased target and correction sessions.
 # 6: schema-enforced normal-vs-privacy-scrubbed correction invariants.
-SCHEMA_VERSION = 6
+# 7: database-enforced append-only corrections outside authorized purge.
+SCHEMA_VERSION = 7
 SCHEMA_VERSION_KEY = "schema_version"
 
 _CLOCK_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -360,12 +362,37 @@ def _ensure_correction_invariant_triggers(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_correction_append_only_triggers(conn: sqlite3.Connection) -> None:
+    """Block correction mutation unless this Store is in its purge transaction.
+
+    The authorization function is registered only on Store-owned connections.
+    An external SQLite connection cannot satisfy the trigger and fails closed.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='corrections'"
+    ).fetchone()
+    if not exists:
+        return
+    for operation in ("UPDATE", "DELETE"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS corrections_append_only_{operation.lower()}
+            BEFORE {operation} ON corrections
+            WHEN haunt_privacy_purge_authorized() != 1
+            BEGIN
+                SELECT RAISE(ABORT, 'corrections are append-only');
+            END
+            """
+        )
+
+
 def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     """Create tables and run one-time migrations. Not invoked per query."""
     _init_namespace_schema(conn)
     current = _schema_version(conn)
     if current >= SCHEMA_VERSION:
         _ensure_correction_invariant_triggers(conn)
+        _ensure_correction_append_only_triggers(conn)
         conn.commit()
         return
     if current < 1:
@@ -435,6 +462,7 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
             """
         )
     _ensure_correction_invariant_triggers(conn)
+    _ensure_correction_append_only_triggers(conn)
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
         (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
@@ -583,6 +611,8 @@ def _erasure_context_values(*raw_values: object) -> set[str]:
 
     Keep target event fields routed through this hook so future provenance
     fields can extend purge sanitization without scattering privacy logic.
+    JSON field names describe structure rather than erased cross-object values,
+    so only mapping values participate in session-context sanitization.
     """
     values: set[str] = set()
     not_json = object()
@@ -591,8 +621,7 @@ def _erasure_context_values(*raw_values: object) -> set[str]:
         if value is None:
             return
         if isinstance(value, dict):
-            for key, child in value.items():
-                add(key)
+            for child in value.values():
                 add(child)
             return
         if isinstance(value, (list, tuple, set)):
@@ -639,7 +668,16 @@ class Store:
         if create:
             register_namespace(self.name, repo_path)
         self.db_path = namespace_db_path(self.name)
+        self._privacy_purge_thread_id: int | None = None
         self.conn = _connect(self.db_path, create=create)
+        self.conn.create_function(
+            "haunt_privacy_purge_authorized",
+            0,
+            lambda: int(
+                self._privacy_purge_thread_id == get_ident()
+                and self.conn.in_transaction
+            ),
+        )
         _ensure_namespace_schema(self.conn)
         self._ensure_graph_evidence()
 
@@ -1393,6 +1431,7 @@ class Store:
 
         try:
             self.conn.execute("BEGIN IMMEDIATE")
+            self._privacy_purge_thread_id = get_ident()
             # Privacy erasure is the sole exception to correction immutability.
             # Replace an erased chain member with a fresh opaque tombstone and
             # scrub correction request/context fields that could retain it.
@@ -1622,6 +1661,8 @@ class Store:
         except Exception:
             self.conn.rollback()
             raise
+        finally:
+            self._privacy_purge_thread_id = None
         try:
             touch_namespace(self.name)
         except Exception:
@@ -1729,9 +1770,10 @@ class Store:
             try:
                 meta_text = original_meta.decode("utf-8")
             except UnicodeDecodeError:
-                if tainted(original_meta):
-                    return row["started_at"], row["ended_at"], safe_source, dumps({})
-                return row["started_at"], row["ended_at"], safe_source, original_meta
+                # Opaque metadata on an affected session cannot be proven free
+                # of erased context. Privacy purge therefore drops it even when
+                # no plaintext marker can be found in the raw bytes.
+                return row["started_at"], row["ended_at"], safe_source, dumps({})
         else:
             meta_text = original_meta
         not_json = object()
