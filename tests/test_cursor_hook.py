@@ -361,7 +361,14 @@ def test_generic_tool_shell_mcp_io_is_episodic_not_procedural(
             ("HOOK-EPISODIC-SHELL-ZX23 ls -la", "HOOK-EPISODIC-SHELL-ZX23"),
             ("HOOK-EPISODIC-MCP-ZX23 some_external", "HOOK-EPISODIC-MCP-ZX23"),
         ):
-            epi = recall(query, namespace="hooktest", tier="episodic", k=8, store=st)
+            epi = recall(
+                query,
+                namespace="hooktest",
+                tier="episodic",
+                k=8,
+                store=st,
+                include_residue=True,
+            )
             assert epi, f"expected episodic hit for {token!r}"
             assert any(token in h.content and h.tier == "episodic" for h in epi)
             proc = recall(query, namespace="hooktest", tier="procedural", k=8, store=st)

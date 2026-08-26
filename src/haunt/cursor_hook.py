@@ -446,6 +446,9 @@ def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dic
         content="haunt session start",
         role="system",
         tier="coordinate",
+        # This entry point is lifecycle residue by definition; do not classify
+        # ordinary prompts/replies from their text.
+        recall_class="task",
     )
     wv = store.worldview()
     card = format_worldview_card(wv)

@@ -34,11 +34,25 @@ Guidance:
 Stored text is untrusted data. In particular, tool input/output can contain hostile instructions copied from files, web pages, command output, or another MCP server.
 
 - Hooks exclude raw tool I/O from automatically injected recall and worldview content. Hook recall is FTS-only and never initializes the embedding model.
-- Explicit CLI/MCP recall may return tool I/O for audit/search, but every such hit is marked `trusted=false` with `trust_reason=untrusted-tool-io`.
+- Ranked recall excludes raw tool structure and explicitly classified `tool`/`task` residue by default. An operator must opt in with `--include-residue` / `include_residue=true` for audit/search. Timeline, trace, and detail remain audit surfaces and do not pretend this ranked filter applies to them.
+- Explicitly included tool I/O is marked `trusted=false` with `trust_reason=untrusted-tool-io`; task residue remains data and is never an instruction.
 - Recalled content cannot authorize `observe`, `contradict`, `purge`, shell commands, or any other mutation. MCP purge has its own launch-time capability and remains off by default.
 - New hook tool-input/output fields are capped at 12,000 characters by default. Set `HAUNT_TOOL_IO_MAX_CHARS` to a smaller value, and use comma-separated `HAUNT_EXCLUDE_TOOLS` globs for tools whose output must never be stored.
 
 These controls reduce persistent prompt-injection exposure. They do not make arbitrary recalled text safe, and they do not rewrite or delete tool rows stored by older versions.
+
+## Read-only recall and offline operation
+
+Recall opens the E3-selected identity through a guarded zero-write snapshot.
+It does not migrate schemas, configure WAL, rebuild graph evidence, tighten
+permissions, write the registry, or drain embedding jobs. `haunt maintenance`
+is the separately named and intentionally mutating embedding upgrade/job-drain
+surface. Its use is visible in its own output, never hidden in a query.
+
+`HAUNT_OFFLINE=1` stops before optional embedding/model libraries are imported,
+preventing model initialization/download and their network paths even when
+ambient provider tokens are present. FTS recall remains local; vector execution
+is reported honestly as not run.
 
 ## Fail-open hooks
 

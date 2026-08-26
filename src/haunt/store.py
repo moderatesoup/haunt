@@ -73,6 +73,7 @@ from haunt.util import (
 
 ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
+RECALL_CLASSES = ("tool", "task")
 
 # 1: one-time normalize of offset/naive clocks to UTC microseconds.
 # 2: graph evidence tables + hook idempotency key.
@@ -82,7 +83,8 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 6: schema-enforced normal-vs-privacy-scrubbed correction invariants.
 # 7: database-enforced append-only corrections outside authorized purge.
 # 8: validated, versioned source provenance on events.
-SCHEMA_VERSION = 8
+# 9: explicit recall-residue classification on new events only.
+SCHEMA_VERSION = 9
 SCHEMA_VERSION_KEY = "schema_version"
 REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
@@ -706,6 +708,53 @@ def _open_mapped_namespace_db_with_configuration_lock(
             raise
 
 
+def _open_mapped_namespace_db_readonly(
+    path: Path, *, expected: tuple[int | None, int | None]
+) -> sqlite3.Connection:
+    """Open one mapped namespace without any SQLite or Haunt maintenance.
+
+    This deliberately bypasses the write-configuration lock and its lock-file,
+    WAL pragmas, schema migration, mode tightening, and graph rebuild path.
+    The existing primary/sidecar guards still pin the physical E3 mapping. A
+    live WAL is read through E3's guarded private shadow, never directly from
+    the source: some SQLite/VFS combinations otherwise create sidecars even
+    for a URI opened with mode=ro.
+    """
+    expected_map = {str(path): expected}
+    actual = validate_namespace_db_paths([str(path)], expected=expected_map)[str(path)]
+    conn = _open_zero_write_sqlite_snapshot(path)
+    try:
+        if isinstance(conn, _SidecarGuardedConnection):
+            conn.verify_storage_guards()
+        validate_namespace_db_paths([str(path)], expected={str(path): actual})
+        # Loading the native module is connection-local and permits vec0 reads.
+        # If it is unavailable, vec_ok() remains false; recall may explicitly
+        # use its persisted-embedding L2 implementation, and labels that
+        # method in both execution and per-hit evidence.  It never presents
+        # that path as a successful native vec0 query, configures WAL, or
+        # changes the namespace file.
+        from haunt.embed import fts_only
+
+        if not fts_only():
+            try:
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+            except Exception:
+                # A read-only FTS recall remains useful when the optional
+                # native vector module is unavailable; _vec_hits can use
+                # persisted embedding blobs if a query vector is available.
+                pass
+            finally:
+                try:
+                    conn.enable_load_extension(False)
+                except Exception:
+                    pass
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
 def _preflight_registry_storage_read_only() -> None:
     """Reject unsafe existing mappings before migration opens the registry RW."""
     registry = registry_path()
@@ -1087,6 +1136,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             origin TEXT,
             tier TEXT NOT NULL,
             meta TEXT,
+            recall_class TEXT CHECK(recall_class IN ('tool', 'task') OR recall_class IS NULL),
             FOREIGN KEY (session_id) REFERENCES sessions(id)
         );
         CREATE TABLE IF NOT EXISTS memories (
@@ -1418,6 +1468,16 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE events ADD COLUMN provenance TEXT "
                 "CHECK (provenance IS NULL OR "
                 "(json_valid(provenance)=1 AND json_type(provenance)='object'))"
+            )
+    if current < 9:
+        event_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "recall_class" not in event_columns:
+            # No backfill: NULL is the honest legacy/unknown classification.
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN recall_class TEXT "
+                "CHECK(recall_class IN ('tool', 'task') OR recall_class IS NULL)"
             )
     _ensure_correction_invariant_triggers(conn)
     _ensure_correction_append_only_triggers(conn)
@@ -1932,6 +1992,41 @@ def namespace_exists(name: str) -> bool:
         conn.close()
 
 
+def namespace_exists_readonly(name: str) -> bool:
+    """Check a label/alias without registry initialization or writes."""
+    return resolve_namespace_identity(name) is not None
+
+
+def list_namespace_rows_readonly() -> list[dict[str, Any]]:
+    """Minimal E3 identity listing for all-namespace recall fan-out."""
+    conn = _readonly_registry()
+    try:
+        rows = conn.execute(
+            """
+            SELECT namespace_id, canonical_label, canonical_label_norm, db_path,
+                   db_device, db_inode, created_at, updated_at
+            FROM namespace_identities ORDER BY canonical_label_norm
+            """
+        ).fetchall()
+        return [
+            {
+                **dict(row),
+                "name": str(row["canonical_label"]),
+                "aliases": [
+                    str(alias["label"])
+                    for alias in conn.execute(
+                        "SELECT label FROM namespace_aliases WHERE namespace_id=? "
+                        "ORDER BY normalized_label",
+                        (row["namespace_id"],),
+                    ).fetchall()
+                ],
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
 def touch_namespace(name: str, *, namespace_id: str | None = None) -> None:
     conn = _registry()
     touched_namespace_id: str | None = None
@@ -2081,7 +2176,19 @@ def list_namespace_rows() -> list[dict[str, Any]]:
 
 def _readonly_registry() -> sqlite3.Connection:
     """Open the existing registry without creating files or setting pragmas."""
-    path = registry_path()
+    return _open_zero_write_sqlite_snapshot(registry_path())
+
+
+def _open_zero_write_sqlite_snapshot(path: Path) -> sqlite3.Connection:
+    """Read a SQLite source without allowing a source-file mutation.
+
+    A quiescent database is opened immutable. For a complete live WAL, copy
+    the guarded primary/WAL snapshot to a private system temporary directory,
+    checkpoint that *copy*, and open the resulting copy immutable. This is the
+    E3 zero-write algorithm shared by registry and namespace recall paths.
+    It deliberately rejects incomplete WAL and rollback-journal states rather
+    than trying a direct `mode=ro` open whose VFS behavior is not portable.
+    """
     if not path.is_file():
         raise FileNotFoundError(path)
     for _attempt in range(3):
@@ -2126,7 +2233,7 @@ def _readonly_registry() -> sqlite3.Connection:
             sidecars.close(clean_unused_claims=False)
             primary.close()
     raise NamespacePathError(
-        "registry changed repeatedly while creating a zero-write read snapshot"
+        f"SQLite source changed repeatedly while creating a zero-write read snapshot: {path}"
     )
 
 
@@ -3624,6 +3731,28 @@ class ObserveResult:
     embedding_queued: bool = False
     deduplicated: bool = False
     provenance: dict[str, Any] = field(default_factory=dict)
+    recall_class: str | None = None
+
+
+def _resolved_recall_class(
+    recall_class: str | None,
+    *,
+    role: str,
+    tool_name: str | None,
+    tool_input: str | None,
+    tool_output: str | None,
+) -> str | None:
+    """Validate explicit residue metadata without inferring from content."""
+    if recall_class is not None and recall_class not in RECALL_CLASSES:
+        raise ValueError("recall_class must be one of: tool, task, or null")
+    raw_tool_structure = role == "tool" or any(
+        value is not None for value in (tool_name, tool_input, tool_output)
+    )
+    if raw_tool_structure:
+        if recall_class is not None and recall_class != "tool":
+            raise ValueError("raw tool structure requires recall_class='tool'")
+        return "tool"
+    return recall_class
 
 
 class Store:
@@ -3676,6 +3805,11 @@ class Store:
             ),
         )
         _ensure_namespace_schema(self.conn)
+        # Writer opens always complete the additive schema migration.  Keeping
+        # this capability explicit makes an explicitly supplied writable Store
+        # report the same selected filters as public read-only recall.
+        self.recall_class_available = True
+        self.read_only = False
         self._ensure_graph_evidence()
 
     def close(self) -> None:
@@ -3801,6 +3935,7 @@ class Store:
         channel: str = "python",
         meta: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
+        recall_class: str | None = None,
         valid_from: str | None = None,
         valid_to: str | None = None,
         idempotency_key: str | None = None,
@@ -3809,6 +3944,13 @@ class Store:
     ) -> ObserveResult:
         # Provenance is validated before sessions, events, embedding jobs, or
         # graph/index projections can be written.
+        resolved_recall_class = _resolved_recall_class(
+            recall_class,
+            role=role,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_output=tool_output,
+        )
         canonical_provenance = validate_provenance(
             provenance,
             origin=origin,
@@ -3826,7 +3968,9 @@ class Store:
         if idem and len(idem) > 512:
             raise ValueError("idempotency_key must be 512 characters or fewer")
         if idem:
-            existing = self._observe_by_idempotency_key(idem, text, encoded_provenance)
+            existing = self._observe_by_idempotency_key(
+                idem, text, encoded_provenance, resolved_recall_class
+            )
             if existing is not None:
                 return existing
         if commit and not defer_embedding:
@@ -3845,8 +3989,8 @@ class Store:
                 INSERT INTO events(
                     id, idempotency_key, session_id, ts, event_time, role, content,
                     tool_name, tool_input, tool_output, origin, tier, meta,
-                    provenance
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    provenance, recall_class
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     event_id,
@@ -3863,6 +4007,7 @@ class Store:
                     tier,
                     dumps(meta or {}),
                     encoded_provenance,
+                    resolved_recall_class,
                 ),
             )
             blob = None
@@ -3923,7 +4068,7 @@ class Store:
             self.conn.rollback()
             if idem:
                 existing = self._observe_by_idempotency_key(
-                    idem, text, encoded_provenance
+                    idem, text, encoded_provenance, resolved_recall_class
                 )
                 if existing is not None:
                     return existing
@@ -3946,6 +4091,7 @@ class Store:
             embedded=embedded,
             embedding_queued=embedding_queued,
             provenance=canonical_provenance,
+            recall_class=resolved_recall_class,
         )
 
     def _observe_by_idempotency_key(
@@ -3953,12 +4099,13 @@ class Store:
         key: str,
         expected_text: str,
         expected_provenance: str,
+        expected_recall_class: str | None,
     ) -> ObserveResult | None:
         row = self.conn.execute(
             """
             SELECT e.id AS event_id, e.session_id, e.tier,
                    m.id AS memory_id, m.content, m.embedding, e.provenance,
-                   e.origin, e.meta, e.tool_name
+                   e.origin, e.meta, e.tool_name, e.recall_class
             FROM events e
             JOIN memories m ON m.event_id=e.id
             WHERE e.idempotency_key=?
@@ -3971,6 +4118,8 @@ class Store:
             return None
         if row["content"] != expected_text:
             raise ValueError("idempotency_key was reused with different content")
+        if row["recall_class"] != expected_recall_class:
+            raise ValueError("idempotency_key was reused with different recall_class")
         if row["provenance"] is None:
             raise ValueError("idempotency_key replay cannot verify legacy provenance")
         stored_provenance = public_provenance(
@@ -4016,6 +4165,7 @@ class Store:
             is not None,
             deduplicated=True,
             provenance=stored_provenance,
+            recall_class=row["recall_class"],
         )
 
     def process_embedding_jobs(self, *, limit: int = 64) -> dict[str, Any]:
@@ -5280,7 +5430,7 @@ class Store:
                    m.valid_from, m.valid_to, m.created_at,
                    e.session_id, e.ts, e.event_time, e.role, e.content AS event_content,
                    e.tool_name, e.tool_input, e.tool_output, e.origin, e.meta,
-                   e.provenance
+                   e.provenance, e.recall_class
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.id = ?
@@ -5657,7 +5807,13 @@ class Store:
                 return replay_result
 
             row = self.conn.execute(
-                "SELECT id, valid_to FROM memories WHERE id=?", (memory_id,)
+                """
+                SELECT m.id, m.valid_to, e.recall_class, e.role,
+                       e.tool_name, e.tool_input, e.tool_output
+                FROM memories m JOIN events e ON e.id=m.event_id
+                WHERE m.id=?
+                """,
+                (memory_id,),
             ).fetchone()
             if not row:
                 self.conn.rollback()
@@ -5670,6 +5826,20 @@ class Store:
                     "error": f"memory {memory_id} already superseded",
                     "valid_to": row["valid_to"],
                 }
+
+            # v8 and older rows have no recorded class.  Preserve the
+            # effective raw-tool boundary when replacing one of those rows:
+            # a system-role correction must not turn tool residue into an
+            # eligible memory merely because historical data was never
+            # backfilled.
+            source_recall_class = row["recall_class"]
+            if source_recall_class is None and (
+                row["role"] == "tool"
+                or row["tool_name"] is not None
+                or row["tool_input"] is not None
+                or row["tool_output"] is not None
+            ):
+                source_recall_class = "tool"
 
             ts = now_iso()
             correction_id = new_id()
@@ -5709,6 +5879,10 @@ class Store:
                     valid_from=ts,
                     origin=origin,
                     channel=channel,
+                    # Corrections preserve the source's effective class. This
+                    # includes v8 raw-tool rows whose class was necessarily
+                    # unstored, avoiding residue laundering on replacement.
+                    recall_class=source_recall_class,
                     commit=False,
                 )
                 replacement_memory_id = r.memory_id
@@ -5745,6 +5919,145 @@ class Store:
         except Exception:
             self.conn.rollback()
             raise
+
+
+class ReadOnlyStore(Store):
+    """A stable-identity Store view that is physically incapable of writes.
+
+    Read paths use this class rather than ``Store(create=False)`` because the
+    latter intentionally performs migration/configuration work for writers.
+    ``recall_class_available`` is a capability, not a migration request: old
+    rows remain eligible as legacy/unknown when the column does not exist.
+    """
+
+    @classmethod
+    def _from_identity(cls, identity: dict[str, Any]) -> "ReadOnlyStore":
+        store = cls.__new__(cls)
+        store._initialize_readonly_identity(identity)
+        return store
+
+    def _initialize_readonly_identity(self, identity: dict[str, Any]) -> None:
+        self.namespace_id = str(identity["namespace_id"])
+        self.name = str(identity["canonical_label"])
+        self.db_path = Path(str(identity["db_path"]))
+        self._privacy_purge_thread_id = None
+        self.read_only = True
+        self.conn = _open_mapped_namespace_db_readonly(
+            self.db_path,
+            expected=(identity.get("db_device"), identity.get("db_inode")),
+        )
+        try:
+            tables = {
+                str(row[0])
+                for row in self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            columns = (
+                {
+                    str(row["name"])
+                    for row in self.conn.execute("PRAGMA table_info(events)").fetchall()
+                }
+                if "events" in tables
+                else set()
+            )
+            self.recall_class_available = "recall_class" in columns
+            self.schema_version = (
+                _schema_version(self.conn) if "meta" in tables else 0
+            )
+        except sqlite3.Error:
+            # The query layer will fail honestly for required missing tables;
+            # do not repair a corrupt/old database while reading it.
+            self.recall_class_available = False
+            self.schema_version = 0
+
+
+def _validate_selected_readonly_identity(
+    identity: dict[str, Any],
+    *,
+    expected_db_path: str | None = None,
+    expected_db_device: int | None = None,
+    expected_db_inode: int | None = None,
+) -> None:
+    if expected_db_path is not None and str(identity["db_path"]) != expected_db_path:
+        raise NamespacePathError("selected namespace database path changed before open")
+    if expected_db_device is not None and int(identity.get("db_device") or -1) != int(
+        expected_db_device
+    ):
+        raise NamespacePathError("selected namespace database identity changed before open")
+    if expected_db_inode is not None and int(identity.get("db_inode") or -1) != int(
+        expected_db_inode
+    ):
+        raise NamespacePathError("selected namespace database identity changed before open")
+
+
+def open_existing_readonly(name: str) -> ReadOnlyStore:
+    """Resolve an E3 label/alias and open its database without any writes."""
+    identity = resolve_namespace_identity(name)
+    if identity is None:
+        raise UnknownNamespaceError(name)
+    store = ReadOnlyStore._from_identity(identity)
+    try:
+        # Alias reassignment cannot silently retarget a recall between lookup
+        # and SQLite open. This is the label equivalent of the MCP ID check.
+        current = resolve_namespace_identity(name)
+        stable_fields = (
+            "namespace_id", "canonical_label", "canonical_label_norm", "db_path",
+            "db_device", "db_inode",
+        )
+        if current is None or any(
+            current[field] != identity[field] for field in stable_fields
+        ):
+            raise NamespacePathError("namespace identity changed while opening")
+        if (
+            store.namespace_id != str(identity["namespace_id"])
+            or str(store.db_path) != str(identity["db_path"])
+        ):
+            raise NamespacePathError("opened namespace does not match selected identity")
+        return store
+    except Exception:
+        store.close()
+        raise
+
+
+def open_namespace_identity_readonly(
+    namespace_id: str,
+    *,
+    expected_db_path: str | None = None,
+    expected_db_device: int | None = None,
+    expected_db_inode: int | None = None,
+) -> ReadOnlyStore:
+    """Open the exact MCP-selected E3 identity without label re-resolution."""
+    identity = resolve_namespace_id(namespace_id)
+    if identity is None:
+        raise UnknownNamespaceError(namespace_id)
+    _validate_selected_readonly_identity(
+        identity,
+        expected_db_path=expected_db_path,
+        expected_db_device=expected_db_device,
+        expected_db_inode=expected_db_inode,
+    )
+    store = ReadOnlyStore._from_identity(identity)
+    try:
+        current = resolve_namespace_id(namespace_id)
+        if current is None:
+            raise UnknownNamespaceError(namespace_id)
+        _validate_selected_readonly_identity(
+            current,
+            expected_db_path=expected_db_path,
+            expected_db_device=expected_db_device,
+            expected_db_inode=expected_db_inode,
+        )
+        stable_fields = (
+            "namespace_id", "canonical_label", "canonical_label_norm", "db_path",
+            "db_device", "db_inode",
+        )
+        if any(current[field] != identity[field] for field in stable_fields):
+            raise NamespacePathError("selected namespace identity changed while opening")
+        return store
+    except Exception:
+        store.close()
+        raise
 
 
 def open_existing(name: str, repo_path: str | None = None) -> Store:

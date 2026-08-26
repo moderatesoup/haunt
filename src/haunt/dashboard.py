@@ -24,9 +24,10 @@ from haunt.store import (
     Store,
     UnknownNamespaceError,
     list_namespaces,
-    list_namespace_rows,
-    namespace_exists,
+    list_namespace_rows_readonly,
+    namespace_exists_readonly,
     open_existing,
+    open_existing_readonly,
 )
 from haunt.temporal import TemporalParseError, compile as compile_temporal
 from haunt.util import clamp_limit, iso_or_now, normalize_clock
@@ -260,6 +261,7 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
         <div class="search">
           <input id="q" placeholder="paraphrase or verbatim query"/>
           <select id="sTier"><option value="">all tiers</option><option>episodic</option><option>semantic</option><option>procedural</option><option>coordinate</option></select>
+          <label title="Include raw tool and task/session residue for audit search"><input id="includeResidue" type="checkbox"/> include residue</label>
           <button class="primary" id="go">recall</button>
         </div>
         <div class="filters">
@@ -743,6 +745,7 @@ async function doRecall(){
   const asOf=$("sAsOf").value;
   const since=$("sSince").value;
   const until=$("sUntil").value;
+  const includeResidue=$("includeResidue").checked;
   let url,data;
   if(ALL_NS){
     url=`/api/recall?q=${encodeURIComponent(q)}`;
@@ -750,6 +753,7 @@ async function doRecall(){
     if(asOf)url+=`&as_of=${encodeURIComponent(asOf+"T23:59:59+00:00")}`;
     if(since)url+=`&since=${encodeURIComponent(since+"T00:00:00+00:00")}`;
     if(until)url+=`&until=${encodeURIComponent(until+"T23:59:59+00:00")}`;
+    if(includeResidue)url+="&include_residue=true";
     data=await j(url);
   }else{
     url=`/api/namespace/${encodeURIComponent(NS)}/recall?q=${encodeURIComponent(q)}`;
@@ -757,6 +761,7 @@ async function doRecall(){
     if(asOf)url+=`&as_of=${encodeURIComponent(asOf+"T23:59:59+00:00")}`;
     if(since)url+=`&since=${encodeURIComponent(since+"T00:00:00+00:00")}`;
     if(until)url+=`&until=${encodeURIComponent(until+"T23:59:59+00:00")}`;
+    if(includeResidue)url+="&include_residue=true";
     data=await j(url);
   }
   const errs=data.errors||[];
@@ -876,7 +881,7 @@ async def api_namespaces(_request: Request) -> JSONResponse:
 
 
 def _missing_namespace(name: str) -> JSONResponse | None:
-    if namespace_exists(name):
+    if namespace_exists_readonly(name):
         return None
     return JSONResponse(
         {"ok": False, "error": f"unknown namespace: {name}", "namespace": name},
@@ -969,6 +974,9 @@ async def api_recall_all(request: Request) -> JSONResponse:
     since = request.query_params.get("since") or None
     until = request.query_params.get("until") or None
     clock = request.query_params.get("clock") or None
+    include_residue = (request.query_params.get("include_residue") or "").lower() in {
+        "1", "true", "yes"
+    }
 
     try:
         _validate_recall_request(
@@ -976,7 +984,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
         )
     except (TemporalParseError, ValueError) as exc:
         return _recall_error(exc, query=q)
-    ns_rows = sorted(list_namespace_rows(), key=lambda row: row["name"])
+    ns_rows = sorted(list_namespace_rows_readonly(), key=lambda row: row["name"])
     namespace_groups: list[dict[str, Any]] = []
     flattened: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -987,7 +995,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
         # evidence, so its group carries the same structured error as errors.
         group: dict[str, Any] = {"namespace": ns_name, "hits": []}
         try:
-            with Store(ns_name, create=False) as st:
+            with open_existing_readonly(ns_name) as st:
                 hits = planned_recall(
                     q,
                     namespace=ns_name,
@@ -998,6 +1006,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
                     until=until,
                     clock=clock,
                     store=st,
+                    include_residue=include_residue,
                 )
                 results: list[dict[str, Any]] = []
                 for h in sorted(hits, key=_local_recall_order):
@@ -1052,11 +1061,14 @@ async def api_recall(request: Request) -> JSONResponse:
     since = request.query_params.get("since") or None
     until = request.query_params.get("until") or None
     clock = request.query_params.get("clock") or None
+    include_residue = (request.query_params.get("include_residue") or "").lower() in {
+        "1", "true", "yes"
+    }
     try:
         _validate_recall_request(
             q, as_of=as_of, since=since, until=until, clock=clock
         )
-        with Store(name, create=False) as st:
+        with open_existing_readonly(name) as st:
             hits = planned_recall(
                 q,
                 namespace=name,
@@ -1067,6 +1079,7 @@ async def api_recall(request: Request) -> JSONResponse:
                 until=until,
                 clock=clock,
                 store=st,
+                include_residue=include_residue,
             )
     except (TemporalParseError, ValueError) as exc:
         return _recall_error(exc, query=q, namespace=name)

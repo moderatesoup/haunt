@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import NoReturn, Optional
@@ -23,7 +24,9 @@ from haunt.store import (
     UnknownNamespaceError,
     change_namespace_label,
     list_namespaces,
+    namespace_exists_readonly,
     open_existing,
+    open_existing_readonly,
     register_namespace,
     retire_namespace_alias,
     undo_namespace_migration,
@@ -45,6 +48,15 @@ def _existing(ns: str) -> Store:
     """Open an existing namespace or exit 2. Never creates a DB."""
     try:
         return open_existing(ns)
+    except UnknownNamespaceError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+
+def _existing_readonly(ns: str):
+    """Open recall's stable alias target without writer maintenance."""
+    try:
+        return open_existing_readonly(ns)
     except UnknownNamespaceError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
@@ -135,6 +147,11 @@ def observe_cmd(
         "--provenance-json",
         help="Versioned source provenance envelope as JSON",
     ),
+    recall_class: Optional[str] = typer.Option(
+        None,
+        "--recall-class",
+        help="Residue class: tool | task. Raw tool fields always stamp tool.",
+    ),
 ) -> None:
     """Store a chat turn or tool call as-is. No summarization."""
     ns = _ns(namespace)
@@ -159,6 +176,7 @@ def observe_cmd(
                 origin=origin,
                 channel="cli",
                 provenance=provenance,
+                recall_class=recall_class,
             )
     except json.JSONDecodeError as exc:
         typer.echo(f"error: invalid provenance JSON: {exc}", err=True)
@@ -170,7 +188,8 @@ def observe_cmd(
     typer.echo(
         f"ok  event={result.event_id}  memory={result.memory_id}  "
         f"ns={result.namespace}  tier={result.tier}  "
-        f"session={result.session_id}  embedded={int(result.embedded)}  entities={ents}"
+        f"session={result.session_id}  embedded={int(result.embedded)}  "
+        f"recall_class={result.recall_class or '-'}  entities={ents}"
     )
     typer.echo(f"provenance {dumps(result.provenance)}")
 
@@ -191,6 +210,11 @@ def recall_cmd(
     ),
     tier: Optional[str] = typer.Option(None, "--tier"),
     k: int = typer.Option(8, "--k"),
+    include_residue: bool = typer.Option(
+        False,
+        "--include-residue",
+        help="Include raw tool and explicitly classified task/tool residue.",
+    ),
     json_out: bool = typer.Option(
         False,
         "--json",
@@ -213,7 +237,7 @@ def recall_cmd(
     try:
         # _existing retains the established human diagnostic. JSON callers
         # need the raw exception so stdout remains a single JSON document.
-        opener = open_existing if json_out else _existing
+        opener = open_existing_readonly if json_out else _existing_readonly
         with opener(ns) as st:
             hits = planned_recall(
                 query,
@@ -225,6 +249,7 @@ def recall_cmd(
                 tier=tier,
                 k=k,
                 store=st,
+                include_residue=include_residue,
             )
     except (TemporalParseError, UnknownNamespaceError, ValueError, sqlite3.Error) as exc:
         if json_out:
@@ -273,6 +298,49 @@ def recall_cmd(
             f"{i:<3} {signal:<12} {tier_text:<12} {memory_id:<36} "
             f"{snippet(h.content, 140)}"
         )
+
+
+@app.command("maintenance")
+def maintenance_cmd(
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+    limit: int = typer.Option(64, "--limit"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Explicitly upgrade embeddings and drain queued embedding jobs.
+
+    Recall is read-only and never invokes this operation.
+    """
+    try:
+        ns = _ns(namespace)
+        limit = clamp_limit(limit, default=64)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    try:
+        # This is the explicit mutating surface, but still must not create a
+        # typo namespace.  Do the rejection through E3's no-write registry
+        # snapshot before opening the mutating store: ``open_existing`` uses
+        # the normal writer registry opener for a known namespace.
+        if not namespace_exists_readonly(ns):
+            raise UnknownNamespaceError(ns)
+        with open_existing(ns) as st:
+            upgraded = st.ensure_current_embeddings()
+            drained = st.process_embedding_jobs(limit=limit)
+        payload = {
+            "namespace": ns,
+            "maintenance_performed": True,
+            "offline": (os.environ.get("HAUNT_OFFLINE") or "").strip().lower()
+            in {"1", "true", "yes"},
+            "embedding_upgrade": upgraded,
+            "embedding_jobs": drained,
+        }
+    except (UnknownNamespaceError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if json_out:
+        typer.echo(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+    else:
+        typer.echo(dumps(payload))
 
 
 @app.command("timeline")

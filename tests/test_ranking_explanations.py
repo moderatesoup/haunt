@@ -32,6 +32,7 @@ def test_fts_only_explanation_preserves_legacy_fields_and_marks_tool_io(haunt_en
         as_of="2030-01-02T03:04:05+00:00",
         since="2025-01-01T00:00:00+00:00",
         tier="episodic",
+        include_residue=True,
     )
 
     hit = next(hit for hit in hits if hit.memory_id == stored.memory_id)
@@ -78,7 +79,12 @@ def test_fts_only_explanation_preserves_legacy_fields_and_marks_tool_io(haunt_en
             "since": "2025-01-01T00:00:00.000000+00:00",
             "until": None,
             "tier": "episodic",
-            "include_untrusted": True,
+            "include_residue": True,
+            "include_untrusted": None,
+            "residue_filter_source": "include_residue",
+            "residue_filter": "bypassed",
+            "recall_class_capability": "available",
+            "maintenance_performed": False,
         },
         "references": {
             "correction_lineage": {"status": "standalone"},
@@ -87,6 +93,11 @@ def test_fts_only_explanation_preserves_legacy_fields_and_marks_tool_io(haunt_en
             "provenance_status": "native",
         },
         "trust": {"trusted": False, "reason": "untrusted-tool-io"},
+        "residue": {
+            "recall_class": "tool",
+            "classification_source": "events.recall_class",
+            "filter": "bypassed",
+        },
     }
     assert explanation["fts"]["raw_score"] is not None
     assert sum(item["value"] for item in explanation["rrf_contributions"]) == explanation["rrf_score"]
@@ -150,7 +161,8 @@ def test_hybrid_explanation_reports_each_rrf_contribution(haunt_env, monkeypatch
     assert first_explanation["rrf_score"] == 1 / 61 + 1 / 63
     assert sum(item["value"] for item in first_explanation["rrf_contributions"]) == first_explanation["rrf_score"]
     assert first_explanation["filters"]["validity"] == "current"
-    assert first_explanation["filters"]["include_untrusted"] is True
+    assert first_explanation["filters"]["include_untrusted"] is None
+    assert first_explanation["filters"]["include_residue"] is False
 
 
 def test_recall_references_use_e1_lineage_and_e2_public_provenance(

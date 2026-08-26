@@ -17,8 +17,9 @@ import sqlite_vec
 
 from haunt.embed import available as embed_available
 from haunt.embed import embed_one
+from haunt.embed import offline as embed_offline
 from haunt.provenance import json_safe_sqlite
-from haunt.store import Store, open_existing
+from haunt.store import ReadOnlyStore, Store, open_existing_readonly
 from haunt.util import clamp_k, clock_sql_column, iso_or_now, normalize_clock, snippet
 
 # Match FTS5 unicode61 word characters (letters/digits) plus the same
@@ -111,6 +112,8 @@ class Hit:
     vector_stage: dict[str, str] | None = None
     fts_stage: dict[str, str] | None = None
     references: dict[str, Any] | None = None
+    recall_class: str | None = None
+    classification_source: str = "legacy_unknown"
 
     @property
     def trusted(self) -> bool:
@@ -196,6 +199,15 @@ class Hit:
                 "trusted": self.trusted,
                 "reason": self.trust_reason,
             },
+            "residue": {
+                "recall_class": self.recall_class,
+                "classification_source": self.classification_source,
+                "filter": (
+                    None
+                    if self.filter_context is None
+                    else self.filter_context.get("residue_filter")
+                ),
+            },
         }
         return json_safe_sqlite({
             "memory_id": self.memory_id,
@@ -211,6 +223,8 @@ class Hit:
             "valid_from": self.valid_from,
             "valid_to": self.valid_to,
             "tool_name": self.tool_name,
+            "recall_class": self.recall_class,
+            "classification_source": self.classification_source,
             "trusted": self.trusted,
             "trust_reason": self.trust_reason,
             "vec_rank": self.vec_rank,
@@ -287,7 +301,8 @@ def _filters(
     until: str | None,
     tier: str | None,
     clock: str | None = None,
-    include_untrusted: bool = True,
+    include_residue: bool = False,
+    recall_class_available: bool = False,
 ) -> tuple[str, list[Any]]:
     clauses = ["1=1"]
     params: list[Any] = []
@@ -309,8 +324,15 @@ def _filters(
     if tier:
         clauses.append("m.tier = ?")
         params.append(tier)
-    if not include_untrusted:
-        clauses.append("e.role != 'tool' AND e.tool_name IS NULL")
+    if not include_residue:
+        # This raw-tool fence works on pre-v9 files too. It intentionally uses
+        # structured columns/role only; Haunt never guesses a class from text.
+        clauses.append(
+            "e.role != 'tool' AND e.tool_name IS NULL "
+            "AND e.tool_input IS NULL AND e.tool_output IS NULL"
+        )
+        if recall_class_available:
+            clauses.append("e.recall_class IS NULL")
     return " AND ".join(clauses), params
 
 
@@ -321,7 +343,10 @@ def _filter_context(
     until: str | None,
     tier: str | None,
     clock: str | None,
-    include_untrusted: bool,
+    include_residue: bool,
+    include_untrusted: bool | None,
+    residue_filter_source: str,
+    recall_class_available: bool,
 ) -> dict[str, Any]:
     """Return the resolved, user-visible filters applied by recall.
 
@@ -337,7 +362,23 @@ def _filter_context(
         "since": iso_or_now(since) if since else None,
         "until": iso_or_now(until) if until else None,
         "tier": tier,
+        "include_residue": include_residue,
         "include_untrusted": include_untrusted,
+        # The compatibility flag is intentionally observable. A caller can
+        # distinguish the new default from an old include_untrusted request,
+        # and an explicit include_residue always wins in recall().
+        "residue_filter_source": residue_filter_source,
+        "residue_filter": (
+            "bypassed"
+            if include_residue
+            else "applied"
+            if recall_class_available
+            else "unavailable"
+        ),
+        "recall_class_capability": (
+            "available" if recall_class_available else "unavailable"
+        ),
+        "maintenance_performed": False,
     }
 
 
@@ -439,24 +480,42 @@ def recall(
     clock: str | None = None,
     tier: str | None = None,
     k: int = 8,
-    store: Store | None = None,
-    include_untrusted: bool = True,
+    store: Store | ReadOnlyStore | None = None,
+    include_residue: bool | None = None,
+    include_untrusted: bool | None = None,
     use_vectors: bool = True,
 ) -> list[Hit]:
     k = clamp_k(k)
     own = store is None
-    store = store or open_existing(namespace or "default")
+    store = store or open_existing_readonly(namespace or "default")
     try:
-        if use_vectors:
-            store.ensure_current_embeddings()
-            store.process_embedding_jobs(limit=64)
+        # The deprecated trust flag remains an alias only when the modern flag
+        # is omitted. Explicit ``include_residue`` always has precedence.
+        resolved_residue = (
+            bool(include_residue)
+            if include_residue is not None
+            else bool(include_untrusted)
+            if include_untrusted is not None
+            else False
+        )
+        residue_filter_source = (
+            "include_residue"
+            if include_residue is not None
+            else "deprecated_include_untrusted"
+            if include_untrusted is not None
+            else "default"
+        )
+        recall_class_available = bool(
+            getattr(store, "recall_class_available", False)
+        )
         where, params = _filters(
             as_of,
             since,
             until,
             tier,
             clock,
-            include_untrusted=include_untrusted,
+            include_residue=resolved_residue,
+            recall_class_available=recall_class_available,
         )
         filter_context = _filter_context(
             as_of=as_of,
@@ -464,7 +523,10 @@ def recall(
             until=until,
             tier=tier,
             clock=clock,
+            include_residue=resolved_residue,
             include_untrusted=include_untrusted,
+            residue_filter_source=residue_filter_source,
+            recall_class_available=recall_class_available,
         )
         match = _fts_match_query(query)
         if match is None:
@@ -479,17 +541,24 @@ def recall(
         vec: list[tuple[str, int, float, str]] = []
         if not use_vectors:
             vector_execution = _stage("not_run", "disabled_by_caller")
+        elif embed_offline():
+            vector_execution = _stage("not_run", "offline_mode")
         elif not embed_available():
             vector_execution = _stage("not_run", "embedding_unavailable")
         else:
             qv = embed_one(query)
             if qv:
                 vec = _vec_hits(store, qv, where, params, CANDIDATES)
-                vector_execution = _stage(
-                    "ran_not_candidate" if not vec else "candidate",
+                vec_reason = (
                     "no_vector_candidates"
                     if not vec
-                    else "returned_vector_candidates",
+                    else "returned_persisted_embedding_candidates"
+                    if any(metric == "l2_distance" for _, _, _, metric in vec)
+                    else "returned_native_vec_candidates"
+                )
+                vector_execution = _stage(
+                    "ran_not_candidate" if not vec else "candidate",
+                    vec_reason,
                 )
             else:
                 # No candidate search can run without a query vector. Keep
@@ -509,11 +578,18 @@ def recall(
 
         ranked = sorted(rrf.items(), key=lambda kv: (-kv[1], kv[0]))[: int(k)]
         hits: list[Hit] = []
+        recall_class_select = (
+            "e.recall_class AS recall_class"
+            if recall_class_available
+            else "NULL AS recall_class"
+        )
         for final_rank, (mid, score) in enumerate(ranked, start=1):
             row = store.conn.execute(
-                """
+                f"""
                 SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
-                       e.role, e.event_time, e.ts, e.tool_name, e.origin
+                       e.role, e.event_time, e.ts, e.tool_name, e.tool_input,
+                       e.tool_output, e.origin,
+                       {recall_class_select}
                 FROM memories m
                 JOIN events e ON e.id = m.event_id
                 WHERE m.id=?
@@ -524,6 +600,20 @@ def recall(
                 continue
             vr = vec_rank.get(mid)
             fr = fts_rank.get(mid)
+            raw_tool = (
+                row["role"] == "tool"
+                or any(
+                    row[field] is not None
+                    for field in ("tool_name", "tool_input", "tool_output")
+                )
+            )
+            classification_source = (
+                "events.recall_class"
+                if row["recall_class"] is not None
+                else "raw_tool_structure"
+                if raw_tool
+                else "legacy_unknown"
+            )
             hits.append(
                 Hit(
                     memory_id=row["id"],
@@ -547,14 +637,37 @@ def recall(
                     final_rank=final_rank,
                     vector_stage=vector_execution,
                     fts_stage=fts_execution,
+                    recall_class=row["recall_class"],
+                    classification_source=classification_source,
                 )
             )
         references = store.recall_references_many([hit.memory_id for hit in hits])
         for hit in hits:
             hit.references = references.get(hit.memory_id)
+        try:
+            pending_jobs = int(
+                store.conn.execute("SELECT COUNT(*) FROM embedding_jobs").fetchone()[0]
+            )
+        except sqlite3.Error:
+            pending_jobs = None
         return RecallResult(
             hits,
-            modalities={"vector": vector_execution, "fts": fts_execution},
+            execution={
+                "version": 1,
+                "strategy": "recall",
+                "modalities": {"vector": vector_execution, "fts": fts_execution},
+                "read_only": bool(getattr(store, "read_only", False)),
+                "maintenance_performed": False,
+                "pending_embedding_jobs": {
+                    "state": "observed_not_drained",
+                    "count": pending_jobs,
+                },
+                "residue_filter": filter_context["residue_filter"],
+                "residue_filter_source": filter_context["residue_filter_source"],
+                "recall_class_capability": filter_context[
+                    "recall_class_capability"
+                ],
+            },
         )
     except sqlite3.Error as exc:
         raise RetrievalBackendError(str(exc)) from exc

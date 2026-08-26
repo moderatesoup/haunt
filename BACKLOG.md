@@ -485,6 +485,12 @@ machine-readable retrieval evidence.
   authorizes a tool mutation.
 - Expose the same explanation semantics through Python, CLI JSON, MCP, and
   dashboard APIs; human rendering may be implementation-specific.
+- The v1 execution evidence must additionally distinguish a physically
+  read-only recall from explicit maintenance, report pending embedding jobs as
+  observed-not-drained, report the residue-filter/classification capability,
+  and give an honest offline/vector-stage reason. Ranked recall defaults to
+  excluding raw tool structure and explicit task/tool residue; audit opt-in
+  remains explicit and timeline/trace/detail say the filter is not applicable.
 
 **Tests/evidence**
 
