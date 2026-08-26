@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import shutil
 import socket
 from copy import deepcopy
 from pathlib import Path
@@ -14,7 +15,6 @@ from haunt import abstention_eval, embed
 from haunt.abstention_eval import (
     FEATURE_DEFINITION,
     FitLabels,
-    RetrievalObservation,
     _coverage_many,
     _evidence,
     analyze_fit,
@@ -61,39 +61,78 @@ def _hit(
     )
 
 
-def _observation(case_id: str, strength: float, returned: tuple[str, ...]):
-    return RetrievalObservation(
-        case_id=case_id,
-        returned=returned,
-        evidence={
-            "strength": strength,
-            "diagnostics": {"native_cosine_top_two_distance_margin": 0.1},
-        },
-        vector_profile={},
-    )
+def _sparse_manifest_cache(root: Path) -> dict:
+    manifest = json.loads((FIXTURE / "hybrid-model-manifest.json").read_text("utf-8"))
+    for row in manifest["files"]:
+        path = root / row["relative_path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as stream:
+            stream.truncate(row["size"])
+    return manifest
 
 
 def test_dataset_split_is_large_predeclared_and_separate_from_e0():
-    dataset, split = load_inputs(FIXTURE)
+    initial_events = []
+
+    def initial_audit(event, details):
+        initial_events.append((event, dict(details)))
+
+    dataset, split = load_inputs(FIXTURE, audit_hook=initial_audit)
+    assert [event for event, _ in initial_events] == [
+        "before_open:records",
+        "before_open:queries",
+        "before_open:split",
+    ]
+    assert not (FIXTURE / "dataset.json").exists()
+    assert (FIXTURE / "fit-labels.json").is_file()
+    assert (FIXTURE / "held-labels.json").is_file()
     by_case = {row["id"]: row for row in dataset["cases"]}
+    fit_labels = abstention_eval._load_phase_labels(
+        FIXTURE,
+        phase="fit",
+        dataset=dataset,
+        split=split,
+        audit_hook=None,
+    )
+    held_labels = abstention_eval._load_phase_labels(
+        FIXTURE,
+        phase="held_out",
+        dataset=dataset,
+        split=split,
+        audit_hook=None,
+    )
+    all_labels = {**fit_labels, **held_labels}
 
     assert len(dataset["records"]) == 40
     assert len(dataset["cases"]) == 160
+    assert all("label" not in row and "relevant" not in row for row in dataset["cases"])
     for phase in ("fit", "held_out"):
         for profile in ("fts", "hybrid"):
-            rows = [by_case[key] for key in split[phase][profile]]
-            assert sum(row["label"] == "answerable" for row in rows) == 20
-            assert sum(row["label"] == "unanswerable" for row in rows) == 20
+            rows = [all_labels[key] for key in split[phase][profile]]
+            assert sum(row.label == "answerable" for row in rows) == 20
+            assert sum(row.label == "unanswerable" for row in rows) == 20
     hybrid_positives = [
-        row
-        for row in dataset["cases"]
-        if row["profile"] == "hybrid" and row["label"] == "answerable"
+        by_case[case_id]
+        for case_id, label in all_labels.items()
+        if by_case[case_id]["profile"] == "hybrid" and label.label == "answerable"
     ]
     assert len(hybrid_positives) == 40
     assert all(row["semantic_paraphrase"] is True for row in hybrid_positives)
     assert all(row["required_lexical_overlap"] is False for row in hybrid_positives)
     assert not any(separation_evidence(dataset)["overlaps"].values())
     assert split["manual_semantic_audit"]["reviewed_on"] == "2026-08-26"
+    composite, manifest = abstention_eval._verify_dataset_manifest_after_scoring(
+        FIXTURE,
+        dataset=dataset,
+        split=split,
+        fit_labels=fit_labels,
+        held_labels=held_labels,
+        audit_hook=None,
+    )
+    assert canonical_hash(composite) == (
+        "8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c"
+    )
+    assert manifest["verified_after_held_out_scoring"] is True
 
 
 def test_sealed_e0_artifacts_have_zero_diff():
@@ -266,59 +305,73 @@ def test_vector_profile_identity_distinguishes_every_execution_arm(
     assert result["matches_pinned_native_cosine"] is matches
 
 
-def test_fit_capability_cannot_reach_poisoned_held_labels():
-    class Poison:
-        def __str__(self):
-            raise AssertionError("held label was read")
+def test_held_file_is_unreachable_until_fit_boundary_and_cannot_change_it(tmp_path):
+    normal_boundary = []
 
-        def __iter__(self):
-            raise AssertionError("held relevant list was read")
+    def capture_normal(event, details):
+        if event == "fit_boundary_complete":
+            normal_boundary.append(deepcopy(details["fit_report"]))
 
-        def __eq__(self, other):
-            raise AssertionError("held label was compared")
+    normal = evaluate_profile("fts", fixture_dir=FIXTURE, audit_hook=capture_normal)
+    assert len(normal_boundary) == 1
+    events = [row["event"] for row in normal["label_access_audit"]["events"]]
+    assert events.index("fit_boundary_complete") < events.index(
+        "before_open:held_labels"
+    )
+    assert events.index("before_open:held_labels") < events.index(
+        "before_open:dataset_manifest"
+    )
 
-    dataset, split = load_inputs(FIXTURE)
-    original = deepcopy(dataset)
-    poisoned = deepcopy(dataset)
-    flipped = deepcopy(dataset)
-    held_ids = {
-        case_id
-        for profile in ("fts", "hybrid")
-        for case_id in split["held_out"][profile]
-    }
-    for row in poisoned["cases"]:
-        if row["id"] in held_ids:
-            row["label"] = Poison()
-            row["relevant"] = Poison()
-    for row in flipped["cases"]:
-        if row["id"] in held_ids:
-            row["label"] = (
-                "unanswerable" if row["label"] == "answerable" else "answerable"
+    poisoned_fixture = tmp_path / "poisoned"
+    shutil.copytree(FIXTURE, poisoned_fixture)
+    (poisoned_fixture / "held-labels.json").write_text(
+        "THIS FILE MUST NOT BE OPENED BEFORE THE FIT BOUNDARY",
+        encoding="utf-8",
+    )
+    poison_state = {"boundary": False, "held_open_after_boundary": False}
+
+    def poison_audit(event, details):
+        if event == "fit_boundary_complete":
+            poison_state["boundary"] = True
+            assert canonical_hash(details["fit_report"]) == canonical_hash(
+                normal_boundary[0]
             )
-            row["relevant"] = ["deliberately-wrong-held-label"]
+        if event == "before_open:held_labels":
+            assert poison_state["boundary"], "held labels opened before fit boundary"
+            poison_state["held_open_after_boundary"] = True
 
-    fit_ids = split["fit"]["hybrid"]
-    original_by_case = {row["id"]: row for row in original["cases"]}
-    observations = [
-        _observation(
-            case_id,
-            0.9 if original_by_case[case_id]["label"] == "answerable" else 0.2,
-            tuple(original_by_case[case_id]["relevant"] or ["irrelevant"]),
-        )
-        for case_id in fit_ids
-    ]
-    result_original = analyze_fit(
-        observations, abstention_eval._fit_labels(original, split, "hybrid")
+    with pytest.raises(json.JSONDecodeError):
+        evaluate_profile("fts", fixture_dir=poisoned_fixture, audit_hook=poison_audit)
+    assert poison_state == {
+        "boundary": True,
+        "held_open_after_boundary": True,
+    }
+
+    flipped_fixture = tmp_path / "flipped"
+    shutil.copytree(FIXTURE, flipped_fixture)
+    held_source = json.loads((flipped_fixture / "held-labels.json").read_text("utf-8"))
+    for row in held_source["labels"]:
+        if row["label"] == "answerable":
+            row["label"] = "unanswerable"
+            row["relevant"] = []
+        else:
+            row["label"] = "answerable"
+            row["relevant"] = ["deliberately-wrong-held-label"]
+    (flipped_fixture / "held-labels.json").write_text(
+        json.dumps(held_source), encoding="utf-8"
     )
-    result_poisoned = analyze_fit(
-        observations, abstention_eval._fit_labels(poisoned, split, "hybrid")
-    )
-    result_flipped = analyze_fit(
-        observations, abstention_eval._fit_labels(flipped, split, "hybrid")
-    )
-    assert canonical_hash(result_original) == canonical_hash(result_poisoned)
-    assert canonical_hash(result_original) == canonical_hash(result_flipped)
-    assert result_original["selected_threshold"] == pytest.approx(0.55)
+    flipped_boundary = []
+
+    def capture_flipped(event, details):
+        if event == "fit_boundary_complete":
+            flipped_boundary.append(deepcopy(details["fit_report"]))
+
+    # The changed held file is invalid against the frozen query semantics or
+    # manifest, but that failure is necessarily after fit is complete.
+    with pytest.raises(ValueError):
+        evaluate_profile("fts", fixture_dir=flipped_fixture, audit_hook=capture_flipped)
+    assert len(flipped_boundary) == 1
+    assert canonical_hash(flipped_boundary[0]) == canonical_hash(normal_boundary[0])
     assert list(FitLabels.__dataclass_fields__) == ["by_case"]
     assert list(inspect.signature(analyze_fit).parameters) == ["observations", "labels"]
 
@@ -359,15 +412,94 @@ def test_fts_reproduction_is_deterministic_offline_and_calibratable():
 def test_hybrid_requires_explicit_verified_cache(tmp_path):
     with pytest.raises(RuntimeError, match="requires --model-cache"):
         evaluate_profile("hybrid", fixture_dir=FIXTURE)
-    with pytest.raises(RuntimeError, match="explicit verified HAUNT_MODEL_CACHE"):
+    with pytest.raises(RuntimeError, match="artifact preflight mismatch"):
         evaluate_profile("hybrid", fixture_dir=FIXTURE, model_cache=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "missing="),
+        ("zero", "zero_byte="),
+        ("size", "size_mismatch="),
+        ("sidecar", "missing_sidecar="),
+        ("extra", "extra_selected="),
+        ("variant", "variant_mismatch_forbidden="),
+    ],
+)
+def test_hybrid_manifest_rejects_cache_shape_before_hashing(
+    tmp_path, mutation, message
+):
+    cache = tmp_path / mutation
+    if mutation == "missing":
+        cache.mkdir()
+    elif mutation == "zero":
+        manifest = json.loads(
+            (FIXTURE / "hybrid-model-manifest.json").read_text("utf-8")
+        )
+        for row in manifest["files"]:
+            path = cache / row["relative_path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+    else:
+        _sparse_manifest_cache(cache)
+        if mutation == "size":
+            with (cache / "BAAI-bge-m3/onnx/model.onnx").open("r+b") as stream:
+                stream.truncate(123)
+        elif mutation == "sidecar":
+            (cache / "BAAI-bge-m3/onnx/model.onnx_data").unlink()
+        elif mutation == "extra":
+            (cache / "BAAI-bge-m3/onnx/unapproved.onnx").write_bytes(b"extra")
+        elif mutation == "variant":
+            (cache / "BAAI-bge-m3/onnx/model_quantized.onnx").write_bytes(
+                b"wrong variant"
+            )
+    with pytest.raises(RuntimeError, match=message):
+        abstention_eval.verify_local_hybrid_cache(cache, fixture_dir=FIXTURE)
+
+
+def test_same_dimension_wrong_cache_fails_hash_before_embed_init(tmp_path, monkeypatch):
+    cache = tmp_path / "same-dimension-wrong-cache"
+    manifest = _sparse_manifest_cache(cache)
+    config_row = next(
+        row for row in manifest["files"] if row["relative_path"].endswith("config.json")
+    )
+    claimed_dimension = json.dumps({"hidden_size": 1024}).encode("utf-8")
+    wrong_config = claimed_dimension + b" " * (
+        config_row["size"] - len(claimed_dimension)
+    )
+    (cache / config_row["relative_path"]).write_bytes(wrong_config)
+
+    def embed_init_must_not_run():
+        raise AssertionError("embed initialization ran before artifact verification")
+
+    monkeypatch.setattr(embed, "reset", embed_init_must_not_run)
+    with pytest.raises(RuntimeError, match="artifact hash mismatch"):
+        evaluate_profile("hybrid", fixture_dir=FIXTURE, model_cache=cache)
+
+
+def test_manifest_id_cannot_bless_alternate_artifact_hashes(tmp_path):
+    fixture = tmp_path / "altered-manifest"
+    shutil.copytree(FIXTURE, fixture)
+    manifest_path = fixture / "hybrid-model-manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["files"][0]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="manifest identity"):
+        abstention_eval.verify_local_hybrid_cache(
+            tmp_path / "unused-cache", fixture_dir=fixture
+        )
 
 
 def test_committed_hybrid_report_is_an_honest_blocker():
     report = json.loads((REPORTS / "hybrid-blocked.json").read_text("utf-8"))
-    dataset, split = load_inputs(FIXTURE)
-    assert report["dataset_canonical_sha256"] == canonical_hash(dataset)
+    _, split = load_inputs(FIXTURE)
+    assert (
+        report["dataset_canonical_sha256"]
+        == "8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c"
+    )
     assert report["split_canonical_sha256"] == canonical_hash(split)
+    assert report["dataset_manifest"]["verified_after_held_out_scoring"] is True
     assert report["status"] == "blocked"
     assert report["runtime_policy_shipped"] is False
     assert report["blocker"]["code"] == "raw_evidence_fit_gate_unsatisfied"
@@ -391,11 +523,28 @@ def test_committed_hybrid_report_is_an_honest_blocker():
     assert report["profile"]["dimension"] == 1024
     assert report["profile"]["vector_backend"] == "sqlite_vec_native"
     assert report["profile"]["vector_metric"] == "cosine_distance"
+    assert (
+        report["local_model_cache"]["matched_manifest_id"]
+        == "haunt-bge-m3-onnx-split-f8425123-v1"
+    )
+    assert report["local_model_cache"]["selected_variant"] == (
+        "nonquantized_split_onnx"
+    )
     assert report["local_model_cache"]["files"] == [
+        {
+            "relative_path": "BAAI-bge-m3/onnx/config.json",
+            "sha256": "f24afd5de914fba8c668426c43d208a1a54022500c63b2c160be20891686fce8",
+            "size": 698,
+        },
         {
             "relative_path": "BAAI-bge-m3/onnx/model.onnx",
             "sha256": "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b",
             "size": 724923,
+        },
+        {
+            "relative_path": "BAAI-bge-m3/onnx/model.onnx_data",
+            "sha256": "1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4",
+            "size": 2266820608,
         },
         {
             "relative_path": "BAAI-bge-m3/onnx/tokenizer.json",
@@ -403,9 +552,9 @@ def test_committed_hybrid_report_is_an_honest_blocker():
             "size": 17082821,
         },
         {
-            "relative_path": "BAAI-bge-m3/onnx/model.onnx_data",
-            "sha256": "1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4",
-            "size": 2266820608,
+            "relative_path": "BAAI-bge-m3/onnx/tokenizer_config.json",
+            "sha256": "7e4c1cc848840aeccdd763458c18dd525eb0f795c992e00ebe9c28554e7db2d4",
+            "size": 1173,
         },
     ]
     assert all(
@@ -445,6 +594,17 @@ def test_reports_prove_fit_label_separation_and_no_public_policy():
         report = json.loads((REPORTS / name).read_text("utf-8"))
         assert report["fit"]["held_out_labels_available_to_fit"] == []
         assert report["held_out"]["labels_loaded_after_fit_analysis"] is True
+        assert (
+            report["label_access_audit"]["fit_boundary_precedes_held_label_open"]
+            is True
+        )
+        events = [row["event"] for row in report["label_access_audit"]["events"]]
+        assert events.index("fit_boundary_complete") < events.index(
+            "before_open:held_labels"
+        )
+        assert events.index("before_open:held_labels") < events.index(
+            "before_open:dataset_manifest"
+        )
         assert report["sealed_e0"]["diff_empty"] is True
         assert report["sealed_e0"]["byte_mismatches"] == []
         assert report["public_runtime_policy"]["diff_empty"] is True

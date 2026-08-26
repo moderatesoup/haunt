@@ -238,6 +238,19 @@
     ]
   },
   "dataset_canonical_sha256": "8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c",
+  "dataset_manifest": {
+    "component_canonical_sha256": {
+      "fit_labels": "2b22611b22b48a4e99b2f58f1dc6b0325d20869f7583e048c1fc610d2d6b7422",
+      "held_labels": "f33049ced043fe25bac44f2f636a5e5cadcfa70dfafd740ee6a05d5a01ba4ca2",
+      "queries": "66dabb8586186c3dbae54e2433ed6ba302efb4ccd058d98064c1b1e314da23a4",
+      "records": "68f715125649a3d9a20c1b0d1d1e1f26df5bd0dea8151eeee9bdfd0e889e2054",
+      "split": "d57b1a02e30d48087065528bfc01575d67735295003de26b1087bb348d05414d"
+    },
+    "composite_dataset_canonical_sha256": "8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c",
+    "manifest_canonical_sha256": "8c36449a8f38fed8daf86fe67e716e3ee53d700c29d4ba95fc4aa4268bb9c64e",
+    "manifest_id": "haunt-abstention-e6-composite-v1",
+    "verified_after_held_out_scoring": true
+  },
   "evidence_query_batching": {
     "candidate_scope": "fixed_top_5",
     "maximum_candidate_count_observed": 5,
@@ -13623,13 +13636,80 @@
       "unanswerable_cases": 0
     }
   },
+  "label_access_audit": {
+    "events": [
+      {
+        "details": {
+          "filename": "records.json"
+        },
+        "event": "before_open:records"
+      },
+      {
+        "details": {
+          "filename": "queries.json"
+        },
+        "event": "before_open:queries"
+      },
+      {
+        "details": {
+          "filename": "split.json"
+        },
+        "event": "before_open:split"
+      },
+      {
+        "details": {
+          "filename": "fit-labels.json"
+        },
+        "event": "before_open:fit_labels"
+      },
+      {
+        "details": {
+          "filename": "hybrid-model-manifest.json"
+        },
+        "event": "before_open:hybrid_model_manifest"
+      },
+      {
+        "details": {
+          "boundary": 0.6240921914577485,
+          "fit_report_canonical_sha256": "ed61c2b5a7a87e45be6aa7c381f96681b2e0908675756d6f902c85640248fad3"
+        },
+        "event": "fit_boundary_complete"
+      },
+      {
+        "details": {
+          "filename": "held-labels.json"
+        },
+        "event": "before_open:held_labels"
+      },
+      {
+        "details": {
+          "filename": "dataset-manifest.json"
+        },
+        "event": "before_open:dataset_manifest"
+      }
+    ],
+    "fit_boundary_precedes_held_label_open": true,
+    "held_labels_physical_file": "held-labels.json"
+  },
   "local_model_cache": {
+    "backend": "onnx",
     "cache_root_supplied": true,
+    "dimension": 1024,
     "files": [
+      {
+        "relative_path": "BAAI-bge-m3/onnx/config.json",
+        "sha256": "f24afd5de914fba8c668426c43d208a1a54022500c63b2c160be20891686fce8",
+        "size": 698
+      },
       {
         "relative_path": "BAAI-bge-m3/onnx/model.onnx",
         "sha256": "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b",
         "size": 724923
+      },
+      {
+        "relative_path": "BAAI-bge-m3/onnx/model.onnx_data",
+        "sha256": "1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4",
+        "size": 2266820608
       },
       {
         "relative_path": "BAAI-bge-m3/onnx/tokenizer.json",
@@ -13637,12 +13717,32 @@
         "size": 17082821
       },
       {
-        "relative_path": "BAAI-bge-m3/onnx/model.onnx_data",
-        "sha256": "1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4",
-        "size": 2266820608
+        "relative_path": "BAAI-bge-m3/onnx/tokenizer_config.json",
+        "sha256": "7e4c1cc848840aeccdd763458c18dd525eb0f795c992e00ebe9c28554e7db2d4",
+        "size": 1173
       }
     ],
-    "model_root": "BAAI-bge-m3"
+    "manifest_canonical_sha256": "d767f2f4a020b36e5a1d26636460af6cc5981836258c6f38cc677de9cab143a2",
+    "matched_manifest_id": "haunt-bge-m3-onnx-split-f8425123-v1",
+    "model_id": "BAAI/bge-m3",
+    "selected_variant": "nonquantized_split_onnx",
+    "variant_policy": {
+      "allowed_variants": [
+        "nonquantized_split_onnx"
+      ],
+      "external_data_sidecar_required": true,
+      "forbidden_relative_paths": [
+        "BAAI-bge-m3/onnx/model_quantized.onnx",
+        "BAAI-bge-m3/onnx/model_quantized.onnx_data",
+        "BAAI-bge-m3/model.onnx",
+        "BAAI-bge-m3/model.onnx_data",
+        "BAAI-bge-m3/model_quantized.onnx",
+        "BAAI-bge-m3/model_quantized.onnx_data"
+      ],
+      "quantized_variant_allowed": false,
+      "reject_unlisted_files_in_selected_directory": true,
+      "selected_directory": "BAAI-bge-m3/onnx"
+    }
   },
   "manual_semantic_audit": {
     "finding": "No E6 logical ID, query, record text, canary, temporal scenario, or expected result is copied from E0. Broad product nouns alone are not shared evaluation cases.",

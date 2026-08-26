@@ -2,9 +2,13 @@
 
 This dataset is independent of the frozen E0 retrieval regression lock. Its
 logical IDs, canonical query hashes, and canonical record hashes are checked
-against E0 before any fit analysis runs. `split.json` is the predeclared split:
-fit analysis receives a capability containing fit labels only, while held-out
-labels are loaded only after the fit-only boundary and feasibility result exist.
+against E0 before any fit analysis runs. `records.json`, unlabeled
+`queries.json`, and `split.json` load first. Fit labels live only in
+`fit-labels.json`. The physically separate `held-labels.json` is not opened,
+parsed, hashed, or validated until fit observations, analysis, metrics, and the
+fit-only boundary are complete. `dataset-manifest.json` is opened and verified
+only after held-out scoring; joining both label files back onto query order
+preserves the predeclared composite dataset hash.
 
 The labels measure whether this small synthetic corpus contains an intended
 answer, not whether a statement is true. The policy controls retrieval-evidence
@@ -32,6 +36,11 @@ Artifacts:
   `HAUNT_OFFLINE=1` and network denial.
 - `reports/hybrid-blocked.json`: deterministic pinned-hybrid blocker report
   using a hashed local cache with `HAUNT_OFFLINE` unset inside network denial.
+- `hybrid-model-manifest.json`: the only accepted BGE-M3 artifact identity. It
+  locks all five selected ONNX-directory files by relative path, size, and
+  SHA-256, requires the external-data sidecar, and rejects quantized, root-level,
+  missing, zero-byte, wrong-size, wrong-hash, and extra selected variants before
+  embedding initialization.
 - `reports/latency.json`: non-gating 1k/10k/100k timing observation. Its
   deterministic gate is one batched coverage statement for the fixed top five;
   absolute timings are machine-specific.

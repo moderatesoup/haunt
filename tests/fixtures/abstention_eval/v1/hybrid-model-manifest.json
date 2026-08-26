@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "manifest_id": "haunt-bge-m3-onnx-split-f8425123-v1",
+  "model_id": "BAAI/bge-m3",
+  "dimension": 1024,
+  "backend": "onnx",
+  "selected_variant": "nonquantized_split_onnx",
+  "variant_policy": {
+    "allowed_variants": ["nonquantized_split_onnx"],
+    "quantized_variant_allowed": false,
+    "external_data_sidecar_required": true,
+    "reject_unlisted_files_in_selected_directory": true,
+    "selected_directory": "BAAI-bge-m3/onnx",
+    "forbidden_relative_paths": [
+      "BAAI-bge-m3/onnx/model_quantized.onnx",
+      "BAAI-bge-m3/onnx/model_quantized.onnx_data",
+      "BAAI-bge-m3/model.onnx",
+      "BAAI-bge-m3/model.onnx_data",
+      "BAAI-bge-m3/model_quantized.onnx",
+      "BAAI-bge-m3/model_quantized.onnx_data"
+    ]
+  },
+  "files": [
+    {
+      "relative_path": "BAAI-bge-m3/onnx/config.json",
+      "size": 698,
+      "sha256": "f24afd5de914fba8c668426c43d208a1a54022500c63b2c160be20891686fce8"
+    },
+    {
+      "relative_path": "BAAI-bge-m3/onnx/model.onnx",
+      "size": 724923,
+      "sha256": "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b"
+    },
+    {
+      "relative_path": "BAAI-bge-m3/onnx/model.onnx_data",
+      "size": 2266820608,
+      "sha256": "1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4"
+    },
+    {
+      "relative_path": "BAAI-bge-m3/onnx/tokenizer.json",
+      "size": 17082821,
+      "sha256": "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790"
+    },
+    {
+      "relative_path": "BAAI-bge-m3/onnx/tokenizer_config.json",
+      "size": 1173,
+      "sha256": "7e4c1cc848840aeccdd763458c18dd525eb0f795c992e00ebe9c28554e7db2d4"
+    }
+  ]
+}

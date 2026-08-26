@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "dataset_id": "haunt-abstention-e6-v1",
+  "records": [
+    {
+      "id": "cal-r01",
+      "content": "The deployment pipeline releases software through a canary cohort before expanding worldwide."
+    },
+    {
+      "id": "cal-r02",
+      "content": "Backups run nightly and retain encrypted snapshots for thirty days."
+    },
+    {
+      "id": "cal-r03",
+      "content": "Customer invoices are generated on the first business day monthly and emailed to account owners."
+    },
+    {
+      "id": "cal-r04",
+      "content": "The veterinarian prescribed two tablets with breakfast for the elderly dog."
+    },
+    {
+      "id": "cal-r05",
+      "content": "Greenhouse irrigation starts at dawn when soil moisture falls below eighteen percent."
+    },
+    {
+      "id": "cal-r06",
+      "content": "The design team chose cobalt blue for primary buttons and amber for warnings."
+    },
+    {
+      "id": "cal-r07",
+      "content": "The train departs platform four at 6:15 and reaches Harbor City at 8:40."
+    },
+    {
+      "id": "cal-r08",
+      "content": "The database connection pool is capped at forty sessions with a five second timeout."
+    },
+    {
+      "id": "cal-r09",
+      "content": "Security policy rotates signing keys every ninety days and archives the retired public keys."
+    },
+    {
+      "id": "cal-r10",
+      "content": "The wedding venue requires the final guest count fourteen days before the ceremony."
+    },
+    {
+      "id": "cal-r11",
+      "content": "Support escalation pages the on-call engineer after three unanswered priority tickets."
+    },
+    {
+      "id": "cal-r12",
+      "content": "The warehouse packs fragile glassware with double-wall cartons and recycled paper cushions."
+    },
+    {
+      "id": "cal-r13",
+      "content": "The analytics batch processes the previous day's events at 02:00 UTC."
+    },
+    {
+      "id": "cal-r14",
+      "content": "The mobile app caches maps offline for seven days before refreshing them."
+    },
+    {
+      "id": "cal-r15",
+      "content": "The bakery proofs sourdough at twenty-four degrees Celsius for four hours."
+    },
+    {
+      "id": "cal-r16",
+      "content": "The conference room projector accepts HDMI and wireless Miracast connections."
+    },
+    {
+      "id": "cal-r17",
+      "content": "Payroll corrections must be approved by the finance director before Friday disbursement."
+    },
+    {
+      "id": "cal-r18",
+      "content": "The incident commander posts status updates every thirty minutes during an outage."
+    },
+    {
+      "id": "cal-r19",
+      "content": "Research samples stay at minus eighty degrees Celsius and trigger an alarm above minus seventy."
+    },
+    {
+      "id": "cal-r20",
+      "content": "Subscription cancellation remains effective at the end of the current billing period."
+    },
+    {
+      "id": "cal-r21",
+      "content": "The public API permits six hundred requests per minute and returns status 429 above that limit."
+    },
+    {
+      "id": "cal-r22",
+      "content": "The museum closes on Tuesdays and offers free admission on the first Sunday each month."
+    },
+    {
+      "id": "cal-r23",
+      "content": "Survey drones return to base when battery charge reaches twenty-two percent."
+    },
+    {
+      "id": "cal-r24",
+      "content": "Application logs remain searchable for forty-five days before archival to cold storage."
+    },
+    {
+      "id": "cal-r25",
+      "content": "The community garden compost accepts vegetable scraps but rejects meat and dairy."
+    },
+    {
+      "id": "cal-r26",
+      "content": "The eastern sales territory includes Ohio, Michigan, and western Pennsylvania."
+    },
+    {
+      "id": "cal-r27",
+      "content": "Library study rooms may be reserved for two hours and renewed once when nobody is waiting."
+    },
+    {
+      "id": "cal-r28",
+      "content": "The solar controller switches to battery power after sunset and preserves a twenty percent reserve."
+    },
+    {
+      "id": "cal-r29",
+      "content": "The restaurant kitchen uses a separate purple cutting board for allergen-free meals."
+    },
+    {
+      "id": "cal-r30",
+      "content": "Recruiting schedules a technical interview only after the take-home exercise passes review."
+    },
+    {
+      "id": "cal-r31",
+      "content": "The island ferry boards bicycles at the stern and asks riders to arrive twenty minutes early."
+    },
+    {
+      "id": "cal-r32",
+      "content": "The photo archive stores camera originals as TIFF and publishes smaller JPEG previews."
+    },
+    {
+      "id": "cal-r33",
+      "content": "The north field receives drip irrigation for ninety minutes every other morning."
+    },
+    {
+      "id": "cal-r34",
+      "content": "Travel insurance claims require receipts and must be filed within sixty days of returning."
+    },
+    {
+      "id": "cal-r35",
+      "content": "The laboratory centrifuge runs blood samples at three thousand g for twelve minutes."
+    },
+    {
+      "id": "cal-r36",
+      "content": "Password recovery links expire fifteen minutes after delivery and work only once."
+    },
+    {
+      "id": "cal-r37",
+      "content": "The third-floor printer uses recycled A4 paper from the cabinet beside the elevator."
+    },
+    {
+      "id": "cal-r38",
+      "content": "API maintenance occurs Wednesday at 03:30 UTC and normally lasts twenty minutes."
+    },
+    {
+      "id": "cal-r39",
+      "content": "The classroom keeps emergency contact cards in the red binder near the south door."
+    },
+    {
+      "id": "cal-r40",
+      "content": "The coffee machine runs its cleaning cycle after every two hundred drinks."
+    }
+  ]
+}

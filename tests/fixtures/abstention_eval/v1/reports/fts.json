@@ -1,5 +1,18 @@
 {
   "dataset_canonical_sha256": "8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c",
+  "dataset_manifest": {
+    "component_canonical_sha256": {
+      "fit_labels": "2b22611b22b48a4e99b2f58f1dc6b0325d20869f7583e048c1fc610d2d6b7422",
+      "held_labels": "f33049ced043fe25bac44f2f636a5e5cadcfa70dfafd740ee6a05d5a01ba4ca2",
+      "queries": "66dabb8586186c3dbae54e2433ed6ba302efb4ccd058d98064c1b1e314da23a4",
+      "records": "68f715125649a3d9a20c1b0d1d1e1f26df5bd0dea8151eeee9bdfd0e889e2054",
+      "split": "d57b1a02e30d48087065528bfc01575d67735295003de26b1087bb348d05414d"
+    },
+    "composite_dataset_canonical_sha256": "8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c",
+    "manifest_canonical_sha256": "8c36449a8f38fed8daf86fe67e716e3ee53d700c29d4ba95fc4aa4268bb9c64e",
+    "manifest_id": "haunt-abstention-e6-composite-v1",
+    "verified_after_held_out_scoring": true
+  },
   "evidence_query_batching": {
     "candidate_scope": "fixed_top_5",
     "maximum_candidate_count_observed": 5,
@@ -6833,6 +6846,55 @@
       "unanswerable_cases": 20
     },
     "pure_semantic_paraphrase_metrics": null
+  },
+  "label_access_audit": {
+    "events": [
+      {
+        "details": {
+          "filename": "records.json"
+        },
+        "event": "before_open:records"
+      },
+      {
+        "details": {
+          "filename": "queries.json"
+        },
+        "event": "before_open:queries"
+      },
+      {
+        "details": {
+          "filename": "split.json"
+        },
+        "event": "before_open:split"
+      },
+      {
+        "details": {
+          "filename": "fit-labels.json"
+        },
+        "event": "before_open:fit_labels"
+      },
+      {
+        "details": {
+          "boundary": 0.875,
+          "fit_report_canonical_sha256": "6b697530a3dd6f75c491c0d0580c7d0120e6d0538ccef47304440ccd7830724c"
+        },
+        "event": "fit_boundary_complete"
+      },
+      {
+        "details": {
+          "filename": "held-labels.json"
+        },
+        "event": "before_open:held_labels"
+      },
+      {
+        "details": {
+          "filename": "dataset-manifest.json"
+        },
+        "event": "before_open:dataset_manifest"
+      }
+    ],
+    "fit_boundary_precedes_held_label_open": true,
+    "held_labels_physical_file": "held-labels.json"
   },
   "local_model_cache": null,
   "manual_semantic_audit": {

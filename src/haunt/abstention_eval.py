@@ -24,7 +24,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from haunt import embed
 from haunt.recall import Hit, recall
@@ -34,6 +34,14 @@ SCHEMA_VERSION = 1
 FEATURE_IMPLEMENTATION = "haunt-abstention-feasibility-v1"
 FTS_PROFILE_ID = "fts5-porter-unicode61-top40-k5-v1"
 HYBRID_PROFILE_ID = "bge-m3-onnx-1024-native-cosine-fts5-rrf60-top40-k5-v1"
+HYBRID_ARTIFACT_MANIFEST_ID = "haunt-bge-m3-onnx-split-f8425123-v1"
+HYBRID_ARTIFACT_MANIFEST_SHA256 = (
+    "d767f2f4a020b36e5a1d26636460af6cc5981836258c6f38cc677de9cab143a2"
+)
+DATASET_MANIFEST_ID = "haunt-abstention-e6-composite-v1"
+DATASET_MANIFEST_SHA256 = (
+    "8c36449a8f38fed8daf86fe67e716e3ee53d700c29d4ba95fc4aa4268bb9c64e"
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIXTURE_DIR = ROOT / "tests" / "fixtures" / "abstention_eval" / "v1"
@@ -55,6 +63,7 @@ PUBLIC_RUNTIME_PATHS = (
 )
 
 _FTS_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+AuditHook = Callable[[str, Mapping[str, Any]], None]
 
 FEATURE_DEFINITION: dict[str, Any] = {
     "schema_version": 1,
@@ -272,19 +281,74 @@ class _DeterministicFixtureIds(AbstractContextManager["_DeterministicFixtureIds"
         store.new_id = self._originals["store"]
 
 
+def _emit_audit(
+    hook: AuditHook | None, event: str, details: Mapping[str, Any] | None = None
+) -> None:
+    if hook is not None:
+        hook(event, details or {})
+
+
+def _read_json_component(
+    fixture_dir: Path,
+    filename: str,
+    *,
+    component: str,
+    audit_hook: AuditHook | None,
+) -> dict[str, Any]:
+    path = fixture_dir / filename
+    _emit_audit(
+        audit_hook,
+        f"before_open:{component}",
+        {"filename": filename},
+    )
+    value = json.loads(path.read_text("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{component} must be a JSON object")
+    return value
+
+
 def load_inputs(
     fixture_dir: Path = DEFAULT_FIXTURE_DIR,
+    *,
+    audit_hook: AuditHook | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    dataset = json.loads((fixture_dir / "dataset.json").read_text("utf-8"))
-    split = json.loads((fixture_dir / "split.json").read_text("utf-8"))
-    if dataset.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("unsupported E6 dataset schema")
+    """Load records, unlabeled queries, and split membership only.
+
+    Neither label file nor the composite manifest is opened here. In
+    particular, callers can complete fit retrieval and threshold analysis
+    without the held-label file being readable.
+    """
+    record_source = _read_json_component(
+        fixture_dir,
+        "records.json",
+        component="records",
+        audit_hook=audit_hook,
+    )
+    query_source = _read_json_component(
+        fixture_dir,
+        "queries.json",
+        component="queries",
+        audit_hook=audit_hook,
+    )
+    split = _read_json_component(
+        fixture_dir,
+        "split.json",
+        component="split",
+        audit_hook=audit_hook,
+    )
+    for name, source in (("records", record_source), ("queries", query_source)):
+        if source.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError(f"unsupported E6 {name} schema")
     if split.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("unsupported E6 split schema")
-    records = dataset.get("records")
-    cases = dataset.get("cases")
+    if record_source.get("dataset_id") != query_source.get("dataset_id"):
+        raise ValueError("E6 records/query dataset IDs differ")
+    records = record_source.get("records")
+    cases = query_source.get("cases")
     if not isinstance(records, list) or not isinstance(cases, list):
-        raise ValueError("E6 dataset requires records and cases")
+        raise ValueError("E6 inputs require records and unlabeled cases")
+    if any("label" in row or "relevant" in row for row in cases):
+        raise ValueError("queries.json must be physically unlabeled")
     record_ids = [row.get("id") for row in records]
     case_ids = [row.get("id") for row in cases]
     if len(record_ids) != len(set(record_ids)) or not all(
@@ -302,24 +366,198 @@ def load_inputs(
         for case_id in split.get(phase, {}).get(profile, [])
     ]
     if len(memberships) != len(set(memberships)) or set(memberships) != set(case_ids):
-        raise ValueError("E6 split must partition every case exactly once")
+        raise ValueError("E6 split must partition every unlabeled case exactly once")
     by_case = {row["id"]: row for row in cases}
     for phase in ("fit", "held_out"):
         for profile in ("fts", "hybrid"):
-            selected = [by_case[case_id] for case_id in split[phase][profile]]
-            positives = [row for row in selected if row["label"] == "answerable"]
-            negatives = [row for row in selected if row["label"] == "unanswerable"]
-            if len(positives) < 20 or len(negatives) < 20:
-                raise ValueError(f"{phase}/{profile} requires 20+ cases per label")
-            if any(row["profile"] != profile for row in selected):
+            if len(split[phase][profile]) != 40:
+                raise ValueError(f"{phase}/{profile} requires exactly 40 cases")
+            if any(
+                by_case[case_id]["profile"] != profile
+                for case_id in split[phase][profile]
+            ):
                 raise ValueError("profile/split mismatch")
-            if profile == "hybrid" and any(
-                row.get("semantic_paraphrase") is not True
-                or row.get("required_lexical_overlap") is not False
-                for row in positives
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_id": record_source["dataset_id"],
+        "records": records,
+        "cases": cases,
+    }, split
+
+
+def _load_phase_labels(
+    fixture_dir: Path,
+    *,
+    phase: str,
+    dataset: Mapping[str, Any],
+    split: Mapping[str, Any],
+    audit_hook: AuditHook | None,
+) -> dict[str, FitLabel]:
+    if phase not in {"fit", "held_out"}:
+        raise ValueError("invalid E6 label phase")
+    component = "fit_labels" if phase == "fit" else "held_labels"
+    filename = "fit-labels.json" if phase == "fit" else "held-labels.json"
+    source = _read_json_component(
+        fixture_dir,
+        filename,
+        component=component,
+        audit_hook=audit_hook,
+    )
+    if (
+        source.get("schema_version") != SCHEMA_VERSION
+        or source.get("dataset_id") != dataset["dataset_id"]
+        or source.get("phase") != phase
+        or not isinstance(source.get("labels"), list)
+    ):
+        raise ValueError(f"invalid E6 {phase} label file")
+    rows = source["labels"]
+    ids = [row.get("id") for row in rows]
+    expected = {
+        case_id for profile in ("fts", "hybrid") for case_id in split[phase][profile]
+    }
+    if len(ids) != len(set(ids)) or set(ids) != expected:
+        raise ValueError(f"{phase} labels must exactly match split membership")
+    by_query = {row["id"]: row for row in dataset["cases"]}
+    result: dict[str, FitLabel] = {}
+    for row in rows:
+        label = row.get("label")
+        relevant = row.get("relevant")
+        if label not in {"answerable", "unanswerable"} or not isinstance(
+            relevant, list
+        ):
+            raise ValueError(f"invalid {phase} label row")
+        if not all(isinstance(value, str) for value in relevant):
+            raise ValueError(f"invalid {phase} relevant IDs")
+        if (label == "answerable") != bool(relevant):
+            raise ValueError(f"{phase} answerability/relevant IDs disagree")
+        query = by_query[row["id"]]
+        if label == "answerable" and query["profile"] == "hybrid":
+            if (
+                query.get("semantic_paraphrase") is not True
+                or query.get("required_lexical_overlap") is not False
             ):
                 raise ValueError("every hybrid answerable must be a pure paraphrase")
-    return dataset, split
+        result[str(row["id"])] = FitLabel(
+            label=str(label), relevant=tuple(str(value) for value in relevant)
+        )
+    for profile in ("fts", "hybrid"):
+        selected = [result[case_id] for case_id in split[phase][profile]]
+        if sum(row.label == "answerable" for row in selected) < 20:
+            raise ValueError(f"{phase}/{profile} requires 20 answerable cases")
+        if sum(row.label == "unanswerable" for row in selected) < 20:
+            raise ValueError(f"{phase}/{profile} requires 20 unanswerable cases")
+    return result
+
+
+def _phase_label_source(
+    phase: str, labels: Mapping[str, FitLabel], *, dataset_id: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_id": dataset_id,
+        "phase": phase,
+        "labels": [
+            {
+                "id": case_id,
+                "label": label.label,
+                "relevant": list(label.relevant),
+            }
+            for case_id, label in labels.items()
+        ],
+    }
+
+
+def _composite_dataset(
+    dataset: Mapping[str, Any],
+    fit_labels: Mapping[str, FitLabel],
+    held_labels: Mapping[str, FitLabel],
+) -> dict[str, Any]:
+    labels = {**fit_labels, **held_labels}
+    if set(labels) != {row["id"] for row in dataset["cases"]}:
+        raise ValueError("fit and held labels do not cover the composite dataset")
+    return {
+        "schema_version": dataset["schema_version"],
+        "dataset_id": dataset["dataset_id"],
+        "records": dataset["records"],
+        "cases": [
+            {
+                **row,
+                "label": labels[row["id"]].label,
+                "relevant": list(labels[row["id"]].relevant),
+            }
+            for row in dataset["cases"]
+        ],
+    }
+
+
+def _verify_dataset_manifest_after_scoring(
+    fixture_dir: Path,
+    *,
+    dataset: Mapping[str, Any],
+    split: Mapping[str, Any],
+    fit_labels: Mapping[str, FitLabel],
+    held_labels: Mapping[str, FitLabel],
+    audit_hook: AuditHook | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest = _read_json_component(
+        fixture_dir,
+        "dataset-manifest.json",
+        component="dataset_manifest",
+        audit_hook=audit_hook,
+    )
+    if (
+        manifest.get("schema_version") != SCHEMA_VERSION
+        or manifest.get("manifest_id") != DATASET_MANIFEST_ID
+        or canonical_hash(manifest) != DATASET_MANIFEST_SHA256
+        or manifest.get("verification_phase") != "after_held_out_scoring"
+    ):
+        raise ValueError("invalid E6 composite dataset manifest")
+    components = {
+        "records": {
+            "schema_version": dataset["schema_version"],
+            "dataset_id": dataset["dataset_id"],
+            "records": dataset["records"],
+        },
+        "queries": {
+            "schema_version": dataset["schema_version"],
+            "dataset_id": dataset["dataset_id"],
+            "cases": dataset["cases"],
+        },
+        "split": split,
+        "fit_labels": _phase_label_source(
+            "fit", fit_labels, dataset_id=str(dataset["dataset_id"])
+        ),
+        "held_labels": _phase_label_source(
+            "held_out", held_labels, dataset_id=str(dataset["dataset_id"])
+        ),
+    }
+    component_hashes = {
+        name: canonical_hash(value) for name, value in components.items()
+    }
+    expected_components = manifest.get("components")
+    if not isinstance(expected_components, dict):
+        raise ValueError("E6 manifest has no component lock")
+    for name, digest in component_hashes.items():
+        expected = expected_components.get(name, {}).get("canonical_sha256")
+        if expected != digest:
+            raise ValueError(
+                f"E6 manifest {name} hash mismatch: expected={expected} actual={digest}"
+            )
+    composite = _composite_dataset(dataset, fit_labels, held_labels)
+    composite_hash = canonical_hash(composite)
+    expected_composite = manifest.get("composite_dataset", {}).get("canonical_sha256")
+    if expected_composite != composite_hash:
+        raise ValueError(
+            "E6 composite dataset hash mismatch: "
+            f"expected={expected_composite} actual={composite_hash}"
+        )
+    return composite, {
+        "manifest_id": manifest["manifest_id"],
+        "manifest_canonical_sha256": canonical_hash(manifest),
+        "verified_after_held_out_scoring": True,
+        "component_canonical_sha256": component_hashes,
+        "composite_dataset_canonical_sha256": composite_hash,
+    }
 
 
 def separation_evidence(
@@ -418,41 +656,146 @@ def public_runtime_evidence() -> dict[str, Any]:
     }
 
 
-def verify_local_hybrid_cache(cache_root: Path) -> dict[str, Any]:
-    """Hash exact local ONNX inputs before entering the network-deny guard."""
-    model_root = cache_root / "BAAI-bge-m3"
-    onnx_candidates = [
-        model_root / "onnx" / "model.onnx",
-        model_root / "onnx" / "model_quantized.onnx",
-        model_root / "model.onnx",
-        model_root / "model_quantized.onnx",
+def verify_local_hybrid_cache(
+    cache_root: Path,
+    *,
+    fixture_dir: Path = DEFAULT_FIXTURE_DIR,
+    audit_hook: AuditHook | None = None,
+) -> dict[str, Any]:
+    """Require the committed BGE-M3 artifact identity before embed init."""
+    manifest = _read_json_component(
+        fixture_dir,
+        "hybrid-model-manifest.json",
+        component="hybrid_model_manifest",
+        audit_hook=audit_hook,
+    )
+    if canonical_hash(manifest) != HYBRID_ARTIFACT_MANIFEST_SHA256:
+        raise RuntimeError("invalid committed hybrid artifact manifest identity")
+    policy = manifest.get("variant_policy")
+    files = manifest.get("files")
+    if (
+        manifest.get("schema_version") != SCHEMA_VERSION
+        or manifest.get("manifest_id") != HYBRID_ARTIFACT_MANIFEST_ID
+        or manifest.get("model_id") != "BAAI/bge-m3"
+        or manifest.get("dimension") != 1024
+        or manifest.get("backend") != "onnx"
+        or manifest.get("selected_variant") != "nonquantized_split_onnx"
+        or not isinstance(policy, dict)
+        or policy.get("allowed_variants") != ["nonquantized_split_onnx"]
+        or policy.get("quantized_variant_allowed") is not False
+        or policy.get("external_data_sidecar_required") is not True
+        or not isinstance(files, list)
+    ):
+        raise RuntimeError("invalid committed hybrid artifact manifest")
+    selected_dir_value = policy.get("selected_directory")
+    forbidden_values = policy.get("forbidden_relative_paths")
+    if not isinstance(selected_dir_value, str) or not isinstance(
+        forbidden_values, list
+    ):
+        raise RuntimeError("hybrid artifact manifest has invalid variant policy")
+    expected: dict[str, dict[str, Any]] = {}
+    for row in files:
+        if (
+            not isinstance(row, dict)
+            or not isinstance(row.get("relative_path"), str)
+            or not isinstance(row.get("size"), int)
+            or not isinstance(row.get("sha256"), str)
+        ):
+            raise RuntimeError("hybrid artifact manifest has invalid file entry")
+        relative = str(row["relative_path"])
+        if (
+            relative in expected
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+        ):
+            raise RuntimeError("hybrid artifact manifest has unsafe/duplicate path")
+        expected[relative] = row
+    sidecar = "BAAI-bge-m3/onnx/model.onnx_data"
+    if sidecar not in expected:
+        raise RuntimeError("hybrid artifact manifest omits required ONNX sidecar")
+
+    problems: list[str] = []
+    selected_dir = cache_root / selected_dir_value
+    expected_selected = {
+        relative
+        for relative in expected
+        if str(Path(relative).parent) == selected_dir_value
+    }
+    actual_selected = (
+        {
+            str(path.relative_to(cache_root))
+            for path in selected_dir.rglob("*")
+            if path.is_file()
+        }
+        if selected_dir.is_dir()
+        else set()
+    )
+    extra = sorted(actual_selected - expected_selected)
+    if extra and policy.get("reject_unlisted_files_in_selected_directory") is True:
+        problems.append(f"extra_selected={extra}")
+    forbidden = [
+        str(value)
+        for value in forbidden_values
+        if isinstance(value, str) and (cache_root / value).exists()
     ]
-    tokenizer_candidates = [
-        model_root / "onnx" / "tokenizer.json",
-        model_root / "tokenizer.json",
-    ]
-    onnx = next((path for path in onnx_candidates if path.is_file()), None)
-    tokenizer = next((path for path in tokenizer_candidates if path.is_file()), None)
-    if onnx is None or tokenizer is None:
-        raise RuntimeError(
-            "hybrid reproduction requires an explicit verified HAUNT_MODEL_CACHE "
-            "containing BAAI-bge-m3 ONNX and tokenizer files"
+    if forbidden:
+        problems.append(f"variant_mismatch_forbidden={sorted(forbidden)}")
+
+    actual_rows: list[dict[str, Any]] = []
+    for relative, row in expected.items():
+        path = cache_root / relative
+        if not path.exists() or not path.is_file():
+            marker = "missing_sidecar" if relative == sidecar else "missing"
+            problems.append(f"{marker}={relative}")
+            continue
+        if path.is_symlink():
+            problems.append(f"symlink={relative}")
+            continue
+        size = path.stat().st_size
+        if size == 0:
+            problems.append(f"zero_byte={relative}")
+        if size != row["size"]:
+            problems.append(
+                f"size_mismatch={relative}:expected={row['size']}:actual={size}"
+            )
+        actual_rows.append(
+            {
+                "relative_path": relative,
+                "size": size,
+                "expected_sha256": row["sha256"],
+                "path": path,
+            }
         )
-    files = [onnx, tokenizer]
-    sidecar = onnx.with_name("model.onnx_data")
-    if sidecar.is_file():
-        files.append(sidecar)
+    if problems:
+        raise RuntimeError(
+            "hybrid cache artifact preflight mismatch: " + "; ".join(problems)
+        )
+
+    verified: list[dict[str, Any]] = []
+    for row in actual_rows:
+        digest = _file_hash(row["path"])
+        if digest != row["expected_sha256"]:
+            raise RuntimeError(
+                "hybrid cache artifact hash mismatch: "
+                f"{row['relative_path']}:expected={row['expected_sha256']}:actual={digest}"
+            )
+        verified.append(
+            {
+                "relative_path": row["relative_path"],
+                "size": row["size"],
+                "sha256": digest,
+            }
+        )
     return {
         "cache_root_supplied": True,
-        "model_root": "BAAI-bge-m3",
-        "files": [
-            {
-                "relative_path": str(path.relative_to(cache_root)),
-                "size": path.stat().st_size,
-                "sha256": _file_hash(path),
-            }
-            for path in files
-        ],
+        "matched_manifest_id": manifest["manifest_id"],
+        "manifest_canonical_sha256": canonical_hash(manifest),
+        "model_id": manifest["model_id"],
+        "dimension": manifest["dimension"],
+        "backend": manifest["backend"],
+        "selected_variant": manifest["selected_variant"],
+        "variant_policy": policy,
+        "files": verified,
     }
 
 
@@ -670,35 +1013,20 @@ def _evidence(store: ReadOnlyStore, query: str, hits: Sequence[Hit]) -> dict[str
 
 
 def _fit_labels(
-    dataset: dict[str, Any], split: dict[str, Any], profile: str
+    labels: Mapping[str, FitLabel], split: Mapping[str, Any], profile: str
 ) -> FitLabels:
-    by_case = {row["id"]: row for row in dataset["cases"]}
-    return FitLabels(
-        {
-            case_id: FitLabel(
-                label=str(by_case[case_id]["label"]),
-                relevant=tuple(str(value) for value in by_case[case_id]["relevant"]),
-            )
-            for case_id in split["fit"][profile]
-        }
-    )
+    return FitLabels({case_id: labels[case_id] for case_id in split["fit"][profile]})
 
 
 def _labels_for_ids(
-    dataset: dict[str, Any], case_ids: Sequence[str]
+    labels: Mapping[str, FitLabel], case_ids: Sequence[str]
 ) -> dict[str, FitLabel]:
-    by_case = {row["id"]: row for row in dataset["cases"]}
-    return {
-        case_id: FitLabel(
-            label=str(by_case[case_id]["label"]),
-            relevant=tuple(str(value) for value in by_case[case_id]["relevant"]),
-        )
-        for case_id in case_ids
-    }
+    return {case_id: labels[case_id] for case_id in case_ids}
 
 
 def _observe_case(
     case: Mapping[str, Any],
+    label: FitLabel,
     memory_ids: Mapping[str, str],
     *,
     profile: str,
@@ -715,7 +1043,7 @@ def _observe_case(
     if profile == "hybrid" and case.get("semantic_paraphrase"):
         lexical = recall(str(case["query"]), k=40, store=store, use_vectors=False)
         lexical_returned = tuple(reverse_ids[hit.memory_id] for hit in lexical)
-        relevant = set(str(value) for value in case["relevant"])
+        relevant = set(label.relevant)
         if relevant & set(lexical_returned):
             raise ValueError(
                 f"semantic case {case['id']} has a lexical/stemming answer path"
@@ -934,10 +1262,30 @@ def evaluate_profile(
     *,
     fixture_dir: Path = DEFAULT_FIXTURE_DIR,
     model_cache: Path | None = None,
+    audit_hook: AuditHook | None = None,
 ) -> dict[str, Any]:
     if profile not in {"fts", "hybrid"}:
         raise ValueError("profile must be fts or hybrid")
-    dataset, split = load_inputs(fixture_dir)
+    audit_events: list[dict[str, Any]] = []
+
+    def audit(event: str, details: Mapping[str, Any]) -> None:
+        recorded = dict(details)
+        if "fit_report" in recorded:
+            recorded = {
+                "fit_report_canonical_sha256": canonical_hash(recorded["fit_report"]),
+                "boundary": recorded["fit_report"]["boundary"],
+            }
+        audit_events.append({"event": event, "details": recorded})
+        _emit_audit(audit_hook, event, details)
+
+    dataset, split = load_inputs(fixture_dir, audit_hook=audit)
+    fit_phase_labels = _load_phase_labels(
+        fixture_dir,
+        phase="fit",
+        dataset=dataset,
+        split=split,
+        audit_hook=audit,
+    )
     separation = separation_evidence(dataset)
     e0_evidence = sealed_e0_evidence()
     if not e0_evidence["diff_empty"]:
@@ -964,7 +1312,9 @@ def evaluate_profile(
     if profile == "hybrid":
         if model_cache is None:
             raise RuntimeError("hybrid reproduction requires --model-cache")
-        cache_evidence = verify_local_hybrid_cache(model_cache)
+        cache_evidence = verify_local_hybrid_cache(
+            model_cache, fixture_dir=fixture_dir, audit_hook=audit
+        )
 
     network_attempts: list[str] = []
     with TemporaryDirectory(prefix=f"haunt-e6-{profile}-") as home:
@@ -1023,13 +1373,14 @@ def evaluate_profile(
                     fit_observations = [
                         _observe_case(
                             by_case[case_id],
+                            fit_phase_labels[case_id],
                             memory_ids,
                             profile=profile,
                             store=read_store,
                         )
                         for case_id in split["fit"][profile]
                     ]
-                    fit_labels = _fit_labels(dataset, split, profile)
+                    fit_labels = _fit_labels(fit_phase_labels, split, profile)
                     fit_analysis = analyze_fit(fit_observations, fit_labels)
                     boundary = float(
                         fit_analysis["selected_threshold"]
@@ -1039,18 +1390,50 @@ def evaluate_profile(
                         ]
                     )
                     fit_metrics = _score(fit_observations, fit_labels.by_case, boundary)
+                    fit_boundary_report = {
+                        "analysis": fit_analysis,
+                        "boundary": boundary,
+                        "metrics": fit_metrics,
+                    }
+                    audit(
+                        "fit_boundary_complete",
+                        {"fit_report": fit_boundary_report},
+                    )
+
+                    # This is the first operation permitted to open or parse
+                    # held labels. Fit analysis and its boundary are immutable.
+                    held_phase_labels = _load_phase_labels(
+                        fixture_dir,
+                        phase="held_out",
+                        dataset=dataset,
+                        split=split,
+                        audit_hook=audit,
+                    )
 
                     held_observations = [
                         _observe_case(
                             by_case[case_id],
+                            held_phase_labels[case_id],
                             memory_ids,
                             profile=profile,
                             store=read_store,
                         )
                         for case_id in split["held_out"][profile]
                     ]
-                    held_labels = _labels_for_ids(dataset, split["held_out"][profile])
+                    held_labels = _labels_for_ids(
+                        held_phase_labels, split["held_out"][profile]
+                    )
                     held_metrics = _score(held_observations, held_labels, boundary)
+                    composite_dataset, dataset_manifest_evidence = (
+                        _verify_dataset_manifest_after_scoring(
+                            fixture_dir,
+                            dataset=dataset,
+                            split=split,
+                            fit_labels=fit_phase_labels,
+                            held_labels=held_phase_labels,
+                            audit_hook=audit,
+                        )
+                    )
                 network_attempts = list(network.attempts)
                 if network_attempts:
                     raise RuntimeError(
@@ -1100,8 +1483,25 @@ def evaluate_profile(
         "report_id": f"haunt-abstention-feasibility-{profile}-v1",
         "status": "calibratable" if possible else "blocked",
         "runtime_policy_shipped": False,
-        "dataset_canonical_sha256": canonical_hash(dataset),
+        "dataset_canonical_sha256": canonical_hash(composite_dataset),
         "split_canonical_sha256": canonical_hash(split),
+        "dataset_manifest": dataset_manifest_evidence,
+        "label_access_audit": {
+            "held_labels_physical_file": "held-labels.json",
+            "fit_boundary_precedes_held_label_open": (
+                next(
+                    index
+                    for index, row in enumerate(audit_events)
+                    if row["event"] == "fit_boundary_complete"
+                )
+                < next(
+                    index
+                    for index, row in enumerate(audit_events)
+                    if row["event"] == "before_open:held_labels"
+                )
+            ),
+            "events": audit_events,
+        },
         "feature_definition": FEATURE_DEFINITION,
         "feature_definition_sha256": canonical_hash(FEATURE_DEFINITION),
         "separation_from_e0": separation,

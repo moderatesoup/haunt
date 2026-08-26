@@ -584,6 +584,10 @@ does not support the query.
   `d57b1a02e30d48087065528bfc01575d67735295003de26b1087bb348d05414d`.
   Its 40 records and 160 cases have no logical-ID, canonical record, or query
   hash overlap with E0; the sealed E0 paths have a byte-for-byte empty diff.
+  Records, unlabeled queries, split membership, fit labels, and held labels are
+  physically separate. The held-label file is first opened only after the
+  fit-only boundary exists; the composite manifest is first opened and verified
+  after held-out scoring, where it reconstructs the same frozen dataset hash.
 - The FTS-only fit cohort is separable at `0.875`; held-out Recall@5,
   conditional retention, and negative abstention are all `1.0`. This proves the
   harness but does not close E6 because a separate pinned hybrid profile is
@@ -602,6 +606,12 @@ does not support the query.
   non-native vector arm. Coverage evidence is case-folded/deduplicated and uses
   one batched SQL statement for the fixed top five; 1k/10k/100k timing evidence
   is recorded separately as a non-cross-machine gate.
+- Hybrid preflight accepts only committed artifact manifest
+  `haunt-bge-m3-onnx-split-f8425123-v1`: exact relative paths, sizes, and hashes
+  for config, nonquantized ONNX, required external-data sidecar, tokenizer, and
+  tokenizer config. Missing/extra/zero-byte/size/hash/sidecar/variant mismatches
+  fail before embedding initialization; quantized and root-level variants are
+  explicitly forbidden.
 - Evidence and reproduction live in `src/haunt/abstention_eval.py`,
   `scripts/reproduce_abstention_eval.py`,
   `scripts/benchmark_abstention_evidence.py`, and
