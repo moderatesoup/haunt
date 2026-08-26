@@ -81,10 +81,10 @@ def test_fts_only_explanation_preserves_legacy_fields_and_marks_tool_io(haunt_en
             "include_untrusted": True,
         },
         "references": {
-            "correction_lineage": None,
-            "correction_lineage_status": "unavailable_legacy",
-            "provenance": None,
-            "provenance_status": "legacy_unstructured",
+            "correction_lineage": {"status": "standalone"},
+            "correction_lineage_status": "standalone",
+            "provenance": stored.provenance,
+            "provenance_status": "native",
         },
         "trust": {"trusted": False, "reason": "untrusted-tool-io"},
     }
@@ -151,6 +151,176 @@ def test_hybrid_explanation_reports_each_rrf_contribution(haunt_env, monkeypatch
     assert sum(item["value"] for item in first_explanation["rrf_contributions"]) == first_explanation["rrf_score"]
     assert first_explanation["filters"]["validity"] == "current"
     assert first_explanation["filters"]["include_untrusted"] is True
+
+
+def test_recall_references_use_e1_lineage_and_e2_public_provenance(
+    haunt_env, monkeypatch
+):
+    """Recall attaches only safe lineage and structured-provenance references."""
+    recall_module = importlib.import_module("haunt.recall")
+    imported_provenance = {
+        "schema_version": 1,
+        "kind": "import",
+        "channel": "python",
+        "source_platform": "reference-test",
+        "source_native_id": "safe-native-id",
+        "source_format": "json",
+        "parser_version": "v1",
+        "imported_at": "2026-08-08T12:00:00+00:00",
+        "fidelity": "lossless",
+        "original_blob_sha256": "sha256:" + "ab" * 32,
+        "transforms": ["parse"],
+    }
+    erased_canary = "EXPLAIN-REFERENCE-ERASED-CANARY"
+    with Store("default") as store:
+        imported = store.observe(
+            "EXPLAIN-REFERENCE-IMPORT",
+            provenance=imported_provenance,
+            defer_embedding=True,
+        )
+        legacy = store.observe("EXPLAIN-REFERENCE-LEGACY", defer_embedding=True)
+        invalid = store.observe("EXPLAIN-REFERENCE-INVALID", defer_embedding=True)
+        store.conn.execute(
+            "UPDATE events SET provenance=NULL WHERE id=?", (legacy.event_id,)
+        )
+        store.conn.execute(
+            "UPDATE events SET provenance='{\"kind\":\"bogus\"}' WHERE id=?",
+            (invalid.event_id,),
+        )
+
+        original = store.observe("EXPLAIN-REFERENCE-ORIGINAL", defer_embedding=True)
+        correction = store.contradict(
+            original.memory_id,
+            replacement="EXPLAIN-REFERENCE-LINKED",
+            idempotency_key="explanation-linked",
+        )
+
+        first = store.observe("EXPLAIN-REFERENCE-FIRST", defer_embedding=True)
+        into_erased = store.contradict(
+            first.memory_id,
+            replacement=erased_canary,
+            idempotency_key="explanation-erased-1",
+        )
+        erased_id = into_erased["replacement_memory_id"]
+        erased_event_id = into_erased["replacement_event_id"]
+        survivor = store.contradict(
+            erased_id,
+            replacement="EXPLAIN-REFERENCE-SURVIVOR",
+            idempotency_key="explanation-erased-2",
+        )["replacement_memory_id"]
+        store.purge(erased_id)
+
+        def recalled(query: str):
+            return recall_module.recall(query, store=store, use_vectors=False)[0]
+
+        import_references = recalled("EXPLAIN-REFERENCE-IMPORT").as_dict()[
+            "explanation"
+        ]["references"]
+        legacy_references = recalled("EXPLAIN-REFERENCE-LEGACY").as_dict()[
+            "explanation"
+        ]["references"]
+        invalid_references = recalled("EXPLAIN-REFERENCE-INVALID").as_dict()[
+            "explanation"
+        ]["references"]
+        linked_references = recalled("EXPLAIN-REFERENCE-LINKED").as_dict()[
+            "explanation"
+        ]["references"]
+        survivor_hit = recalled("EXPLAIN-REFERENCE-SURVIVOR")
+        survivor_references = survivor_hit.as_dict()["explanation"]["references"]
+
+    assert import_references == {
+        "correction_lineage": {"status": "standalone"},
+        "correction_lineage_status": "standalone",
+        "provenance": imported.provenance,
+        "provenance_status": "import",
+    }
+    assert legacy_references["provenance"] is None
+    assert legacy_references["provenance_status"] == "legacy_unstructured"
+    assert invalid_references["provenance"] is None
+    assert invalid_references["provenance_status"] == "invalid_stored"
+    assert linked_references["correction_lineage"] == {
+        "status": "linked",
+        "correction_ids": [correction["correction_id"]],
+    }
+    assert survivor_hit.memory_id == survivor
+    assert survivor_references["correction_lineage"] == {
+        "status": "privacy_tombstone"
+    }
+    serialized = json.dumps(survivor_hit.as_dict(), allow_nan=False)
+    assert erased_canary not in serialized
+    assert erased_id not in serialized
+    assert erased_event_id not in serialized
+
+    from haunt import cli, mcp_server
+    from tests.dashutil import make_dash_client
+
+    cli_result = CliRunner().invoke(
+        cli.app,
+        ["recall", "EXPLAIN-REFERENCE-LINKED", "-n", "default", "--json"],
+    )
+    assert cli_result.exit_code == 0, cli_result.output
+    cli_payload = json.loads(cli_result.stdout)
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    mcp_server._MCP_AUTHORITY = None
+    mcp_payload = json.loads(
+        mcp_server.memory_recall(
+            query="EXPLAIN-REFERENCE-LINKED", namespace="default"
+        )
+    )
+    dashboard_response = make_dash_client().get(
+        "/api/namespace/default/recall?q=EXPLAIN-REFERENCE-LINKED"
+    )
+    assert dashboard_response.status_code == 200, dashboard_response.text
+    expected_reference = linked_references
+    for payload in (cli_payload, mcp_payload, dashboard_response.json()):
+        hit = next(
+            hit
+            for hit in payload["hits"]
+            if hit["memory_id"] == correction["replacement_memory_id"]
+        )
+        assert hit["explanation"]["references"] == expected_reference
+
+
+def test_recall_reference_batch_avoids_unrelated_correction_graph_scans(
+    haunt_env, monkeypatch
+):
+    """One result batch uses one chain-local correction query, not O(k * N)."""
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    with Store("default") as store:
+        root = store.observe("REFERENCE-BATCH-ROOT", defer_embedding=True)
+        linked = store.contradict(
+            root.memory_id,
+            replacement="REFERENCE-BATCH-LINKED",
+            idempotency_key="reference-batch-root",
+        )
+        for index in range(128):
+            unrelated = store.observe(
+                f"REFERENCE-BATCH-UNRELATED-{index}", defer_embedding=True
+            )
+            store.contradict(
+                unrelated.memory_id,
+                replacement=f"REFERENCE-BATCH-REPLACEMENT-{index}",
+                idempotency_key=f"reference-batch-{index}",
+            )
+
+        statements: list[str] = []
+        store.conn.set_trace_callback(statements.append)
+        try:
+            references = store.recall_references_many(
+                [linked["replacement_memory_id"]]
+            )
+        finally:
+            store.conn.set_trace_callback(None)
+
+    correction_reads = [
+        statement for statement in statements if "corrections" in statement.lower()
+    ]
+    assert len(correction_reads) == 1
+    assert "ORDER BY corrected_at, rowid" not in correction_reads[0]
+    assert references[linked["replacement_memory_id"]]["correction_lineage"] == {
+        "status": "linked",
+        "correction_ids": [linked["correction_id"]],
+    }
 
 
 def test_vector_only_explanation_reports_vector_evidence(haunt_env, monkeypatch):
@@ -526,8 +696,8 @@ def test_cli_json_errors_are_machine_readable_and_nonzero(haunt_env):
     assert "clock must be" in payload["error"]
 
 
-def test_explanation_references_remain_explicitly_legacy_and_unscored():
-    """Before E2 there are no correction/provenance IDs or confidence claims."""
+def test_synthetic_hit_references_remain_explicitly_legacy_and_unscored():
+    """A bare compatibility Hit does not fabricate Store-derived references."""
     hit = Hit(
         memory_id="legacy-memory",
         event_id="legacy-event",

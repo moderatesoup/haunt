@@ -20,7 +20,14 @@ from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
 from haunt.recall import BACKEND_ERROR_CODE, Hit, execution_metadata, is_retrieval_backend_error
-from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
+from haunt.store import (
+    Store,
+    UnknownNamespaceError,
+    list_namespaces,
+    list_namespace_rows,
+    namespace_exists,
+    open_existing,
+)
 from haunt.temporal import TemporalParseError, compile as compile_temporal
 from haunt.util import clamp_limit, iso_or_now, normalize_clock
 

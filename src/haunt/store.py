@@ -5082,6 +5082,196 @@ class Store:
             }
         )
 
+    def recall_references_many(
+        self, memory_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Return public E1/E2 references for a batch of recall hits.
+
+        The projection never copies trace text, correction reasons, tombstone
+        IDs, or legacy metadata. A single recursive query walks only each
+        requested chain through the four indexed correction endpoints; it does
+        not load or rebuild the namespace's complete correction graph for every
+        hit. Any tombstone in a requested chain suppresses every correction ID
+        in that chain's output.
+        """
+        ids = list(dict.fromkeys(memory_ids))
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT m.id AS memory_id, m.valid_to, e.provenance, e.origin, e.tool_name
+            FROM memories m
+            JOIN events e ON e.id=m.event_id
+            WHERE m.id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+        by_id = {str(row["memory_id"]): row for row in rows}
+
+        roots = ", ".join("(?)" for _ in by_id)
+        edge_rows: list[sqlite3.Row] = []
+        if roots:
+            # Every recursive arm has one indexed endpoint predicate. UNION
+            # de-duplicates cycles, so a requested correction component is
+            # visited once per root without touching unrelated components.
+            edge_rows = self.conn.execute(
+                f"""
+                WITH RECURSIVE
+                roots(root_id) AS (VALUES {roots}),
+                walk(root_id, node_kind, node_id) AS (
+                    SELECT root_id, 'memory', root_id FROM roots
+                    UNION
+                    SELECT w.root_id, 'memory', c.replacement_memory_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                      AND c.replacement_memory_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'tombstone', c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                      AND c.replacement_tombstone_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'memory', c.target_memory_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                      AND c.target_memory_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'tombstone', c.target_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                      AND c.target_tombstone_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'memory', c.replacement_memory_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                      AND c.replacement_memory_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'tombstone', c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                      AND c.replacement_tombstone_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'memory', c.target_memory_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                      AND c.target_memory_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'tombstone', c.target_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                      AND c.target_tombstone_id IS NOT NULL
+                ),
+                reference_edges AS (
+                    SELECT w.root_id, c.id, c.corrected_at, c.rowid AS correction_rowid,
+                           c.target_tombstone_id, c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                    UNION
+                    SELECT w.root_id, c.id, c.corrected_at, c.rowid,
+                           c.target_tombstone_id, c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                    UNION
+                    SELECT w.root_id, c.id, c.corrected_at, c.rowid,
+                           c.target_tombstone_id, c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                    UNION
+                    SELECT w.root_id, c.id, c.corrected_at, c.rowid,
+                           c.target_tombstone_id, c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                )
+                SELECT DISTINCT root_id, id, corrected_at, correction_rowid,
+                                target_tombstone_id, replacement_tombstone_id
+                FROM reference_edges
+                """,
+                list(by_id),
+            ).fetchall()
+
+        correction_by_root: dict[str, list[sqlite3.Row]] = {
+            memory_id: [] for memory_id in by_id
+        }
+        for edge in edge_rows:
+            correction_by_root[str(edge["root_id"])].append(edge)
+
+        out: dict[str, dict[str, Any]] = {}
+        for memory_id, row in by_id.items():
+            public = public_provenance(
+                row["provenance"],
+                origin=row["origin"],
+                # Legacy metadata is available in full detail, but is not a
+                # recall reference because it can be arbitrary/sensitive.
+                legacy_meta=None,
+                tool_name=row["tool_name"],
+            )
+            provenance_status = str(public.get("kind", "invalid_stored"))
+            provenance = (
+                public if provenance_status in {"native", "import"} else None
+            )
+            edges = sorted(
+                correction_by_root[memory_id],
+                key=lambda edge: (
+                    str(edge["corrected_at"]),
+                    int(edge["correction_rowid"]),
+                    str(edge["id"]),
+                ),
+            )
+            includes_privacy_tombstone = any(
+                edge["target_tombstone_id"] is not None
+                or edge["replacement_tombstone_id"] is not None
+                for edge in edges
+            )
+            if includes_privacy_tombstone:
+                correction_lineage = {"status": "privacy_tombstone"}
+                correction_status = "privacy_tombstone"
+            elif edges:
+                correction_lineage = {
+                    "status": "linked",
+                    "correction_ids": [str(edge["id"]) for edge in edges],
+                }
+                correction_status = "linked"
+            elif row["valid_to"] is not None:
+                correction_lineage = {"status": "legacy_unlinked"}
+                correction_status = "legacy_unlinked"
+            else:
+                correction_lineage = {"status": "standalone"}
+                correction_status = "standalone"
+            out[memory_id] = json_safe_sqlite(
+                {
+                    "correction_lineage": correction_lineage,
+                    "correction_lineage_status": correction_status,
+                    "provenance": provenance,
+                    "provenance_status": provenance_status,
+                }
+            )
+        return out
+
+    def recall_references(self, memory_id: str) -> dict[str, Any]:
+        """Return one safe recall-reference projection (compatibility helper)."""
+        return self.recall_references_many([memory_id]).get(
+            memory_id,
+            {
+                "correction_lineage": None,
+                "correction_lineage_status": "unavailable",
+                "provenance": None,
+                "provenance_status": "unavailable",
+            },
+        )
+
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         """Retrieve full provenance detail for a single memory."""
         row = self.conn.execute(

@@ -327,6 +327,9 @@ def run_timeline(
     time_attr = "ts" if _clocks(chosen)[0] == "storage_time" else "event_time"
     hits.sort(key=lambda hit: getattr(hit, time_attr) or "", reverse=True)
     hits = hits[:limit]
+    references = store.recall_references_many([hit.memory_id for hit in hits])
+    for hit in hits:
+        hit.references = references.get(hit.memory_id)
     for final_rank, hit in enumerate(hits, start=1):
         hit.final_rank = final_rank
     return RecallResult(

@@ -110,6 +110,7 @@ class Hit:
     final_rank: int | None = None
     vector_stage: dict[str, str] | None = None
     fts_stage: dict[str, str] | None = None
+    references: dict[str, Any] | None = None
 
     @property
     def trusted(self) -> bool:
@@ -183,7 +184,9 @@ class Hit:
             "vector": vector,
             "fts": fts,
             "filters": self.filter_context,
-            "references": {
+            "references": self.references
+            if self.references is not None
+            else {
                 "correction_lineage": None,
                 "correction_lineage_status": "unavailable_legacy",
                 "provenance": None,
@@ -546,6 +549,9 @@ def recall(
                     fts_stage=fts_execution,
                 )
             )
+        references = store.recall_references_many([hit.memory_id for hit in hits])
+        for hit in hits:
+            hit.references = references.get(hit.memory_id)
         return RecallResult(
             hits,
             modalities={"vector": vector_execution, "fts": fts_execution},

@@ -401,7 +401,9 @@ def test_recall_hit_dynamic_sqlite_values_are_exact_on_every_public_surface(
             ),
         )
         st.conn.commit()
-        python_hits = recall(query, store=st, use_vectors=False)
+        # Match public recall surfaces so E5's honest vector-stage evidence
+        # describes one execution mode on every compared payload.
+        python_hits = recall(query, store=st)
     assert len(python_hits) == 1
     expected = python_hits[0].as_dict()
     assert _decode_public_blob(expected["content"]) == blob
