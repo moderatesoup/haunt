@@ -732,3 +732,27 @@ def test_synthetic_hit_references_remain_explicitly_legacy_and_unscored():
         "provenance_status": "legacy_unstructured",
     }
     assert "confidence" not in explanation
+
+
+def test_synthetic_tool_class_is_untrusted_without_internal_raw_marker():
+    """Compatibility-created Hits cannot accidentally launder tool residue."""
+    hit = Hit(
+        memory_id="tool-memory",
+        event_id="tool-event",
+        score=0.0,
+        tier="episodic",
+        content="tool residue",
+        role="user",
+        event_time="2026-08-08T12:00:00+00:00",
+        valid_from="2026-08-08T12:00:00+00:00",
+        valid_to=None,
+        tool_name=None,
+        recall_class="tool",
+    )
+
+    assert hit.trusted is False
+    assert hit.trust_reason == "untrusted-tool-io"
+    assert hit.as_dict()["explanation"]["trust"] == {
+        "trusted": False,
+        "reason": "untrusted-tool-io",
+    }

@@ -125,7 +125,11 @@ class Hit:
         raw_tool = (
             self.raw_tool_structure
             if self.raw_tool_structure is not None
-            else self.role == "tool" or self.tool_name is not None
+            else (
+                self.recall_class == "tool"
+                or self.role == "tool"
+                or self.tool_name is not None
+            )
         )
         return not raw_tool
 

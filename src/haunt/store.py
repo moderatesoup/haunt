@@ -288,6 +288,7 @@ class _SidecarGuardedConnection(sqlite3.Connection):
     _clean_primary_claim = True
     _zero_write_snapshot: tuple[Path, SQLiteStorageSnapshot] | None = None
     _temporary_read_dir: Any = None
+    _configured_writer = False
 
     def set_sidecar_guard(
         self, guard: SQLiteSidecarGuard, *, clean_unused_claims: bool
@@ -305,6 +306,10 @@ class _SidecarGuardedConnection(sqlite3.Connection):
 
     def set_temporary_read_dir(self, temporary: Any) -> None:
         self._temporary_read_dir = temporary
+
+    def mark_configured_writer(self) -> None:
+        """Serialize this writable connection's close with writer opens."""
+        self._configured_writer = True
 
     def verify_storage_guards(self) -> None:
         if self._primary_guard is None or self._sidecar_guard is None:
@@ -361,6 +366,20 @@ class _SidecarGuardedConnection(sqlite3.Connection):
         self._clean_primary_claim = False
 
     def close(self) -> None:
+        configured_writer = self._configured_writer
+        if configured_writer:
+            # SQLite may checkpoint, truncate, or unlink WAL/SHM during close.
+            # Writer opens take this same cross-process lock before validating
+            # those sidecars, so preserve that ordering at teardown as well.
+            with _sqlite_configuration_lock():
+                # Do not clear this before lock acquisition: an unsafe or
+                # replaced lock must leave a later close serialized too.
+                self._configured_writer = False
+                self._close_with_storage_guards()
+            return
+        self._close_with_storage_guards()
+
+    def _close_with_storage_guards(self) -> None:
         guard = self._sidecar_guard
         primary = self._primary_guard
         zero_write = self._zero_write_snapshot
@@ -485,6 +504,8 @@ def _configure_connection(
         raise NamespacePathError(
             "SQLite write configuration requires the serialized sidecar lock"
         )
+    if isinstance(conn, _SidecarGuardedConnection):
+        conn.mark_configured_writer()
     _sqlite_sidecar_pragma_hook(path)
     if sidecars is not None:
         sidecars.verify()
@@ -634,7 +655,10 @@ def _validate_all_registered_namespace_dbs_read_only() -> None:
     registry = registry_path()
     if not registry.is_file():
         raise NamespacePathError(f"namespace registry is missing: {registry}")
-    conn = _open_readonly_connection(registry)
+    # This validation also runs on writer paths.  Use the E3 zero-write
+    # snapshot rather than a direct mode=ro connection, whose lock/sidecar
+    # behavior is not portable while another SQLite handle is winding down.
+    conn = _open_zero_write_sqlite_snapshot(registry)
     try:
         tables = {
             str(row[0])
@@ -760,7 +784,7 @@ def _preflight_registry_storage_read_only() -> None:
     registry = registry_path()
     if not registry.exists():
         return
-    conn = _open_readonly_connection(registry)
+    conn = _open_zero_write_sqlite_snapshot(registry)
     try:
         tables = {
             str(row[0])
@@ -782,6 +806,12 @@ def _vec_loaded(conn: sqlite3.Connection) -> bool:
 
 
 def init_registry() -> None:
+    """Initialize/migrate the registry under the writer sidecar lifecycle lock."""
+    with _sqlite_configuration_lock():
+        _init_registry_once()
+
+
+def _init_registry_once() -> None:
     ensure_layout()
     _preflight_registry_storage_read_only()
     conn = _connect(registry_path())
@@ -1514,28 +1544,32 @@ class _FreshNamespaceClaim:
         )
 
     def close(self, *, remove_target: bool) -> None:
-        with _NAMESPACE_DB_HANDLE_LOCK:
+        # Keep SQLite close and every claimed-name cleanup in one writer
+        # lifecycle critical section. SQLite close can release WAL/SHM just
+        # before this explicit claim cleanup; releasing the flock between
+        # those steps let another opener validate a sidecar we then unlinked.
+        with _sqlite_configuration_lock():
             self.conn.close()
-        self.sidecars.remove_claimed_files()
-        try:
-            os.close(self.claim_fd)
-        except OSError:
-            pass
-        for extra in (self.temporary,):
+            self.sidecars.remove_claimed_files()
             try:
-                extra.unlink()
-            except FileNotFoundError:
-                pass
-        if remove_target:
-            try:
-                current = self.target.lstat()
+                os.close(self.claim_fd)
             except OSError:
-                return
-            if (
-                stat.S_ISREG(current.st_mode)
-                and (int(current.st_dev), int(current.st_ino)) == self.identity
-            ):
-                self.target.unlink()
+                pass
+            for extra in (self.temporary,):
+                try:
+                    extra.unlink()
+                except FileNotFoundError:
+                    pass
+            if remove_target:
+                try:
+                    current = self.target.lstat()
+                except OSError:
+                    return
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and (int(current.st_dev), int(current.st_ino)) == self.identity
+                ):
+                    self.target.unlink()
 
 
 def _claim_fresh_namespace_db(target: Path) -> _FreshNamespaceClaim:
@@ -1733,10 +1767,13 @@ _CONCURRENT_REGISTRY_CHANGE_MARKERS = (
     "sidecar changed while opening",
     "sidecar physical identity changed while opening",
     "sidecar physical identity changed:",
+    # SQLite's SQLITE_PROTOCOL is a transient shared-lock handoff failure;
+    # it is not an identity, path, or permission failure.
+    "locking protocol",
 )
 
 
-def is_concurrent_registry_change(exc: NamespacePathError) -> bool:
+def is_concurrent_registry_change(exc: BaseException) -> bool:
     """Return whether a read can be retried after observed registry drift."""
     message = str(exc)
     return any(marker in message for marker in _CONCURRENT_REGISTRY_CHANGE_MARKERS)
@@ -1852,7 +1889,15 @@ def _bind_repository(
     )
 
 
-def register_namespace(name: str, repo_path: str | None = None) -> Path:
+def _register_namespace_once(name: str, repo_path: str | None = None) -> Path:
+    """Run one complete registry/namespace publication under one writer lock."""
+    with _sqlite_configuration_lock():
+        return _register_namespace_once_with_configuration_lock(name, repo_path)
+
+
+def _register_namespace_once_with_configuration_lock(
+    name: str, repo_path: str | None = None
+) -> Path:
     label = safe_name(name)
     norm = normalize_namespace_label(label)
     now = now_iso()
@@ -1983,9 +2028,27 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
         if claim is not None:
             claim.close(remove_target=False)
         else:
-            with _NAMESPACE_DB_HANDLE_LOCK:
-                ns.close()
+            ns.close()
     return db
+
+
+def register_namespace(name: str, repo_path: str | None = None) -> Path:
+    """Register a namespace, retrying only recognized registry handoffs.
+
+    A failed attempt may have committed the identity before a subsequent
+    mapped-DB validation sees a changing WAL sidecar.  Re-entering the
+    idempotent registration path is safe in that narrow case.  Do not retry
+    path/identity/permission errors: those remain fail-closed on the first
+    attempt.
+    """
+    for attempt in range(8):
+        try:
+            return _register_namespace_once(name, repo_path)
+        except (NamespacePathError, sqlite3.Error) as exc:
+            if not is_concurrent_registry_change(exc) or attempt == 7:
+                raise
+            threading.Event().wait(0.002 * (attempt + 1))
+    raise AssertionError("unreachable namespace registration retry exhaustion")
 
 
 def namespace_exists(name: str) -> bool:
@@ -2001,10 +2064,11 @@ def namespace_exists_readonly(name: str) -> bool:
     return resolve_namespace_identity(name) is not None
 
 
-def list_namespace_rows_readonly() -> list[dict[str, Any]]:
-    """Minimal E3 identity listing for all-namespace recall fan-out."""
-    conn = _readonly_registry()
+def _list_namespace_rows_readonly_once() -> list[dict[str, Any]]:
+    """Read all E3 identities once, preserving honest SQLite read failures."""
+    conn: sqlite3.Connection | None = None
     try:
+        conn = _readonly_registry()
         rows = conn.execute(
             """
             SELECT namespace_id, canonical_label, canonical_label_norm, db_path,
@@ -2027,8 +2091,23 @@ def list_namespace_rows_readonly() -> list[dict[str, Any]]:
             }
             for row in rows
         ]
+    except sqlite3.Error as exc:
+        raise NamespacePathError(f"cannot read namespace registry: {exc}") from exc
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+
+
+def list_namespace_rows_readonly() -> list[dict[str, Any]]:
+    """List all E3 identities, retrying only transient registry churn."""
+    for attempt in range(8):
+        try:
+            return _list_namespace_rows_readonly_once()
+        except NamespacePathError as exc:
+            if not is_concurrent_registry_change(exc) or attempt == 7:
+                raise
+            threading.Event().wait(0.002 * (attempt + 1))
+    raise AssertionError("unreachable namespace listing retry exhaustion")
 
 
 def touch_namespace(name: str, *, namespace_id: str | None = None) -> None:
@@ -3762,27 +3841,61 @@ def _resolved_recall_class(
 class Store:
     def __init__(self, name: str, repo_path: str | None = None, *, create: bool = True):
         requested = safe_name(name)
+        registered = False
         if create:
             register_namespace(requested, repo_path)
-        identity = None
-        attempts = 8 if create else 1
-        last_error: NamespacePathError | None = None
-        for _attempt in range(attempts):
+            registered = True
+        attempts = 8 if registered else 1
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
             try:
                 identity = resolve_namespace_identity(requested)
                 last_error = None
-            except NamespacePathError as exc:
+            except (NamespacePathError, sqlite3.Error) as exc:
                 if not create or not is_concurrent_registry_change(exc):
                     raise
                 last_error = exc
+                if attempt + 1 < attempts:
+                    threading.Event().wait(0.002 * (attempt + 1))
                 continue
-            if identity is not None:
-                break
+            if identity is None:
+                if registered and attempt + 1 < attempts:
+                    # register_namespace() committed this exact label before
+                    # the read began. A zero-write SQLite snapshot can
+                    # nevertheless briefly observe the preceding registry
+                    # image while another creator is closing/checkpointing it.
+                    # Retry only this post-registration absence; do not make
+                    # ordinary create=False unknown labels retryable.
+                    threading.Event().wait(0.002 * (attempt + 1))
+                continue
+            try:
+                self._initialize_identity(identity)
+                return
+            except (NamespacePathError, sqlite3.Error) as exc:
+                self._discard_failed_initialization()
+                if not create or not is_concurrent_registry_change(exc):
+                    raise
+                last_error = exc
+                if attempt + 1 < attempts:
+                    threading.Event().wait(0.002 * (attempt + 1))
+                continue
         if last_error is not None:
             raise last_error
-        if not identity:
-            raise UnknownNamespaceError(requested)
-        self._initialize_identity(identity)
+        raise UnknownNamespaceError(requested)
+
+    def _discard_failed_initialization(self) -> None:
+        """Close a partially assigned writable connection before retrying."""
+        conn = getattr(self, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            # The original classified race is the useful failure; a best-effort
+            # close must not replace it or retain a stale connection for retry.
+            pass
+        finally:
+            del self.conn
 
     @classmethod
     def _from_identity(cls, identity: dict[str, Any]) -> "Store":
@@ -3817,8 +3930,7 @@ class Store:
         self._ensure_graph_evidence()
 
     def close(self) -> None:
-        with _NAMESPACE_DB_HANDLE_LOCK:
-            self.conn.close()
+        self.conn.close()
 
     def __enter__(self) -> "Store":
         return self
