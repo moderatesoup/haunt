@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import typer
 
@@ -52,7 +52,7 @@ def _existing(ns: str) -> Store:
 
 def _recall_json_error(
     exc: Exception, *, namespace: str | None, query: str
-) -> None:
+) -> NoReturn:
     """Keep --json machine-readable even when recall rejects its input."""
     typer.echo(
         dumps(
@@ -234,7 +234,8 @@ def recall_cmd(
     except Exception as exc:
         if json_out and is_retrieval_backend_error(exc):
             _recall_json_error(exc, namespace=ns, query=query)
-        raise
+        else:
+            raise
     if json_out:
         payload = {
             "namespace": ns,

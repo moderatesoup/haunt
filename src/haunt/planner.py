@@ -424,12 +424,15 @@ def run_union(
     recall_execution = execution_metadata(recalled)
     if timeline_execution is None or recall_execution is None:
         return hits
+    aggregate = _aggregate_execution(
+        "union", [("timeline", timeline), ("recall", recalled)]
+    )
+    if aggregate is None:
+        return hits
     execution = {
         "version": 1,
         "strategy": "union",
-        "modalities": _aggregate_execution(
-            "union", [("timeline", timeline), ("recall", recalled)]
-        )["modalities"],  # Both components above were known.
+        "modalities": aggregate["modalities"],
         "components": {
             "timeline": timeline_execution,
             "recall": recall_execution,

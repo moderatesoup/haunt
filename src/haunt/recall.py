@@ -9,6 +9,7 @@ import math
 import re
 import sqlite3
 import struct
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,10 +67,12 @@ class RecallResult(list["Hit"]):
                 "strategy": strategy,
                 "modalities": modalities,
             }
-        self.execution = execution
+        self.execution = deepcopy(execution) if execution is not None else None
         # Kept as a convenient compatibility alias for internal callers.
         self.modalities = (
-            execution.get("modalities") if execution is not None else None
+            deepcopy(self.execution.get("modalities"))
+            if self.execution is not None
+            else None
         )
 
 
@@ -81,7 +84,7 @@ def execution_metadata(hits: object) -> dict[str, Any] | None:
     modalities = execution.get("modalities")
     if not isinstance(modalities, dict):
         return None
-    return execution
+    return deepcopy(execution)
 
 
 @dataclass

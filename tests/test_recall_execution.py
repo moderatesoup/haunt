@@ -136,6 +136,13 @@ def test_execution_metadata_covers_disabled_vectors_and_legacy_lists(fts_recall_
         "reason": "disabled_by_caller",
     }
     assert recall_module.execution_metadata([disabled[0]]) is None
+    copied = recall_module.execution_metadata(disabled)
+    assert copied is not None
+    copied["modalities"]["vector"]["reason"] = "tampered"
+    assert recall_module.execution_metadata(disabled)["modalities"]["vector"] == {
+        "state": "not_run",
+        "reason": "disabled_by_caller",
+    }
 
 
 def test_union_execution_is_explicit_and_keeps_component_evidence(fts_recall_env):
@@ -224,6 +231,8 @@ def test_real_vec_dimension_mismatch_is_structured_on_machine_surfaces(
         cli.app, ["recall", "DIMENSION-MISMATCH-CANARY", "-n", "default", "--json"]
     )
     assert cli_result.exit_code != 0
+    assert len(cli_result.stdout.strip().splitlines()) == 1
+    assert "Traceback" not in cli_result.stdout
     cli_payload = json.loads(cli_result.stdout)
     mcp_payload = json.loads(memory_recall(query="DIMENSION-MISMATCH-CANARY"))
     dashboard_result = make_dash_client().get(
