@@ -182,6 +182,48 @@ LLM self-assessment. Existing `trusted`/`trust_reason` labels continue to mean
 that raw tool I/O is untrusted data and no recalled row authorizes a mutation
 (`README.md:203`; `src/haunt/recall.py:50-78`). “Trusted” is not “true.”
 
+## 2a. Recall selection and access are explicit, read-only semantics
+
+Schema v9 records nullable `events.recall_class`, constrained to `tool` or
+`task`. A null class means legacy/unknown; migrations **MUST NOT** backfill or
+guess it from text. The `tool` role or raw tool structure **MUST** be stamped `tool` before the
+event write, and contradictory explicit classification **MUST** fail before any
+event/session/job write. An actual host session-start coordinate entry point
+MAY stamp its own event `task`; no ordinary prompt, procedure, correction,
+import, or free text is task-classified without entry-point knowledge.
+
+Correction replacement **MUST** preserve the target event's effective class:
+the recorded class when present, otherwise `tool` when a legacy target has raw
+tool structure. This prevents a correction from laundering task/tool residue
+into eligible memory. Procedures and imports are unclassified unless their
+real input shape or entry point carries an explicit valid class.
+
+Ranked recall **MUST** exclude raw tool structure and explicit `tool`/`task`
+classes by default. An explicit `include_residue` option **MAY** bypass that
+selection rule for audit/search. The legacy `include_untrusted` option is a
+deprecated alias only when the modern option is omitted; structured metadata
+**MUST** identify the winning control. On a pre-v9 read-only database, raw tool
+structure remains excluded, class capability is reported unavailable, and null-
+like legacy rows remain eligible. Timeline, trace, and detail are reachability
+surfaces, not ranked recall; timeline execution **MUST** say this filter is not
+applicable, while trace and detail remain available for audit.
+
+Recall **MUST NOT** perform maintenance. It resolves the stable namespace
+identity without registry writes and opens a guarded zero-write SQLite view;
+schema migration, WAL configuration, graph rebuild, permission tightening,
+embedding-job drain, and model upgrade are forbidden on that path. A complete
+live WAL **MAY** be read from a verified private temporary shadow when required
+by SQLite portability, but source `HAUNT_HOME` files remain untouched. A
+separately named maintenance operation owns any embedding upgrade/job drain and
+reports it as mutating. Recall execution metadata **MUST** expose read-only
+status, no-maintenance status, observed pending jobs, residue filtering/class
+capability, and an honest offline/vector stage reason.
+
+With `HAUNT_OFFLINE=1`, Haunt **MUST NOT** initialize/download a remote-capable
+embedding backend or invoke its network path. FTS retrieval remains available;
+the vector stage **MUST** report that it was not run rather than fabricate a
+vector result.
+
 ## 3. RRF score is ranking evidence, never confidence
 
 The value computed from `1 / (RRF_K + rank)` contributions is an RRF ordering

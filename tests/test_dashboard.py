@@ -50,6 +50,73 @@ def test_api_recall(dash_client):
     assert any("DASH-CANARY-42" in (h.get("content", "") or "") for h in data["hits"])
 
 
+def test_api_recall_uses_planner_for_bare_temporal_query(dash_client, monkeypatch):
+    """Dashboard matches CLI/MCP timeline semantics instead of raw recall."""
+    from haunt import dashboard
+    from haunt.recall import Hit
+
+    timeline = Hit(
+        memory_id="timeline-memory",
+        event_id="timeline-event",
+        score=0.0,
+        tier="episodic",
+        content="timeline content",
+        role="user",
+        event_time="2026-08-08T12:00:00+00:00",
+        valid_from="2026-08-08T12:00:00+00:00",
+        valid_to=None,
+        tool_name=None,
+        final_rank=1,
+        vector_stage={"state": "not_run", "reason": "timeline_time_order"},
+        fts_stage={"state": "not_run", "reason": "timeline_time_order"},
+    )
+    calls: list[str] = []
+
+    def planned(query, **kwargs):
+        calls.append(query)
+        return [timeline]
+
+    monkeypatch.setattr(dashboard, "planned_recall", planned)
+    response = dash_client.get(
+        "/api/namespace/default/recall?q=what+happened+two+weeks+ago"
+    )
+    assert response.status_code == 200
+    assert calls == ["what happened two weeks ago"]
+    explanation = response.json()["hits"][0]["explanation"]
+    assert explanation["retrieval_method"] == "timeline"
+    assert explanation["score_semantics"] == "not_ranked"
+
+
+def test_api_recall_temporal_surface_matches_planner_and_mcp(dash_client, monkeypatch):
+    """A real endpoint shares CLI/MCP's planned timeline semantics."""
+    import json
+
+    from haunt.mcp_server import memory_recall
+    from haunt.planner import planned_recall
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    with Store("default") as store:
+        stored = store.observe(
+            "dashboard temporal parity",
+            event_time="2026-08-08T12:00:00+00:00",
+            defer_embedding=True,
+        )
+        expected = planned_recall("what happened on 2026-08-08", store=store)
+
+    dashboard_result = dash_client.get(
+        "/api/namespace/default/recall?q=what+happened+on+2026-08-08"
+    )
+    assert dashboard_result.status_code == 200
+    dashboard_hits = dashboard_result.json()["hits"]
+    mcp_hits = json.loads(memory_recall(query="what happened on 2026-08-08"))["hits"]
+
+    expected_ids = [hit.memory_id for hit in expected]
+    assert stored.memory_id in expected_ids
+    assert [hit["memory_id"] for hit in dashboard_hits] == expected_ids
+    assert [hit["memory_id"] for hit in mcp_hits] == expected_ids
+    assert dashboard_hits[0]["explanation"]["score_semantics"] == "not_ranked"
+
+
 def test_api_browse(dash_client):
     r = dash_client.get("/api/namespace/default/browse?limit=10")
     assert r.status_code == 200

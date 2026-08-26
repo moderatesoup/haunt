@@ -321,7 +321,9 @@ def test_mcp_explicit_recall_labels_trust_and_cannot_enable_purge(trust_env):
     safe, malicious = _seed_safe_and_malicious_tool_memory()
     from haunt.mcp_server import memory_purge, memory_recall
 
-    data = json.loads(memory_recall(query="DEPLOY-TRUST-CANARY", k=8))
+    data = json.loads(
+        memory_recall(query="DEPLOY-TRUST-CANARY", k=8, include_residue=True)
+    )
     by_id = {hit["memory_id"]: hit for hit in data["hits"]}
     assert by_id[safe.memory_id]["trusted"] is True
     assert by_id[malicious.memory_id]["trusted"] is False

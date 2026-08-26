@@ -73,6 +73,7 @@ from haunt.util import (
 
 ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
+RECALL_CLASSES = ("tool", "task")
 
 # 1: one-time normalize of offset/naive clocks to UTC microseconds.
 # 2: graph evidence tables + hook idempotency key.
@@ -82,7 +83,8 @@ TIERS = ("episodic", "semantic", "procedural", "coordinate")
 # 6: schema-enforced normal-vs-privacy-scrubbed correction invariants.
 # 7: database-enforced append-only corrections outside authorized purge.
 # 8: validated, versioned source provenance on events.
-SCHEMA_VERSION = 8
+# 9: explicit recall-residue classification on new events only.
+SCHEMA_VERSION = 9
 SCHEMA_VERSION_KEY = "schema_version"
 REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
@@ -286,6 +288,7 @@ class _SidecarGuardedConnection(sqlite3.Connection):
     _clean_primary_claim = True
     _zero_write_snapshot: tuple[Path, SQLiteStorageSnapshot] | None = None
     _temporary_read_dir: Any = None
+    _configured_writer = False
 
     def set_sidecar_guard(
         self, guard: SQLiteSidecarGuard, *, clean_unused_claims: bool
@@ -303,6 +306,10 @@ class _SidecarGuardedConnection(sqlite3.Connection):
 
     def set_temporary_read_dir(self, temporary: Any) -> None:
         self._temporary_read_dir = temporary
+
+    def mark_configured_writer(self) -> None:
+        """Serialize this writable connection's close with writer opens."""
+        self._configured_writer = True
 
     def verify_storage_guards(self) -> None:
         if self._primary_guard is None or self._sidecar_guard is None:
@@ -359,6 +366,20 @@ class _SidecarGuardedConnection(sqlite3.Connection):
         self._clean_primary_claim = False
 
     def close(self) -> None:
+        configured_writer = self._configured_writer
+        if configured_writer:
+            # SQLite may checkpoint, truncate, or unlink WAL/SHM during close.
+            # Writer opens take this same cross-process lock before validating
+            # those sidecars, so preserve that ordering at teardown as well.
+            with _sqlite_configuration_lock():
+                # Do not clear this before lock acquisition: an unsafe or
+                # replaced lock must leave a later close serialized too.
+                self._configured_writer = False
+                self._close_with_storage_guards()
+            return
+        self._close_with_storage_guards()
+
+    def _close_with_storage_guards(self) -> None:
         guard = self._sidecar_guard
         primary = self._primary_guard
         zero_write = self._zero_write_snapshot
@@ -483,6 +504,8 @@ def _configure_connection(
         raise NamespacePathError(
             "SQLite write configuration requires the serialized sidecar lock"
         )
+    if isinstance(conn, _SidecarGuardedConnection):
+        conn.mark_configured_writer()
     _sqlite_sidecar_pragma_hook(path)
     if sidecars is not None:
         sidecars.verify()
@@ -632,7 +655,10 @@ def _validate_all_registered_namespace_dbs_read_only() -> None:
     registry = registry_path()
     if not registry.is_file():
         raise NamespacePathError(f"namespace registry is missing: {registry}")
-    conn = _open_readonly_connection(registry)
+    # This validation also runs on writer paths.  Use the E3 zero-write
+    # snapshot rather than a direct mode=ro connection, whose lock/sidecar
+    # behavior is not portable while another SQLite handle is winding down.
+    conn = _open_zero_write_sqlite_snapshot(registry)
     try:
         tables = {
             str(row[0])
@@ -706,12 +732,59 @@ def _open_mapped_namespace_db_with_configuration_lock(
             raise
 
 
+def _open_mapped_namespace_db_readonly(
+    path: Path, *, expected: tuple[int | None, int | None]
+) -> sqlite3.Connection:
+    """Open one mapped namespace without any SQLite or Haunt maintenance.
+
+    This deliberately bypasses the write-configuration lock and its lock-file,
+    WAL pragmas, schema migration, mode tightening, and graph rebuild path.
+    The existing primary/sidecar guards still pin the physical E3 mapping. A
+    live WAL is read through E3's guarded private shadow, never directly from
+    the source: some SQLite/VFS combinations otherwise create sidecars even
+    for a URI opened with mode=ro.
+    """
+    expected_map = {str(path): expected}
+    actual = validate_namespace_db_paths([str(path)], expected=expected_map)[str(path)]
+    conn = _open_zero_write_sqlite_snapshot(path)
+    try:
+        if isinstance(conn, _SidecarGuardedConnection):
+            conn.verify_storage_guards()
+        validate_namespace_db_paths([str(path)], expected={str(path): actual})
+        # Loading the native module is connection-local and permits vec0 reads.
+        # If it is unavailable, vec_ok() remains false; recall may explicitly
+        # use its persisted-embedding L2 implementation, and labels that
+        # method in both execution and per-hit evidence.  It never presents
+        # that path as a successful native vec0 query, configures WAL, or
+        # changes the namespace file.
+        from haunt.embed import fts_only
+
+        if not fts_only():
+            try:
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+            except Exception:
+                # A read-only FTS recall remains useful when the optional
+                # native vector module is unavailable; _vec_hits can use
+                # persisted embedding blobs if a query vector is available.
+                pass
+            finally:
+                try:
+                    conn.enable_load_extension(False)
+                except Exception:
+                    pass
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
 def _preflight_registry_storage_read_only() -> None:
     """Reject unsafe existing mappings before migration opens the registry RW."""
     registry = registry_path()
     if not registry.exists():
         return
-    conn = _open_readonly_connection(registry)
+    conn = _open_zero_write_sqlite_snapshot(registry)
     try:
         tables = {
             str(row[0])
@@ -733,6 +806,12 @@ def _vec_loaded(conn: sqlite3.Connection) -> bool:
 
 
 def init_registry() -> None:
+    """Initialize/migrate the registry under the writer sidecar lifecycle lock."""
+    with _sqlite_configuration_lock():
+        _init_registry_once()
+
+
+def _init_registry_once() -> None:
     ensure_layout()
     _preflight_registry_storage_read_only()
     conn = _connect(registry_path())
@@ -1087,6 +1166,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             origin TEXT,
             tier TEXT NOT NULL,
             meta TEXT,
+            recall_class TEXT CHECK(recall_class IN ('tool', 'task') OR recall_class IS NULL),
             FOREIGN KEY (session_id) REFERENCES sessions(id)
         );
         CREATE TABLE IF NOT EXISTS memories (
@@ -1419,6 +1499,16 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
                 "CHECK (provenance IS NULL OR "
                 "(json_valid(provenance)=1 AND json_type(provenance)='object'))"
             )
+    if current < 9:
+        event_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "recall_class" not in event_columns:
+            # No backfill: NULL is the honest legacy/unknown classification.
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN recall_class TEXT "
+                "CHECK(recall_class IN ('tool', 'task') OR recall_class IS NULL)"
+            )
     _ensure_correction_invariant_triggers(conn)
     _ensure_correction_append_only_triggers(conn)
     _ensure_provenance_type_triggers(conn)
@@ -1454,28 +1544,32 @@ class _FreshNamespaceClaim:
         )
 
     def close(self, *, remove_target: bool) -> None:
-        with _NAMESPACE_DB_HANDLE_LOCK:
+        # Keep SQLite close and every claimed-name cleanup in one writer
+        # lifecycle critical section. SQLite close can release WAL/SHM just
+        # before this explicit claim cleanup; releasing the flock between
+        # those steps let another opener validate a sidecar we then unlinked.
+        with _sqlite_configuration_lock():
             self.conn.close()
-        self.sidecars.remove_claimed_files()
-        try:
-            os.close(self.claim_fd)
-        except OSError:
-            pass
-        for extra in (self.temporary,):
+            self.sidecars.remove_claimed_files()
             try:
-                extra.unlink()
-            except FileNotFoundError:
-                pass
-        if remove_target:
-            try:
-                current = self.target.lstat()
+                os.close(self.claim_fd)
             except OSError:
-                return
-            if (
-                stat.S_ISREG(current.st_mode)
-                and (int(current.st_dev), int(current.st_ino)) == self.identity
-            ):
-                self.target.unlink()
+                pass
+            for extra in (self.temporary,):
+                try:
+                    extra.unlink()
+                except FileNotFoundError:
+                    pass
+            if remove_target:
+                try:
+                    current = self.target.lstat()
+                except OSError:
+                    return
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and (int(current.st_dev), int(current.st_ino)) == self.identity
+                ):
+                    self.target.unlink()
 
 
 def _claim_fresh_namespace_db(target: Path) -> _FreshNamespaceClaim:
@@ -1661,6 +1755,10 @@ def _resolve_namespace_identity_once(name: str) -> dict[str, Any] | None:
 _CONCURRENT_REGISTRY_CHANGE_MARKERS = (
     "storage drift",
     "registry changed repeatedly",
+    # Shared zero-write snapshots may name the source rather than the
+    # registry.  Registry identity resolution still owns the retry policy, so
+    # recognize this equivalent transient contention result there.
+    "SQLite source changed repeatedly while creating a zero-write read snapshot",
     "incomplete WAL state",
     "changed while copying read snapshot",
     "changed while snapshotting",
@@ -1669,10 +1767,13 @@ _CONCURRENT_REGISTRY_CHANGE_MARKERS = (
     "sidecar changed while opening",
     "sidecar physical identity changed while opening",
     "sidecar physical identity changed:",
+    # SQLite's SQLITE_PROTOCOL is a transient shared-lock handoff failure;
+    # it is not an identity, path, or permission failure.
+    "locking protocol",
 )
 
 
-def is_concurrent_registry_change(exc: NamespacePathError) -> bool:
+def is_concurrent_registry_change(exc: BaseException) -> bool:
     """Return whether a read can be retried after observed registry drift."""
     message = str(exc)
     return any(marker in message for marker in _CONCURRENT_REGISTRY_CHANGE_MARKERS)
@@ -1788,7 +1889,15 @@ def _bind_repository(
     )
 
 
-def register_namespace(name: str, repo_path: str | None = None) -> Path:
+def _register_namespace_once(name: str, repo_path: str | None = None) -> Path:
+    """Run one complete registry/namespace publication under one writer lock."""
+    with _sqlite_configuration_lock():
+        return _register_namespace_once_with_configuration_lock(name, repo_path)
+
+
+def _register_namespace_once_with_configuration_lock(
+    name: str, repo_path: str | None = None
+) -> Path:
     label = safe_name(name)
     norm = normalize_namespace_label(label)
     now = now_iso()
@@ -1919,9 +2028,27 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
         if claim is not None:
             claim.close(remove_target=False)
         else:
-            with _NAMESPACE_DB_HANDLE_LOCK:
-                ns.close()
+            ns.close()
     return db
+
+
+def register_namespace(name: str, repo_path: str | None = None) -> Path:
+    """Register a namespace, retrying only recognized registry handoffs.
+
+    A failed attempt may have committed the identity before a subsequent
+    mapped-DB validation sees a changing WAL sidecar.  Re-entering the
+    idempotent registration path is safe in that narrow case.  Do not retry
+    path/identity/permission errors: those remain fail-closed on the first
+    attempt.
+    """
+    for attempt in range(8):
+        try:
+            return _register_namespace_once(name, repo_path)
+        except (NamespacePathError, sqlite3.Error) as exc:
+            if not is_concurrent_registry_change(exc) or attempt == 7:
+                raise
+            threading.Event().wait(0.002 * (attempt + 1))
+    raise AssertionError("unreachable namespace registration retry exhaustion")
 
 
 def namespace_exists(name: str) -> bool:
@@ -1930,6 +2057,57 @@ def namespace_exists(name: str) -> bool:
         return _identity_row(conn, name) is not None
     finally:
         conn.close()
+
+
+def namespace_exists_readonly(name: str) -> bool:
+    """Check a label/alias without registry initialization or writes."""
+    return resolve_namespace_identity(name) is not None
+
+
+def _list_namespace_rows_readonly_once() -> list[dict[str, Any]]:
+    """Read all E3 identities once, preserving honest SQLite read failures."""
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _readonly_registry()
+        rows = conn.execute(
+            """
+            SELECT namespace_id, canonical_label, canonical_label_norm, db_path,
+                   db_device, db_inode, created_at, updated_at
+            FROM namespace_identities ORDER BY canonical_label_norm
+            """
+        ).fetchall()
+        return [
+            {
+                **dict(row),
+                "name": str(row["canonical_label"]),
+                "aliases": [
+                    str(alias["label"])
+                    for alias in conn.execute(
+                        "SELECT label FROM namespace_aliases WHERE namespace_id=? "
+                        "ORDER BY normalized_label",
+                        (row["namespace_id"],),
+                    ).fetchall()
+                ],
+            }
+            for row in rows
+        ]
+    except sqlite3.Error as exc:
+        raise NamespacePathError(f"cannot read namespace registry: {exc}") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def list_namespace_rows_readonly() -> list[dict[str, Any]]:
+    """List all E3 identities, retrying only transient registry churn."""
+    for attempt in range(8):
+        try:
+            return _list_namespace_rows_readonly_once()
+        except NamespacePathError as exc:
+            if not is_concurrent_registry_change(exc) or attempt == 7:
+                raise
+            threading.Event().wait(0.002 * (attempt + 1))
+    raise AssertionError("unreachable namespace listing retry exhaustion")
 
 
 def touch_namespace(name: str, *, namespace_id: str | None = None) -> None:
@@ -2081,7 +2259,19 @@ def list_namespace_rows() -> list[dict[str, Any]]:
 
 def _readonly_registry() -> sqlite3.Connection:
     """Open the existing registry without creating files or setting pragmas."""
-    path = registry_path()
+    return _open_zero_write_sqlite_snapshot(registry_path())
+
+
+def _open_zero_write_sqlite_snapshot(path: Path) -> sqlite3.Connection:
+    """Read a SQLite source without allowing a source-file mutation.
+
+    A quiescent database is opened immutable. For a complete live WAL, copy
+    the guarded primary/WAL snapshot to a private system temporary directory,
+    checkpoint that *copy*, and open the resulting copy immutable. This is the
+    E3 zero-write algorithm shared by registry and namespace recall paths.
+    It deliberately rejects incomplete WAL and rollback-journal states rather
+    than trying a direct `mode=ro` open whose VFS behavior is not portable.
+    """
     if not path.is_file():
         raise FileNotFoundError(path)
     for _attempt in range(3):
@@ -2126,7 +2316,7 @@ def _readonly_registry() -> sqlite3.Connection:
             sidecars.close(clean_unused_claims=False)
             primary.close()
     raise NamespacePathError(
-        "registry changed repeatedly while creating a zero-write read snapshot"
+        f"SQLite source changed repeatedly while creating a zero-write read snapshot: {path}"
     )
 
 
@@ -3624,32 +3814,82 @@ class ObserveResult:
     embedding_queued: bool = False
     deduplicated: bool = False
     provenance: dict[str, Any] = field(default_factory=dict)
+    recall_class: str | None = None
+
+
+def _resolved_recall_class(
+    recall_class: str | None,
+    *,
+    role: str,
+    tool_name: str | None,
+    tool_input: str | None,
+    tool_output: str | None,
+) -> str | None:
+    """Validate explicit residue metadata without inferring from content."""
+    if recall_class is not None and recall_class not in RECALL_CLASSES:
+        raise ValueError("recall_class must be one of: tool, task, or null")
+    raw_tool_structure = role == "tool" or any(
+        value is not None for value in (tool_name, tool_input, tool_output)
+    )
+    if raw_tool_structure:
+        if recall_class is not None and recall_class != "tool":
+            raise ValueError("raw tool structure requires recall_class='tool'")
+        return "tool"
+    return recall_class
 
 
 class Store:
     def __init__(self, name: str, repo_path: str | None = None, *, create: bool = True):
         requested = safe_name(name)
+        registered = False
         if create:
             register_namespace(requested, repo_path)
-        identity = None
-        attempts = 8 if create else 1
-        last_error: NamespacePathError | None = None
-        for _attempt in range(attempts):
+            registered = True
+        attempts = 8 if registered else 1
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
             try:
                 identity = resolve_namespace_identity(requested)
                 last_error = None
-            except NamespacePathError as exc:
+            except (NamespacePathError, sqlite3.Error) as exc:
                 if not create or not is_concurrent_registry_change(exc):
                     raise
                 last_error = exc
+                if attempt + 1 < attempts:
+                    threading.Event().wait(0.002 * (attempt + 1))
                 continue
-            if identity is not None:
-                break
+            if identity is None:
+                if registered and attempt + 1 < attempts:
+                    # register_namespace() committed this exact label before
+                    # the read began. A zero-write SQLite snapshot can
+                    # nevertheless briefly observe the preceding registry
+                    # image while another creator is closing/checkpointing it.
+                    # Retry only this post-registration absence; do not make
+                    # ordinary create=False unknown labels retryable.
+                    threading.Event().wait(0.002 * (attempt + 1))
+                continue
+            try:
+                self._initialize_identity(identity)
+                return
+            except (NamespacePathError, sqlite3.Error) as exc:
+                self._discard_failed_initialization()
+                if not create or not is_concurrent_registry_change(exc):
+                    raise
+                last_error = exc
+                if attempt + 1 < attempts:
+                    threading.Event().wait(0.002 * (attempt + 1))
+                continue
         if last_error is not None:
             raise last_error
-        if not identity:
-            raise UnknownNamespaceError(requested)
-        self._initialize_identity(identity)
+        raise UnknownNamespaceError(requested)
+
+    def _discard_failed_initialization(self) -> None:
+        """Close a partially assigned writable connection before retrying."""
+        conn = getattr(self, "conn", None)
+        if conn is None:
+            return
+        conn.close()
+        del self.conn
 
     @classmethod
     def _from_identity(cls, identity: dict[str, Any]) -> "Store":
@@ -3659,6 +3899,23 @@ class Store:
         return store
 
     def _initialize_identity(self, identity: dict[str, Any]) -> None:
+        """Open and finish writer initialization in one sidecar lifecycle.
+
+        The mapped open already serializes its configure step, but schema
+        upgrades and first graph-evidence construction also write WAL state.
+        Keeping that work under the same lock prevents a sibling first opener
+        from committing or closing through a graph rebuild concurrently.
+        """
+        with _sqlite_configuration_lock():
+            self._initialize_identity_with_configuration_lock(identity)
+
+    def _initialize_identity_with_configuration_lock(
+        self, identity: dict[str, Any]
+    ) -> None:
+        if not _sqlite_configuration_lock_held():
+            raise NamespacePathError(
+                "writer initialization requires the serialized sidecar lock"
+            )
         self.namespace_id = str(identity["namespace_id"])
         self.name = str(identity["canonical_label"])
         self.db_path = Path(str(identity["db_path"]))
@@ -3676,11 +3933,15 @@ class Store:
             ),
         )
         _ensure_namespace_schema(self.conn)
+        # Writer opens always complete the additive schema migration.  Keeping
+        # this capability explicit makes an explicitly supplied writable Store
+        # report the same selected filters as public read-only recall.
+        self.recall_class_available = True
+        self.read_only = False
         self._ensure_graph_evidence()
 
     def close(self) -> None:
-        with _NAMESPACE_DB_HANDLE_LOCK:
-            self.conn.close()
+        self.conn.close()
 
     def __enter__(self) -> "Store":
         return self
@@ -3689,12 +3950,17 @@ class Store:
         self.close()
 
     def _ensure_graph_evidence(self) -> None:
-        row = self.conn.execute(
-            "SELECT value FROM meta WHERE key='graph_evidence_version'"
-        ).fetchone()
-        if row and str(row["value"]) == "1":
-            return
-        self.rebuild_graph(touch=False)
+        # Two creators can both observe the absent marker immediately after a
+        # fresh namespace is published.  Re-read it while holding the same
+        # writer lifecycle lock used for WAL configuration and close, so only
+        # one automatic rebuild can reach its commit.
+        with _sqlite_configuration_lock():
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key='graph_evidence_version'"
+            ).fetchone()
+            if row and str(row["value"]) == "1":
+                return
+            self._rebuild_graph_with_configuration_lock(touch=False)
 
     def vec_ok(self) -> bool:
         return _vec_loaded(self.conn)
@@ -3801,6 +4067,7 @@ class Store:
         channel: str = "python",
         meta: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
+        recall_class: str | None = None,
         valid_from: str | None = None,
         valid_to: str | None = None,
         idempotency_key: str | None = None,
@@ -3809,6 +4076,13 @@ class Store:
     ) -> ObserveResult:
         # Provenance is validated before sessions, events, embedding jobs, or
         # graph/index projections can be written.
+        resolved_recall_class = _resolved_recall_class(
+            recall_class,
+            role=role,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_output=tool_output,
+        )
         canonical_provenance = validate_provenance(
             provenance,
             origin=origin,
@@ -3826,7 +4100,9 @@ class Store:
         if idem and len(idem) > 512:
             raise ValueError("idempotency_key must be 512 characters or fewer")
         if idem:
-            existing = self._observe_by_idempotency_key(idem, text, encoded_provenance)
+            existing = self._observe_by_idempotency_key(
+                idem, text, encoded_provenance, resolved_recall_class
+            )
             if existing is not None:
                 return existing
         if commit and not defer_embedding:
@@ -3845,8 +4121,8 @@ class Store:
                 INSERT INTO events(
                     id, idempotency_key, session_id, ts, event_time, role, content,
                     tool_name, tool_input, tool_output, origin, tier, meta,
-                    provenance
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    provenance, recall_class
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     event_id,
@@ -3863,6 +4139,7 @@ class Store:
                     tier,
                     dumps(meta or {}),
                     encoded_provenance,
+                    resolved_recall_class,
                 ),
             )
             blob = None
@@ -3923,7 +4200,7 @@ class Store:
             self.conn.rollback()
             if idem:
                 existing = self._observe_by_idempotency_key(
-                    idem, text, encoded_provenance
+                    idem, text, encoded_provenance, resolved_recall_class
                 )
                 if existing is not None:
                     return existing
@@ -3946,6 +4223,7 @@ class Store:
             embedded=embedded,
             embedding_queued=embedding_queued,
             provenance=canonical_provenance,
+            recall_class=resolved_recall_class,
         )
 
     def _observe_by_idempotency_key(
@@ -3953,12 +4231,13 @@ class Store:
         key: str,
         expected_text: str,
         expected_provenance: str,
+        expected_recall_class: str | None,
     ) -> ObserveResult | None:
         row = self.conn.execute(
             """
             SELECT e.id AS event_id, e.session_id, e.tier,
                    m.id AS memory_id, m.content, m.embedding, e.provenance,
-                   e.origin, e.meta, e.tool_name
+                   e.origin, e.meta, e.tool_name, e.recall_class
             FROM events e
             JOIN memories m ON m.event_id=e.id
             WHERE e.idempotency_key=?
@@ -3971,6 +4250,8 @@ class Store:
             return None
         if row["content"] != expected_text:
             raise ValueError("idempotency_key was reused with different content")
+        if row["recall_class"] != expected_recall_class:
+            raise ValueError("idempotency_key was reused with different recall_class")
         if row["provenance"] is None:
             raise ValueError("idempotency_key replay cannot verify legacy provenance")
         stored_provenance = public_provenance(
@@ -4016,6 +4297,7 @@ class Store:
             is not None,
             deduplicated=True,
             provenance=stored_provenance,
+            recall_class=row["recall_class"],
         )
 
     def process_embedding_jobs(self, *, limit: int = 64) -> dict[str, Any]:
@@ -4251,9 +4533,15 @@ class Store:
             sql += f" AND {col}<=?"
             params.append(iso_or_now(until))
         if normalize_clock(clock) == "storage_time":
-            sql += " ORDER BY ts DESC, event_time DESC, rowid DESC LIMIT ? OFFSET ?"
+            # Exact selected-clock ties are settled by event ID before LIMIT.
+            # The planner may then materialize and order equal-time memories
+            # independently; keep this stable selection rule explicit.
+            sql += " ORDER BY ts DESC, id ASC LIMIT ? OFFSET ?"
         else:
-            sql += " ORDER BY event_time DESC, ts DESC, rowid DESC LIMIT ? OFFSET ?"
+            # Exact selected-clock ties are settled by event ID before LIMIT.
+            # The planner may then materialize and order equal-time memories
+            # independently; keep this stable selection rule explicit.
+            sql += " ORDER BY event_time DESC, id ASC LIMIT ? OFFSET ?"
         params.append(clamp_limit(limit, default=100))
         try:
             off = int(offset)
@@ -4383,6 +4671,17 @@ class Store:
 
     def rebuild_graph(self, *, touch: bool = True) -> dict[str, Any]:
         """Rebuild graph evidence and derived aggregates from stored events."""
+        with _sqlite_configuration_lock():
+            return self._rebuild_graph_with_configuration_lock(touch=touch)
+
+    def _rebuild_graph_with_configuration_lock(
+        self, *, touch: bool
+    ) -> dict[str, Any]:
+        """Run one graph-rebuild transaction under the writer lifecycle lock."""
+        if not _sqlite_configuration_lock_held():
+            raise NamespacePathError(
+                "graph rebuild requires the serialized sidecar lock"
+            )
         from haunt.graph import extract_and_store
 
         def count(table: str) -> int:
@@ -5076,6 +5375,196 @@ class Store:
             }
         )
 
+    def recall_references_many(
+        self, memory_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Return public E1/E2 references for a batch of recall hits.
+
+        The projection never copies trace text, correction reasons, tombstone
+        IDs, or legacy metadata. A single recursive query walks only each
+        requested chain through the four indexed correction endpoints; it does
+        not load or rebuild the namespace's complete correction graph for every
+        hit. Any tombstone in a requested chain suppresses every correction ID
+        in that chain's output.
+        """
+        ids = list(dict.fromkeys(memory_ids))
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT m.id AS memory_id, m.valid_to, e.provenance, e.origin, e.tool_name
+            FROM memories m
+            JOIN events e ON e.id=m.event_id
+            WHERE m.id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+        by_id = {str(row["memory_id"]): row for row in rows}
+
+        roots = ", ".join("(?)" for _ in by_id)
+        edge_rows: list[sqlite3.Row] = []
+        if roots:
+            # Every recursive arm has one indexed endpoint predicate. UNION
+            # de-duplicates cycles, so a requested correction component is
+            # visited once per root without touching unrelated components.
+            edge_rows = self.conn.execute(
+                f"""
+                WITH RECURSIVE
+                roots(root_id) AS (VALUES {roots}),
+                walk(root_id, node_kind, node_id) AS (
+                    SELECT root_id, 'memory', root_id FROM roots
+                    UNION
+                    SELECT w.root_id, 'memory', c.replacement_memory_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                      AND c.replacement_memory_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'tombstone', c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                      AND c.replacement_tombstone_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'memory', c.target_memory_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                      AND c.target_memory_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'tombstone', c.target_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                      AND c.target_tombstone_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'memory', c.replacement_memory_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                      AND c.replacement_memory_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'tombstone', c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                      AND c.replacement_tombstone_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'memory', c.target_memory_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                      AND c.target_memory_id IS NOT NULL
+                    UNION
+                    SELECT w.root_id, 'tombstone', c.target_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                      AND c.target_tombstone_id IS NOT NULL
+                ),
+                reference_edges AS (
+                    SELECT w.root_id, c.id, c.corrected_at, c.rowid AS correction_rowid,
+                           c.target_tombstone_id, c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                    UNION
+                    SELECT w.root_id, c.id, c.corrected_at, c.rowid,
+                           c.target_tombstone_id, c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_memory_id=w.node_id
+                    WHERE w.node_kind='memory'
+                    UNION
+                    SELECT w.root_id, c.id, c.corrected_at, c.rowid,
+                           c.target_tombstone_id, c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.target_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                    UNION
+                    SELECT w.root_id, c.id, c.corrected_at, c.rowid,
+                           c.target_tombstone_id, c.replacement_tombstone_id
+                    FROM walk w JOIN corrections c
+                      ON c.replacement_tombstone_id=w.node_id
+                    WHERE w.node_kind='tombstone'
+                )
+                SELECT DISTINCT root_id, id, corrected_at, correction_rowid,
+                                target_tombstone_id, replacement_tombstone_id
+                FROM reference_edges
+                """,
+                list(by_id),
+            ).fetchall()
+
+        correction_by_root: dict[str, list[sqlite3.Row]] = {
+            memory_id: [] for memory_id in by_id
+        }
+        for edge in edge_rows:
+            correction_by_root[str(edge["root_id"])].append(edge)
+
+        out: dict[str, dict[str, Any]] = {}
+        for memory_id, row in by_id.items():
+            public = public_provenance(
+                row["provenance"],
+                origin=row["origin"],
+                # Legacy metadata is available in full detail, but is not a
+                # recall reference because it can be arbitrary/sensitive.
+                legacy_meta=None,
+                tool_name=row["tool_name"],
+            )
+            provenance_status = str(public.get("kind", "invalid_stored"))
+            provenance = (
+                public if provenance_status in {"native", "import"} else None
+            )
+            edges = sorted(
+                correction_by_root[memory_id],
+                key=lambda edge: (
+                    str(edge["corrected_at"]),
+                    int(edge["correction_rowid"]),
+                    str(edge["id"]),
+                ),
+            )
+            includes_privacy_tombstone = any(
+                edge["target_tombstone_id"] is not None
+                or edge["replacement_tombstone_id"] is not None
+                for edge in edges
+            )
+            if includes_privacy_tombstone:
+                correction_lineage = {"status": "privacy_tombstone"}
+                correction_status = "privacy_tombstone"
+            elif edges:
+                correction_lineage = {
+                    "status": "linked",
+                    "correction_ids": [str(edge["id"]) for edge in edges],
+                }
+                correction_status = "linked"
+            elif row["valid_to"] is not None:
+                correction_lineage = {"status": "legacy_unlinked"}
+                correction_status = "legacy_unlinked"
+            else:
+                correction_lineage = {"status": "standalone"}
+                correction_status = "standalone"
+            out[memory_id] = json_safe_sqlite(
+                {
+                    "correction_lineage": correction_lineage,
+                    "correction_lineage_status": correction_status,
+                    "provenance": provenance,
+                    "provenance_status": provenance_status,
+                }
+            )
+        return out
+
+    def recall_references(self, memory_id: str) -> dict[str, Any]:
+        """Return one safe recall-reference projection (compatibility helper)."""
+        return self.recall_references_many([memory_id]).get(
+            memory_id,
+            {
+                "correction_lineage": None,
+                "correction_lineage_status": "unavailable",
+                "provenance": None,
+                "provenance_status": "unavailable",
+            },
+        )
+
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         """Retrieve full provenance detail for a single memory."""
         row = self.conn.execute(
@@ -5084,7 +5573,7 @@ class Store:
                    m.valid_from, m.valid_to, m.created_at,
                    e.session_id, e.ts, e.event_time, e.role, e.content AS event_content,
                    e.tool_name, e.tool_input, e.tool_output, e.origin, e.meta,
-                   e.provenance
+                   e.provenance, e.recall_class
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.id = ?
@@ -5461,7 +5950,13 @@ class Store:
                 return replay_result
 
             row = self.conn.execute(
-                "SELECT id, valid_to FROM memories WHERE id=?", (memory_id,)
+                """
+                SELECT m.id, m.valid_to, e.recall_class, e.role,
+                       e.tool_name, e.tool_input, e.tool_output
+                FROM memories m JOIN events e ON e.id=m.event_id
+                WHERE m.id=?
+                """,
+                (memory_id,),
             ).fetchone()
             if not row:
                 self.conn.rollback()
@@ -5474,6 +5969,20 @@ class Store:
                     "error": f"memory {memory_id} already superseded",
                     "valid_to": row["valid_to"],
                 }
+
+            # v8 and older rows have no recorded class.  Preserve the
+            # effective raw-tool boundary when replacing one of those rows:
+            # a system-role correction must not turn tool residue into an
+            # eligible memory merely because historical data was never
+            # backfilled.
+            source_recall_class = row["recall_class"]
+            if source_recall_class is None and (
+                row["role"] == "tool"
+                or row["tool_name"] is not None
+                or row["tool_input"] is not None
+                or row["tool_output"] is not None
+            ):
+                source_recall_class = "tool"
 
             ts = now_iso()
             correction_id = new_id()
@@ -5513,6 +6022,10 @@ class Store:
                     valid_from=ts,
                     origin=origin,
                     channel=channel,
+                    # Corrections preserve the source's effective class. This
+                    # includes v8 raw-tool rows whose class was necessarily
+                    # unstored, avoiding residue laundering on replacement.
+                    recall_class=source_recall_class,
                     commit=False,
                 )
                 replacement_memory_id = r.memory_id
@@ -5549,6 +6062,145 @@ class Store:
         except Exception:
             self.conn.rollback()
             raise
+
+
+class ReadOnlyStore(Store):
+    """A stable-identity Store view that is physically incapable of writes.
+
+    Read paths use this class rather than ``Store(create=False)`` because the
+    latter intentionally performs migration/configuration work for writers.
+    ``recall_class_available`` is a capability, not a migration request: old
+    rows remain eligible as legacy/unknown when the column does not exist.
+    """
+
+    @classmethod
+    def _from_identity(cls, identity: dict[str, Any]) -> "ReadOnlyStore":
+        store = cls.__new__(cls)
+        store._initialize_readonly_identity(identity)
+        return store
+
+    def _initialize_readonly_identity(self, identity: dict[str, Any]) -> None:
+        self.namespace_id = str(identity["namespace_id"])
+        self.name = str(identity["canonical_label"])
+        self.db_path = Path(str(identity["db_path"]))
+        self._privacy_purge_thread_id = None
+        self.read_only = True
+        self.conn = _open_mapped_namespace_db_readonly(
+            self.db_path,
+            expected=(identity.get("db_device"), identity.get("db_inode")),
+        )
+        try:
+            tables = {
+                str(row[0])
+                for row in self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            columns = (
+                {
+                    str(row["name"])
+                    for row in self.conn.execute("PRAGMA table_info(events)").fetchall()
+                }
+                if "events" in tables
+                else set()
+            )
+            self.recall_class_available = "recall_class" in columns
+            self.schema_version = (
+                _schema_version(self.conn) if "meta" in tables else 0
+            )
+        except sqlite3.Error:
+            # The query layer will fail honestly for required missing tables;
+            # do not repair a corrupt/old database while reading it.
+            self.recall_class_available = False
+            self.schema_version = 0
+
+
+def _validate_selected_readonly_identity(
+    identity: dict[str, Any],
+    *,
+    expected_db_path: str | None = None,
+    expected_db_device: int | None = None,
+    expected_db_inode: int | None = None,
+) -> None:
+    if expected_db_path is not None and str(identity["db_path"]) != expected_db_path:
+        raise NamespacePathError("selected namespace database path changed before open")
+    if expected_db_device is not None and int(identity.get("db_device") or -1) != int(
+        expected_db_device
+    ):
+        raise NamespacePathError("selected namespace database identity changed before open")
+    if expected_db_inode is not None and int(identity.get("db_inode") or -1) != int(
+        expected_db_inode
+    ):
+        raise NamespacePathError("selected namespace database identity changed before open")
+
+
+def open_existing_readonly(name: str) -> ReadOnlyStore:
+    """Resolve an E3 label/alias and open its database without any writes."""
+    identity = resolve_namespace_identity(name)
+    if identity is None:
+        raise UnknownNamespaceError(name)
+    store = ReadOnlyStore._from_identity(identity)
+    try:
+        # Alias reassignment cannot silently retarget a recall between lookup
+        # and SQLite open. This is the label equivalent of the MCP ID check.
+        current = resolve_namespace_identity(name)
+        stable_fields = (
+            "namespace_id", "canonical_label", "canonical_label_norm", "db_path",
+            "db_device", "db_inode",
+        )
+        if current is None or any(
+            current[field] != identity[field] for field in stable_fields
+        ):
+            raise NamespacePathError("namespace identity changed while opening")
+        if (
+            store.namespace_id != str(identity["namespace_id"])
+            or str(store.db_path) != str(identity["db_path"])
+        ):
+            raise NamespacePathError("opened namespace does not match selected identity")
+        return store
+    except Exception:
+        store.close()
+        raise
+
+
+def open_namespace_identity_readonly(
+    namespace_id: str,
+    *,
+    expected_db_path: str | None = None,
+    expected_db_device: int | None = None,
+    expected_db_inode: int | None = None,
+) -> ReadOnlyStore:
+    """Open the exact MCP-selected E3 identity without label re-resolution."""
+    identity = resolve_namespace_id(namespace_id)
+    if identity is None:
+        raise UnknownNamespaceError(namespace_id)
+    _validate_selected_readonly_identity(
+        identity,
+        expected_db_path=expected_db_path,
+        expected_db_device=expected_db_device,
+        expected_db_inode=expected_db_inode,
+    )
+    store = ReadOnlyStore._from_identity(identity)
+    try:
+        current = resolve_namespace_id(namespace_id)
+        if current is None:
+            raise UnknownNamespaceError(namespace_id)
+        _validate_selected_readonly_identity(
+            current,
+            expected_db_path=expected_db_path,
+            expected_db_device=expected_db_device,
+            expected_db_inode=expected_db_inode,
+        )
+        stable_fields = (
+            "namespace_id", "canonical_label", "canonical_label_norm", "db_path",
+            "db_device", "db_inode",
+        )
+        if any(current[field] != identity[field] for field in stable_fields):
+            raise NamespacePathError("selected namespace identity changed while opening")
+        return store
+    except Exception:
+        store.close()
+        raise
 
 
 def open_existing(name: str, repo_path: str | None = None) -> Store:

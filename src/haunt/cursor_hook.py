@@ -250,7 +250,7 @@ def format_recall_block(hits: list[Hit], namespace: str) -> str:
         return "\n".join(lines)
     for i, h in enumerate(safe_hits, 1):
         lines.append(
-            f"{i}  {h.score:.4f}  {h.tier}  {h.memory_id}  {snippet(h.content, 160)}"
+            f"{i}  rrf={h.score:.4f}  {h.tier}  {h.memory_id}  {snippet(h.content, 160)}"
         )
     return "\n".join(lines)
 
@@ -446,6 +446,9 @@ def _handle_session_start(store: Store, payload: dict[str, Any], ns: str) -> dic
         content="haunt session start",
         role="system",
         tier="coordinate",
+        # This entry point is lifecycle residue by definition; do not classify
+        # ordinary prompts/replies from their text.
+        recall_class="task",
     )
     wv = store.worldview()
     card = format_worldview_card(wv)

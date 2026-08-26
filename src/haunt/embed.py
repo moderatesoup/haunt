@@ -8,7 +8,8 @@ Load order when HAUNT_EMBED_MODEL is BAAI/bge-m3 (the default):
   3. Newer fastembed if it lists BAAI/bge-m3
   4. BAAI/bge-small-en-v1.5 via fastembed (384-d) — automatic fallback
 
-Set HAUNT_EMBED_MODEL=off or HAUNT_FTS_ONLY=1 for FTS-only.
+Set HAUNT_EMBED_MODEL=off or HAUNT_FTS_ONLY=1 for FTS-only. Set
+HAUNT_OFFLINE=1 to prohibit model/network initialization entirely.
 Existing namespace DBs created at another dim must be rebuilt
 (`haunt bootstrap --reembed`, or the store auto-rebuilds on mismatch).
 """
@@ -70,6 +71,15 @@ def fts_only() -> bool:
         return True
     model = _env_model().lower()
     return model in {"off", "none", "fts", "fts5", "disabled"}
+
+
+def offline() -> bool:
+    """True when Haunt must not initialize/download a model or use sockets."""
+    return (os.environ.get("HAUNT_OFFLINE") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def _max_len() -> int:
@@ -148,6 +158,8 @@ def _local_bge_m3_ready(root: Path | None = None) -> Path | None:
 
 def _download_bge_m3(root: Path) -> Path:
     """Download official BGE-M3 ONNX (+ tokenizer) into root. Local files only after this."""
+    if offline():
+        raise RuntimeError("offline mode forbids embedding model download")
     from huggingface_hub import snapshot_download
 
     root.mkdir(parents=True, exist_ok=True)
@@ -268,6 +280,8 @@ def _load_onnx_bge_m3() -> tuple[OnnxEmbedder, int]:
 
 
 def _load_fastembed(model_id: str) -> Any:
+    if offline():
+        raise RuntimeError("offline mode forbids embedding backend initialization")
     from fastembed import TextEmbedding
 
     cache = models_dir()
@@ -290,6 +304,16 @@ def _load() -> EmbedState:
             fallback=False,
             backend="off",
             error="FTS-only (embeddings disabled)",
+        )
+    if offline():
+        return EmbedState(
+            model_id="off",
+            requested=_env_model(),
+            dim=0,
+            available=False,
+            fallback=False,
+            backend="off",
+            error="offline mode (vector stage not run)",
         )
     requested = _env_model()
     last_err: str | None = None

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -1204,6 +1205,485 @@ def test_fresh_mcp_authority_pins_first_identity_concurrently(alias_home):
     assert not namespace_exists("fresh-bound")
 
 
+def test_zero_write_snapshot_contention_marker_retries_registry_resolution(
+    alias_home, monkeypatch,
+):
+    """Shared snapshot wording remains retryable in E3's identity loop."""
+    import haunt.store as store_mod
+
+    with Store("snapshot-retry"):
+        pass
+    original = store_mod._resolve_namespace_identity_once
+    attempts = 0
+
+    def transient(name):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise NamespacePathError(
+                "SQLite source changed repeatedly while creating a zero-write "
+                "read snapshot: registry.db"
+            )
+        return original(name)
+
+    monkeypatch.setattr(store_mod, "_resolve_namespace_identity_once", transient)
+    resolved = store_mod.resolve_namespace_identity("snapshot-retry")
+    assert resolved is not None
+    assert attempts == 2
+
+
+def test_namespace_registration_retries_only_recognized_registry_handoff(
+    alias_home, monkeypatch,
+):
+    """A post-commit sidecar handoff is idempotent; unsafe paths are not."""
+    import haunt.store as store_mod
+
+    original = store_mod._register_namespace_once
+    attempts = 0
+
+    def transient(name, repo_path=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise NamespacePathError(
+                "SQLite sidecar disappeared during safe open: registry.db-wal"
+            )
+        return original(name, repo_path)
+
+    monkeypatch.setattr(store_mod, "_register_namespace_once", transient)
+    db = store_mod.register_namespace("registered-retry")
+    assert db.exists()
+    assert attempts == 2
+
+    unsafe = NamespacePathError("namespace database physical identity changed")
+    unsafe_attempts = 0
+
+    def unsafe_once(name, repo_path=None):
+        nonlocal unsafe_attempts
+        unsafe_attempts += 1
+        raise unsafe
+
+    monkeypatch.setattr(store_mod, "_register_namespace_once", unsafe_once)
+    with pytest.raises(NamespacePathError) as caught:
+        store_mod.register_namespace("registered-unsafe")
+    assert caught.value is unsafe
+    assert unsafe_attempts == 1
+
+    exhausted = NamespacePathError(
+        "SQLite sidecar disappeared during safe open: registry.db-shm"
+    )
+    exhausted_attempts = 0
+
+    def always_transient(name, repo_path=None):
+        nonlocal exhausted_attempts
+        exhausted_attempts += 1
+        raise exhausted
+
+    monkeypatch.setattr(store_mod, "_register_namespace_once", always_transient)
+    with pytest.raises(NamespacePathError) as caught:
+        store_mod.register_namespace("registered-exhausted")
+    assert caught.value is exhausted
+    assert exhausted_attempts == 8
+
+
+def test_registration_holds_configuration_lock_across_registry_transaction(
+    alias_home, monkeypatch,
+):
+    """A registry BEGIN cannot later wait for the namespace claim lock."""
+    import haunt.store as store_mod
+
+    original = store_mod._identity_row
+    observed = 0
+
+    def checked(conn, label):
+        nonlocal observed
+        if label == "registration-lock-order":
+            observed += 1
+            assert store_mod._sqlite_configuration_lock_held()
+        return original(conn, label)
+
+    monkeypatch.setattr(store_mod, "_identity_row", checked)
+    store_mod.register_namespace("registration-lock-order")
+    assert observed == 1
+
+
+def test_readonly_namespace_listing_retries_only_recognized_registry_handoff(
+    alias_home, monkeypatch,
+):
+    """All-namespace recall uses the same safe retry boundary as one label."""
+    import haunt.store as store_mod
+
+    register_namespace("listing-retry")
+    original = store_mod._list_namespace_rows_readonly_once
+    attempts = 0
+
+    def transient():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise NamespacePathError(
+                "SQLite source changed repeatedly while creating a zero-write "
+                "read snapshot: registry.db"
+            )
+        return original()
+
+    monkeypatch.setattr(store_mod, "_list_namespace_rows_readonly_once", transient)
+    rows = store_mod.list_namespace_rows_readonly()
+    assert any(row["name"] == "listing-retry" for row in rows)
+    assert attempts == 2
+
+    unsafe = NamespacePathError("namespace registry identity path is unsafe")
+    unsafe_attempts = 0
+
+    def unsafe_once():
+        nonlocal unsafe_attempts
+        unsafe_attempts += 1
+        raise unsafe
+
+    monkeypatch.setattr(store_mod, "_list_namespace_rows_readonly_once", unsafe_once)
+    with pytest.raises(NamespacePathError) as caught:
+        store_mod.list_namespace_rows_readonly()
+    assert caught.value is unsafe
+    assert unsafe_attempts == 1
+
+    exhausted = NamespacePathError(
+        "SQLite sidecar appeared during safe open: registry.db-wal"
+    )
+    exhausted_attempts = 0
+
+    def always_transient():
+        nonlocal exhausted_attempts
+        exhausted_attempts += 1
+        raise exhausted
+
+    monkeypatch.setattr(store_mod, "_list_namespace_rows_readonly_once", always_transient)
+    with pytest.raises(NamespacePathError) as caught:
+        store_mod.list_namespace_rows_readonly()
+    assert caught.value is exhausted
+    assert exhausted_attempts == 8
+
+
+def test_store_create_retries_post_registration_transient_absence(
+    alias_home, monkeypatch,
+):
+    """A fresh creator waits out only a stale read after its own commit."""
+    import haunt.store as store_mod
+
+    real_register = store_mod.register_namespace
+    real_resolve = store_mod.resolve_namespace_identity
+    registration_returned = False
+    resolution_calls = 0
+
+    def registered(name, repo_path=None):
+        nonlocal registration_returned
+        result = real_register(name, repo_path)
+        registration_returned = True
+        return result
+
+    def stale_once(name):
+        nonlocal resolution_calls
+        if name == "post-register-stale":
+            assert registration_returned
+            resolution_calls += 1
+            if resolution_calls <= 2:
+                return None
+        return real_resolve(name)
+
+    monkeypatch.setattr(store_mod, "register_namespace", registered)
+    monkeypatch.setattr(store_mod, "resolve_namespace_identity", stale_once)
+    with Store("post-register-stale") as store:
+        assert store.name == "post-register-stale"
+    assert resolution_calls == 3
+
+    unknown_calls = 0
+
+    def unknown_once(name):
+        nonlocal unknown_calls
+        unknown_calls += 1
+        return None
+
+    monkeypatch.setattr(store_mod, "resolve_namespace_identity", unknown_once)
+    with pytest.raises(UnknownNamespaceError):
+        Store("post-register-unknown", create=False)
+    assert unknown_calls == 1
+
+
+def test_store_create_retries_only_recognized_initialize_handoff(
+    alias_home, monkeypatch,
+):
+    """A writer retries the post-registration mapped-DB open, not unsafe paths."""
+    original = Store._initialize_identity
+    attempts = 0
+
+    def transient(self, identity):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise NamespacePathError(
+                "SQLite sidecar disappeared during safe open: init-retry.db-wal"
+            )
+        return original(self, identity)
+
+    monkeypatch.setattr(Store, "_initialize_identity", transient)
+    with Store("init-retry") as store:
+        assert store.name == "init-retry"
+    assert attempts == 2
+
+    unsafe = NamespacePathError("namespace database physical identity changed")
+    unsafe_attempts = 0
+
+    def unsafe_once(self, identity):
+        nonlocal unsafe_attempts
+        unsafe_attempts += 1
+        raise unsafe
+
+    monkeypatch.setattr(Store, "_initialize_identity", unsafe_once)
+    with pytest.raises(NamespacePathError) as caught:
+        Store("init-unsafe")
+    assert caught.value is unsafe
+    assert unsafe_attempts == 1
+
+    exhausted = NamespacePathError(
+        "SQLite sidecar appeared during safe open: init-exhausted.db-shm"
+    )
+    exhausted_attempts = 0
+
+    def always_transient(self, identity):
+        nonlocal exhausted_attempts
+        exhausted_attempts += 1
+        raise exhausted
+
+    monkeypatch.setattr(Store, "_initialize_identity", always_transient)
+    with pytest.raises(NamespacePathError) as caught:
+        Store("init-exhausted")
+    assert caught.value is exhausted
+    assert exhausted_attempts == 8
+
+    cleanup_unsafe = NamespacePathError("SQLite configuration lock is unsafe")
+    cleanup_calls = 0
+    partial_stores = []
+
+    class UnclosableConnection:
+        def close(self):
+            raise cleanup_unsafe
+
+    def transient_with_unclosable_connection(self, identity):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        partial_stores.append(self)
+        self.conn = UnclosableConnection()
+        raise NamespacePathError(
+            "SQLite sidecar appeared during safe open: init-cleanup.db-wal"
+        )
+
+    monkeypatch.setattr(
+        Store, "_initialize_identity", transient_with_unclosable_connection
+    )
+    with pytest.raises(NamespacePathError) as caught:
+        Store("init-cleanup-unsafe")
+    assert caught.value is cleanup_unsafe
+    assert cleanup_calls == 1
+    assert isinstance(partial_stores[0].conn, UnclosableConnection)
+
+
+def test_configured_writer_close_retries_the_configuration_lock_after_failure(
+    alias_home, monkeypatch,
+):
+    """A failed lock acquisition cannot make a later writer close unguarded."""
+    import haunt.store as store_mod
+
+    store = Store("close-lock-retry")
+    original_lock = store_mod._sqlite_configuration_lock
+    failed = 0
+
+    class UnsafeLock:
+        def __enter__(self):
+            nonlocal failed
+            failed += 1
+            raise NamespacePathError("SQLite configuration lock is unsafe")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(store_mod, "_sqlite_configuration_lock", UnsafeLock)
+    with pytest.raises(NamespacePathError, match="configuration lock is unsafe"):
+        store.close()
+    assert failed == 1
+
+    acquired = 0
+
+    @contextmanager
+    def counted_lock():
+        nonlocal acquired
+        acquired += 1
+        with original_lock():
+            yield
+
+    monkeypatch.setattr(store_mod, "_sqlite_configuration_lock", counted_lock)
+    store.close()
+    assert acquired == 1
+
+
+def test_store_initialization_serializes_schema_and_graph_evidence(
+    alias_home, monkeypatch,
+):
+    """A first writer keeps every schema/graph WAL write in one lifecycle."""
+    import haunt.store as store_mod
+
+    original_schema = store_mod._ensure_namespace_schema
+    original_graph = Store._ensure_graph_evidence
+    observed: list[str] = []
+
+    def checked_schema(conn):
+        assert store_mod._sqlite_configuration_lock_held()
+        observed.append("schema")
+        return original_schema(conn)
+
+    def checked_graph(self):
+        assert store_mod._sqlite_configuration_lock_held()
+        observed.append("graph")
+        return original_graph(self)
+
+    monkeypatch.setattr(store_mod, "_ensure_namespace_schema", checked_schema)
+    monkeypatch.setattr(Store, "_ensure_graph_evidence", checked_graph)
+    with Store("initialization-lifecycle-lock"):
+        pass
+    assert observed == ["schema", "graph"]
+
+
+def test_graph_rebuild_and_automatic_evidence_share_configuration_lock(
+    alias_home, monkeypatch,
+):
+    """Automatic and explicit rebuild commits use the same sidecar lock."""
+    import haunt.store as store_mod
+
+    with Store("graph-rebuild-lifecycle-lock") as store:
+        calls: list[bool] = []
+
+        def checked_rebuild(self, *, touch):
+            assert store_mod._sqlite_configuration_lock_held()
+            calls.append(touch)
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("graph_evidence_version", "1"),
+            )
+            self.conn.commit()
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            Store, "_rebuild_graph_with_configuration_lock", checked_rebuild
+        )
+        store.conn.execute(
+            "DELETE FROM meta WHERE key='graph_evidence_version'"
+        )
+        store.conn.commit()
+        store._ensure_graph_evidence()
+        store._ensure_graph_evidence()
+        assert calls == [False]
+        assert store.rebuild_graph() == {"ok": True}
+        assert calls == [False, True]
+
+
+def test_repeated_cross_process_fresh_store_creation_resolves_registered_identity(
+    tmp_path, monkeypatch,
+):
+    """Fresh interpreters cover the WAL/checkpoint boundary missed by threads."""
+    home = tmp_path / "fresh-process-home"
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+    env = os.environ.copy()
+    source_root = str(Path(__file__).parents[1] / "src")
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        source_root
+        if not existing_pythonpath
+        else os.pathsep.join((source_root, existing_pythonpath))
+    )
+    # Enable fatal-signal tracebacks before the child imports Haunt. This makes
+    # an SQLite SIGBUS/SIGSEGV failure actionable rather than an empty return.
+    env["PYTHONFAULTHANDLER"] = "1"
+    # This test targets concurrent fresh *namespace* creation. Establish the
+    # registry in a separate interpreter so the pytest process does not retain
+    # an SQLite VFS handle while the fresh children test their own lifecycle.
+    initialized = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from haunt.store import init_registry; init_registry()",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+    assert initialized.returncode == 0, initialized.stderr.decode()
+
+    for round_number in range(4):
+        label = f"repeated-cross-process-first-create-{round_number}"
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import faulthandler, sys; "
+                "faulthandler.enable(all_threads=True); "
+                "faulthandler.dump_traceback_later(8, repeat=True); "
+                "print('phase:before-import', file=sys.stderr, flush=True); "
+                "from haunt.store import Store; "
+                "print('phase:before-store', file=sys.stderr, flush=True); "
+                f"store=Store({label!r}); "
+                "print('phase:after-store', file=sys.stderr, flush=True); "
+                "print(store.namespace_id, flush=True); store.close(); "
+                "print('phase:after-close', file=sys.stderr, flush=True); "
+                "faulthandler.cancel_dump_traceback_later()"
+            ),
+        ]
+        processes = [
+            subprocess.Popen(
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _ in range(8)
+        ]
+        try:
+            outputs = [process.communicate(timeout=15) for process in processes]
+        except subprocess.TimeoutExpired:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+            outputs = [process.communicate(timeout=5) for process in processes]
+            diagnostics = [
+                (
+                    process.pid,
+                    process.returncode,
+                    stdout.decode(errors="replace"),
+                    stderr.decode(errors="replace"),
+                )
+                for process, (stdout, stderr) in zip(processes, outputs)
+            ]
+            pytest.fail(
+                f"fresh Store subprocess timed out in round {round_number}: "
+                f"{diagnostics!r}"
+            )
+        diagnostics = [
+            (
+                process.pid,
+                process.returncode,
+                stdout.decode(errors="replace"),
+                stderr.decode(errors="replace"),
+            )
+            for process, (stdout, stderr) in zip(processes, outputs)
+        ]
+        assert all(process.returncode == 0 for process in processes), (
+            f"fresh Store subprocess failed in round {round_number}: {diagnostics!r}"
+        )
+        identities = {stdout.decode().strip() for stdout, _stderr in outputs}
+        assert len(identities) == 1
+
+
 @pytest.mark.parametrize("surface", ["current", "pin"])
 def test_mcp_identity_retry_accepts_only_recognized_registry_drift(
     alias_home, monkeypatch, surface
@@ -1412,9 +1892,21 @@ def test_mcp_recall_opens_selected_stable_id_after_label_reassignment(
 
     assert result["namespace"] == "mcp-race-original-renamed"
     assert planned_store_ids == [original_id]
+    assert result["execution"]["version"] == 1
+    assert result["execution"]["modalities"]["fts"] == {
+        "state": "candidate",
+        "reason": "returned_fts_candidates",
+    }
     contents = [hit["content"] for hit in result["hits"]]
     assert "MCP AUTHORITY RACE CANARY FROM ORIGINAL" in contents
     assert "MCP AUTHORITY RACE CANARY FROM REPLACEMENT" not in contents
+    original_hit = next(
+        hit
+        for hit in result["hits"]
+        if hit["content"] == "MCP AUTHORITY RACE CANARY FROM ORIGINAL"
+    )
+    assert original_hit["explanation"]["final_rank"] == 1
+    assert original_hit["explanation"]["references"]["provenance_status"] == "native"
 
 
 def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(
@@ -1430,6 +1922,15 @@ def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(
     )
     assert cli.exit_code == 0, cli.output
     assert "ROUTE-ALIAS-CANARY" in cli.output
+    cli_json = CliRunner().invoke(
+        app,
+        ["recall", "ROUTE-ALIAS-CANARY", "--namespace", "route-alias", "--json"],
+    )
+    assert cli_json.exit_code == 0, cli_json.output
+    cli_payload = json.loads(cli_json.stdout)
+    assert cli_payload["namespace"] == "route-main"
+    assert cli_payload["execution"]["version"] == 1
+    assert cli_payload["hits"][0]["explanation"]["final_rank"] == 1
 
     monkeypatch.setenv("HAUNT_NAMESPACE", "route-alias")
     from haunt.claude_hook import _hook_namespace
@@ -1449,9 +1950,124 @@ def test_cli_hooks_and_dashboard_alias_routes_use_canonical_store(
             "/api/namespace/route-alias/recall?q=ROUTE-ALIAS-CANARY"
         )
         assert response.status_code == 200
-        assert response.json()["hits"][0]["namespace"] == "route-main"
+        dashboard_payload = response.json()
+        assert dashboard_payload["hits"][0]["namespace"] == "route-main"
+        assert dashboard_payload["execution"]["version"] == 1
+        assert dashboard_payload["hits"][0]["explanation"]["final_rank"] == 1
     finally:
         reset_dashboard_security()
+
+
+def test_e5_references_and_execution_survive_e3_rename_without_purge_leaks(
+    alias_home, monkeypatch
+):
+    """Alias-routed E5 output keeps E1/E2 evidence, never erased bytes."""
+    imported_provenance = {
+        "schema_version": 1,
+        "kind": "import",
+        "channel": "python",
+        "origin": "python",
+        "source_platform": "e5-e3-test",
+        "source_native_id": "safe-import-id",
+        "source_format": "json",
+        "parser_version": "v1",
+        "imported_at": "2026-08-08T12:00:00+00:00",
+        "fidelity": "lossless",
+        "original_blob_sha256": "sha256:" + "ab" * 32,
+        "transforms": ["parse"],
+    }
+    erased_canary = "E5-E3-ERASED-PRIVATE-CANARY"
+    with Store("e5-e3-old") as store:
+        imported = store.observe(
+            "E5E3ALIAS imported provenance evidence",
+            provenance=imported_provenance,
+            defer_embedding=True,
+        )
+        first = store.observe("E5E3ALIAS first lineage member", defer_embedding=True)
+        erased = store.contradict(
+            first.memory_id,
+            replacement=f"E5E3ALIAS {erased_canary}",
+            idempotency_key="e5-e3-purge-first",
+        )
+        erased_id = erased["replacement_memory_id"]
+        erased_event_id = erased["replacement_event_id"]
+        survivor = store.contradict(
+            erased_id,
+            replacement="E5E3ALIAS surviving lineage member",
+            idempotency_key="e5-e3-purge-second",
+        )["replacement_memory_id"]
+        assert store.purge(erased_id)["ok"] is True
+        assert store.conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0] == "9"
+
+    _apply_change("e5-e3-old", "e5-e3-new")
+    conn = sqlite3.connect(registry_path())
+    assert conn.execute(
+        "SELECT value FROM registry_meta WHERE key='schema_version'"
+    ).fetchone()[0] == "5"
+    conn.close()
+
+    cli = CliRunner().invoke(
+        app, ["recall", "E5E3ALIAS", "--namespace", "e5-e3-old", "--json"]
+    )
+    assert cli.exit_code == 0, cli.output
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "e5-e3-old")
+    monkeypatch.delenv("HAUNT_MCP_ADMIN", raising=False)
+    import haunt.mcp_server as mcp
+
+    monkeypatch.setattr(mcp, "_MCP_AUTHORITY", None)
+    monkeypatch.setattr(mcp, "_MCP_AUTHORITY_HOME", None)
+    mcp_payload = json.loads(mcp.memory_recall("E5E3ALIAS", namespace="e5-e3-old"))
+
+    from tests.dashutil import make_dash_client
+
+    dashboard = make_dash_client().get(
+        "/api/namespace/e5-e3-old/recall?q=E5E3ALIAS"
+    )
+    assert dashboard.status_code == 200, dashboard.text
+
+    for payload in (json.loads(cli.stdout), mcp_payload, dashboard.json()):
+        assert payload["namespace"] == "e5-e3-new"
+        assert payload["execution"]["version"] == 1
+        hits = {hit["memory_id"]: hit for hit in payload["hits"]}
+        assert hits[imported.memory_id]["explanation"]["references"][
+            "provenance_status"
+        ] == "import"
+        assert hits[survivor]["explanation"]["references"][
+            "correction_lineage"
+        ] == {"status": "privacy_tombstone"}
+        serialized = json.dumps(payload, sort_keys=True)
+        assert erased_canary not in serialized
+        assert erased_id not in serialized
+        assert erased_event_id not in serialized
+
+
+def test_dashboard_all_namespace_groups_use_e3_canonical_labels(alias_home):
+    """All-namespace E5 groups are canonical and retain local execution/ranks."""
+    with Store("e5-group-old") as store:
+        store.observe("E5E3GROUP alpha result", defer_embedding=True)
+    _apply_change("e5-group-old", "e5-group-new")
+    with Store("e5-group-beta") as store:
+        store.observe("E5E3GROUP beta result", defer_embedding=True)
+
+    from tests.dashutil import make_dash_client
+
+    response = make_dash_client().get("/api/recall?q=E5E3GROUP")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ranking_scope"] == "per_namespace"
+    assert [group["namespace"] for group in payload["namespace_groups"]] == [
+        "e5-group-beta",
+        "e5-group-new",
+    ]
+    assert "e5-group-old" not in [
+        group["namespace"] for group in payload["namespace_groups"]
+    ]
+    for group in payload["namespace_groups"]:
+        assert group["execution"]["version"] == 1
+        assert group["hits"][0]["explanation"]["final_rank"] == 1
 
 
 def test_cli_dashboard_and_mcp_namespace_listings_are_portable(alias_home, monkeypatch):

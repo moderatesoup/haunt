@@ -401,7 +401,9 @@ def test_recall_hit_dynamic_sqlite_values_are_exact_on_every_public_surface(
             ),
         )
         st.conn.commit()
-        python_hits = recall(query, store=st, use_vectors=False)
+        # Match public recall surfaces so E5's honest vector-stage evidence
+        # describes one execution mode on every compared payload.
+        python_hits = recall(query, store=st, include_residue=True)
     assert len(python_hits) == 1
     expected = python_hits[0].as_dict()
     assert _decode_public_blob(expected["content"]) == blob
@@ -416,8 +418,12 @@ def test_recall_hit_dynamic_sqlite_values_are_exact_on_every_public_surface(
     json.dumps(expected, ensure_ascii=False, allow_nan=False)
 
     runner = CliRunner()
-    cli_json = runner.invoke(app, ["recall", query, "--namespace", "default", "--json"])
-    cli_human = runner.invoke(app, ["recall", query, "--namespace", "default"])
+    cli_json = runner.invoke(
+        app, ["recall", query, "--namespace", "default", "--include-residue", "--json"]
+    )
+    cli_human = runner.invoke(
+        app, ["recall", query, "--namespace", "default", "--include-residue"]
+    )
     assert cli_json.exit_code == 0, cli_json.output
     assert cli_human.exit_code == 0, cli_human.output
     assert json.loads(cli_json.stdout)["hits"] == [expected]
@@ -428,14 +434,18 @@ def test_recall_hit_dynamic_sqlite_values_are_exact_on_every_public_surface(
     from haunt import mcp_server
 
     mcp_server._MCP_AUTHORITY = None
-    mcp = json.loads(mcp_server.memory_recall(query, namespace="default"))
+    mcp = json.loads(
+        mcp_server.memory_recall(query, namespace="default", include_residue=True)
+    )
     assert mcp["hits"] == [expected]
 
     from tests.dashutil import make_dash_client
 
     client = make_dash_client()
-    single = client.get(f"/api/namespace/default/recall?q={query}")
-    all_namespaces = client.get(f"/api/recall?q={query}")
+    single = client.get(
+        f"/api/namespace/default/recall?q={query}&include_residue=true"
+    )
+    all_namespaces = client.get(f"/api/recall?q={query}&include_residue=true")
     assert single.status_code == 200, single.text
     assert all_namespaces.status_code == 200, all_namespaces.text
     assert single.json()["hits"] == [{**expected, "namespace": "default"}]

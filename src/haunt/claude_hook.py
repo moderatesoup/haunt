@@ -157,6 +157,8 @@ def _handle_session_start(
         content="haunt session start",
         role="system",
         tier="coordinate",
+        # SessionStart is host lifecycle residue, not a text-derived guess.
+        recall_class="task",
     )
     wv = store.worldview()
     card = format_worldview_card(wv)

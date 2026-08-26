@@ -78,7 +78,9 @@ def test_tool_call_verbatim(haunt_env):
         assert row["tool_input"] == inp
         assert row["tool_output"] == out
         assert row["content"] == ""
-    hits = recall("init_schema store.py", namespace="default", k=8)
+    hits = recall(
+        "init_schema store.py", namespace="default", k=8, include_residue=True
+    )
     assert hits
     assert "init_schema" in hits[0].content or "store.py" in hits[0].content
 

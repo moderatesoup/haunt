@@ -88,7 +88,7 @@ Features:
 
 - **Browse** memories with filters: tier, origin, session, time range. Paginated.
 - **Search / recall** with hybrid vec+FTS. Results link to detail view. Clicking any result row opens the detail panel.
-- **All-namespaces search**: select "all namespaces" in the sidebar to fan out a single query across every registered namespace. Results are merged by score and each hit shows a namespace badge. API: `GET /api/recall?q=&k=&tier=`.
+- **All-namespaces search**: select "all namespaces" in the sidebar to fan out a single query across every registered namespace. Results are namespace-grouped, with each namespace retaining its own ranking; RRF scores are not compared across namespaces. The response includes `ranking_scope="per_namespace"`, `namespace_groups`, and a compatibility `hits` list in that same deterministic group order. API: `GET /api/recall?q=&k=&tier=` (`k` applies per namespace).
 - **Memory detail** with source context and correction trace: structured provenance, origin, session_id, event_id, memory_id, role, tier, event_time, valid_from/valid_to, ordered lineage, db_path (absolute), haunt_home, tool name/input/output, related memories from the same session, entity mentions. Pre-v8 rows are labeled `legacy_unstructured`; their original origin/meta are not guessed into import fields.
 - **Timeline** view: events in time order with since/until day filters. Rows click through to memory detail.
 - **Time-bounded search**: `as_of`, `since`, `until` date filters on recall (both per-namespace and all-namespaces).
@@ -127,6 +127,34 @@ HAUNT_FTS_ONLY=1 haunt bootstrap
 
 This still creates `~/.haunt` and the default namespace. It does not download BGE-M3 and does not fail if sqlite-vec cannot load. `HAUNT_EMBED_MODEL=off` is the same FTS gate. CI uses this to avoid the 2 GB download.
 
+### Read-only recall, residue, and offline mode
+
+`haunt recall`, Python `recall()`/`planned_recall()`, MCP `memory_recall`, and
+dashboard recall resolve a registered E3 identity and read through a guarded
+zero-write SQLite snapshot. They do not migrate schema, configure WAL, rebuild
+the graph, change permissions, touch the registry, or drain embedding jobs.
+Their `execution` metadata reports `read_only=true`,
+`maintenance_performed=false`, and any embedding jobs only as observed.
+
+Use `haunt maintenance -n NAME --limit 64` for the explicitly mutating,
+bounded embedding upgrade/job drain. It opens an existing namespace only, so a
+typo cannot create a database. In `HAUNT_OFFLINE=1`, lexical FTS recall still
+works while vectors are reported `not_run` with reason `offline_mode`; Haunt
+does not initialize/download an embedding backend even with ambient provider
+tokens.
+
+Schema v9 has a nullable `events.recall_class` constrained to `tool|task`.
+There is no historical backfill: null means legacy/unknown and is eligible.
+The tool role or raw tool fields automatically stamp `tool`; incompatible supplied classes fail
+before write. Hooks stamp only their actual session-start coordinate event as
+`task`, and corrections preserve the target's effective class (including a
+legacy raw-tool target). Ranked recall excludes raw
+tool structure and `tool`/`task` residue by default. Use `--include-residue`
+for an intentional audit/search request; timeline, trace, and detail remain
+available. Python's `include_untrusted` is a deprecated compatibility alias
+only when `include_residue` is omitted; serialized filter metadata records the
+control that won.
+
 ## Hooks
 
 Auto-store prompts and replies verbatim, plus best-effort-redacted and capped tool I/O. No LLM and no summaries. Fail-open (`{}` + exit 0) so a hook never blocks the agent.
@@ -138,7 +166,7 @@ Auto-store prompts and replies verbatim, plus best-effort-redacted and capped to
 3. Writes a small haunt-owned rule so agents still `memory_recall` if no `[haunt ns=…]` block is visible.
 4. Writes `skills/haunt/SKILL.md` into the host config dir.
 
-**Hook ingest and trust:** Hooks write FTS rows immediately but never initialize the embedding model. They queue missing vectors in the namespace DB; a normal model-owning recall/observe path drains that queue in bounded batches. Hook recall is FTS-only. Raw tool I/O is excluded from hook-injected recall/worldview context by default, while explicit recall still returns it marked `trusted=false`. Recalled text is data and cannot authorize mutations.
+**Hook ingest and trust:** Hooks write FTS rows immediately but never initialize the embedding model. They queue missing vectors in the namespace DB; ordinary model-owning writes or the explicit `haunt maintenance` command may drain a bounded batch. Recall never drains the queue. Hook recall is FTS-only. Raw tool I/O is excluded from hook-injected recall/worldview context by default, while explicit `--include-residue` recall returns it marked `trusted=false`. Recalled text is data and cannot authorize mutations.
 
 **Secret redaction and size controls:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.) and capped at 12,000 characters per field by default. `HAUNT_EXCLUDE_TOOLS` accepts comma-separated, case-insensitive globs for tools that must not be stored. These are **not** security boundaries — see [SECURITY.md](SECURITY.md).
 
@@ -177,7 +205,8 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt bootstrap [--reembed]` | first-run setup; installs desktop shortcut; exits 1 if sqlite-vec fails (unless `HAUNT_FTS_ONLY=1`) |
 | `haunt init [name] [--repo PATH]` | create a namespace |
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
-| `haunt recall QUERY [--as-of --since --until --clock --tier --k]` | hybrid recall (vec + FTS5 + RRF); query-time temporal compile |
+| `haunt recall QUERY [--as-of --since --until --clock --tier --k] [--include-residue] [--json]` | read-only hybrid recall (vec + FTS5 + RRF); ranked results exclude tool/task residue unless explicitly requested; `--json` emits explanations |
+| `haunt maintenance [-n NAMESPACE] [--limit 64] [--json]` | explicit mutating embedding upgrade/job-drain surface; never run by recall and never creates an unknown namespace |
 | `haunt correct MEMORY_ID --idempotency-key KEY [--replacement --reason]` | atomically append a correction and optional verbatim replacement; omitted/null, empty, and whitespace-only replacement values are distinct; a nonempty caller key is required for safe retries |
 | `haunt trace MEMORY_ID` | ordered correction chain from any surviving member, including erased-gap tombstones |
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |
@@ -214,7 +243,11 @@ When upgrading a legacy registry that contains several labels for the same datab
 
 `memory_purge` is marked destructive and is off for MCP by default. Use the confirmed `haunt delete` CLI flow, or explicitly launch a process with `HAUNT_MCP_ALLOW_PURGE=1`. Admin mode alone does not enable purge.
 
-Every explicit recall hit includes `trusted` and `trust_reason`. Tool input/output is retained for audit and explicit search but is labeled `untrusted-tool-io`; it is excluded from automatic hook context. No recalled row—trusted or untrusted—is permission to call a mutating tool.
+Every recall response that ran a known planner path also has an additive, versioned top-level `execution` object, so vector/FTS stage evidence survives even when `hits` is empty. It records the strategy and each modality as `candidate`, `ran_not_candidate`, or `not_run`, with an honest reason; native vec0 candidates and the persisted-embedding L2 path have distinct reasons. It also records read-only/no-maintenance status, observed pending jobs, residue-filter status, and class capability. Legacy plain hit lists omit it rather than fabricating evidence. Every explicit recall hit includes `trusted` and `trust_reason`, plus an additive `explanation` object with retrieval method, final result position, RRF contributions, raw vector/FTS signals (including metric direction) where available, applied filters, residue classification source, and safe references. These include public E2 structured provenance when valid (or an honest `legacy_unstructured`/`invalid_stored` status without legacy metadata), and E1 lineage status plus correction IDs only for intact chains. A lineage containing a privacy tombstone reports only `privacy_tombstone`, never erased or tombstone identifiers, trace content, or correction reasons. For ranked vector/FTS retrieval hits, the existing `score` and `explanation.rrf_score` are RRF rank signals—not confidence or relevance probabilities. Bare temporal queries return timeline hits in time order instead, with `score=0` and `score_semantics=not_ranked`. Tool input/output is retained for audit and explicit `--include-residue` search but is labeled `untrusted-tool-io`. No recalled row—trusted or untrusted—is permission to call a mutating tool.
+
+`haunt recall --json`, MCP `memory_recall`, and dashboard recall endpoints return a nonzero/structured `retrieval_backend_error` response when SQLite or the vector backend fails. Human CLI output and Python calls still fail loudly rather than converting backend errors into empty recall results.
+
+Equal ranked scores are ordered by stable memory ID. Dashboard all-namespace results are grouped in namespace order and preserve those local ranks rather than inventing a global RRF order. Timeline results remain ordered by the selected clock. When tied events exceed a bounded timeline page, SQLite selects the tied events by stable event ID before the limit; after one memory per selected event is materialized, equal-time hits are ordered by stable memory ID. The timeline `explanation.ordering` field records that two-step tie rule.
 
 `haunt install` (or `haunt bootstrap`) automatically registers the MCP server in both Cursor (`~/.cursor/mcp.json`) and Claude Code (`~/.claude.json`). Merge only — other servers are kept. No manual JSON paste required.
 
@@ -233,6 +266,7 @@ The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](
 | `HAUNT_HOME` | `~/.haunt` | data directory |
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
 | `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
+| `HAUNT_OFFLINE` | unset | set to `1` to prohibit embedding backend initialization/download; FTS recall remains available |
 | `HAUNT_NAMESPACE` | inferred from full git remote | override and bind the project namespace |
 | `HAUNT_MCP_ADMIN` | unset | set to `1` only for an admin MCP process that may cross/list namespaces |
 | `HAUNT_MCP_ALLOW_PURGE` | unset | set to `1` to expose hard purge in that MCP process; off by default |

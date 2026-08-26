@@ -12,13 +12,20 @@ must not apply a storage_time / events.ts filter.
 from __future__ import annotations
 
 import re
+import sqlite3
 from datetime import datetime
 from typing import Literal
 
-from haunt.recall import Hit, recall
-from haunt.store import Store, open_existing
+from haunt.recall import (
+    Hit,
+    RecallResult,
+    classify_recall_residue,
+    execution_metadata,
+    recall,
+)
+from haunt.store import ReadOnlyStore, Store, open_existing_readonly
 from haunt.temporal import TemporalQuery, compile
-from haunt.util import clamp_k, iso_or_now, normalize_clock, utc_iso
+from haunt.util import LIMIT_MAX, clamp_k, iso_or_now, normalize_clock, utc_iso
 
 Plan = Literal["timeline", "recall", "union"]
 
@@ -169,18 +176,106 @@ def _clocks(clock: str) -> tuple[str, ...]:
     return (c,)
 
 
-def _hits_from_events(store: Store, events: list[dict], *, limit: int) -> list[Hit]:
+def _aggregate_execution(
+    strategy: str,
+    runs: list[tuple[str, list[Hit]]],
+) -> dict[str, object] | None:
+    """Combine only known stage evidence from one or more clock executions."""
+    known = [(clock, execution_metadata(hits)) for clock, hits in runs]
+    if not known or any(execution is None for _, execution in known):
+        # Tests and external integrations may provide a plain list of Hits.
+        # It carries no execution provenance, so do not synthesize any.
+        return None
+
+    sources = ("vector", "fts")
+    modalities: dict[str, dict[str, str]] = {}
+    for source in sources:
+        stages = [
+            execution["modalities"][source]  # type: ignore[index]
+            for _, execution in known
+        ]
+        if all(stage == stages[0] for stage in stages[1:]):
+            modalities[source] = dict(stages[0])
+        elif any(stage.get("state") == "candidate" for stage in stages):
+            modalities[source] = {
+                "state": "candidate",
+                "reason": "candidate_in_one_or_more_clocks",
+            }
+        elif any(stage.get("state") == "ran_not_candidate" for stage in stages):
+            modalities[source] = {
+                "state": "ran_not_candidate",
+                "reason": "no_candidates_in_one_or_more_clocks",
+            }
+        else:
+            modalities[source] = {
+                "state": "not_run",
+                "reason": "not_run_in_all_clocks",
+            }
+
+    pending_by_run = {
+        clock: execution.get("pending_embedding_jobs")
+        for clock, execution in known
+        if execution.get("pending_embedding_jobs") is not None
+    }
+    pending_values = list(pending_by_run.values())
+    if not pending_values:
+        pending: object | None = None
+    elif all(value == pending_values[0] for value in pending_values[1:]):
+        pending = pending_values[0]
+    else:
+        # A concurrent writer can enqueue between two independently planned
+        # legs. Do not hide that observation behind the first leg's count.
+        pending = {
+            "state": "observed_not_drained",
+            "count": None,
+            "by_run": pending_by_run,
+        }
+
+    def combined(field: str) -> object | None:
+        values = [execution.get(field) for _, execution in known]
+        return values[0] if all(value == values[0] for value in values[1:]) else "mixed"
+
+    return {
+        "version": 1,
+        "strategy": strategy,
+        "modalities": modalities,
+        "read_only": all(bool(execution.get("read_only")) for _, execution in known),
+        "maintenance_performed": False,
+        "pending_embedding_jobs": pending,
+        "residue_filter": combined("residue_filter"),
+        "residue_filter_source": combined("residue_filter_source"),
+        "recall_class_capability": combined("recall_class_capability"),
+        "clock_runs": [
+            {"clock": clock, "modalities": execution["modalities"]}
+            for clock, execution in known
+        ],
+    }
+
+
+def _hits_from_events(
+    store: Store,
+    events: list[dict],
+    *,
+    limit: int,
+    filter_context: dict[str, object],
+) -> list[Hit]:
     hits: list[Hit] = []
     seen: set[str] = set()
+    recall_class_select = (
+        "e.recall_class AS recall_class"
+        if bool(getattr(store, "recall_class_available", False))
+        else "NULL AS recall_class"
+    )
     for ev in events:
         row = store.conn.execute(
-            """
+            f"""
             SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
-                   e.role, e.event_time, e.ts, e.tool_name, e.origin
+                   e.role, e.event_time, e.ts, e.tool_name, e.tool_input,
+                   e.tool_output, e.origin, {recall_class_select}
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.event_id=? AND m.valid_to IS NULL
-            ORDER BY m.created_at DESC, m.rowid DESC
+            ORDER BY m.created_at DESC, m.rowid DESC, m.id ASC
             LIMIT 1
             """,
             (ev["id"],),
@@ -188,6 +283,13 @@ def _hits_from_events(store: Store, events: list[dict], *, limit: int) -> list[H
         if not row or row["id"] in seen:
             continue
         seen.add(row["id"])
+        raw_tool, classification_source = classify_recall_residue(
+            recall_class=row["recall_class"],
+            role=row["role"],
+            tool_name=row["tool_name"],
+            tool_input=row["tool_input"],
+            tool_output=row["tool_output"],
+        )
         hits.append(
             Hit(
                 memory_id=row["id"],
@@ -202,6 +304,12 @@ def _hits_from_events(store: Store, events: list[dict], *, limit: int) -> list[H
                 valid_to=row["valid_to"],
                 tool_name=row["tool_name"],
                 origin=row["origin"],
+                filter_context=filter_context,
+                vector_stage={"state": "not_run", "reason": "timeline_time_order"},
+                fts_stage={"state": "not_run", "reason": "timeline_time_order"},
+                recall_class=row["recall_class"],
+                classification_source=classification_source,
+                raw_tool_structure=raw_tool,
             )
         )
         if len(hits) >= limit:
@@ -219,17 +327,36 @@ def run_timeline(
 ) -> list[Hit]:
     """A: events in [start, end] on the chosen clock(s).
 
-    Fetch enough events to fill ``limit`` *current* memories. Superseded
-    rows (valid_to IS NOT NULL) are skipped by ``_hits_from_events``; a
-    short prefix of recent superseded events must not starve k.
+    Direct callers share the public ``clamp_k`` contract, so ``limit`` is
+    always in [1, K_MAX]. Fetch enough bounded event pages to fill that many
+    *current* memories. Superseded rows (valid_to IS NOT NULL) are skipped by
+    ``_hits_from_events``; a short prefix of recent superseded events must not
+    starve the requested count.
     """
+    limit = clamp_k(limit)
     since, until = _iso(tq.start), _iso(tq.end)
     chosen = clock or tq.clock
     merged: dict[str, Hit] = {}
     for clk in _clocks(chosen):
-        # Page through events. store.events clamps LIMIT to 100; doubling
-        # fetch_n past that made len(rows) < fetch_n and starved refill.
-        batch = max(int(limit), 1)
+        filter_context: dict[str, object] = {
+            "validity": "current",
+            "as_of": None,
+            "clock": clk,
+            "since": since,
+            "until": until,
+            "tier": None,
+            "include_untrusted": None,
+            "include_residue": None,
+            "residue_filter": "not_applicable",
+            "residue_filter_source": "not_applicable",
+            "recall_class_capability": "not_applicable",
+            "maintenance_performed": False,
+            "session_id": session_id,
+        }
+        # Page through events at the store's hard page ceiling. ``limit`` is
+        # already clamped, but retaining this min keeps pagination correct if
+        # the two public bounds ever diverge.
+        batch = min(limit, LIMIT_MAX)
         offset = 0
         while True:
             rows = store.events(
@@ -240,7 +367,9 @@ def run_timeline(
                 limit=batch,
                 offset=offset,
             )
-            for h in _hits_from_events(store, rows, limit=limit):
+            for h in _hits_from_events(
+                store, rows, limit=limit, filter_context=filter_context
+            ):
                 merged.setdefault(h.memory_id, h)
             if len(merged) >= limit or len(rows) < batch:
                 break
@@ -248,7 +377,44 @@ def run_timeline(
             if nxt <= offset:
                 break
             offset = nxt
-    return list(merged.values())[:limit]
+    # Preserve chronological order. Only exact values on the selected clock
+    # fall back to the stable memory ID; never sort timeline hits by ID alone.
+    hits = list(merged.values())
+    hits.sort(key=lambda hit: hit.memory_id)
+    time_attr = "ts" if _clocks(chosen)[0] == "storage_time" else "event_time"
+    hits.sort(key=lambda hit: getattr(hit, time_attr) or "", reverse=True)
+    hits = hits[:limit]
+    references = store.recall_references_many([hit.memory_id for hit in hits])
+    for hit in hits:
+        hit.references = references.get(hit.memory_id)
+    for final_rank, hit in enumerate(hits, start=1):
+        hit.final_rank = final_rank
+    try:
+        pending_jobs = int(
+            store.conn.execute("SELECT COUNT(*) FROM embedding_jobs").fetchone()[0]
+        )
+    except sqlite3.Error:
+        pending_jobs = None
+    return RecallResult(
+        hits,
+        execution={
+            "version": 1,
+            "strategy": "timeline",
+            "modalities": {
+                "vector": {"state": "not_run", "reason": "timeline_time_order"},
+                "fts": {"state": "not_run", "reason": "timeline_time_order"},
+            },
+            "read_only": bool(getattr(store, "read_only", False)),
+            "maintenance_performed": False,
+            "pending_embedding_jobs": {
+                "state": "observed_not_drained",
+                "count": pending_jobs,
+            },
+            "residue_filter": "not_applicable",
+            "residue_filter_source": "not_applicable",
+            "recall_class_capability": "not_applicable",
+        },
+    )
 
 
 def run_recall(
@@ -260,12 +426,15 @@ def run_recall(
     k: int = 8,
     clock: str | None = None,
     namespace: str | None = None,
+    include_residue: bool | None = None,
+    include_untrusted: bool | None = None,
 ) -> list[Hit]:
     """B: recall(cleaned_query, window, clock)."""
     k = clamp_k(k)
     since, until = _iso(tq.start), _iso(tq.end)
     chosen = clock or tq.clock
     merged: dict[str, Hit] = {}
+    recall_runs: list[tuple[str, list[Hit]]] = []
     for clk in _clocks(chosen):
         hits = recall(
             tq.cleaned_query,
@@ -277,13 +446,22 @@ def run_recall(
             tier=tier,
             k=k,
             store=store,
+            include_residue=include_residue,
+            include_untrusted=include_untrusted,
         )
+        recall_runs.append((clk, hits))
         for h in hits:
             prev = merged.get(h.memory_id)
             if prev is None or h.score > prev.score:
                 merged[h.memory_id] = h
-    ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)
-    return ranked[:k]
+    ranked = sorted(merged.values(), key=lambda h: (-h.score, h.memory_id))
+    hits = ranked[:k]
+    for final_rank, hit in enumerate(hits, start=1):
+        hit.final_rank = final_rank
+    execution = _aggregate_execution("recall", recall_runs)
+    if execution is None:
+        return hits
+    return RecallResult(hits, execution=execution)
 
 
 def run_union(
@@ -297,22 +475,74 @@ def run_union(
     namespace: str | None = None,
     session_id: str | None = None,
     timeline_limit: int = 50,
+    include_residue: bool | None = None,
+    include_untrusted: bool | None = None,
 ) -> list[Hit]:
     """C: union of timeline(window, clock) and windowed recall."""
     k = clamp_k(k)
     by_id: dict[str, Hit] = {}
-    for h in run_timeline(
+    timeline = run_timeline(
         tq, store, session_id=session_id, limit=timeline_limit, clock=clock
-    ):
+    )
+    for h in timeline:
         by_id[h.memory_id] = h
-    for h in run_recall(
-        tq, store, as_of=as_of, tier=tier, k=k, clock=clock, namespace=namespace
-    ):
+    recalled = run_recall(
+        tq,
+        store,
+        as_of=as_of,
+        tier=tier,
+        k=k,
+        clock=clock,
+        namespace=namespace,
+        include_residue=include_residue,
+        include_untrusted=include_untrusted,
+    )
+    for h in recalled:
         prev = by_id.get(h.memory_id)
         if prev is None or h.score > prev.score:
             by_id[h.memory_id] = h
-    ranked = sorted(by_id.values(), key=lambda h: h.score, reverse=True)
-    return ranked[:k]
+    ranked = sorted(
+        (hit for hit in by_id.values() if hit.vec_rank is not None or hit.fts_rank is not None),
+        key=lambda hit: (-hit.score, hit.memory_id),
+    )
+    # Unranked timeline rows remain in their already chronological order.
+    timeline_hits = [
+        hit
+        for hit in timeline
+        if by_id.get(hit.memory_id) is hit
+        and hit.vec_rank is None
+        and hit.fts_rank is None
+    ]
+    hits = (ranked + timeline_hits)[:k]
+    for final_rank, hit in enumerate(hits, start=1):
+        hit.final_rank = final_rank
+    timeline_execution = execution_metadata(timeline)
+    recall_execution = execution_metadata(recalled)
+    if timeline_execution is None or recall_execution is None:
+        return hits
+    aggregate = _aggregate_execution(
+        "union", [("timeline", timeline), ("recall", recalled)]
+    )
+    if aggregate is None:
+        return hits
+    execution = {
+        "version": 1,
+        "strategy": "union",
+        "modalities": aggregate["modalities"],
+        "read_only": aggregate["read_only"],
+        "maintenance_performed": False,
+        "pending_embedding_jobs": aggregate["pending_embedding_jobs"],
+        # The legs intentionally differ: ranked recall filters residue while
+        # a timeline is an audit/navigation view where it is not applicable.
+        "residue_filter": aggregate["residue_filter"],
+        "residue_filter_source": aggregate["residue_filter_source"],
+        "recall_class_capability": aggregate["recall_class_capability"],
+        "components": {
+            "timeline": timeline_execution,
+            "recall": recall_execution,
+        },
+    }
+    return RecallResult(hits, execution=execution)
 
 
 def execute(
@@ -326,6 +556,8 @@ def execute(
     clock: str | None = None,
     namespace: str | None = None,
     session_id: str | None = None,
+    include_residue: bool | None = None,
+    include_untrusted: bool | None = None,
 ) -> list[Hit]:
     k = clamp_k(k)
     chosen = strategy or plan(tq)
@@ -333,7 +565,15 @@ def execute(
         return run_timeline(tq, store, session_id=session_id, limit=k, clock=clock)
     if chosen == "recall":
         return run_recall(
-            tq, store, as_of=as_of, tier=tier, k=k, clock=clock, namespace=namespace
+            tq,
+            store,
+            as_of=as_of,
+            tier=tier,
+            k=k,
+            clock=clock,
+            namespace=namespace,
+            include_residue=include_residue,
+            include_untrusted=include_untrusted,
         )
     if chosen == "union":
         return run_union(
@@ -345,6 +585,8 @@ def execute(
             clock=clock,
             namespace=namespace,
             session_id=session_id,
+            include_residue=include_residue,
+            include_untrusted=include_untrusted,
         )
     raise ValueError(f"unknown plan {chosen!r}")
 
@@ -360,8 +602,10 @@ def planned_recall(
     clock: str | None = None,
     tier: str | None = None,
     k: int = 8,
-    store: Store | None = None,
+    store: Store | ReadOnlyStore | None = None,
     strategy: Plan | None = None,
+    include_residue: bool | None = None,
+    include_untrusted: bool | None = None,
 ) -> list[Hit]:
     """Recall entry used by CLI/MCP.
 
@@ -389,6 +633,8 @@ def planned_recall(
             tier=tier,
             k=k,
             store=store,
+            include_residue=include_residue,
+            include_untrusted=include_untrusted,
         )
 
     # Temporal: do not silently drop the compiled window. Explicit since/until
@@ -418,7 +664,7 @@ def planned_recall(
             confidence=tq.confidence,
         )
     own = store is None
-    store = store or open_existing(namespace or "default")
+    store = store or open_existing_readonly(namespace or "default")
     try:
         return execute(
             tq,
@@ -428,6 +674,8 @@ def planned_recall(
             tier=tier,
             k=k,
             namespace=namespace,
+            include_residue=include_residue,
+            include_untrusted=include_untrusted,
         )
     finally:
         if own:

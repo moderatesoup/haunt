@@ -458,7 +458,7 @@ and retain the canonical memory semantics and audit information.
 
 ## E5 — Explain ranking without calling it confidence
 
-**Status:** In progress
+**Status:** Done
 
 **Depends on:** E0
 
@@ -485,6 +485,12 @@ machine-readable retrieval evidence.
   authorizes a tool mutation.
 - Expose the same explanation semantics through Python, CLI JSON, MCP, and
   dashboard APIs; human rendering may be implementation-specific.
+- The v1 execution evidence must additionally distinguish a physically
+  read-only recall from explicit maintenance, report pending embedding jobs as
+  observed-not-drained, report the residue-filter/classification capability,
+  and give an honest offline/vector-stage reason. Ranked recall defaults to
+  excluding raw tool structure and explicit task/tool residue; audit opt-in
+  remains explicit and timeline/trace/detail say the filter is not applicable.
 
 **Tests/evidence**
 
@@ -496,6 +502,18 @@ machine-readable retrieval evidence.
   reviewed deterministic-tie correction.
 - Once E2 lands, integration tests assert its correction/provenance references
   appear in explanations without changing scores or order.
+
+**Completion evidence (2026-08-26)**
+
+- Author/release proof: the completed E5 release branch closed at reviewed head
+  `46649df`; the frozen E0 corpus and baseline remain byte-for-byte unchanged.
+- Independent GPT-5.6 Terra review was **CLEAN** at `46649df`: broad Py3.10
+  and exact Py3.12/SQLite 3.43/MCP2 matrices, repeated 4x8 fresh-process
+  creation, native-vec checks, and compile/diff checks were green.
+- Root release gating also passed the Py3.10 E0-E5 integration selection and
+  native four-target matrix; it caught and this approved head fixed the stale
+  MCP read-only-opener assertion and fail-closed initialization cleanup before
+  approval. Calibrated abstention remains E6 work, not E5.
 
 **Non-goals**
 

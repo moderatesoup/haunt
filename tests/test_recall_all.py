@@ -4,12 +4,29 @@ from __future__ import annotations
 
 import pytest
 
-from haunt.paths import namespace_db_path
-from haunt.store import Store, observe
+from haunt.paths import ensure_layout, namespace_db_path
+from haunt.store import Store, init_registry, observe
 
 
 @pytest.fixture
-def multi_ns_client(haunt_env):
+def recall_all_env(tmp_path, monkeypatch):
+    """Exercise dashboard fan-out without downloading an embedding model."""
+    home = tmp_path / "haunt-home"
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+    from haunt import embed
+
+    embed.reset()
+    ensure_layout()
+    init_registry()
+    yield home
+    embed.reset()
+
+
+@pytest.fixture
+def multi_ns_client(recall_all_env):
     """Set up two namespaces with distinct memories, return test client."""
     from tests.dashutil import make_dash_client
 
@@ -109,11 +126,13 @@ def test_all_ns_recall_tier_filter(multi_ns_client):
 
 
 def test_all_ns_recall_k_param(multi_ns_client):
-    """k parameter limits total results."""
+    """k is a per-namespace limit; endpoint does not invent a global rank."""
     r = multi_ns_client.get("/api/recall?q=quantum&k=1")
     assert r.status_code == 200
     data = r.json()
-    assert len(data["hits"]) <= 1
+    assert data["ranking_scope"] == "per_namespace"
+    assert all(len(group["hits"]) <= 1 for group in data["namespace_groups"])
+    assert len(data["hits"]) <= len(data["namespace_groups"])
 
 
 def test_all_ns_recall_includes_origin(multi_ns_client):
@@ -132,9 +151,32 @@ def test_per_ns_recall_includes_namespace(multi_ns_client):
     data = r.json()
     for h in data["hits"]:
         assert h["namespace"] == "alpha"
+    assert data["ranking_scope"] == "namespace"
 
 
-def test_all_ns_recall_surfaces_corrupt_namespace_errors(haunt_env):
+def test_dashboard_recall_rejects_invalid_clock_and_temporal_query(multi_ns_client):
+    """Bad recall input has the same JSON error envelope as MCP recall."""
+    bad_clock = multi_ns_client.get(
+        "/api/namespace/alpha/recall?q=quantum&clock=wrong-clock"
+    )
+    assert bad_clock.status_code == 400
+    assert bad_clock.json() == {
+        "ok": False,
+        "code": "invalid_recall_request",
+        "error": bad_clock.json()["error"],
+        "query": "quantum",
+        "namespace": "alpha",
+    }
+    assert "clock must be" in bad_clock.json()["error"]
+
+    bad_date = multi_ns_client.get("/api/recall?q=what+happened+on+2026-02-30")
+    assert bad_date.status_code == 400
+    assert bad_date.json()["ok"] is False
+    assert bad_date.json()["query"] == "what happened on 2026-02-30"
+    assert "invalid date" in bad_date.json()["error"]
+
+
+def test_all_ns_recall_surfaces_corrupt_namespace_errors(recall_all_env):
     """#55: one good ns + one corrupt registered DB is not a clean hits-only 200.
 
     Partial success is ok: hits from the good namespace stay, but the payload
@@ -165,12 +207,16 @@ def test_all_ns_recall_surfaces_corrupt_namespace_errors(haunt_env):
     )
     for err in data["errors"]:
         assert err.get("namespace"), f"error entry missing namespace: {err!r}"
+        assert err.get("code") == "retrieval_backend_error", err
         assert isinstance(err.get("error"), str) and err["error"].strip(), (
             f"error entry missing error string: {err!r}"
         )
     err_ns = {err["namespace"] for err in data["errors"]}
     assert "badns" in err_ns
     assert "goodns" not in err_ns
+    groups = {group["namespace"]: group for group in data["namespace_groups"]}
+    assert groups["badns"]["hits"] == []
+    assert groups["badns"]["error"]["code"] == "retrieval_backend_error"
     assert any(canary in (h.get("content") or "") for h in data["hits"])
     assert all(h.get("namespace") != "badns" for h in data["hits"])
 

@@ -56,7 +56,7 @@ def _reset_mcp() -> None:
     mcp._MCP_AUTHORITY_HOME = None
 
 
-def test_namespace_v8_registry_v5_upgrade_restart_through_alias(integrated_home):
+def test_namespace_v9_registry_v5_upgrade_restart_through_alias(integrated_home):
     with Store("integrated-v7") as store:
         namespace_id = store.namespace_id
         db_path = store.db_path
@@ -74,7 +74,7 @@ def test_namespace_v8_registry_v5_upgrade_restart_through_alias(integrated_home)
         with Store(label, create=False) as reopened:
             assert reopened.namespace_id == namespace_id
             assert reopened.db_path == db_path
-            assert int(reopened.get_meta("schema_version")) == SCHEMA_VERSION == 8
+            assert int(reopened.get_meta("schema_version")) == SCHEMA_VERSION == 9
             detail = reopened.get_memory(event.memory_id)
             assert detail is not None
             assert detail["provenance"]["schema_version"] == 1
