@@ -393,13 +393,20 @@ def test_bootstrap_reembed_report_omits_healthy_namespaces(drain_env):
 # forever, because process_embedding_jobs's `if not es.available` branch
 # never advances `attempts` so `remaining` never shrinks. See
 # bootstrap._drain_worth_reporting's docstring for the full reasoning.
+#
+# _drain_worth_reporting takes `deliberately_off` as an explicit keyword
+# rather than calling haunt.embed.fts_only()/offline() itself, so every
+# test below controls it directly instead of depending on this process's
+# ambient HAUNT_FTS_ONLY/HAUNT_EMBED_MODEL/HAUNT_OFFLINE -- these tests
+# take no env-controlling fixture at all, by design.
 # ---------------------------------------------------------------------------
 
 
 def test_drain_worth_reporting_silences_pure_backend_unavailable():
     """A namespace whose only signal is "backend unavailable, backlog
     sitting there" (available=False, remaining>0, nothing else) must not
-    be considered report-worthy."""
+    be considered report-worthy -- when that unavailability is the
+    deliberate, permanent FTS-only/offline shape."""
     from haunt.bootstrap import _drain_worth_reporting
 
     perma_fts_only = {
@@ -413,7 +420,38 @@ def test_drain_worth_reporting_silences_pure_backend_unavailable():
         "stop_reason": "blocked",
         "stopped_early": True,
     }
-    assert _drain_worth_reporting(perma_fts_only) is False
+    assert _drain_worth_reporting(perma_fts_only, deliberately_off=True) is False
+
+
+def test_drain_worth_reporting_does_not_silence_genuine_backend_failure():
+    """C-series adversarial review defect: embed.py::_load() has a THIRD
+    available=False branch beyond fts_only()/offline() -- a bare `except
+    Exception` catch-all for a genuine load failure (missing dependency,
+    corrupted model cache, persistent network failure), EmbedState.backend
+    == "none" rather than "off". Reproduced against the real loader by
+    forcing fastembed's supported-model list empty with neither
+    HAUNT_FTS_ONLY nor HAUNT_OFFLINE set: _load() returned available=False,
+    backend="none", error="fastembed has no supported text embedding
+    models". That is not "normal, permanent, and not actionable" -- it is
+    an operator-fixable fault -- so it must not be silenced just because
+    the dict shape (available=False, only `remaining` nonzero) is
+    identical to the deliberate-FTS-only case above. The caller
+    distinguishes the two by passing deliberately_off=False here (mirrors
+    bootstrap()'s own `embed_state.backend == "off"` check)."""
+    from haunt.bootstrap import _drain_worth_reporting
+
+    genuinely_broken = {
+        "processed": 0,
+        "failed": 0,
+        "batches": 1,
+        "remaining": 4,
+        "exhausted": 0,
+        "available": False,
+        "bound": 500,
+        "stop_reason": "blocked",
+        "stopped_early": True,
+    }
+    assert _drain_worth_reporting(genuinely_broken, deliberately_off=False) is True
 
 
 def test_drain_worth_reporting_keeps_block_while_backend_available():
@@ -423,7 +461,9 @@ def test_drain_worth_reporting_keeps_block_while_backend_available():
     block is never accidentally silenced alongside the FTS-only one, even
     though nothing in today's store.py can produce this combination --
     see the docstring on _drain_worth_reporting for why that decoupling
-    matters anyway."""
+    matters anyway. deliberately_off is moot here (available=True already
+    exits the silencing branch), so it is passed as False -- an available
+    backend can never actually be the deliberate-off shape."""
     from haunt.bootstrap import _drain_worth_reporting
 
     blocked_but_available = {
@@ -437,7 +477,7 @@ def test_drain_worth_reporting_keeps_block_while_backend_available():
         "stop_reason": "blocked",
         "stopped_early": True,
     }
-    assert _drain_worth_reporting(blocked_but_available) is True
+    assert _drain_worth_reporting(blocked_but_available, deliberately_off=False) is True
 
 
 def test_drain_worth_reporting_keeps_exhausted_even_when_unavailable():
@@ -458,7 +498,10 @@ def test_drain_worth_reporting_keeps_exhausted_even_when_unavailable():
         "stop_reason": "blocked",
         "stopped_early": True,
     }
-    assert _drain_worth_reporting(stale_failures_now_fts_only) is True
+    assert (
+        _drain_worth_reporting(stale_failures_now_fts_only, deliberately_off=True)
+        is True
+    )
 
 
 def test_drain_worth_reporting_still_silences_healthy_namespace():
@@ -477,7 +520,7 @@ def test_drain_worth_reporting_still_silences_healthy_namespace():
         "stop_reason": "drained",
         "stopped_early": False,
     }
-    assert _drain_worth_reporting(healthy) is False
+    assert _drain_worth_reporting(healthy, deliberately_off=False) is False
 
 
 def test_bootstrap_omits_permanently_fts_only_backlog_from_reembed_report(drain_env):
@@ -514,6 +557,75 @@ def test_bootstrap_omits_permanently_fts_only_backlog_from_reembed_report(drain_
             "SELECT COUNT(*) FROM embedding_jobs"
         ).fetchone()[0]
         assert still_queued == 4  # untouched -- genuinely stuck, just quiet about it
+
+
+def test_bootstrap_reports_genuine_embed_backend_failure(tmp_path, monkeypatch):
+    """End-to-end contrast case for the fix above: a namespace with a real
+    embedding_jobs backlog, stuck because the embed backend genuinely
+    failed to LOAD (neither HAUNT_FTS_ONLY nor HAUNT_OFFLINE set --
+    embed.py::_load()'s bare `except Exception` catch-all,
+    EmbedState.backend == "none"), must still appear in report["reembed"]
+    with its drain block. Before the fix, bootstrap._drain_worth_reporting
+    could not tell this apart from the deliberate FTS-only/offline shape
+    in test_bootstrap_omits_permanently_fts_only_backlog_from_reembed_report
+    above (both report available=False with only `remaining` nonzero) and
+    silenced it too.
+
+    _supported_fastembed is forced empty so `_load()` reaches its generic
+    "no supported model" RuntimeError deterministically, with no network
+    access and regardless of what is actually installed/cached in this
+    environment -- the same failure mode the task reproduced directly
+    against the real loader (error message: "fastembed has no supported
+    text embedding models").
+    """
+    import haunt.embed as embed_mod
+    from haunt.bootstrap import bootstrap, probe_sqlite_vec
+    from haunt.paths import ensure_layout
+    from haunt.store import Store, init_registry
+
+    home = tmp_path / "haunthome"
+    monkeypatch.setenv("HAUNT_HOME", str(home))
+    monkeypatch.delenv("HAUNT_FTS_ONLY", raising=False)
+    monkeypatch.delenv("HAUNT_OFFLINE", raising=False)
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "definitely-not-a-real-model")
+    monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
+    monkeypatch.setattr(embed_mod, "_supported_fastembed", lambda: {})
+    embed_mod.reset()
+    ensure_layout()
+    init_registry()
+    try:
+        if not probe_sqlite_vec().get("ok"):
+            pytest.skip("sqlite-vec extension not loadable in this environment")
+
+        with Store("broken-embed-backlog") as store:
+            for i in range(4):
+                store.observe(f"stuck row {i}", defer_embedding=True)
+            queued = store.conn.execute(
+                "SELECT COUNT(*) FROM embedding_jobs"
+            ).fetchone()[0]
+            assert queued == 4
+
+        report = bootstrap()
+        assert report["embed"]["available"] is False
+        assert report["backend"] == "none"  # not "off" -- confirms this is
+        # the genuine-failure branch, not fts_only()/offline()
+
+        names = {r.get("namespace"): r for r in report["reembed"]}
+        assert "broken-embed-backlog" in names, (
+            "a genuine embed-backend load failure must not be silenced the "
+            "same way deliberate FTS-only/offline is"
+        )
+        drain = names["broken-embed-backlog"]["drain"]
+        assert drain["available"] is False
+        assert drain["remaining"] == 4
+
+        with Store("broken-embed-backlog", create=False) as store:
+            still_queued = store.conn.execute(
+                "SELECT COUNT(*) FROM embedding_jobs"
+            ).fetchone()[0]
+            assert still_queued == 4  # untouched, same as the FTS-only case
+    finally:
+        embed_mod.reset()
 
 
 # ---------------------------------------------------------------------------

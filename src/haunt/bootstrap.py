@@ -96,7 +96,7 @@ class BootstrapError(SystemExit):
         super().__init__(1)
 
 
-def _drain_worth_reporting(drained: dict) -> bool:
+def _drain_worth_reporting(drained: dict, *, deliberately_off: bool) -> bool:
     """True when Store.drain_embedding_queue() found or touched anything
     worth telling the operator about.
 
@@ -120,17 +120,40 @@ def _drain_worth_reporting(drained: dict) -> bool:
     existed, a namespace in this shape produced no report line at all;
     this restores that silence for that specific shape rather than
     printing "stopped early (blocked)" -- wording that reads as a fault --
-    for a condition that is normal, permanent, and not actionable by the
-    operator. The top-level report already says the embedding backend is
-    off once per run (`sqlite-vec skipped (FTS-only)` / the `embed`
-    block); repeating it per namespace on every run adds no information,
-    only alarm. Anyone who wants the raw per-namespace backlog count can
-    still get it from Store.stats()'s `embedding_pending` /
-    `embedding_exhausted` fields (also what the dashboard's per-namespace
-    JSON exposes) -- it is only this alarming, repeats-forever bootstrap
-    report line that is silenced, not the underlying data.
+    for a namespace that is deliberately, permanently configured this way
+    and not actionable by the operator. The top-level report already says
+    the embedding backend is off once per run (`sqlite-vec skipped
+    (FTS-only)` / the `embed` block); repeating it per namespace on every
+    run adds no information, only alarm. Anyone who wants the raw
+    per-namespace backlog count can still get it from Store.stats()'s
+    `embedding_pending` / `embedding_exhausted` fields (also what the
+    dashboard's per-namespace JSON exposes) -- it is only this alarming,
+    repeats-forever bootstrap report line that is silenced, not the
+    underlying data.
 
-    This checks the `available` flag itself rather than
+    `deliberately_off` is the caller's answer to "is `available=False`
+    actually this deliberate, permanent shape, or something else".
+    embed.py::_load() has THREE branches that all report
+    available=False: fts_only(), offline(), and a bare `except Exception`
+    catch-all for a genuine load failure (missing dependency, corrupted
+    model cache, persistent network failure). Only the first two are
+    "normal, permanent, and not actionable" -- both set
+    EmbedState.backend="off" for exactly this reason. The catch-all sets
+    EmbedState.backend="none" and is none of those things: it is an
+    operator-fixable fault that can start or stop happening between runs,
+    and silencing it here would hide a real backlog stuck for a reason
+    the operator can actually do something about. The caller
+    (bootstrap()) passes `embed_state.backend == "off"` -- reading the
+    very EmbedState that already decided `available`, rather than
+    re-deriving fts_only()/offline() a second time, which could disagree
+    with the state that actually produced this `drained` result if
+    anything about the environment changed in between. Threading this in
+    as an explicit parameter (instead of calling fts_only()/offline()
+    directly in here) also keeps this function a pure, hermetic check of
+    its inputs -- see the tests, none of which need to control process
+    env to exercise every branch.
+
+    This also checks the `available` flag itself rather than
     `stop_reason == "blocked"`, and only silences when `processed`,
     `failed`, and `exhausted` are *all* zero too -- so it stays narrowly
     scoped to "nothing happened because there is no backend at all, and
@@ -141,11 +164,13 @@ def _drain_worth_reporting(drained: dict) -> bool:
     off `available` rather than the derived stop_reason string also means
     this stays correct even if a future change adds some other way to
     reach stop_reason="blocked" -- the only thing silenced here is "no
-    backend, nothing else to say", never a block that happens with a
-    working backend.
+    backend, and it is deliberately, permanently configured that way,
+    with nothing else to say" -- never a block that happens with a
+    working backend, and never a genuine embedding-backend load failure.
     """
     if (
         drained.get("available") is False
+        and deliberately_off
         and not drained.get("processed")
         and not drained.get("failed")
         and not drained.get("exhausted")
@@ -210,7 +235,13 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                 # bootstrap` indefinitely -- see Store.drain_embedding_queue.
                 drained = st.drain_embedding_queue()
                 entry = dict(changed) if changed else {}
-                if changed or _drain_worth_reporting(drained):
+                # embed_state is the same EmbedState warmup() already
+                # produced above -- backend=="off" only for _load()'s
+                # fts_only()/offline() branches, never for the genuine
+                # load-failure catch-all -- see _drain_worth_reporting.
+                if changed or _drain_worth_reporting(
+                    drained, deliberately_off=(embed_state.backend == "off")
+                ):
                     entry["drain"] = drained
                     entry["namespace"] = row["name"]
                     entry["auto"] = True

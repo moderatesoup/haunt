@@ -393,3 +393,21 @@ def test_mmr_diversity_penalty_is_scaled_by_one_minus_lambda():
         "outweigh a 0.85 relevance gap; picking 'far' means the (1 - lambda_) "
         "factor was dropped"
     )
+
+
+def test_readme_documents_rerank_env_vars():
+    """C-series adversarial review defect (LOW): HAUNT_RERANK_ENABLED and
+    HAUNT_RERANK_LAMBDA appeared nowhere in README.md, unlike every other
+    env var this branch adds. Guards against that regressing, and against
+    the table saying so without also being clear the reranker is off by
+    default and wired into no call site today (this module's own
+    docstring: "No production call path imports this module yet") -- a
+    reader who only sees the var names could reasonably assume setting
+    them does something today.
+    """
+    from pathlib import Path
+
+    readme = Path("README.md").read_text(encoding="utf-8")
+    assert RERANK_ENABLED_ENV in readme
+    assert RERANK_LAMBDA_ENV in readme
+    assert "no call site" in readme.lower()

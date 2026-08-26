@@ -830,6 +830,292 @@ def test_embeddings_stripped_fts_rebuilt_jobs_requeued(reconcile_home):
         assert still_there == b"\x01\x02\x03\x04"
 
 
+# ---------------------------------------------------------------------------
+# C-series adversarial review defect (merge blocker): re-queueing on
+# reconcile must mirror SOURCE's own embed-capture outcome, not blindly
+# enqueue every copied row. Before this fix, a row that SOURCE deliberately
+# captured-but-never-embedded (skip_embedding=True, the C6 policy, or
+# HAUNT_EMBED_EXCLUDE_TOOLS at the hook layer) got queued in TARGET and
+# silently embedded on the next drain -- exactly the tool exhaust the
+# policy exists to keep out of the vector index. See
+# _reconcile_requeue_embedding in src/haunt/store.py for the fix and the
+# exhausted-row reasoning. The last test in this block
+# (test_reconcile_tolerates_source_missing_embedding_jobs_table) instead
+# guards the fix's OWN blast radius: it now reads SOURCE's embedding_jobs
+# table, which a never-migrated read-only SOURCE can genuinely lack.
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_excludes_skip_embedding_row_from_target_queue(reconcile_home):
+    """The core defect repro: a skip_embedding=True row in SOURCE (the C6
+    capture policy -- what HAUNT_EMBED_EXCLUDE_TOOLS uses at the hook
+    layer) must come out the other side of reconcile still unembedded AND
+    still unqueued in TARGET. Queuing it would silently embed policy-
+    excluded tool exhaust on the next drain."""
+    register_namespace("policy-src")
+    with Store("policy-src") as st:
+        r = st.observe(
+            "$ curl -s https://example.com/secret | jq .token",
+            tool_name="Bash",
+            skip_embedding=True,
+        )
+        mem_id = r.memory_id
+        # Sanity: reproduce the precondition this defect assumes -- SOURCE
+        # really did admit this with neither an embedding nor a queued job.
+        src_row = st.conn.execute(
+            "SELECT embedding FROM memories WHERE id=?", (mem_id,)
+        ).fetchone()
+        assert src_row["embedding"] is None
+        assert (
+            st.conn.execute(
+                "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (mem_id,)
+            ).fetchone()
+            is None
+        )
+
+    register_namespace("policy-dst")
+    with Store("policy-dst") as st:
+        st.observe("unrelated dst content")
+
+    _plan_and_apply("policy-src", "policy-dst")
+
+    with Store("policy-dst", create=False) as st:
+        row = st.conn.execute(
+            "SELECT embedding FROM memories WHERE id=?", (mem_id,)
+        ).fetchone()
+        assert row is not None, "the row itself must still be copied"
+        assert row["embedding"] is None
+        job = st.conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (mem_id,)
+        ).fetchone()
+        assert job is None, (
+            "skip_embedding row must not be queued for embedding in TARGET"
+        )
+
+
+def test_reconcile_requeues_row_actually_embedded_via_observe(
+    reconcile_home, monkeypatch
+):
+    """The mirror-image case, driven through the real capture-policy code
+    path (observe() with skip_embedding=False) rather than a raw SQL
+    UPDATE: a row SOURCE genuinely embedded must be re-queued in TARGET,
+    since reconcile drops the embedding itself and TARGET needs to
+    recompute it under its own model. Complements
+    test_embeddings_stripped_fts_rebuilt_jobs_requeued above, which
+    exercises the same outcome by injecting a raw embedding blob."""
+    import haunt.store as store_mod
+
+    def fake_embed_one(text):
+        return [0.1, 0.2, 0.3, 0.4] if (text or "").strip() else None
+
+    monkeypatch.setattr(store_mod, "embed_one", fake_embed_one)
+
+    register_namespace("embedded-src")
+    with Store("embedded-src") as st:
+        r = st.observe("genuinely embedded content")
+        mem_id = r.memory_id
+        src_row = st.conn.execute(
+            "SELECT embedding FROM memories WHERE id=?", (mem_id,)
+        ).fetchone()
+        assert src_row["embedding"] is not None  # sanity: real embed path ran
+
+    register_namespace("embedded-dst")
+    with Store("embedded-dst") as st:
+        st.observe("unrelated dst content")
+
+    _plan_and_apply("embedded-src", "embedded-dst")
+
+    with Store("embedded-dst", create=False) as st:
+        row = st.conn.execute(
+            "SELECT embedding FROM memories WHERE id=?", (mem_id,)
+        ).fetchone()
+        assert row["embedding"] is None  # dropped, per documented reconcile behavior
+        job = st.conn.execute(
+            "SELECT attempts FROM embedding_jobs WHERE memory_id=?", (mem_id,)
+        ).fetchone()
+        assert job is not None, "previously-embedded row must be re-queued in TARGET"
+        assert job["attempts"] == 0
+
+
+def test_reconcile_preserves_pending_embedding_job_state(reconcile_home):
+    """A row SOURCE never embedded but did queue (attempts > 0 from a
+    prior transient failure, still under the cap) must arrive in TARGET
+    with that exact state -- attempts, last_error, and queued_at intact --
+    rather than a fresh `INSERT ... attempts=0` that would discard the
+    retry history and let it silently get another full retry budget."""
+    register_namespace("pending-src")
+    with Store("pending-src") as st:
+        r = st.observe("deferred content awaiting embedding", defer_embedding=True)
+        mem_id = r.memory_id
+        src_memory = st.conn.execute(
+            "SELECT embedding, created_at FROM memories WHERE id=?", (mem_id,)
+        ).fetchone()
+        assert src_memory["embedding"] is None
+        # queued_at is deliberately set far from created_at: observe()
+        # happens to leave them equal at admission (both come from the
+        # same `ts`), which would let a reconcile that reuses
+        # `created_at` (the pre-fix behavior for the *embedded* branch)
+        # accidentally look right here too. Forcing them apart makes the
+        # "queued_at survives verbatim" assertion below actually
+        # discriminate that from "queued_at was recomputed".
+        st.conn.execute(
+            "UPDATE embedding_jobs SET attempts=2, last_error=?, queued_at=? "
+            "WHERE memory_id=?",
+            (
+                "simulated transient failure",
+                "2020-01-01T00:00:00.000000+00:00",
+                mem_id,
+            ),
+        )
+        st.conn.commit()
+        job_before = dict(
+            st.conn.execute(
+                "SELECT queued_at, attempts, last_error FROM embedding_jobs "
+                "WHERE memory_id=?",
+                (mem_id,),
+            ).fetchone()
+        )
+        assert job_before["queued_at"] != src_memory["created_at"]
+
+    register_namespace("pending-dst")
+    with Store("pending-dst") as st:
+        st.observe("unrelated dst content")
+
+    _plan_and_apply("pending-src", "pending-dst")
+
+    with Store("pending-dst", create=False) as st:
+        job_after = st.conn.execute(
+            "SELECT queued_at, attempts, last_error FROM embedding_jobs "
+            "WHERE memory_id=?",
+            (mem_id,),
+        ).fetchone()
+        assert job_after is not None
+        assert job_after["attempts"] == job_before["attempts"] == 2
+        assert (
+            job_after["last_error"]
+            == job_before["last_error"]
+            == "simulated transient failure"
+        )
+        assert job_after["queued_at"] == job_before["queued_at"]
+
+
+def test_reconcile_does_not_reset_attempts_for_exhausted_row(reconcile_home):
+    """The exhausted-row decision, stated explicitly and verified two
+    ways: a SOURCE row already at HAUNT_EMBED_MAX_ATTEMPTS must land in
+    TARGET with its `attempts` counter copied verbatim, not reset to 0.
+    max_attempts is evaluated dynamically at drain time (never persisted
+    per-row), so copying the raw count is what keeps a copied exhausted
+    row excluded from TARGET's own process_embedding_jobs selection
+    immediately -- resetting it would resurrect a known-bad row into a
+    fresh retry loop, which this explicitly refuses to do."""
+    from haunt.store import EMBED_MAX_ATTEMPTS_DEFAULT
+
+    register_namespace("exhausted-src")
+    with Store("exhausted-src") as st:
+        r = st.observe("content that always fails to embed", defer_embedding=True)
+        mem_id = r.memory_id
+        st.conn.execute(
+            "UPDATE embedding_jobs SET attempts=?, last_error=? WHERE memory_id=?",
+            (EMBED_MAX_ATTEMPTS_DEFAULT, "permanent failure", mem_id),
+        )
+        st.conn.commit()
+
+    register_namespace("exhausted-dst")
+    with Store("exhausted-dst") as st:
+        st.observe("unrelated dst content")
+
+    _plan_and_apply("exhausted-src", "exhausted-dst")
+
+    with Store("exhausted-dst", create=False) as st:
+        # 1) The raw column value: not reset to 0.
+        job = st.conn.execute(
+            "SELECT attempts, last_error FROM embedding_jobs WHERE memory_id=?",
+            (mem_id,),
+        ).fetchone()
+        assert job is not None
+        assert job["attempts"] == EMBED_MAX_ATTEMPTS_DEFAULT, (
+            "copying an exhausted row must not reset its attempts counter"
+        )
+        assert job["last_error"] == "permanent failure"
+        # 2) Behaviorally: TARGET's own stats() must classify it as
+        # exhausted, not pending -- i.e. it does not silently get a fresh
+        # retry budget just because it was copied. The unrelated
+        # "unrelated dst content" row (queued fresh, attempts=0) is the
+        # only pending one.
+        stats = st.stats()
+        assert stats["embedding_exhausted"] == 1
+        assert stats["embedding_pending"] == 1
+        row = st.conn.execute(
+            "SELECT embedding FROM memories WHERE id=?", (mem_id,)
+        ).fetchone()
+        assert row["embedding"] is None
+
+
+def test_reconcile_tolerates_source_missing_embedding_jobs_table(reconcile_home):
+    """A blast-radius check on the fix itself, not the original defect:
+    SOURCE is opened via open_existing_readonly (a ReadOnlyStore), which
+    deliberately never runs schema migration on open -- see its class
+    docstring: "the latter [Store(create=False)] intentionally performs
+    migration/configuration work for writers" and "do not repair a
+    corrupt/old database while reading it." A namespace old enough to
+    predate the embedding_jobs table -- exactly the C3 motivating shape,
+    a long-lived legacy database like `ironscope` that was never since
+    opened by a current writer -- can genuinely lack that table on disk.
+
+    The pre-fix code never queried SOURCE at all (it only ever wrote to
+    TARGET, which open_existing always migrates), so it had no dependency
+    on SOURCE's embedding_jobs existing. Naively querying it from
+    _reconcile_requeue_embedding would turn a merely-old, perfectly valid
+    SOURCE database into a hard `sqlite3.OperationalError: no such table:
+    embedding_jobs` for the *whole* reconcile apply -- a regression this
+    fix must not introduce. Missing table must be handled exactly like
+    "no job row": don't enqueue, don't crash.
+    """
+    register_namespace("old-schema-src")
+    with Store("old-schema-src") as st:
+        r = st.observe(
+            "row from a namespace older than embedding_jobs", defer_embedding=True
+        )
+        mem_id = r.memory_id
+        assert (
+            st.conn.execute(
+                "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (mem_id,)
+            ).fetchone()
+            is not None
+        )
+        st.conn.execute("DROP TABLE embedding_jobs")
+        st.conn.commit()
+        assert (
+            st.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='embedding_jobs'"
+            ).fetchone()
+            is None
+        )
+
+    register_namespace("old-schema-dst")
+    with Store("old-schema-dst") as st:
+        st.observe("unrelated dst content")
+
+    # The point of the test: this must not raise.
+    _plan_and_apply("old-schema-src", "old-schema-dst")
+
+    with Store("old-schema-dst", create=False) as st:
+        row = st.conn.execute(
+            "SELECT embedding FROM memories WHERE id=?", (mem_id,)
+        ).fetchone()
+        assert row is not None, "the row itself must still be copied"
+        assert row["embedding"] is None
+        job = st.conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (mem_id,)
+        ).fetchone()
+        assert job is None, (
+            "no job info was available from SOURCE (table absent), so "
+            "TARGET must not enqueue -- same 'no positive signal' rule as "
+            "the skip_embedding case, not a fresh INSERT"
+        )
+
+
 def test_meta_table_never_copied(reconcile_home):
     register_namespace("meta-src")
     with Store("meta-src") as st:
@@ -1051,7 +1337,11 @@ def test_every_content_table_is_in_the_reconcile_copy_set(reconcile_home):
     # Deliberately not copied, each for a stated reason:
     #   meta          - per-database identity (schema_version, embed_dim);
     #                   TARGET keeps its own or the merge would corrupt it.
-    #   embedding_jobs - regenerated: copied rows are re-queued, not moved.
+    #   embedding_jobs - not row-for-row copied: re-derived per copied
+    #                   memories row from SOURCE's own embed/queue state
+    #                   (see _reconcile_requeue_embedding) so a
+    #                   skip_embedding-excluded row stays excluded instead
+    #                   of being blindly re-queued in TARGET.
     #   memories_fts* - FTS5 shadow tables, rebuilt from copied memories.
     #   vec_memories* - vec0 shadow tables; embeddings are re-derived.
     #   sqlite_*      - SQLite internals.

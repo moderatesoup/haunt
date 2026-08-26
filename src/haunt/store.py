@@ -4215,6 +4215,103 @@ def _backup_namespace_database(store: "ReadOnlyStore", *, purpose: str) -> _Veri
         os.close(backup_root_fd)
 
 
+def _reconcile_requeue_embedding(
+    source_conn: sqlite3.Connection,
+    target_conn: sqlite3.Connection,
+    values: dict[str, Any],
+    *,
+    source_embedded: bool,
+    source_has_embedding_jobs: bool,
+) -> None:
+    """Mirror SOURCE's embed-capture outcome onto a freshly-copied TARGET row.
+
+    reconcile() always nulls out `memories.embedding` on copy (vectors are
+    never carried across a possibly differently-configured model/dim --
+    see the module comment above `_RECONCILE_TABLES`), so a naive "always
+    enqueue" would defeat any capture policy (`skip_embedding` /
+    `HAUNT_EMBED_EXCLUDE_TOOLS`, see observe()'s C6 docstring) SOURCE
+    applied at admission: a row deliberately captured-but-never-embedded in
+    SOURCE would get queued in TARGET and silently embedded on the next
+    drain -- putting exactly the tool exhaust the policy excludes into the
+    vector index.
+
+    This function never re-derives the policy from today's env (reconcile
+    writes raw SQL and never calls observe(), which is the only place the
+    policy is actually evaluated) -- that could disagree with the decision
+    actually made at admission, since env can change between then and now
+    and SOURCE/TARGET can even be different hosts. Instead it preserves
+    whatever SOURCE's own state already says:
+
+      - SOURCE had a non-NULL `embedding` (`source_embedded`) -> enqueue.
+        It was embedded, and the caller just dropped that embedding, so
+        TARGET genuinely needs to (re)compute it under TARGET's own model.
+      - SOURCE had no embedding but an `embedding_jobs` row -> copy that
+        row verbatim, `attempts`/`last_error`/`queued_at` included, rather
+        than a fresh `INSERT ... queued_at=now`. Copying `attempts` as-is
+        (never resetting to 0) matters most for a row already at or past
+        HAUNT_EMBED_MAX_ATTEMPTS: max_attempts is evaluated dynamically
+        from env at drain time (_embed_max_attempts()), never persisted,
+        so a copied exhausted row is still excluded from TARGET's
+        process_embedding_jobs SELECT immediately -- it does not get a
+        fresh retry budget just for having been copied. A row still under
+        the cap keeps its real remaining budget (max_attempts - attempts)
+        instead of extra tries for free.
+      - SOURCE had neither -> do not enqueue. That is the policy-excluded
+        case (skip_embedding at admission) or blank content; TARGET must
+        preserve the exclusion, not resurrect it.
+
+    `source_has_embedding_jobs` guards a real regression the naive
+    version of this fix introduced: SOURCE is a ReadOnlyStore connection
+    (see open_existing_readonly), which deliberately never runs schema
+    migration on open -- "do not repair a corrupt/old database while
+    reading it" (ReadOnlyStore's own class docstring). A namespace old
+    enough to predate `embedding_jobs` (exactly the shape C3 exists to
+    reconcile: a long-lived legacy database like `ironscope`) can
+    genuinely lack that table on disk if it was never since opened by a
+    writer running current code. The pre-fix code never queried SOURCE at
+    all -- it only ever wrote to TARGET, which open_existing always
+    migrates -- so it had no dependency on SOURCE's embedding_jobs
+    existing. Querying it unconditionally would turn a merely-old,
+    perfectly valid SOURCE database into a hard crash (`sqlite3
+    .OperationalError: no such table: embedding_jobs`) for the whole
+    reconcile apply. The caller checks existence once via
+    `_table_columns` (PRAGMA table_info tolerates a missing table,
+    returning `[]` rather than raising) instead of a query here per row.
+    Missing table -> treated exactly like "no job row": don't enqueue,
+    consistent with "no positive signal that SOURCE wanted embedding".
+    """
+    memory_id = values["id"]
+    if source_embedded:
+        target_conn.execute(
+            """
+            INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
+            VALUES (?, ?)
+            """,
+            (memory_id, values["created_at"]),
+        )
+        return
+    if not source_has_embedding_jobs:
+        return
+    source_job = source_conn.execute(
+        "SELECT queued_at, attempts, last_error FROM embedding_jobs WHERE memory_id=?",
+        (memory_id,),
+    ).fetchone()
+    if source_job is None:
+        return
+    target_conn.execute(
+        """
+        INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at, attempts, last_error)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            memory_id,
+            source_job["queued_at"],
+            source_job["attempts"],
+            source_job["last_error"],
+        ),
+    )
+
+
 def _execute_reconciliation_writes(
     source_conn: sqlite3.Connection, target_conn: sqlite3.Connection
 ) -> dict[str, dict[str, int]]:
@@ -4234,6 +4331,13 @@ def _execute_reconciliation_writes(
         raise NamespaceCollisionError(
             "cannot safely reconcile: " + "; ".join(unsafe_reasons)
         )
+    # Checked once, not per row: SOURCE is a never-migrated read-only
+    # connection (see _reconcile_requeue_embedding's docstring), so a
+    # legacy database old enough to predate embedding_jobs must not crash
+    # the whole apply just because this fix now looks at it.
+    # _table_columns tolerates a missing table (PRAGMA table_info returns
+    # `[]` rather than raising).
+    source_has_embedding_jobs = bool(_table_columns(source_conn, "embedding_jobs"))
     table_results: dict[str, dict[str, int]] = {}
     for table, _pk_columns, _ignore in _RECONCILE_TABLES:
         diff = diffs[table]
@@ -4243,7 +4347,9 @@ def _execute_reconciliation_writes(
         inserted = 0
         for row in diff.to_insert:
             values = dict(row)
+            source_embedded = False
             if table == "memories":
+                source_embedded = values.get("embedding") is not None
                 values["embedding"] = None
             target_conn.execute(
                 f"INSERT INTO {table}({column_list}) VALUES ({placeholders})",
@@ -4255,12 +4361,12 @@ def _execute_reconciliation_writes(
                     "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
                     (values["id"], values["content"]),
                 )
-                target_conn.execute(
-                    """
-                    INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
-                    VALUES (?, ?)
-                    """,
-                    (values["id"], values["created_at"]),
+                _reconcile_requeue_embedding(
+                    source_conn,
+                    target_conn,
+                    values,
+                    source_embedded=source_embedded,
+                    source_has_embedding_jobs=source_has_embedding_jobs,
                 )
         table_results[table] = {
             "inserted": inserted,
@@ -5494,6 +5600,22 @@ class Store:
         # vec_memories was never created (nothing has ever embedded
         # successfully yet) -- see _vec_memories_count. Without this flag,
         # both of those look identical to "fully embedded, nothing queued".
+        #
+        # C-series capture policy caveat: memories_embedded +
+        # embedding_pending + embedding_exhausted does NOT always sum to
+        # `memories`. A row admitted with skip_embedding=True (the C6
+        # capture policy -- see observe()) is written in full but
+        # deliberately gets neither a non-NULL `embedding` nor an
+        # `embedding_jobs` row, and the same is true of a row with
+        # blank/whitespace-only content -- both are a fourth, currently
+        # unlabeled bucket ("will never be embedded, by design") absent
+        # from all three counters above. Nothing in this repo computes a
+        # coverage percentage from these fields today, but anyone who
+        # later does (e.g. memories_embedded / memories * 100) will land
+        # short of 100% forever on a namespace with policy-excluded rows,
+        # even once every embeddable row really is embedded. If that
+        # bucket ever needs its own counter, it is `memories` rows with
+        # `embedding IS NULL` and no matching `embedding_jobs` row.
         max_attempts = _embed_max_attempts()
         vec_count = self._vec_memories_count()
         # C7 phase 1: content_hash only exists once a writer has completed
