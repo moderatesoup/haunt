@@ -84,7 +84,11 @@ RECALL_CLASSES = ("tool", "task")
 # 7: database-enforced append-only corrections outside authorized purge.
 # 8: validated, versioned source provenance on events.
 # 9: explicit recall-residue classification on new events only.
-SCHEMA_VERSION = 9
+# 10: content_hash on memories, populated at admission and backfilled for
+#     existing rows. Measurement only -- phase 1 changes no write
+#     behavior, suppresses nothing, and collapses no rows. See
+#     _content_hash for why normalization is deliberately absent.
+SCHEMA_VERSION = 10
 SCHEMA_VERSION_KEY = "schema_version"
 REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
@@ -1232,6 +1236,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             valid_from TEXT NOT NULL,
             valid_to TEXT,
             created_at TEXT NOT NULL,
+            content_hash TEXT,
             FOREIGN KEY (event_id) REFERENCES events(id)
         );
         CREATE TABLE IF NOT EXISTS entities (
@@ -1466,6 +1471,45 @@ def _ensure_provenance_type_triggers(conn: sqlite3.Connection) -> None:
         )
 
 
+def _content_hash(content: str) -> str:
+    """SHA-256 hex digest over the exact stored ``content`` bytes (UTF-8).
+
+    Deliberately no normalization: no case-folding, no whitespace-
+    stripping, no Unicode normalization, no semantic similarity. Two
+    memory rows collide here if and only if their stored content is
+    byte-identical. Measured against the dogfooded corpus, normalizing
+    before hashing was found to buy essentially nothing beyond exact-byte
+    matching, while semantic/normalized collapse risks silently treating
+    genuinely distinct facts as duplicates -- the dangerous direction for
+    a verbatim memory store to err toward.
+
+    This is a measurement primitive only (C7 phase 1): nothing reads this
+    hash to suppress, collapse, or short-circuit a write. See
+    SCHEMA_VERSION's v10 note.
+    """
+    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+
+
+def _backfill_content_hashes(conn: sqlite3.Connection) -> int:
+    """Populate content_hash for memory rows written before schema v10.
+
+    Uses the exact same hash function observe() uses at admission, so a
+    backfilled row and a freshly written row with identical content always
+    produce identical hashes. Only ever fills the new column -- `content`
+    itself is never read back out and rewritten. Returns the row count
+    touched.
+    """
+    rows = conn.execute(
+        "SELECT id, content FROM memories WHERE content_hash IS NULL"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE memories SET content_hash=? WHERE id=?",
+            (_content_hash(row["content"]), row["id"]),
+        )
+    return len(rows)
+
+
 def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     """Create tables and run one-time migrations. Not invoked per query."""
     _init_namespace_schema(conn)
@@ -1563,6 +1607,21 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE events ADD COLUMN recall_class TEXT "
                 "CHECK(recall_class IN ('tool', 'task') OR recall_class IS NULL)"
             )
+    if current < 10:
+        memory_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "content_hash" not in memory_columns:
+            conn.execute("ALTER TABLE memories ADD COLUMN content_hash TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_content_hash "
+            "ON memories(content_hash)"
+        )
+        # Unlike v9's recall_class, backfill is both possible and required
+        # here: every existing row's content is already present, so its
+        # hash is deterministically recomputable. This only ever fills the
+        # new column -- it never reads back and rewrites `content` itself.
+        _backfill_content_hashes(conn)
     _ensure_correction_invariant_triggers(conn)
     _ensure_correction_append_only_triggers(conn)
     _ensure_provenance_type_triggers(conn)
@@ -4179,6 +4238,12 @@ class Store:
         if tier not in TIERS:
             raise ValueError(f"tier must be one of {TIERS}")
         text = verbatim_text(content, tool_name, tool_input, tool_output)
+        # C7 phase 1: measurement only. This hash is never read back to
+        # suppress, collapse, or short-circuit a write -- it is purely an
+        # indexed column that feeds Store.stats() duplicate counting. It
+        # is a separate mechanism from the idempotency-key replay check
+        # below, which is what actually changes what gets written.
+        content_hash = _content_hash(text)
         idem = (idempotency_key or "").strip() or None
         if idem and len(idem) > 512:
             raise ValueError("idempotency_key must be 512 characters or fewer")
@@ -4254,10 +4319,11 @@ class Store:
             self.conn.execute(
                 """
                 INSERT INTO memories(
-                    id, event_id, tier, content, embedding, valid_from, valid_to, created_at
-                ) VALUES (?,?,?,?,?,?,?,?)
+                    id, event_id, tier, content, embedding, valid_from, valid_to, created_at,
+                    content_hash
+                ) VALUES (?,?,?,?,?,?,?,?,?)
                 """,
-                (memory_id, event_id, tier, text, blob, vf, vt, ts),
+                (memory_id, event_id, tier, text, blob, vf, vt, ts, content_hash),
             )
             # Unconditional -- runs regardless of skip_embedding (or
             # defer_embedding, or blob). This is what makes a capture-policy
@@ -4874,6 +4940,34 @@ class Store:
         # both of those look identical to "fully embedded, nothing queued".
         max_attempts = _embed_max_attempts()
         vec_count = self._vec_memories_count()
+        # C7 phase 1: content_hash only exists once a writer has completed
+        # the v10 migration (_ensure_namespace_schema). ReadOnlyStore never
+        # migrates -- see its class docstring -- so a database that has
+        # never yet been opened by a writer at this code version would
+        # otherwise make this raise "no such column: content_hash" instead
+        # of reporting an honest zero.
+        memory_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        duplicate_memories = 0
+        duplicate_content_values = 0
+        if "content_hash" in memory_columns:
+            dup_row = self.conn.execute(
+                """
+                SELECT COALESCE(SUM(n - 1), 0) AS dup_memories,
+                       COUNT(*) AS dup_values
+                FROM (
+                    SELECT COUNT(*) AS n
+                    FROM memories
+                    WHERE content_hash IS NOT NULL
+                    GROUP BY content_hash
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()
+            duplicate_memories = int(dup_row["dup_memories"] or 0)
+            duplicate_content_values = int(dup_row["dup_values"] or 0)
         return json_safe_sqlite(
             {
                 "namespace": self.name,
@@ -4896,6 +4990,8 @@ class Store:
                 "embedding_exhausted": self._exhausted_embedding_jobs(max_attempts),
                 "vector_index": vec_count is not None,
                 "vector_index_version": self.vec_version(),
+                "duplicate_memories": duplicate_memories,
+                "duplicate_content_values": duplicate_content_values,
             }
         )
 
