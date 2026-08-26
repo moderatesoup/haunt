@@ -207,6 +207,8 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
 | `haunt recall QUERY [--as-of --since --until --clock --tier --k] [--include-residue] [--json]` | read-only hybrid recall (vec + FTS5 + RRF); ranked results exclude tool/task residue unless explicitly requested; `--json` emits explanations |
 | `haunt maintenance [-n NAMESPACE] [--limit 64] [--json]` | explicit mutating embedding upgrade/job-drain surface; never run by recall and never creates an unknown namespace |
+| `haunt export OUTPUT [-n NAMESPACE] [--cut ISO]` | write a new mode-0600 canonical v1 namespace bundle; warns that verbatim data is sensitive |
+| `haunt import BUNDLE [--timeout SECONDS] [limit options]` | strictly validate and transactionally import/replay one canonical namespace bundle |
 | `haunt correct MEMORY_ID --idempotency-key KEY [--replacement --reason]` | atomically append a correction and optional verbatim replacement; omitted/null, empty, and whitespace-only replacement values are distinct; a nonempty caller key is required for safe retries |
 | `haunt trace MEMORY_ID` | ordered correction chain from any surviving member, including erased-gap tombstones |
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |
@@ -226,6 +228,33 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt install` | bind all known hosts (Cursor, Claude Code): hooks + MCP + rules + skill |
 | `haunt doctor` | check sqlite-vec (or FTS-only), haunt-mcp wrapper/python, embed (or FTS-only), and host files; rematch host files if missing; exit 1 if any check fails |
 | `haunt cursor-install` | bind Cursor only: hooks.json + mcp.json + haunt.mdc + skill |
+
+### Portable namespace bundles
+
+`haunt export` moves durable namespace semantics—not SQLite implementation
+state. The v1 bundle preserves the stable namespace ID and aliases, sessions,
+events, memory IDs and validity, corrections/tombstones, provenance, entities,
+mentions, and graph evidence. It excludes local paths, embeddings, FTS/vector
+tables, jobs, and WAL files. Import rebuilds destination-local indexes and
+queues non-empty text memories for the destination embedding model.
+
+```bash
+haunt export project.haunt.json -n project
+HAUNT_HOME=/path/to/fresh-home haunt import project.haunt.json --json
+```
+
+Default exports use a stable durable high-water temporal cut, so unchanged
+exports and a fresh import/re-export retain the same semantic digest. Use
+`--cut` for an explicit historical instant. Import is bounded, validates before
+publication, is idempotent for an exact replay, and rejects identity/alias or
+record conflicts rather than merging ambiguously.
+
+The file contains potentially sensitive verbatim history. The digest detects
+transfer corruption; it is not encryption or proof of authorship. MCP transfer
+tools require `HAUNT_MCP_ADMIN=1`. Dashboard transfer uses the launch-token
+authenticated export API and the trusted-Origin import API; the HTML console
+intentionally has no paste/import control. See
+[the v1 format contract](docs/EXPORT_FORMAT.md) and [SECURITY.md](SECURITY.md).
 
 ## MCP
 
@@ -253,7 +282,7 @@ Equal ranked scores are ordered by stable memory ID. Dashboard all-namespace res
 
 `haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
 
-Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_trace`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`. `memory_contradict` requires a nonempty caller `idempotency_key`; supplying the same key and exact correction payload safely replays the original result. Replacement strings are verbatim: omitted/null means no replacement, while empty and whitespace-only strings create replacements with those exact bytes.
+Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_trace`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_export_bundle`, `memory_import_bundle`, `memory_session_end`. Export/import are admin-only. `memory_contradict` requires a nonempty caller `idempotency_key`; supplying the same key and exact correction payload safely replays the original result. Replacement strings are verbatim: omitted/null means no replacement, while empty and whitespace-only strings create replacements with those exact bytes.
 
 `memory_observe.provenance` accepts a versioned object. Native envelopes use `kind="native"`; Haunt binds the actual entry channel (`mcp` here), `origin`, and supplied producer tool/call ID rather than trusting claimed values. Direct Python, CLI, Cursor hook, Claude Code hook, dashboard correction, and evaluation writes use their own explicit channels. Import envelopes use `kind="import"` and require canonical `imported_at`, `fidelity`, and `original_blob_sha256` (set it to `null` when no original blob exists). Source platform/native ID, format/parser version, and ordered transforms remain absent or null when unknown. Provenance and import fidelity are attribution—not confidence or truth scores.
 

@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import get_ident
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import sqlite_vec
 
@@ -90,6 +90,7 @@ REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
 _NAMESPACE_DB_HANDLE_LOCK = SQLITE_OPEN_LOCK
 _NAMESPACE_MIGRATION_LOCK = threading.RLock()
+_NAMESPACE_MIGRATION_STATE = threading.local()
 _SQLITE_CONFIGURATION_LOCK = threading.RLock()
 _SQLITE_CONFIGURATION_STATE = threading.local()
 
@@ -98,43 +99,57 @@ _SQLITE_CONFIGURATION_STATE = threading.local()
 def _namespace_migration_lock() -> Iterator[None]:
     """Serialize migration plan verification/apply across local processes."""
     with _NAMESPACE_MIGRATION_LOCK:
-        root = haunt_home()
-        mkdir_private(root)
-        lock_path = root / ".namespace-migration.lock"
-        nofollow = required_o_nofollow()
-        flags = os.O_RDWR | nofollow | getattr(os, "O_CLOEXEC", 0)
-        try:
-            fd = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            fd = os.open(lock_path, flags)
-        try:
-            held = os.fstat(fd)
-            current = lock_path.lstat()
-            if (
-                not stat.S_ISREG(held.st_mode)
-                or not stat.S_ISREG(current.st_mode)
-                or stat.S_ISLNK(current.st_mode)
-                or int(held.st_nlink) != 1
-                or int(current.st_nlink) != 1
-                or stat.S_IMODE(held.st_mode) != 0o600
-                or (int(held.st_dev), int(held.st_ino))
-                != (int(current.st_dev), int(current.st_ino))
-            ):
-                raise NamespaceMigrationError("namespace migration lock is unsafe")
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            current = lock_path.lstat()
-            if (int(current.st_dev), int(current.st_ino)) != (
-                int(held.st_dev), int(held.st_ino)
-            ):
-                raise NamespaceMigrationError(
-                    "namespace migration lock changed while acquiring it"
-                )
-            yield
-        finally:
+        depth = int(getattr(_NAMESPACE_MIGRATION_STATE, "depth", 0))
+        if depth:
+            _NAMESPACE_MIGRATION_STATE.depth = depth + 1
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                yield
             finally:
-                os.close(fd)
+                _NAMESPACE_MIGRATION_STATE.depth = depth
+            return
+        _NAMESPACE_MIGRATION_STATE.depth = 1
+        try:
+            root = haunt_home()
+            mkdir_private(root)
+            lock_path = root / ".namespace-migration.lock"
+            nofollow = required_o_nofollow()
+            flags = os.O_RDWR | nofollow | getattr(os, "O_CLOEXEC", 0)
+            try:
+                fd = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                fd = os.open(lock_path, flags)
+            try:
+                held = os.fstat(fd)
+                current = lock_path.lstat()
+                if (
+                    not stat.S_ISREG(held.st_mode)
+                    or not stat.S_ISREG(current.st_mode)
+                    or stat.S_ISLNK(current.st_mode)
+                    or int(held.st_nlink) != 1
+                    or int(current.st_nlink) != 1
+                    or stat.S_IMODE(held.st_mode) != 0o600
+                    or (int(held.st_dev), int(held.st_ino))
+                    != (int(current.st_dev), int(current.st_ino))
+                ):
+                    raise NamespaceMigrationError(
+                        "namespace migration lock is unsafe"
+                    )
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                current = lock_path.lstat()
+                if (int(current.st_dev), int(current.st_ino)) != (
+                    int(held.st_dev), int(held.st_ino)
+                ):
+                    raise NamespaceMigrationError(
+                        "namespace migration lock changed while acquiring it"
+                    )
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+        finally:
+            _NAMESPACE_MIGRATION_STATE.depth = 0
 
 
 @contextmanager
@@ -1580,8 +1595,16 @@ def _claim_fresh_namespace_db(target: Path) -> _FreshNamespaceClaim:
 
 def _claim_fresh_namespace_db_with_configuration_lock(
     target: Path,
+    *,
+    prepare: Callable[[sqlite3.Connection], None] | None = None,
 ) -> _FreshNamespaceClaim:
-    """Initialize a fresh DB while holding serialized sidecar configuration."""
+    """Initialize a fresh DB while holding serialized sidecar configuration.
+
+    ``prepare`` runs and must commit while the database still has its private
+    temporary pathname.  WAL sidecars belong to that pathname, so publishing
+    the hard link only after preparation prevents committed staged data from
+    being stranded in a temporary WAL when the final name becomes visible.
+    """
     _validate_unmapped_namespace_target(target)
     root = validate_namespace_root()
     claim_fd, raw_temporary = tempfile.mkstemp(
@@ -1615,6 +1638,17 @@ def _claim_fresh_namespace_db_with_configuration_lock(
         _configure_connection(conn, temporary, sidecars=sidecars)
         conn.preserve_sidecar_claims()
         _init_namespace_schema(conn)
+        if prepare is not None:
+            prepare(conn)
+            if conn.in_transaction:
+                raise NamespacePathError(
+                    "fresh namespace preparation left a transaction open"
+                )
+            checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint is None or int(checkpoint[0]) != 0:
+                raise NamespacePathError(
+                    "fresh namespace preparation could not checkpoint staged data"
+                )
         try:
             os.link(temporary, target, follow_symlinks=False)
         except FileExistsError as exc:

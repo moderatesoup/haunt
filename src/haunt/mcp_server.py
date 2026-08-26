@@ -25,6 +25,14 @@ from haunt.paths import (
     safe_name,
 )
 from haunt.planner import planned_recall
+from haunt.portability import (
+    ExportError,
+    ImportBundleError,
+    build_namespace_export,
+    canonical_export_bytes,
+    import_namespace_bytes,
+    resolve_import_limits,
+)
 from haunt.recall import BACKEND_ERROR_CODE, execution_metadata, is_retrieval_backend_error
 from haunt.store import (
     Store,
@@ -598,6 +606,79 @@ def memory_namespaces() -> str:
             "admin": authority.admin,
         }
     )
+
+
+@server.tool(
+    description=(
+        "Admin-only canonical namespace export. Returns potentially sensitive "
+        "verbatim data inline as strict UTF-8 JSON; embeddings, jobs, local "
+        "paths, and caches are excluded."
+    )
+)
+def memory_export_bundle(
+    namespace: Optional[str] = None,
+    temporal_cut: Optional[str] = None,
+) -> str:
+    authority = _authority()
+    if not authority.admin:
+        return _authority_error(
+            MCPAuthorityError("namespace export requires HAUNT_MCP_ADMIN=1")
+        )
+    try:
+        selected = _mcp_namespace(namespace)
+        bundle = build_namespace_export(str(selected), cut=temporal_cut)
+        encoded = canonical_export_bytes(bundle).decode("utf-8")
+    except (MCPAuthorityError, ExportError, NamespacePathError, ValueError) as exc:
+        return _json({"ok": False, "error": str(exc), "admin": authority.admin})
+    return _json(
+        {
+            "ok": True,
+            "namespace": bundle["namespace"]["canonical_label"],
+            "namespace_id": bundle["namespace"]["namespace_id"],
+            "semantic_digest": bundle["manifest"]["semantic_digest"],
+            "warning": "Export contains potentially sensitive verbatim namespace data.",
+            "bundle_json": encoded,
+        }
+    )
+
+
+@server.tool(
+    description=(
+        "Admin-only bounded transactional import of one canonical namespace "
+        "bundle supplied as strict JSON text. Returns resolved resource limits."
+    )
+)
+def memory_import_bundle(
+    bundle_json: str,
+    timeout_seconds: float = 30.0,
+    input_bytes: Optional[int] = None,
+    decompressed_bytes: Optional[int] = None,
+    records: Optional[int] = None,
+    record_bytes: Optional[int] = None,
+    json_depth: Optional[int] = None,
+    collection_items: Optional[int] = None,
+) -> str:
+    authority = _authority()
+    if not authority.admin:
+        return _authority_error(
+            MCPAuthorityError("namespace import requires HAUNT_MCP_ADMIN=1")
+        )
+    try:
+        raw = bundle_json.encode("utf-8", errors="strict")
+        limits = resolve_import_limits(
+            input_bytes=input_bytes,
+            decompressed_bytes=decompressed_bytes,
+            records=records,
+            record_bytes=record_bytes,
+            json_depth=json_depth,
+            collection_items=collection_items,
+        )
+        report = import_namespace_bytes(
+            raw, limits=limits, timeout_seconds=timeout_seconds
+        )
+    except (UnicodeError, ImportBundleError, NamespacePathError, ValueError) as exc:
+        return _json({"ok": False, "error": str(exc), "admin": authority.admin})
+    return _json({"ok": True, **report})
 
 
 @server.tool(

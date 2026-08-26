@@ -391,7 +391,7 @@ broadening access.
 
 ## E4 — Ship versioned export/import round trips
 
-**Status:** Blocked
+**Status:** In progress
 
 **Depends on:** E1, E2, E3
 
@@ -449,6 +449,43 @@ and retain the canonical memory semantics and audit information.
   A purge test proves erased content is absent from the bundle and cannot
   reappear after import.
 
+**Implementation evidence (2026-08-26; independent merge review pending)**
+
+- The v1 implementation fixes a stable data-derived default cut and explicit
+  historical-cut projection, including atomic correction/replacement closure
+  and graph entity clocks derived only from retained evidence. Guarded
+  zero-write snapshots retry concurrent observe/correct/purge drift; the
+  deterministic purge race never returns the erased canary.
+- Canonical namespace identity uses stable ID, canonical-first alias ordering,
+  closed/acyclic `source_alias_norm` links, and remote identities without local
+  paths. Existing import opens exact ID/path/device/inode under the migration
+  lock; a deterministic label-retirement/reassignment race leaves namespace B
+  unchanged.
+- Exact import receipts recheck every durable row before reporting a no-write
+  replay and conflict on later tamper or deletion. Scratch SQLite readback
+  rejects affinity/type coercion and signed-64 overflow. Legitimate BLOB and
+  non-finite REAL values round-trip exactly; BLOB memory content gets neither a
+  fake FTS row nor an embedding job.
+- Token-level parsing enforces actual UTF-8, duplicate-key, input/decompressed
+  byte, record/count, depth/item, and timeout budgets. Injected whitespace,
+  scratch-validation, and SQLite-progress timeouts clean up without a
+  namespace or job; corrupt versions/digests and every durable record class
+  likewise commit no logical mutation.
+- CLI/Python semantics are mirrored by admin-only MCP export/import and the
+  launch-token dashboard APIs. Dashboard tests cover authentication, trusted
+  Origin, media type, bounded body, conflict status, safe download filename,
+  and unknown-export no-create. Purge tests scan raw and base64 canaries before
+  import and after re-export.
+- Author evidence: focused portability passed 50/50 on Python 3.10 and 3.12;
+  the broad Python 3.10 compatibility suite passed 800 with 5 optional skips
+  and 7 expected failures. Ruff, compile, canonical fixture, and diff checks
+  were clean. A full native Python 3.12 run was not used as evidence because
+  its model fixture repeatedly downloaded outside the pinned cache.
+- Independent root pre-review evidence: portability passed 50/50 on Python
+  3.10; portability plus E3 alias/sidecar integration passed 182/182 on exact
+  Python 3.12/SQLite 3.43/MCP2; diff check was clean. E4 remains **In progress**
+  until a fresh independent GPT-5.6 Terra review approves the exact commit.
+
 **Non-goals**
 
 - Byte-copying SQLite databases, syncing live stores, exporting caches, remote
@@ -505,11 +542,16 @@ machine-readable retrieval evidence.
 
 **Completion evidence (2026-08-26)**
 
-- Author/release proof: the completed E5 release branch closed at reviewed head
-  `46649df`; the frozen E0 corpus and baseline remain byte-for-byte unchanged.
-- Independent GPT-5.6 Terra review was **CLEAN** at `46649df`: broad Py3.10
-  and exact Py3.12/SQLite 3.43/MCP2 matrices, repeated 4x8 fresh-process
-  creation, native-vec checks, and compile/diff checks were green.
+- Pre-fix author/release proof reached reviewed head `46649df`; the frozen E0
+  corpus and baseline remained byte-for-byte unchanged.
+- The pre-fix independent GPT-5.6 Terra review was **CLEAN** at `46649df` with
+  broad Py3.10 and exact
+  Py3.12/SQLite 3.43/MCP2 matrices, repeated 4x8 fresh-process creation,
+  native-vec checks, and compile/diff checks green.
+- The exact final GPT-5.6 Terra merge-gate review was **CLEAN** at
+  `681419220df2374608fd52965efc8063dc555b2a` after the Linux SIGBUS
+  graph-lifecycle fix. PR #82 CI was green on Python 3.10 and 3.12 and the
+  branch squash-merged as `ed806b2c0e97f04f87106672cb1ea60b27fe245e`.
 - Root release gating also passed the Py3.10 E0-E5 integration selection and
   native four-target matrix; it caught and this approved head fixed the stale
   MCP read-only-opener assertion and fail-closed initialization cleanup before
