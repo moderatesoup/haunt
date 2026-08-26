@@ -598,3 +598,229 @@ and is ready for a normal Haunt release.
   namespace storage into an authorization boundary.
 - This program does not weaken explicit privacy erasure, export embeddings, or
   silently synthesize provenance that the source did not provide.
+
+## Corpus health and capture policy (C-series)
+
+**Status:** Ready
+
+The E-series above adopts new capabilities. The C-series repairs what Haunt
+already does to a live store. These items were found on 2026-08-26 by measuring
+the dogfooded corpus under `~/.haunt/namespaces/`, not by reading the contract,
+and several are firing in production today.
+
+Every count below is from a live, growing corpus. The direction is the
+evidence; the last digit is not.
+
+### Measured baseline (2026-08-26)
+
+| Namespace | `repo_path` | Memories | Unembedded | Registered |
+|---|---|---:|---:|---|
+| `aronriley` | *(blank)* | 58 | 3 | 2026-08-21 |
+| `default` | *(blank)* | 0 | 0 | 2026-08-21 |
+| `haunt` | `github.com/moderatesoup/haunt` | 211 | 4 | 2026-08-21 |
+| `memory-protocol` | *(blank)* | 151 | 0 | 2026-08-22 |
+| `ironscope` | *(blank)* | 156 | 0 | 2026-08-22 |
+| `github.com-moderatesoup-ironscope` | *(blank)* | 313 | 313 | 2026-08-25T17:55:08 |
+| `github.com-memory-protocol-memory-protocol` | *(blank)* | 1491 | 1363 | 2026-08-25T17:55:15 |
+
+Two repositories hold memory in two namespaces each, and the duplicate pair was
+registered seven seconds apart. `haunt` is the only namespace with a populated
+`repo_path` and the only one that did not fork.
+
+Across the six non-empty namespaces, `role='tool'` rows are 79.8% of all
+memory, and 8.1–13.5% of rows are exact byte-duplicates of another row
+depending on the grouping cut.
+
+### Relationship to the E-series
+
+- C1–C3 sit beneath **E3 — namespace aliases** and are not satisfied by it.
+  E3 adds identity tables and a label migration, but that migration explicitly
+  never moves, copies, or renames a namespace database; its legacy backfill
+  skips registry rows whose `repo_path` is blank; and it groups legacy rows by
+  `db_path`, so two database files are never unified. The split stores above
+  survive E3 unchanged.
+- C8 is **evidence for E6 — calibrated abstention**, not a competing epic.
+- Two ranking defects found in the same investigation — `vec_distance` and
+  `fts_rank_raw` computed then dropped from `as_dict()`, and the dashboard
+  sorting RRF scores across independent namespace pools — are already resolved
+  on `codex/ranking-explanations` and are deliberately absent from this list.
+
+### Namespace integrity
+
+**C1 — Persist `repo_path` on every namespace registration**
+
+Hooks and MCP build `Store(ns)` with no repository
+(`src/haunt/claude_hook.py:225`, `src/haunt/cursor_hook.py:477`,
+`src/haunt/mcp_server.py:169`), so hook-created namespaces register with a
+blank `repo_path`. `_registered_namespace_for_repo()` matches only on
+`repo_path` and skips blank rows (`src/haunt/paths.py:107`), so reuse can
+never match, and `infer_namespace()` falls through and mints a second namespace
+for a repository that already had one (`src/haunt/paths.py:148-172`). Only
+`haunt init --repo` supplies the value today.
+
+- Every path that can create a namespace records the repository it was inferred
+  from, or records explicitly that there was none.
+- Reuse matches repositories whose registry row predates the fix.
+- A repository with an existing namespace never mints a second one, asserted
+  across the hook, MCP, and CLI entry points.
+
+**C2 — Refuse to derive a namespace from a non-repository directory**
+
+`infer_namespace()` falls back to the working directory's name
+(`src/haunt/paths.py:169-171`). A session started in the home directory
+produced the namespace `aronriley`, holding 58 rows that are every one of them
+the identical string `haunt session start` — pure ceremony, zero knowledge.
+`_is_user_home()` already exists (`src/haunt/paths.py:181`) but is used only in
+permission paths, never in inference.
+
+- The home directory never becomes a namespace name.
+- A non-repository working directory resolves to `default` or fails loudly; it
+  never silently mints a directory-named store.
+- Existing junk namespaces are reportable so an operator can retire them.
+
+**C3 — Reconcile namespaces that are already split**
+
+E3 hard-fails when a label already maps to another namespace, which is correct
+for aliasing but leaves the four forked stores above with no path forward.
+
+- An operator can merge two namespaces that resolve to the same repository,
+  preserving rows from both sides and keeping event identity stable.
+- Dry-run reports exactly what would move before anything moves.
+- The operation is idempotent, and reversible or backed up before it writes.
+
+### Embedding pipeline
+
+**C4 — Hook-deferred embeddings have no drain**
+
+Hook writes pass `defer_embedding=True`, and `observe()` drains its queue only
+when `commit and not defer_embedding` (`src/haunt/store.py:916`), so a
+hook-driven write never triggers the drain that would clear it; the queue
+shrinks only when something calls `recall()`. Measured result: 1363 of 1491
+rows unembedded in one namespace (91%), and 313 of 313 in another (100%) — the
+latter has no `vec_memories` table at all, making it FTS-only without ever
+saying so.
+
+- A drain runs independently of read traffic.
+- Embedding coverage is reportable per namespace, and a namespace with no
+  vector index says so rather than silently degrading to FTS-only.
+- Sequencing: land C6's policy first. Draining before that spends compute
+  embedding precisely the rows C6 excludes.
+
+**C5 — Isolate per-row failures in `process_embedding_jobs`**
+
+One permanently failing row blocks every job queued behind it, with no attempt
+ceiling and no surfaced error (`src/haunt/store.py:1105`).
+
+- Per-row failure isolation, a max-attempt cutoff, and failures visible rather
+  than silent.
+
+### Capture policy and duplication
+
+**C6 — Exclusion should skip embedding, not drop capture**
+
+`HAUNT_EXCLUDE_TOOLS` returns before `observe()` is ever called
+(`src/haunt/claude_hook.py:191`, `src/haunt/cursor_hook.py:354`, `:375`,
+`:396`), so an excluded call leaves no event, no memory row, and no FTS entry.
+That is irreversible, and it destroys the forensic record — the same record
+this investigation used to find every defect on this list. The log should stay
+complete; the embedder is where the cost actually is.
+
+FTS insertion already runs unconditionally (`src/haunt/store.py:978`), so
+keyword recall over un-embedded rows needs no new mechanism.
+
+- Excluded tool I/O is still captured and still keyword-searchable.
+- Policy is per-tool, not per-category: `Bash` is the flood, `Edit`/`Write`/
+  `Task` are not.
+- Session ceremony (`src/haunt/cursor_hook.py:446`,
+  `src/haunt/claude_hook.py:157`) is excluded from embedding.
+- The embed call and the `embedding_jobs` enqueue are skipped together
+  (`src/haunt/store.py:955`, `:985`); skipping only one either inflates
+  the backlog or embeds the rows anyway once C4 lands.
+- Open question to settle before building: whether excluded rows should be
+  retroactively embeddable on demand. That is the difference between reversible
+  in principle and reversible in practice.
+
+**C7 — Exact-content-hash dedup and reference-not-copy**
+
+No `content_hash` exists. The only dedup is idempotency-key replay
+(`src/haunt/store.py:447`, `:913`), which catches a redelivered hook
+call but not two distinct calls producing identical bytes. This is orthogonal
+to C6: the measured duplicates include `role='system'` ceremony rows that are
+not tool I/O at all.
+
+- Hash at admission on identical bytes only, never semantic similarity.
+- A repeat hash writes a reference to the original rather than a second
+  payload, preserving that the event genuinely recurred.
+- Re-measure the duplicate fraction after C6 lands to size what remains.
+
+### Retrieval quality and cost
+
+**C8 — Reproducible abstention failure (evidence for E6)**
+
+A long query about git-history tooling, run against namespace `aronriley`,
+returned ten hits that were every one of them the string `haunt session start`,
+with `fts_rank: null` on all ten and scores of exactly `1/(RRF_K + rank)` —
+0.016393, 0.016129, 0.015873, down the floor.
+
+The FTS half was right to return nothing: the query shares no token with the
+only string in that corpus. The defect is that vector search returns k-nearest
+with no distance floor, so a corpus with nothing relevant still fills k. The
+consuming agent had to read the hit contents to conclude the recall was noise.
+
+- Recorded as a fixture for E6 rather than a separate epic. E6 owns the
+  abstention contract; this is the case it must handle.
+
+**C9 — FTS5 tokenizer fragments code identifiers**
+
+`tokenize='porter unicode61'` (`src/haunt/store.py:255`) splits `snake_case`
+and `dotted.paths` and never splits `camelCase`, while the corpus is almost
+entirely coding sessions.
+
+- Keyword recall finds identifiers in all three shapes.
+- Any tokenizer change re-runs the E0 frozen gate, since it moves FTS ranks.
+
+**C10 — Unindexed validity scans**
+
+Default recall filters `m.valid_to IS NULL` (`src/haunt/recall.py:113`) with no
+supporting index, so the current slice scans every superseded row ever written.
+`trace()` loads a namespace's whole correction history per call
+(`src/haunt/store.py:2036`) instead of walking existing indexes.
+
+**C11 — Recall response has no size budget**
+
+`k` accepts up to 100, and each hit carries full untruncated `content` plus a
+redundant 200-character `snippet`. `codex/ranking-explanations` adds a per-hit
+`explanation` object on top, so payloads grow rather than shrink.
+
+**C12 — Diversity and reranking**
+
+There is no MMR or diversity step, so near-duplicates can occupy the whole
+top-k, as C8 shows in the extreme. `src/haunt/recall.py:3` documents the
+cross-encoder as deliberately not wired.
+
+- Measure before adopting. Extend the frozen evaluation to hybrid retrieval
+  first (E6 already owns pinned hybrid evaluation), then compare recall quality
+  with and without a rerank pass on clear-top-1 and ambiguous-candidate
+  queries.
+- A reranker cannot repair C8: nothing can rerank a corpus holding one distinct
+  string. C1–C4 land first or rerank evaluation measures noise.
+
+**Tests/evidence**
+
+- A namespace-integrity test creates a namespace through each entry point and
+  asserts a repository never yields two namespaces.
+- A migration test merges two populated namespaces and proves no row is lost,
+  duplicated, or re-identified.
+- Coverage reporting proves the embedding backlog is drainable and observable.
+- A capture-policy test proves excluded tool I/O remains keyword-recallable.
+- The dedup test asserts identical bytes collapse to a reference and that
+  distinct rows never collapse.
+- Any change touching FTS ranks or fusion re-runs the E0 frozen gate.
+
+**Non-goals**
+
+- Semantic or embedding-based deduplication at write. Its failure mode is
+  silent suppression of genuinely distinct facts.
+- Dropping capture as a corpus-size remedy. Size is managed at the embedder and
+  in the view, not by discarding the log.
+- Redefining `trusted`, which is an authority label, as a visibility switch.
