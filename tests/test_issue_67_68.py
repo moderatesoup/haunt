@@ -407,8 +407,12 @@ def test_mcp_cli_read_paths_use_identity_openers_not_create():
     import haunt.cli as cli
     import haunt.mcp_server as mcp
 
+    recall_src = inspect.getsource(mcp.memory_recall)
+    assert "_open_mcp_readonly_store" in recall_src
+    assert "_open_mcp_store(" not in recall_src
+    assert "Store(" not in recall_src
+
     for fn in (
-        mcp.memory_recall,
         mcp.memory_timeline,
         mcp.memory_health,
         mcp.memory_session_end,
