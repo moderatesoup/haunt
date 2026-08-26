@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as pkg_version
@@ -24,6 +25,7 @@ from haunt.paths import (
     safe_name,
 )
 from haunt.planner import planned_recall
+from haunt.recall import BACKEND_ERROR_CODE, execution_metadata, is_retrieval_backend_error
 from haunt.store import (
     Store,
     NamespaceCollisionError,
@@ -447,15 +449,47 @@ def memory_recall(
                 store=st,
             )
     except (TemporalParseError, UnknownNamespaceError, ValueError) as exc:
-        return _json({"ok": False, "error": str(exc), "namespace": ns, "query": query})
-    return _json(
-        {
-            "namespace": ns,
-            "query": query,
-            "trust_policy": RECALL_TRUST_POLICY,
-            "hits": [h.as_dict() for h in hits],
-        }
-    )
+        return _json(
+            {
+                "ok": False,
+                "code": "invalid_recall_request",
+                "error": str(exc),
+                "namespace": ns,
+                "query": query,
+            }
+        )
+    except sqlite3.Error as exc:
+        return _json(
+            {
+                "ok": False,
+                "code": BACKEND_ERROR_CODE,
+                "error": str(exc),
+                "namespace": ns,
+                "query": query,
+            }
+        )
+    except Exception as exc:
+        if is_retrieval_backend_error(exc):
+            return _json(
+                {
+                    "ok": False,
+                    "code": BACKEND_ERROR_CODE,
+                    "error": str(exc),
+                    "namespace": ns,
+                    "query": query,
+                }
+            )
+        raise
+    payload: dict[str, Any] = {
+        "namespace": ns,
+        "query": query,
+        "trust_policy": RECALL_TRUST_POLICY,
+        "hits": [h.as_dict() for h in hits],
+    }
+    execution = execution_metadata(hits)
+    if execution is not None:
+        payload["execution"] = execution
+    return _json(payload)
 
 
 @server.tool(

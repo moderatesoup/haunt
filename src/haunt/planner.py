@@ -15,7 +15,7 @@ import re
 from datetime import datetime
 from typing import Literal
 
-from haunt.recall import Hit, recall
+from haunt.recall import Hit, RecallResult, execution_metadata, recall
 from haunt.store import Store, open_existing
 from haunt.temporal import TemporalQuery, compile
 from haunt.util import clamp_k, iso_or_now, normalize_clock, utc_iso
@@ -169,6 +169,53 @@ def _clocks(clock: str) -> tuple[str, ...]:
     return (c,)
 
 
+def _aggregate_execution(
+    strategy: str,
+    runs: list[tuple[str, list[Hit]]],
+) -> dict[str, object] | None:
+    """Combine only known stage evidence from one or more clock executions."""
+    known = [(clock, execution_metadata(hits)) for clock, hits in runs]
+    if not known or any(execution is None for _, execution in known):
+        # Tests and external integrations may provide a plain list of Hits.
+        # It carries no execution provenance, so do not synthesize any.
+        return None
+
+    sources = ("vector", "fts")
+    modalities: dict[str, dict[str, str]] = {}
+    for source in sources:
+        stages = [
+            execution["modalities"][source]  # type: ignore[index]
+            for _, execution in known
+        ]
+        if all(stage == stages[0] for stage in stages[1:]):
+            modalities[source] = dict(stages[0])
+        elif any(stage.get("state") == "candidate" for stage in stages):
+            modalities[source] = {
+                "state": "candidate",
+                "reason": "candidate_in_one_or_more_clocks",
+            }
+        elif any(stage.get("state") == "ran_not_candidate" for stage in stages):
+            modalities[source] = {
+                "state": "ran_not_candidate",
+                "reason": "no_candidates_in_one_or_more_clocks",
+            }
+        else:
+            modalities[source] = {
+                "state": "not_run",
+                "reason": "not_run_in_all_clocks",
+            }
+
+    return {
+        "version": 1,
+        "strategy": strategy,
+        "modalities": modalities,
+        "clock_runs": [
+            {"clock": clock, "modalities": execution["modalities"]}
+            for clock, execution in known
+        ],
+    }
+
+
 def _hits_from_events(
     store: Store,
     events: list[dict],
@@ -278,7 +325,14 @@ def run_timeline(
     hits = hits[:limit]
     for final_rank, hit in enumerate(hits, start=1):
         hit.final_rank = final_rank
-    return hits
+    return RecallResult(
+        hits,
+        modalities={
+            "vector": {"state": "not_run", "reason": "timeline_time_order"},
+            "fts": {"state": "not_run", "reason": "timeline_time_order"},
+        },
+        strategy="timeline",
+    )
 
 
 def run_recall(
@@ -296,6 +350,7 @@ def run_recall(
     since, until = _iso(tq.start), _iso(tq.end)
     chosen = clock or tq.clock
     merged: dict[str, Hit] = {}
+    recall_runs: list[tuple[str, list[Hit]]] = []
     for clk in _clocks(chosen):
         hits = recall(
             tq.cleaned_query,
@@ -308,6 +363,7 @@ def run_recall(
             k=k,
             store=store,
         )
+        recall_runs.append((clk, hits))
         for h in hits:
             prev = merged.get(h.memory_id)
             if prev is None or h.score > prev.score:
@@ -316,7 +372,10 @@ def run_recall(
     hits = ranked[:k]
     for final_rank, hit in enumerate(hits, start=1):
         hit.final_rank = final_rank
-    return hits
+    execution = _aggregate_execution("recall", recall_runs)
+    if execution is None:
+        return hits
+    return RecallResult(hits, execution=execution)
 
 
 def run_union(
@@ -339,9 +398,10 @@ def run_union(
     )
     for h in timeline:
         by_id[h.memory_id] = h
-    for h in run_recall(
+    recalled = run_recall(
         tq, store, as_of=as_of, tier=tier, k=k, clock=clock, namespace=namespace
-    ):
+    )
+    for h in recalled:
         prev = by_id.get(h.memory_id)
         if prev is None or h.score > prev.score:
             by_id[h.memory_id] = h
@@ -360,7 +420,22 @@ def run_union(
     hits = (ranked + timeline_hits)[:k]
     for final_rank, hit in enumerate(hits, start=1):
         hit.final_rank = final_rank
-    return hits
+    timeline_execution = execution_metadata(timeline)
+    recall_execution = execution_metadata(recalled)
+    if timeline_execution is None or recall_execution is None:
+        return hits
+    execution = {
+        "version": 1,
+        "strategy": "union",
+        "modalities": _aggregate_execution(
+            "union", [("timeline", timeline), ("recall", recalled)]
+        )["modalities"],  # Both components above were known.
+        "components": {
+            "timeline": timeline_execution,
+            "recall": recall_execution,
+        },
+    }
+    return RecallResult(hits, execution=execution)
 
 
 def execute(

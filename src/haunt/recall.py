@@ -27,14 +27,61 @@ _FTS_TOKEN = re.compile(r"[\w./+-]+", re.UNICODE)
 
 RRF_K = 60
 CANDIDATES = 40
+BACKEND_ERROR_CODE = "retrieval_backend_error"
+
+
+class RetrievalBackendError(RuntimeError):
+    """A sqlite/vector retrieval failure that machine surfaces can classify.
+
+    Python callers still receive an exception (with the sqlite error chained),
+    while CLI/MCP/dashboard adapters can return one stable error code.
+    """
+
+    code = BACKEND_ERROR_CODE
+
+
+def is_retrieval_backend_error(exc: BaseException) -> bool:
+    """True for a retrieval backend failure, including an unwrapped DB error."""
+    return isinstance(exc, (RetrievalBackendError, sqlite3.Error)) or (
+        isinstance(exc, RuntimeError)
+        and str(exc).startswith("sqlite-vec failed to load:")
+    )
 
 
 class RecallResult(list["Hit"]):
-    """List-compatible recall result with execution evidence for empty results."""
+    """List-compatible result with optional, versioned execution evidence."""
 
-    def __init__(self, hits: list["Hit"], *, modalities: dict[str, dict[str, str]]):
+    def __init__(
+        self,
+        hits: list["Hit"],
+        *,
+        modalities: dict[str, dict[str, str]] | None = None,
+        strategy: str = "recall",
+        execution: dict[str, Any] | None = None,
+    ):
         super().__init__(hits)
-        self.modalities = modalities
+        if execution is None and modalities is not None:
+            execution = {
+                "version": 1,
+                "strategy": strategy,
+                "modalities": modalities,
+            }
+        self.execution = execution
+        # Kept as a convenient compatibility alias for internal callers.
+        self.modalities = (
+            execution.get("modalities") if execution is not None else None
+        )
+
+
+def execution_metadata(hits: object) -> dict[str, Any] | None:
+    """Return structured execution evidence, never inventing it for old lists."""
+    execution = getattr(hits, "execution", None)
+    if not isinstance(execution, dict) or execution.get("version") != 1:
+        return None
+    modalities = execution.get("modalities")
+    if not isinstance(modalities, dict):
+        return None
+    return execution
 
 
 @dataclass
@@ -187,6 +234,9 @@ def _modality_explanation(
         state = _stage("candidate", candidate_reason)
     elif stage is None:
         state = _stage("not_run", "legacy_unstructured")
+    elif stage["state"] == "candidate":
+        # A different candidate was returned by this stage, but not this hit.
+        state = _stage("ran_not_candidate", "candidate_not_returned_for_hit")
     else:
         state = stage
     return {**state, **fields}
@@ -392,33 +442,33 @@ def recall(
         match = _fts_match_query(query)
         if match is None:
             fts = []
-            fts_stage = _stage("not_run", "query_has_no_fts_tokens")
+            fts_execution = _stage("not_run", "query_has_no_fts_tokens")
         else:
             fts = _fts_hits(store.conn, query, where, params, CANDIDATES)
-            fts_stage = _stage(
-                "ran_not_candidate",
-                "no_fts_candidates" if not fts else "candidate_not_returned_for_hit",
+            fts_execution = _stage(
+                "ran_not_candidate" if not fts else "candidate",
+                "no_fts_candidates" if not fts else "returned_fts_candidates",
             )
         vec: list[tuple[str, int, float, str]] = []
         if not use_vectors:
-            vector_stage = _stage("not_run", "disabled_by_caller")
+            vector_execution = _stage("not_run", "disabled_by_caller")
         elif not embed_available():
-            vector_stage = _stage("not_run", "embedding_unavailable")
+            vector_execution = _stage("not_run", "embedding_unavailable")
         else:
             qv = embed_one(query)
             if qv:
                 vec = _vec_hits(store, qv, where, params, CANDIDATES)
-                vector_stage = _stage(
-                    "ran_not_candidate",
+                vector_execution = _stage(
+                    "ran_not_candidate" if not vec else "candidate",
                     "no_vector_candidates"
                     if not vec
-                    else "candidate_not_returned_for_hit",
+                    else "returned_vector_candidates",
                 )
             else:
                 # No candidate search can run without a query vector. Keep
                 # ran_not_candidate for the branch that actually calls
                 # _vec_hits above.
-                vector_stage = _stage("not_run", "query_embedding_empty")
+                vector_execution = _stage("not_run", "query_embedding_empty")
 
         rrf: dict[str, float] = {}
         vec_rank: dict[str, tuple[int, float, str]] = {}
@@ -468,14 +518,16 @@ def recall(
                     fts_rank_raw=fr[1] if fr else None,
                     filter_context=filter_context,
                     final_rank=final_rank,
-                    vector_stage=vector_stage,
-                    fts_stage=fts_stage,
+                    vector_stage=vector_execution,
+                    fts_stage=fts_execution,
                 )
             )
         return RecallResult(
             hits,
-            modalities={"vector": vector_stage, "fts": fts_stage},
+            modalities={"vector": vector_execution, "fts": fts_execution},
         )
+    except sqlite3.Error as exc:
+        raise RetrievalBackendError(str(exc)) from exc
     finally:
         if own:
             store.close()

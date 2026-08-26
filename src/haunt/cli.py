@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,7 @@ from haunt.bootstrap import bootstrap, format_report
 from haunt.embed import state as embed_state
 from haunt.paths import NamespacePathError, haunt_home, resolve_namespace
 from haunt.planner import planned_recall
+from haunt.recall import BACKEND_ERROR_CODE, execution_metadata, is_retrieval_backend_error
 from haunt.store import (
     AliasRetirementError,
     NamespaceCollisionError,
@@ -56,6 +58,11 @@ def _recall_json_error(
         dumps(
             {
                 "ok": False,
+                "code": (
+                    BACKEND_ERROR_CODE
+                    if is_retrieval_backend_error(exc)
+                    else "invalid_recall_request"
+                ),
                 "error": str(exc),
                 "namespace": namespace,
                 "query": query,
@@ -219,19 +226,27 @@ def recall_cmd(
                 k=k,
                 store=st,
             )
-    except (TemporalParseError, UnknownNamespaceError, ValueError) as exc:
+    except (TemporalParseError, UnknownNamespaceError, ValueError, sqlite3.Error) as exc:
         if json_out:
             _recall_json_error(exc, namespace=ns, query=query)
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
+    except Exception as exc:
+        if json_out and is_retrieval_backend_error(exc):
+            _recall_json_error(exc, namespace=ns, query=query)
+        raise
     if json_out:
+        payload = {
+            "namespace": ns,
+            "query": query,
+            "hits": [hit.as_dict() for hit in hits],
+        }
+        execution = execution_metadata(hits)
+        if execution is not None:
+            payload["execution"] = execution
         typer.echo(
             json.dumps(
-                {
-                    "namespace": ns,
-                    "query": query,
-                    "hits": [hit.as_dict() for hit in hits],
-                },
+                payload,
                 ensure_ascii=False,
                 allow_nan=False,
             )

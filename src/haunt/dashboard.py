@@ -19,7 +19,7 @@ from starlette.routing import Route
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
-from haunt.recall import Hit
+from haunt.recall import BACKEND_ERROR_CODE, Hit, execution_metadata, is_retrieval_backend_error
 from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
 from haunt.temporal import TemporalParseError, compile as compile_temporal
 from haunt.util import clamp_limit, iso_or_now, normalize_clock
@@ -885,7 +885,16 @@ def _recall_error(
     status_code: int = 400,
 ) -> JSONResponse:
     """Use the MCP-style error envelope for dashboard recall endpoints."""
-    payload: dict[str, Any] = {"ok": False, "error": str(exc), "query": query}
+    payload: dict[str, Any] = {
+        "ok": False,
+        "code": (
+            BACKEND_ERROR_CODE
+            if is_retrieval_backend_error(exc)
+            else "invalid_recall_request"
+        ),
+        "error": str(exc),
+        "query": query,
+    }
     if namespace is not None:
         payload["namespace"] = namespace
     return JSONResponse(payload, status_code=status_code)
@@ -998,10 +1007,24 @@ async def api_recall_all(request: Request) -> JSONResponse:
                     result = h.as_dict()
                     result["namespace"] = ns_name
                     results.append(result)
-                namespace_groups.append({"namespace": ns_name, "hits": results})
+                group: dict[str, Any] = {"namespace": ns_name, "hits": results}
+                execution = execution_metadata(hits)
+                if execution is not None:
+                    group["execution"] = execution
+                namespace_groups.append(group)
                 flattened.extend(results)
         except Exception as exc:
-            errors.append({"namespace": ns_name, "error": str(exc)})
+            errors.append(
+                {
+                    "namespace": ns_name,
+                    "code": (
+                        BACKEND_ERROR_CODE
+                        if is_retrieval_backend_error(exc)
+                        else "retrieval_namespace_error"
+                    ),
+                    "error": str(exc),
+                }
+            )
 
     return JSONResponse(
         {
@@ -1057,9 +1080,16 @@ async def api_recall(request: Request) -> JSONResponse:
         d = h.as_dict()
         d["namespace"] = name
         results.append(d)
-    return JSONResponse(
-        {"query": q, "namespace": name, "ranking_scope": "namespace", "hits": results}
-    )
+    payload: dict[str, Any] = {
+        "query": q,
+        "namespace": name,
+        "ranking_scope": "namespace",
+        "hits": results,
+    }
+    execution = execution_metadata(hits)
+    if execution is not None:
+        payload["execution"] = execution
+    return JSONResponse(payload)
 
 
 async def api_browse(request: Request) -> JSONResponse:
