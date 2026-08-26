@@ -617,7 +617,7 @@ def test_temporal_timeline_surfaces_not_ranked_and_cli_uses_time_order(haunt_env
     assert query.temporal is True
 
     monkeypatch.setattr(cli, "planned_recall", lambda *args, **kwargs: [hit])
-    monkeypatch.setattr(cli, "_existing", lambda namespace: Store("default"))
+    monkeypatch.setattr(cli, "_existing_readonly", lambda namespace: Store("default"))
     result = CliRunner().invoke(cli.app, ["recall", "what happened two weeks ago"])
     assert result.exit_code == 0
     assert "signal" in result.stdout
@@ -666,8 +666,10 @@ def test_cli_json_serializes_ranked_and_timeline_explanations(haunt_env, monkeyp
         tool_name=None,
         final_rank=1,
     )
-    monkeypatch.setattr(cli, "_existing", lambda namespace: Store("default"))
-    monkeypatch.setattr(cli, "open_existing", lambda namespace: Store("default"))
+    monkeypatch.setattr(cli, "_existing_readonly", lambda namespace: Store("default"))
+    monkeypatch.setattr(
+        cli, "open_existing_readonly", lambda namespace: Store("default")
+    )
     runner = CliRunner()
 
     monkeypatch.setattr(cli, "planned_recall", lambda *args, **kwargs: [ranked])
