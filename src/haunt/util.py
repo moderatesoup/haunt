@@ -64,11 +64,11 @@ def format_iso(value: Any) -> str:
     if value is None or value == "":
         return ""
     if not isinstance(value, str):
-        return human_display(value, limit=80)
+        return human_display(value, limit=80, sqlite_scalar=True)
     try:
         return utc_iso(parse_iso(value))
     except ValueError:
-        return human_display(value, limit=80)
+        return human_display(value, limit=80, sqlite_scalar=True)
 
 
 CLOCKS = ("event_time", "storage_time")
@@ -184,6 +184,7 @@ def human_display(
     limit: int = 160,
     collapse_whitespace: bool = False,
     preserve_layout: bool = False,
+    sqlite_scalar: bool = False,
 ) -> str:
     """Render an already-serialized value safely for bounded human output.
 
@@ -215,14 +216,17 @@ def human_display(
             )
             text = f"<sqlite-real {token}>"
     elif (
-        isinstance(value, dict)
+        sqlite_scalar
+        and isinstance(value, dict)
         and set(value) == {"encoding", "data"}
         and value.get("encoding") == "base64"
         and isinstance(value.get("data"), str)
+        and _is_canonical_base64(value["data"])
     ):
         text = f"<sqlite-blob base64:{value['data']}>"
     elif (
-        isinstance(value, dict)
+        sqlite_scalar
+        and isinstance(value, dict)
         and set(value) == {"encoding", "data"}
         and value.get("encoding") == "sqlite-real"
         and isinstance(value.get("data"), str)
@@ -245,5 +249,19 @@ def human_display(
     return _bounded_human_text(text, limit)
 
 
+def _is_canonical_base64(value: str) -> bool:
+    """True only for the exact RFC 4648 form emitted by json_safe_sqlite."""
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except ValueError:
+        return False
+    return base64.b64encode(raw).decode("ascii") == value
+
+
 def snippet(text: Any, n: int = 160) -> str:
-    return human_display(text, limit=n, collapse_whitespace=True)
+    return human_display(
+        text,
+        limit=n,
+        collapse_whitespace=True,
+        sqlite_scalar=True,
+    )

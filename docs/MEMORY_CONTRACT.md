@@ -144,11 +144,24 @@ Malformed legacy BLOB metadata remains available through detail/trace but is
 not guessed into typed procedure fields; guarded selectors treat it as no
 match rather than raising.
 
+New non-null structured provenance **MUST** use SQLite `TEXT` storage. A
+non-text value found in a triggerless or corrupt database is never decoded,
+even if its bytes look like valid JSON: reads label it `invalid_stored` and
+idempotent replay fails closed. Public mappings **MUST NOT** rely on JSON's
+lossy string-key coercion. Non-string SQLite keys use Haunt's reserved,
+versioned reversible key codec; ordinary string keys keep their existing shape
+unless they begin with the reserved prefix, in which case they are escaped.
+
 Human CLI output is a bounded presentation of those already-serialized
 values, never a replacement for the machine envelope. It labels BLOB and
 non-finite REAL values explicitly, escapes terminal controls, and accepts every
 JSON-safe scalar/container without assuming timestamp, content, role, tier,
 identifier, or procedure fields are strings.
+Generic dictionaries remain stable JSON and are not inferred to be SQLite
+scalar envelopes. Only explicitly typed scalar presentation sites recognize a
+valid BLOB/REAL envelope. Recall results use the same recursive lossless
+serialization on direct Python, CLI JSON, MCP, per-namespace dashboard, and
+all-namespace dashboard paths, with no `str()` fallback.
 
 For ordered import transforms, omitted, explicit `null`, and an empty list are
 distinct: not supplied, explicitly unknown, and known to have no transforms,

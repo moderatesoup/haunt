@@ -6,6 +6,7 @@ import base64
 import json
 import math
 import sqlite3
+import struct
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from typing import Any
@@ -16,10 +17,14 @@ from typer.testing import CliRunner
 from haunt.cli import app
 from haunt.provenance import (
     IMPORT_FIDELITIES,
+    SQLITE_KEY_PREFIX,
+    decode_json_safe_sqlite_key,
+    encode_json_safe_sqlite_key,
     json_safe_sqlite,
     native_provenance,
     public_provenance,
 )
+from haunt.recall import Hit, recall
 from haunt.store import SCHEMA_VERSION, Store, observe as public_observe
 from haunt.util import format_iso, human_display, loads
 
@@ -123,7 +128,7 @@ def test_json_safe_sqlite_losslessly_encodes_blob_memoryview_and_nonfinite_real(
         (math.inf, "<sqlite-real +infinity>"),
         (
             {"encoding": "sqlite-real", "data": "nan"},
-            "<sqlite-real nan>",
+            '{"encoding": "sqlite-real", "data": "nan"}',
         ),
         (
             {"encoding": "sqlite-real", "data": []},
@@ -141,10 +146,36 @@ def test_human_display_marks_blobs_escapes_controls_and_bounds_output():
     encoded = base64.b64encode(raw).decode("ascii")
     assert human_display(b"abc") == "<sqlite-blob base64:YWJj>"
     assert human_display(memoryview(b"abc")) == "<sqlite-blob base64:YWJj>"
+    assert (
+        human_display({"encoding": "base64", "data": "YWJj"}, sqlite_scalar=True)
+        == "<sqlite-blob base64:YWJj>"
+    )
+    assert human_display({"encoding": "base64", "data": "YWJj"}) == (
+        '{"encoding": "base64", "data": "YWJj"}'
+    )
+    assert (
+        human_display(
+            {"encoding": "base64", "data": "YWJj", "extra": True},
+            sqlite_scalar=True,
+        )
+        == '{"encoding": "base64", "data": "YWJj", "extra": true}'
+    )
+    assert (
+        human_display(
+            {"encoding": "base64", "data": "***not-base64***"},
+            sqlite_scalar=True,
+        )
+        == '{"encoding": "base64", "data": "***not-base64***"}'
+    )
+    assert (
+        human_display({"encoding": "sqlite-real", "data": "nan"}, sqlite_scalar=True)
+        == "<sqlite-real nan>"
+    )
     assert human_display("normal\x1b[31m") == "normal\\u001b[31m"
     bounded = human_display(
         {"encoding": "base64", "data": encoded},
         limit=80,
+        sqlite_scalar=True,
     )
     assert bounded.startswith("<sqlite-blob base64:")
     assert bounded.endswith("…")
@@ -162,6 +193,263 @@ def test_human_display_preserves_safe_layout_but_blocks_terminal_controls():
     assert "\x1b" not in rendered
     assert "\x07" not in rendered
     assert "\u202e" not in rendered
+
+
+def _key_signature(value: Any) -> tuple[str, Any]:
+    if isinstance(value, float):
+        return ("real", struct.pack(">d", value))
+    if isinstance(value, bytes):
+        return ("blob", value)
+    return (type(value).__name__, value)
+
+
+def test_sqlite_mapping_key_codec_is_reversible_and_collision_free():
+    reserved_text = SQLITE_KEY_PREFIX + "integer:7"
+    keys = [
+        "ordinary",
+        "雪",
+        reserved_text,
+        None,
+        False,
+        7,
+        -9,
+        2.5,
+        math.inf,
+        -math.inf,
+        float("nan"),
+        b"\x00\xffblob",
+        memoryview(b"memoryview-key"),
+    ]
+    encoded = [encode_json_safe_sqlite_key(key) for key in keys]
+    assert encoded[0] == "ordinary"
+    assert encoded[1] == "雪"
+    assert encoded[2] != reserved_text
+    assert len(encoded) == len(set(encoded))
+    decoded = [decode_json_safe_sqlite_key(key) for key in encoded]
+    assert [_key_signature(value) for value in decoded] == [
+        _key_signature(key.tobytes() if isinstance(key, memoryview) else key)
+        for key in keys
+    ]
+
+    mapping = {
+        "1": "ordinary-string",
+        1: "integer",
+        reserved_text: "escaped-reserved-string",
+        b"1": "blob",
+    }
+    public = json_safe_sqlite(mapping)
+    assert public["1"] == "ordinary-string"
+    assert len(public) == len(mapping)
+    assert {
+        _key_signature(decode_json_safe_sqlite_key(key)): value
+        for key, value in public.items()
+    } == {_key_signature(key): value for key, value in mapping.items()}
+    json.dumps(public, ensure_ascii=False, allow_nan=False)
+
+    with pytest.raises(TypeError, match="unsupported public SQLite mapping key"):
+        json_safe_sqlite({("tuple",): "unsupported"})
+    first_nan = float("nan")
+    second_nan = float("nan")
+    with pytest.raises(ValueError, match="mapping key collision"):
+        json_safe_sqlite({first_nan: "one", second_nan: "two"})
+
+
+def test_stats_tier_keys_round_trip_all_sqlite_types_across_public_surfaces(
+    provenance_env, monkeypatch
+):
+    db_path = provenance_env / "namespaces" / "default.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DROP TABLE events")
+    conn.execute(
+        """
+        CREATE TABLE events (
+            id TEXT PRIMARY KEY,
+            idempotency_key,
+            session_id,
+            ts,
+            event_time,
+            role,
+            content,
+            tool_name,
+            tool_input,
+            tool_output,
+            origin,
+            tier,
+            meta,
+            provenance
+        )
+        """
+    )
+    tiers = [
+        None,
+        "episodic",
+        7,
+        2.5,
+        math.inf,
+        sqlite3.Binary(b"\x00\xfftier-blob"),
+        memoryview(b"tier-memoryview"),
+    ]
+    for index, tier in enumerate(tiers):
+        conn.execute(
+            """
+            INSERT INTO events(
+                id, session_id, ts, event_time, role, content,
+                origin, tier, meta, provenance
+            ) VALUES (?, 'dynamic-session', ?, ?, 'user', ?, 'legacy', ?, '{}', NULL)
+            """,
+            (
+                f"dynamic-tier-{index}",
+                f"2026-01-01T00:00:{index:02d}+00:00",
+                f"2026-01-01T00:00:{index:02d}+00:00",
+                f"dynamic tier {index}",
+                tier,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    with Store("default") as st:
+        stats = st.stats()
+    assert stats["tiers"]["episodic"] == 1
+    decoded = {
+        _key_signature(decode_json_safe_sqlite_key(key)): count
+        for key, count in stats["tiers"].items()
+    }
+    expected_tiers = [
+        None,
+        "episodic",
+        7,
+        2.5,
+        math.inf,
+        b"\x00\xfftier-blob",
+        b"tier-memoryview",
+    ]
+    assert decoded == {_key_signature(value): 1 for value in expected_tiers}
+    json.dumps(stats, ensure_ascii=False, allow_nan=False)
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp = json.loads(mcp_server.memory_health(namespace="default"))
+    assert mcp["stats"] == stats
+
+    from tests.dashutil import make_dash_client
+
+    client = make_dash_client()
+    health = client.get("/api/namespace/default/health")
+    namespace = client.get("/api/namespace/default")
+    assert health.status_code == 200, health.text
+    assert namespace.status_code == 200, namespace.text
+    assert health.json()["stats"] == stats
+    assert namespace.json()["stats"] == stats
+    json.dumps(namespace.json(), ensure_ascii=False, allow_nan=False)
+
+
+def test_recall_hit_dynamic_sqlite_values_are_exact_on_every_public_surface(
+    provenance_env, monkeypatch
+):
+    blob = b"\x00\xffrecall-blob</script>\x80"
+    direct = Hit(
+        memory_id=blob,
+        event_id=memoryview(blob),
+        score=0.5,
+        tier=math.inf,
+        content=memoryview(blob),
+        role=7,
+        event_time=None,
+        valid_from=2.5,
+        valid_to=-math.inf,
+        tool_name=sqlite3.Binary(blob),
+        ts=float("nan"),
+        origin=bytearray(blob),
+    ).as_dict()
+    assert _decode_public_blob(direct["memory_id"]) == blob
+    assert _decode_public_blob(direct["event_id"]) == blob
+    assert _decode_public_blob(direct["content"]) == blob
+    assert _decode_public_blob(direct["tool_name"]) == blob
+    assert _decode_public_blob(direct["origin"]) == blob
+    assert direct["tier"] == {"encoding": "sqlite-real", "data": "+infinity"}
+    assert direct["ts"] == {"encoding": "sqlite-real", "data": "nan"}
+    json.dumps(direct, ensure_ascii=False, allow_nan=False)
+
+    query = "DYNAMIC-RECALL-CANARY-5f17"
+    with Store("default") as st:
+        observed = st.observe(query, defer_embedding=True)
+        st.conn.execute(
+            """
+            UPDATE memories
+               SET content=?, tier=?, valid_from=?
+             WHERE id=?
+            """,
+            (sqlite3.Binary(blob), math.inf, sqlite3.Binary(blob), observed.memory_id),
+        )
+        st.conn.execute(
+            """
+            UPDATE events
+               SET role=?, event_time=?, ts=?, tool_name=?, origin=?
+             WHERE id=?
+            """,
+            (
+                7,
+                sqlite3.Binary(blob),
+                math.inf,
+                sqlite3.Binary(blob),
+                sqlite3.Binary(blob),
+                observed.event_id,
+            ),
+        )
+        st.conn.commit()
+        python_hits = recall(query, store=st, use_vectors=False)
+    assert len(python_hits) == 1
+    expected = python_hits[0].as_dict()
+    assert _decode_public_blob(expected["content"]) == blob
+    assert _decode_public_blob(expected["valid_from"]) == blob
+    assert _decode_public_blob(expected["event_time"]) == blob
+    assert _decode_public_blob(expected["tool_name"]) == blob
+    assert _decode_public_blob(expected["origin"]) == blob
+    # These columns have TEXT affinity, so SQLite canonically stores the
+    # non-finite values as text.  The direct Hit above covers REAL values.
+    assert expected["tier"] == "Inf"
+    assert expected["ts"] == "Inf"
+    json.dumps(expected, ensure_ascii=False, allow_nan=False)
+
+    runner = CliRunner()
+    cli_json = runner.invoke(app, ["recall", query, "--namespace", "default", "--json"])
+    cli_human = runner.invoke(app, ["recall", query, "--namespace", "default"])
+    assert cli_json.exit_code == 0, cli_json.output
+    assert cli_human.exit_code == 0, cli_human.output
+    assert json.loads(cli_json.stdout)["hits"] == [expected]
+    assert "<sqlite-blob base64:" in cli_human.stdout
+    assert "</script>" not in cli_human.stdout
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp = json.loads(mcp_server.memory_recall(query, namespace="default"))
+    assert mcp["hits"] == [expected]
+
+    from tests.dashutil import make_dash_client
+
+    client = make_dash_client()
+    single = client.get(f"/api/namespace/default/recall?q={query}")
+    all_namespaces = client.get(f"/api/recall?q={query}")
+    assert single.status_code == 200, single.text
+    assert all_namespaces.status_code == 200, all_namespaces.text
+    assert single.json()["hits"] == [{**expected, "namespace": "default"}]
+    assert all_namespaces.json()["hits"] == [{**expected, "namespace": "default"}]
+    payloads = [
+        direct,
+        expected,
+        json.loads(cli_json.stdout),
+        mcp,
+        single.json(),
+        all_namespaces.json(),
+    ]
+    assert not _contains_key(payloads, "confidence")
+    json.dumps(payloads, ensure_ascii=False, allow_nan=False)
 
 
 @pytest.mark.parametrize("fidelity", IMPORT_FIDELITIES)
@@ -568,6 +856,8 @@ def test_provenance_migration_preserves_legacy_origin_and_meta_bytes(provenance_
     # Simulate the exact pre-v8 shape rather than merely a null v8 value.
     db_path = provenance_env / "namespaces" / "default.db"
     conn = sqlite3.connect(db_path)
+    conn.execute("DROP TRIGGER IF EXISTS events_provenance_type_insert")
+    conn.execute("DROP TRIGGER IF EXISTS events_provenance_type_update_of_provenance")
     conn.execute("ALTER TABLE events DROP COLUMN provenance")
     conn.commit()
     conn.close()
@@ -621,6 +911,8 @@ def test_v7_blob_origin_and_meta_migrate_losslessly_across_public_surfaces(
 
     db_path = provenance_env / "namespaces" / "default.db"
     conn = sqlite3.connect(db_path)
+    conn.execute("DROP TRIGGER IF EXISTS events_provenance_type_insert")
+    conn.execute("DROP TRIGGER IF EXISTS events_provenance_type_update_of_provenance")
     conn.execute("ALTER TABLE events DROP COLUMN provenance")
     conn.commit()
     conn.close()
@@ -911,6 +1203,97 @@ def test_corrupt_or_unsupported_stored_envelope_fails_honest(provenance_env):
     assert not _contains_key(detail, "confidence")
 
 
+def test_provenance_storage_is_text_only_and_blob_replay_fails_closed(
+    provenance_env,
+):
+    with Store("default") as st:
+        result = st.observe(
+            "typed provenance",
+            idempotency_key="typed-provenance-key",
+            defer_embedding=True,
+        )
+        row = st.conn.execute(
+            "SELECT provenance, session_id, ts, event_time FROM events WHERE id=?",
+            (result.event_id,),
+        ).fetchone()
+        encoded = row["provenance"].encode("utf-8")
+        before_count = st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+        with pytest.raises(sqlite3.IntegrityError, match="provenance must be text"):
+            st.conn.execute(
+                "UPDATE events SET provenance=? WHERE id=?",
+                (sqlite3.Binary(encoded), result.event_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="provenance must be text"):
+            st.conn.execute(
+                """
+                INSERT INTO events(
+                    id, session_id, ts, event_time, role, content,
+                    origin, tier, meta, provenance
+                ) VALUES (?, ?, ?, ?, 'user', '', 'python', 'episodic', '{}', ?)
+                """,
+                (
+                    "blob-provenance-insert",
+                    row["session_id"],
+                    row["ts"],
+                    row["event_time"],
+                    sqlite3.Binary(encoded),
+                ),
+            )
+        assert (
+            st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == before_count
+        )
+        assert (
+            st.conn.execute(
+                "SELECT typeof(provenance) FROM events WHERE id=?", (result.event_id,)
+            ).fetchone()[0]
+            == "text"
+        )
+
+        # A triggerless/corrupt database remains readable, but bytes are never
+        # guessed to be text even when they contain exact valid JSON.
+        st.conn.execute("DROP TRIGGER events_provenance_type_update_of_provenance")
+        st.conn.execute(
+            "UPDATE events SET provenance=? WHERE id=?",
+            (sqlite3.Binary(encoded), result.event_id),
+        )
+        st.conn.commit()
+        detail = st.get_memory(result.memory_id)
+        assert detail["provenance"] == {
+            "schema_version": 1,
+            "kind": "invalid_stored",
+            "origin": "python",
+        }
+        assert (
+            public_provenance(memoryview(encoded), origin="python", legacy_meta="{}")[
+                "kind"
+            ]
+            == "invalid_stored"
+        )
+        with pytest.raises(ValueError, match="invalid stored provenance"):
+            st.observe(
+                "typed provenance",
+                idempotency_key="typed-provenance-key",
+                defer_embedding=True,
+            )
+        raw = st.conn.execute(
+            "SELECT typeof(provenance), provenance FROM events WHERE id=?",
+            (result.event_id,),
+        ).fetchone()
+        assert raw[0] == "blob" and bytes(raw[1]) == encoded
+
+    with Store("default") as reopened:
+        assert (
+            reopened.get_memory(result.memory_id)["provenance"]["kind"]
+            == "invalid_stored"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="provenance must be text"):
+            reopened.conn.execute(
+                "UPDATE events SET provenance=? WHERE id=?",
+                (sqlite3.Binary(encoded), result.event_id),
+            )
+
+
 def test_invalid_stored_provenance_with_blob_origin_and_meta_is_json_safe(
     provenance_env, monkeypatch
 ):
@@ -920,6 +1303,7 @@ def test_invalid_stored_provenance_with_blob_origin_and_meta_is_json_safe(
     invalid_provenance = b'{"schema_version":99,"kind":"native"}'
     with Store("default") as st:
         result = st.observe("invalid stored blob row")
+        st.conn.execute("DROP TRIGGER events_provenance_type_update_of_provenance")
         st.conn.execute(
             "UPDATE events SET origin=?, meta=?, tool_name=?, provenance=? WHERE id=?",
             (
@@ -1212,14 +1596,47 @@ def test_purge_erases_blob_provenance_canary_and_its_public_base64_form(
 ):
     blob_canary = b"BLOB-PURGE-CANARY-9d71\x00\xff</script><img onerror=alert(7)>"
     encoded_canary = base64.b64encode(blob_canary).decode("ascii")
+    public_blob = json_safe_sqlite(blob_canary)
+    human_blob = human_display(public_blob, sqlite_scalar=True)
+    spaced_envelope = json.dumps(public_blob, ensure_ascii=False)
+    compact_envelope = json.dumps(
+        public_blob, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    encoded_key = encode_json_safe_sqlite_key(blob_canary)
     with Store("default") as st:
-        target = st.observe("blob purge target")
+        target = st.observe("blob purge target", session_id="shared-blob-purge-session")
+        unrelated = st.observe(
+            "unrelated blob purge memory must survive",
+            session_id="shared-blob-purge-session",
+            origin="unrelated-safe-origin",
+        )
         correction = st.contradict(
             target.memory_id,
             replacement="blob purge survivor",
             idempotency_key="blob-purge-correction",
+            session_id="shared-blob-purge-session",
         )
         survivor_id = correction["replacement_memory_id"]
+        st.conn.execute(
+            "UPDATE sessions SET source=?, meta=? WHERE id=?",
+            (
+                "unrelated-safe-source",
+                json.dumps(
+                    {
+                        "keep": "unrelated-safe-meta",
+                        "raw_hex": blob_canary.hex(),
+                        "base64": encoded_canary,
+                        "human_marker": human_blob,
+                        "spaced_envelope": spaced_envelope,
+                        "compact_envelope": compact_envelope,
+                        "nested_public_envelope": public_blob,
+                        encoded_key: "encoded-key-secret",
+                    },
+                    ensure_ascii=False,
+                ),
+                "shared-blob-purge-session",
+            ),
+        )
         st.conn.execute(
             "UPDATE events SET origin=?, meta=?, provenance=NULL WHERE id=?",
             (
@@ -1234,12 +1651,24 @@ def test_purge_erases_blob_provenance_canary_and_its_public_base64_form(
         assert before["provenance"]["origin"]["data"] == encoded_canary
         purge = st.purge(target.memory_id)
         assert purge["ok"] is True
+        unrelated_after = st.get_memory(unrelated.memory_id)
+        assert unrelated_after["content"] == "unrelated blob purge memory must survive"
+        assert unrelated_after["origin"] == "unrelated-safe-origin"
+        safe_session = st.conn.execute(
+            "SELECT source, meta FROM sessions WHERE id=?",
+            (unrelated_after["session_id"],),
+        ).fetchone()
+        assert safe_session["source"] == "unrelated-safe-source"
+        safe_meta = json.loads(safe_session["meta"])
+        assert safe_meta["keep"] == "unrelated-safe-meta"
         surfaces = {
             "detail": st.get_memory(survivor_id),
+            "unrelated": unrelated_after,
             "browse": st.browse_memories(),
             "events": st.events(),
             "trace": st.trace(survivor_id),
             "worldview": st.worldview(),
+            "session_meta": safe_meta,
         }
         raw_values: list[Any] = []
         for table_row in st.conn.execute(
@@ -1253,8 +1682,13 @@ def test_purge_erases_blob_provenance_canary_and_its_public_base64_form(
                     for value in tuple(row)
                 )
 
-    serialized = json.dumps(surfaces, ensure_ascii=False, default=str)
+    serialized = json.dumps(surfaces, ensure_ascii=False, allow_nan=False)
     assert encoded_canary not in serialized
+    assert blob_canary.hex() not in serialized
+    assert human_blob not in serialized
+    assert spaced_envelope not in serialized
+    assert compact_envelope not in serialized
+    assert encoded_key not in serialized
     assert "BLOB-PURGE-CANARY-9d71" not in serialized
     for value in raw_values:
         if isinstance(value, bytes):
@@ -1269,13 +1703,37 @@ def test_purge_erases_blob_provenance_canary_and_its_public_base64_form(
     from haunt import mcp_server
 
     mcp_server._MCP_AUTHORITY = None
-    mcp_trace = mcp_server.memory_trace(survivor_id, namespace="default")
-    assert encoded_canary not in mcp_trace
+    mcp_surfaces = json.dumps(
+        [
+            json.loads(mcp_server.memory_trace(survivor_id, namespace="default")),
+            json.loads(mcp_server.memory_timeline(namespace="default")),
+            json.loads(mcp_server.memory_worldview(namespace="default")),
+        ],
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    assert encoded_canary not in mcp_surfaces
+    assert blob_canary.hex() not in mcp_surfaces
+    assert encoded_key not in mcp_surfaces
     from tests.dashutil import make_dash_client
 
-    dashboard = make_dash_client().get(f"/api/namespace/default/memory/{survivor_id}")
-    assert dashboard.status_code == 200, dashboard.text
-    assert encoded_canary not in dashboard.text
+    client = make_dash_client()
+    dashboard_responses = [
+        client.get(f"/api/namespace/default/memory/{survivor_id}"),
+        client.get(f"/api/namespace/default/memory/{unrelated.memory_id}"),
+        client.get("/api/namespace/default/browse"),
+        client.get("/api/namespace/default/timeline"),
+        client.get("/api/namespace/default/worldview"),
+    ]
+    assert all(response.status_code == 200 for response in dashboard_responses)
+    dashboard_surfaces = json.dumps(
+        [response.json() for response in dashboard_responses],
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    assert encoded_canary not in dashboard_surfaces
+    assert blob_canary.hex() not in dashboard_surfaces
+    assert encoded_key not in dashboard_surfaces
 
 
 def test_cli_mcp_and_dashboard_share_the_same_envelope_schema(

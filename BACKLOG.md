@@ -261,6 +261,10 @@ that source metadata measures truth.
   derived job, graph, or index write. Idempotency includes exact canonical
   attribution, including concurrent retry behavior, and fails closed when a
   legacy-null or invalid stored envelope cannot prove exact attribution.
+- Schema-v8 insert/update triggers require non-null provenance to use SQLite
+  `TEXT`. Triggerless/corrupt BLOB provenance is labeled `invalid_stored`
+  without a UTF-8 guess and conflicts on replay, even when its bytes contain
+  valid-looking JSON.
 - Opaque legacy SQLite BLOB values are exposed losslessly through an explicit
   standard-base64 object at the recursive Store serialization boundary. This
   includes BLOB `origin`, `meta`, and invalid-stored rows without UTF-8 guesses,
@@ -272,6 +276,11 @@ that source metadata measures truth.
   already-serialized values. Timeline, worldview, recall, graph, namespace,
   and procedure formatting no longer applies string-only operations directly
   to migrated SQLite dynamic types; JSON output remains exact and unchanged.
+- Recursive public serialization uses a reserved reversible codec for
+  non-string mapping keys and escapes colliding ordinary string keys. Stats,
+  graph, namespace, detail, and recall payloads therefore remain strict JSON
+  without collapsing dynamic SQLite types; generic dictionaries are displayed
+  as stable JSON unless a caller explicitly identifies a serialized scalar.
 - `tests/test_structured_provenance.py` covers every fidelity, Unicode source
   and call IDs, unknown fields, parser/version/hash rejection with zero rows,
   byte-preserving migration/restart, corrected-import trace, actual Store/CLI/
@@ -282,13 +291,15 @@ that source metadata measures truth.
   recursive no-confidence assertions, schema-v7 BLOB origin/meta migration and
   restart across Store/CLI/MCP/dashboard/procedure/worldview surfaces, strict
   JSON serialization, exact base64 recovery, exhaustive bounded human CLI
-  rendering, and privacy purge canaries across all tables and serialized
-  surfaces.
-- The dependency-correct Python 3.14/MCP 2.1 full suite passes with 559 tests,
-  5 environment/data skips, and 7 declared temporal xfails. The focused E2,
-  E1, E0, hook, host, migration, and FTS compatibility group passes 225 tests
-  under Python 3.12/MCP 2.1; that pyenv build cannot load SQLite extensions, so
-  its unrelated vector-required tests are not a valid profile.
+  rendering, strict/reversible dynamic mapping keys, exact recall values across
+  Python/CLI/MCP/dashboard, and raw plus encoded privacy-purge canaries across
+  shared sessions, all tables, and serialized surfaces.
+- The dependency-correct Python 3.14/MCP 2.1 sqlite-vec full suite passes with
+  566 tests, 2 environment/data skips, and 7 declared temporal xfails. The
+  focused E2/E1/E0/security/authority/clock FTS compatibility group passes 158
+  tests under both Python 3.10 and Python 3.12 with MCP 2.1. Those pyenv builds
+  cannot load SQLite extensions, so their unrelated vector-required full-suite
+  bootstrap failures are not a valid compatibility profile.
 
 **Non-goals**
 

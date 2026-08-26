@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import sqlite3
 import struct
 from dataclasses import dataclass, field
@@ -26,6 +28,7 @@ from haunt.paths import (
     tighten_db_files,
 )
 from haunt.provenance import (
+    encode_json_safe_sqlite_key,
     json_safe_sqlite,
     provenance_json,
     public_provenance,
@@ -278,9 +281,7 @@ def _normalize_stored_clocks(conn: sqlite3.Connection) -> int:
         ).fetchone()
         if not exists:
             continue
-        rows = conn.execute(
-            f"SELECT rowid, {', '.join(cols)} FROM {table}"
-        ).fetchall()
+        rows = conn.execute(f"SELECT rowid, {', '.join(cols)} FROM {table}").fetchall()
         for row in rows:
             sets: list[str] = []
             params: list[Any] = []
@@ -401,6 +402,28 @@ def _ensure_correction_append_only_triggers(conn: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_provenance_type_triggers(conn: sqlite3.Connection) -> None:
+    """Require new structured provenance to use SQLite TEXT storage."""
+    columns = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(events)").fetchall()
+    }
+    if "provenance" not in columns:
+        return
+    for operation in ("INSERT", "UPDATE OF provenance"):
+        name = operation.lower().replace(" ", "_")
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS events_provenance_type_{name}
+            BEFORE {operation} ON events
+            WHEN NEW.provenance IS NOT NULL
+                 AND typeof(NEW.provenance) != 'text'
+            BEGIN
+                SELECT RAISE(ABORT, 'event provenance must be text');
+            END
+            """
+        )
+
+
 def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     """Create tables and run one-time migrations. Not invoked per query."""
     _init_namespace_schema(conn)
@@ -408,6 +431,7 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     if current >= SCHEMA_VERSION:
         _ensure_correction_invariant_triggers(conn)
         _ensure_correction_append_only_triggers(conn)
+        _ensure_provenance_type_triggers(conn)
         conn.commit()
         return
     if current < 1:
@@ -489,6 +513,7 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
             )
     _ensure_correction_invariant_triggers(conn)
     _ensure_correction_append_only_triggers(conn)
+    _ensure_provenance_type_triggers(conn)
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
         (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
@@ -496,12 +521,12 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def ensure_vec_table(conn: sqlite3.Connection, dim: int, *, commit: bool = True) -> bool:
+def ensure_vec_table(
+    conn: sqlite3.Connection, dim: int, *, commit: bool = True
+) -> bool:
     if dim <= 0 or not _vec_loaded(conn):
         return False
-    existing = conn.execute(
-        "SELECT value FROM meta WHERE key='embed_dim'"
-    ).fetchone()
+    existing = conn.execute("SELECT value FROM meta WHERE key='embed_dim'").fetchone()
     if existing and int(existing["value"]) != dim:
         conn.execute("DROP TABLE IF EXISTS vec_memories")
     try:
@@ -531,7 +556,9 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
     repo = str(Path(repo_path).expanduser().resolve()) if repo_path else None
     conn = _registry()
     try:
-        row = conn.execute("SELECT name FROM namespaces WHERE name=?", (name,)).fetchone()
+        row = conn.execute(
+            "SELECT name FROM namespaces WHERE name=?", (name,)
+        ).fetchone()
         if row:
             conn.execute(
                 "UPDATE namespaces SET repo_path=COALESCE(?, repo_path), db_path=?, updated_at=? WHERE name=?",
@@ -655,10 +682,29 @@ def _erasure_context_values(*raw_values: object) -> set[str]:
             for child in value:
                 add(child)
             return
-        if isinstance(value, bytes):
-            values.add(value.hex())
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, (bytes, bytearray)):
+            raw = bytes(value)
+            encoded = base64.b64encode(raw).decode("ascii")
+            envelope = {"encoding": "base64", "data": encoded}
+            values.update(
+                {
+                    raw.hex(),
+                    encoded,
+                    f"<sqlite-blob base64:{encoded}>",
+                    json.dumps(envelope, ensure_ascii=False),
+                    json.dumps(
+                        envelope,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    encode_json_safe_sqlite_key(raw),
+                }
+            )
             try:
-                add(value.decode("utf-8"))
+                add(raw.decode("utf-8"))
             except UnicodeDecodeError:
                 pass
             return
@@ -906,9 +952,7 @@ class Store:
             blob = None
             embedded = False
             vec = (
-                None
-                if defer_embedding
-                else (embed_one(text) if text.strip() else None)
+                None if defer_embedding else (embed_one(text) if text.strip() else None)
             )
             if vec is not None:
                 blob = sqlite_vec.serialize_float32(vec)
@@ -1012,9 +1056,7 @@ class Store:
         if row["content"] != expected_text:
             raise ValueError("idempotency_key was reused with different content")
         if row["provenance"] is None:
-            raise ValueError(
-                "idempotency_key replay cannot verify legacy provenance"
-            )
+            raise ValueError("idempotency_key replay cannot verify legacy provenance")
         stored_provenance = public_provenance(
             row["provenance"],
             origin=row["origin"],
@@ -1059,7 +1101,6 @@ class Store:
             deduplicated=True,
             provenance=stored_provenance,
         )
-
 
     def process_embedding_jobs(self, *, limit: int = 64) -> dict[str, Any]:
         """Embed queued hook writes in a persistent, model-owning process."""
@@ -1181,7 +1222,6 @@ class Store:
             "failed": failed,
             "available": True,
         }
-
 
     def embeddings_stale(self) -> bool:
         """True when stored vectors do not match the currently loaded model."""
@@ -1334,23 +1374,25 @@ class Store:
         wal = db.with_suffix(db.suffix + "-wal")
         if wal.exists():
             size += wal.stat().st_size
-        return {
-            "namespace": self.name,
-            "db_path": str(db.resolve()),
-            "db_size_bytes": size,
-            "events": count("events"),
-            "memories": count("memories"),
-            "sessions": count("sessions"),
-            "entities": count("entities"),
-            "relations": count("relations"),
-            "embedding_jobs": count("embedding_jobs"),
-            "corrections": count("corrections"),
-            "lineage_tombstones": count("lineage_tombstones"),
-            "tiers": tiers,
-            "last_write": last["ts"] if last else None,
-            "last_event_time": last["event_time"] if last else None,
-            "wal": True,
-        }
+        return json_safe_sqlite(
+            {
+                "namespace": self.name,
+                "db_path": str(db.resolve()),
+                "db_size_bytes": size,
+                "events": count("events"),
+                "memories": count("memories"),
+                "sessions": count("sessions"),
+                "entities": count("entities"),
+                "relations": count("relations"),
+                "embedding_jobs": count("embedding_jobs"),
+                "corrections": count("corrections"),
+                "lineage_tombstones": count("lineage_tombstones"),
+                "tiers": tiers,
+                "last_write": last["ts"] if last else None,
+                "last_event_time": last["event_time"] if last else None,
+                "wal": True,
+            }
+        )
 
     def top_entities(
         self,
@@ -1382,7 +1424,7 @@ class Store:
             """,
             (clamp_limit(limit, default=15),),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return json_safe_sqlite([dict(r) for r in rows])
 
     def graph(self, entity: str | None = None) -> dict[str, Any]:
         if entity:
@@ -1405,11 +1447,23 @@ class Store:
                         ids + ids,
                     )
                 ]
-            return {"entities": ents, "relations": rels}
-        return {
-            "entities": [dict(r) for r in self.conn.execute("SELECT * FROM entities ORDER BY last_seen DESC LIMIT 200")],
-            "relations": [dict(r) for r in self.conn.execute("SELECT * FROM relations ORDER BY valid_from DESC LIMIT 400")],
-        }
+            return json_safe_sqlite({"entities": ents, "relations": rels})
+        return json_safe_sqlite(
+            {
+                "entities": [
+                    dict(r)
+                    for r in self.conn.execute(
+                        "SELECT * FROM entities ORDER BY last_seen DESC LIMIT 200"
+                    )
+                ],
+                "relations": [
+                    dict(r)
+                    for r in self.conn.execute(
+                        "SELECT * FROM relations ORDER BY valid_from DESC LIMIT 400"
+                    )
+                ],
+            }
+        )
 
     def rebuild_graph(self, *, touch: bool = True) -> dict[str, Any]:
         """Rebuild graph evidence and derived aggregates from stored events."""
@@ -1473,7 +1527,6 @@ class Store:
             "entities": count("entities"),
             "relations": count("relations"),
         }
-
 
     # ------------------------------------------------------------------
     # purge: hard-delete a memory and its entire provenance chain
@@ -1633,22 +1686,16 @@ class Store:
             self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
 
             has_fts = self.conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type='table' AND name='memories_fts'"
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'"
             ).fetchone()
             if has_fts:
-                self.conn.execute(
-                    "DELETE FROM memories_fts WHERE id=?", (memory_id,)
-                )
+                self.conn.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
                 deleted["fts_deleted"] = True
             has_vec = self.conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type='table' AND name='vec_memories'"
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_memories'"
             ).fetchone()
             if has_vec:
-                self.conn.execute(
-                    "DELETE FROM vec_memories WHERE id=?", (memory_id,)
-                )
+                self.conn.execute("DELETE FROM vec_memories WHERE id=?", (memory_id,))
                 deleted["vec_deleted"] = True
 
             other_memories = self.conn.execute(
@@ -1849,10 +1896,13 @@ class Store:
         dropped = object()
 
         def tainted(value: Any) -> bool:
-            if isinstance(value, bytes):
+            if isinstance(value, memoryview):
+                value = value.tobytes()
+            if isinstance(value, (bytes, bytearray)):
+                raw = bytes(value)
                 return any(
-                    value == token.encode("utf-8")
-                    or (len(token) >= 8 and token.encode("utf-8") in value)
+                    raw == token.encode("utf-8")
+                    or (len(token) >= 8 and token.encode("utf-8") in raw)
                     for token in sensitive_values
                 )
             if not isinstance(value, str):
@@ -1863,9 +1913,11 @@ class Store:
             )
 
         safe_source = PURGE_SAFE_SESSION_SOURCE if tainted(source) else source
-        if isinstance(original_meta, bytes):
+        if isinstance(original_meta, memoryview):
+            original_meta = original_meta.tobytes()
+        if isinstance(original_meta, (bytes, bytearray)):
             try:
-                meta_text = original_meta.decode("utf-8")
+                meta_text = bytes(original_meta).decode("utf-8")
             except UnicodeDecodeError:
                 # Opaque metadata on an affected session cannot be proven free
                 # of erased context. Privacy purge therefore drops it even when
@@ -2089,18 +2141,24 @@ class Store:
             current = successor
 
         linked = bool(corrections or incoming.get(("memory", memory_id)))
-        lineage_status = "linked" if linked else (
-            "legacy_unlinked" if requested["valid_to"] is not None else "standalone"
+        lineage_status = (
+            "linked"
+            if linked
+            else (
+                "legacy_unlinked" if requested["valid_to"] is not None else "standalone"
+            )
         )
-        return json_safe_sqlite({
-            "ok": True,
-            "schema_version": 1,
-            "namespace": self.name,
-            "requested_memory_id": memory_id,
-            "lineage_status": lineage_status,
-            "members": members,
-            "corrections": corrections,
-        })
+        return json_safe_sqlite(
+            {
+                "ok": True,
+                "schema_version": 1,
+                "namespace": self.name,
+                "requested_memory_id": memory_id,
+                "lineage_status": lineage_status,
+                "members": members,
+                "corrections": corrections,
+            }
+        )
 
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         """Retrieve full provenance detail for a single memory."""
@@ -2213,27 +2271,29 @@ class Store:
         total = self.conn.execute(count_sql, params).fetchone()[0]
         sql += " ORDER BY m.created_at DESC, m.rowid DESC LIMIT ? OFFSET ?"
         rows = self.conn.execute(sql, params + [limit, offset]).fetchall()
-        return json_safe_sqlite({
-            "memories": [
-                {
-                    **{
-                        k: value
-                        for k, value in dict(r).items()
-                        if k not in {"provenance", "meta"}
-                    },
-                    "provenance": public_provenance(
-                        r["provenance"],
-                        origin=r["origin"],
-                        legacy_meta=r["meta"],
-                        tool_name=r["tool_name"],
-                    ),
-                }
-                for r in rows
-            ],
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-        })
+        return json_safe_sqlite(
+            {
+                "memories": [
+                    {
+                        **{
+                            k: value
+                            for k, value in dict(r).items()
+                            if k not in {"provenance", "meta"}
+                        },
+                        "provenance": public_provenance(
+                            r["provenance"],
+                            origin=r["origin"],
+                            legacy_meta=r["meta"],
+                            tool_name=r["tool_name"],
+                        ),
+                    }
+                    for r in rows
+                ],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
 
     # ------------------------------------------------------------------
     # worldview: compact per-namespace briefing
@@ -2280,20 +2340,24 @@ class Store:
         proc_index: list[dict[str, Any]] = []
         for p in procedures:
             emeta = loads(p.get("meta"))
-            proc_index.append({
-                "id": p["id"],
-                "name": emeta.get("name", ""),
-                "trigger": emeta.get("trigger", ""),
-                "provenance": public_provenance(
-                    p["provenance"],
-                    origin=p["origin"],
-                    legacy_meta=p["meta"],
-                    tool_name=p["tool_name"],
-                ),
-            })
+            proc_index.append(
+                {
+                    "id": p["id"],
+                    "name": emeta.get("name", ""),
+                    "trigger": emeta.get("trigger", ""),
+                    "provenance": public_provenance(
+                        p["provenance"],
+                        origin=p["origin"],
+                        legacy_meta=p["meta"],
+                        tool_name=p["tool_name"],
+                    ),
+                }
+            )
 
         names = self.top_entities(limit=names_cap, trusted_only=True)
-        name_list = [{"name": n["name"], "type": n["type"], "mentions": n["rels"]} for n in names]
+        name_list = [
+            {"name": n["name"], "type": n["type"], "mentions": n["rels"]} for n in names
+        ]
 
         stats = self.stats()
         counts = {
@@ -2302,13 +2366,15 @@ class Store:
             "sessions": stats["sessions"],
         }
 
-        return json_safe_sqlite({
-            "namespace": self.name,
-            "facts": facts,
-            "names": name_list,
-            "procedures": proc_index,
-            "counts": counts,
-        })
+        return json_safe_sqlite(
+            {
+                "namespace": self.name,
+                "facts": facts,
+                "names": name_list,
+                "procedures": proc_index,
+                "counts": counts,
+            }
+        )
 
     # ------------------------------------------------------------------
     # procedure: named how-tos
@@ -2358,20 +2424,22 @@ class Store:
         if not row:
             return None
         emeta = loads(row["meta"])
-        return json_safe_sqlite({
-            "id": row["id"],
-            "name": emeta.get("name", name),
-            "body": row["content"],
-            "trigger": emeta.get("trigger", ""),
-            "valid_from": row["valid_from"],
-            "created_at": row["created_at"],
-            "provenance": public_provenance(
-                row["provenance"],
-                origin=row["origin"],
-                legacy_meta=row["meta"],
-                tool_name=row["tool_name"],
-            ),
-        })
+        return json_safe_sqlite(
+            {
+                "id": row["id"],
+                "name": emeta.get("name", name),
+                "body": row["content"],
+                "trigger": emeta.get("trigger", ""),
+                "valid_from": row["valid_from"],
+                "created_at": row["created_at"],
+                "provenance": public_provenance(
+                    row["provenance"],
+                    origin=row["origin"],
+                    legacy_meta=row["meta"],
+                    tool_name=row["tool_name"],
+                ),
+            }
+        )
 
     def procedure_list(self) -> list[dict[str, Any]]:
         """List all active procedures (valid_to IS NULL)."""
@@ -2391,28 +2459,28 @@ class Store:
         out: list[dict[str, Any]] = []
         for r in rows:
             emeta = loads(r["meta"])
-            out.append({
-                "id": r["id"],
-                "name": emeta.get("name", ""),
-                "body": r["content"],
-                "trigger": emeta.get("trigger", ""),
-                "created_at": r["created_at"],
-                "provenance": public_provenance(
-                    r["provenance"],
-                    origin=r["origin"],
-                    legacy_meta=r["meta"],
-                    tool_name=r["tool_name"],
-                ),
-            })
+            out.append(
+                {
+                    "id": r["id"],
+                    "name": emeta.get("name", ""),
+                    "body": r["content"],
+                    "trigger": emeta.get("trigger", ""),
+                    "created_at": r["created_at"],
+                    "provenance": public_provenance(
+                        r["provenance"],
+                        origin=r["origin"],
+                        legacy_meta=r["meta"],
+                        tool_name=r["tool_name"],
+                    ),
+                }
+            )
         return json_safe_sqlite(out)
 
     # ------------------------------------------------------------------
     # contradict: supersede a memory
     # ------------------------------------------------------------------
 
-    def _correction_replay(
-        self, key: str, payload: bytes
-    ) -> dict[str, Any] | None:
+    def _correction_replay(self, key: str, payload: bytes) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT request_payload, response_json FROM corrections WHERE idempotency_key=?",
             (key,),
@@ -2621,12 +2689,13 @@ def list_namespaces(*, only: str | None = None) -> list[dict[str, Any]]:
         except (sqlite3.Error, OSError) as exc:
             extra["error"] = str(exc)
         out.append({**row, **extra})
-    return out
+    return json_safe_sqlite(out)
 
 
 def iter_stores() -> Iterator[Store]:
     for row in list_namespace_rows():
         yield Store(row["name"], create=False)
+
 
 def reembed_all_namespaces() -> list[dict[str, Any]]:
     """Rebuild embeddings in every registered namespace."""

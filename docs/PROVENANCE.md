@@ -104,6 +104,11 @@ The v8 migration adds the provenance column without rewriting existing
 Haunt does not synthesize import fields from that legacy data. A structurally
 invalid or unsupported non-null stored envelope is labeled `invalid_stored`
 instead of being presented as valid or leaking unvalidated fields.
+New non-null provenance is required to have SQLite storage type `TEXT` by
+schema-v8 insert/update triggers. A triggerless or externally corrupted row
+whose provenance has any other SQLite type is still readable, but is always
+`invalid_stored`; Haunt never decodes even a BLOB containing valid-looking JSON,
+and an idempotent replay against it fails closed.
 
 SQLite uses dynamic value types, so a pre-v8 database may contain a BLOB even
 in the `origin` or `meta` columns. Public JSON never guesses that an opaque BLOB
@@ -122,6 +127,15 @@ This encoding applies recursively at the Store boundary, including the raw
 legacy columns and fields copied into `legacy_unstructured` or
 `invalid_stored`; it does not rewrite the database.
 
+SQLite values can also become mapping keys, for example a dynamically typed
+`tier` grouped by `Store.stats()`. Ordinary string keys retain their existing
+JSON spelling. Every non-string key uses the reserved reversible
+`$haunt.sqlite-key:v1:` codec (including IEEE-754 bits for REALs and standard
+base64 for BLOBs), while an ordinary string beginning with that prefix is
+escaped through the same codec. This prevents JSON's implicit string-key
+coercion from collapsing distinct SQLite keys. The public decoder in
+`haunt.provenance` recovers the exact key type and value.
+
 When an opaque legacy `meta` value is not valid JSON, typed read features do
 not guess its meaning. In particular, it cannot match a named procedure and is
 omitted from procedure indexes/worldview summaries, while memory detail and
@@ -135,3 +149,8 @@ separate bounded renderer: BLOBs appear as
 stable JSON. Normal strings keep their familiar display, while terminal
 control characters are escaped. This prevents migrated dynamic SQLite values
 from reaching string-only timestamp, snippet, slicing, or width formatters.
+Only call sites that know a value is a serialized SQLite scalar interpret the
+two-field BLOB/REAL envelope as a human marker. Generic dictionaries—including
+lookalikes—remain stable JSON. Recall hits pass through the same lossless
+recursive boundary before Store/CLI/MCP/dashboard output; none of those paths
+falls back to `str()` coercion.

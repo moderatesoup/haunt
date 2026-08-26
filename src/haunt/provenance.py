@@ -6,6 +6,7 @@ import base64
 import json
 import math
 import re
+import struct
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -20,6 +21,7 @@ _TRANSFORM_MAX = 256
 _TRANSFORM_COUNT_MAX = 128
 _SERIALIZED_MAX = 32768
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+SQLITE_KEY_PREFIX = "$haunt.sqlite-key:v1:"
 _COMMON = {
     "schema_version",
     "kind",
@@ -68,10 +70,77 @@ def json_safe_sqlite(value: Any) -> Any:
             token = "-infinity"
         return {"encoding": "sqlite-real", "data": token}
     if isinstance(value, Mapping):
-        return {key: json_safe_sqlite(item) for key, item in value.items()}
+        encoded: dict[str, Any] = {}
+        for key, item in value.items():
+            public_key = encode_json_safe_sqlite_key(key)
+            if public_key in encoded:
+                raise ValueError("public SQLite mapping key collision")
+            encoded[public_key] = json_safe_sqlite(item)
+        return encoded
     if isinstance(value, (list, tuple)):
         return [json_safe_sqlite(item) for item in value]
     raise TypeError(f"unsupported public SQLite value type: {type(value).__name__}")
+
+
+def encode_json_safe_sqlite_key(value: Any) -> str:
+    """Encode a SQLite mapping key without JSON string-key collisions."""
+    if isinstance(value, str):
+        if not value.startswith(SQLITE_KEY_PREFIX):
+            return value
+        data = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        return f"{SQLITE_KEY_PREFIX}text:{data}"
+    if value is None:
+        return f"{SQLITE_KEY_PREFIX}null"
+    if isinstance(value, bool):
+        return f"{SQLITE_KEY_PREFIX}bool:{int(value)}"
+    if isinstance(value, int):
+        return f"{SQLITE_KEY_PREFIX}integer:{value}"
+    if isinstance(value, float):
+        bits = struct.pack(">d", value).hex()
+        return f"{SQLITE_KEY_PREFIX}real:{bits}"
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, bytes):
+        data = base64.b64encode(value).decode("ascii")
+        return f"{SQLITE_KEY_PREFIX}blob:{data}"
+    raise TypeError(f"unsupported public SQLite mapping key: {type(value).__name__}")
+
+
+def decode_json_safe_sqlite_key(value: str) -> Any:
+    """Reverse a key produced by :func:`encode_json_safe_sqlite_key`."""
+    if not isinstance(value, str):
+        raise TypeError("public SQLite mapping key must be a string")
+    if not value.startswith(SQLITE_KEY_PREFIX):
+        return value
+    payload = value[len(SQLITE_KEY_PREFIX) :]
+    if payload == "null":
+        return None
+    if payload == "bool:0":
+        return False
+    if payload == "bool:1":
+        return True
+    if payload.startswith("integer:"):
+        try:
+            return int(payload.removeprefix("integer:"))
+        except ValueError as exc:
+            raise ValueError("invalid encoded SQLite integer key") from exc
+    if payload.startswith("real:"):
+        raw = payload.removeprefix("real:")
+        if len(raw) != 16 or not re.fullmatch(r"[0-9a-f]{16}", raw):
+            raise ValueError("invalid encoded SQLite REAL key")
+        return struct.unpack(">d", bytes.fromhex(raw))[0]
+    for kind, decoder in (
+        ("text:", lambda raw: raw.decode("utf-8")),
+        ("blob:", lambda raw: raw),
+    ):
+        if payload.startswith(kind):
+            encoded = payload.removeprefix(kind)
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+                return decoder(raw)
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ValueError(f"invalid encoded SQLite {kind[:-1]} key") from exc
+    raise ValueError("unknown encoded SQLite mapping key")
 
 
 def _optional_text(value: Any, field: str, *, limit: int = _TEXT_MAX) -> str | None:
@@ -123,9 +192,7 @@ def validate_provenance(
     """
     actual_origin = _actual_text(origin, "origin")
     actual_channel = _actual_text(channel, "channel")
-    actual_tool = (
-        None if tool_name is None else _actual_text(tool_name, "tool_name")
-    )
+    actual_tool = None if tool_name is None else _actual_text(tool_name, "tool_name")
     actual_call = (
         None
         if producer_call_id is None
@@ -221,9 +288,7 @@ def validate_provenance(
             transforms = envelope["transforms"]
             if transforms is not None:
                 if not isinstance(transforms, list):
-                    raise ValueError(
-                        "provenance.transforms must be an array or null"
-                    )
+                    raise ValueError("provenance.transforms must be an array or null")
                 if len(transforms) > _TRANSFORM_COUNT_MAX:
                     raise ValueError(
                         "provenance.transforms may contain at most "
@@ -238,9 +303,7 @@ def validate_provenance(
                     for index, item in enumerate(transforms)
                 ]
                 if any(item is None for item in envelope["transforms"]):
-                    raise ValueError(
-                        "provenance.transforms items must be strings"
-                    )
+                    raise ValueError("provenance.transforms items must be strings")
 
     encoded = json.dumps(
         envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -267,10 +330,12 @@ def public_provenance(
 ) -> dict[str, Any]:
     """Serialize structured rows or label untouched pre-v8 rows honestly."""
     if stored is not None:
-        try:
-            parsed = json.loads(stored)
-        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
-            parsed = None
+        parsed = None
+        if isinstance(stored, str):
+            try:
+                parsed = json.loads(stored)
+            except json.JSONDecodeError:
+                pass
         if isinstance(parsed, dict):
             try:
                 validated = validate_provenance(

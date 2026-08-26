@@ -157,6 +157,7 @@ def recall_cmd(
     ),
     tier: Optional[str] = typer.Option(None, "--tier"),
     k: int = typer.Option(8, "--k"),
+    json_out: bool = typer.Option(False, "--json", help="Output stable JSON"),
 ) -> None:
     """Hybrid recall (vec + FTS5 + RRF). Prints score, tier, id, snippet.
 
@@ -165,7 +166,7 @@ def recall_cmd(
     """
     ns = _ns(namespace)
     try:
-        with _existing(ns) as st:
+        with open_existing(ns) as st:
             hits = planned_recall(
                 query,
                 namespace=ns,
@@ -177,16 +178,43 @@ def recall_cmd(
                 k=k,
                 store=st,
             )
-    except (TemporalParseError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
+    except (TemporalParseError, UnknownNamespaceError, ValueError) as exc:
+        if json_out:
+            typer.echo(
+                json.dumps(
+                    {"ok": False, "error": str(exc), "namespace": ns, "query": query},
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                err=True,
+            )
+        else:
+            typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
+    if json_out:
+        typer.echo(
+            json.dumps(
+                {
+                    "namespace": ns,
+                    "query": query,
+                    "hits": [hit.as_dict() for hit in hits],
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+        return
     if not hits:
         typer.echo("no hits")
         return
     typer.echo(f"{'#':<3} {'score':<8} {'tier':<12} {'id':<36} snippet")
     for i, h in enumerate(hits, 1):
-        tier_text = human_display(h.tier, limit=40, collapse_whitespace=True)
-        memory_id = human_display(h.memory_id, limit=64, collapse_whitespace=True)
+        tier_text = human_display(
+            h.tier, limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        memory_id = human_display(
+            h.memory_id, limit=64, collapse_whitespace=True, sqlite_scalar=True
+        )
         typer.echo(
             f"{i:<3} {h.score:<8.4f} {tier_text:<12} {memory_id:<36} "
             f"{snippet(h.content, 140)}"
@@ -235,18 +263,29 @@ def timeline_cmd(
     for r in rows:
         body = "" if r["content"] is None else snippet(r["content"], 120)
         if r["tool_name"] is not None and r["tool_name"] != "":
-            tool = human_display(r["tool_name"], limit=48, collapse_whitespace=True)
+            tool = human_display(
+                r["tool_name"],
+                limit=48,
+                collapse_whitespace=True,
+                sqlite_scalar=True,
+            )
             body = snippet(f"[tool:{tool}] {body}", 120)
         provenance = r["provenance"]
         source_channel = provenance.get("channel")
         source_origin = provenance.get("origin")
         source = (
-            f"{human_display(source_channel, limit=48, collapse_whitespace=True) if source_channel is not None and source_channel != '' else 'unknown'}/"
-            f"{human_display(source_origin, limit=80, collapse_whitespace=True) if source_origin is not None and source_origin != '' else 'unknown'}"
+            f"{human_display(source_channel, limit=48, collapse_whitespace=True, sqlite_scalar=True) if source_channel is not None and source_channel != '' else 'unknown'}/"
+            f"{human_display(source_origin, limit=80, collapse_whitespace=True, sqlite_scalar=True) if source_origin is not None and source_origin != '' else 'unknown'}"
         )
-        role = human_display(r["role"], limit=40, collapse_whitespace=True)
-        tier = human_display(r["tier"], limit=40, collapse_whitespace=True)
-        event_id = human_display(r["id"], limit=64, collapse_whitespace=True)
+        role = human_display(
+            r["role"], limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        tier = human_display(
+            r["tier"], limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        event_id = human_display(
+            r["id"], limit=64, collapse_whitespace=True, sqlite_scalar=True
+        )
         typer.echo(
             f"{format_iso(r['event_time'])}  {role:<10} {tier:<12} "
             f"{event_id}  source={source}  {body}"
@@ -263,8 +302,15 @@ def namespaces_cmd() -> None:
     typer.echo(f"{'name':<24} {'events':>7} {'mem':>7} {'sess':>6} {'ents':>6}  db")
     for r in rows:
         err = r.get("error")
-        name = human_display(r.get("name"), limit=48, collapse_whitespace=True)
-        db_path = human_display(r.get("db_path"), limit=240, collapse_whitespace=True)
+        name = human_display(
+            r.get("name"), limit=48, collapse_whitespace=True, sqlite_scalar=True
+        )
+        db_path = human_display(
+            r.get("db_path"),
+            limit=240,
+            collapse_whitespace=True,
+            sqlite_scalar=True,
+        )
         if err:
             error = human_display(err, limit=240, collapse_whitespace=True)
             typer.echo(f"{name:<24}  error: {error}  {db_path}")
@@ -338,10 +384,17 @@ def graph_cmd(
         names = {e["id"]: e for e in g["entities"]}
         typer.echo(f"entities ({len(g['entities'])})")
         for e in g["entities"][:40]:
-            name_text = human_display(e.get("name"), limit=64, collapse_whitespace=True)
-            type_text = human_display(e.get("type"), limit=40, collapse_whitespace=True)
+            name_text = human_display(
+                e.get("name"), limit=64, collapse_whitespace=True, sqlite_scalar=True
+            )
+            type_text = human_display(
+                e.get("type"), limit=40, collapse_whitespace=True, sqlite_scalar=True
+            )
             last_seen = human_display(
-                e.get("last_seen"), limit=80, collapse_whitespace=True
+                e.get("last_seen"),
+                limit=80,
+                collapse_whitespace=True,
+                sqlite_scalar=True,
             )
             typer.echo(f"  {name_text:<32} {type_text:<12} last={last_seen}")
         typer.echo(f"relations ({len(g['relations'])})")
@@ -350,14 +403,25 @@ def graph_cmd(
             dst_name = names.get(r["dst_entity"], {}).get("name")
             src_value = src_name if src_name is not None else r["src_entity"]
             dst_value = dst_name if dst_name is not None else r["dst_entity"]
-            src = human_display(src_value, limit=64, collapse_whitespace=True)
-            dst = human_display(dst_value, limit=64, collapse_whitespace=True)
+            src = human_display(
+                src_value, limit=64, collapse_whitespace=True, sqlite_scalar=True
+            )
+            dst = human_display(
+                dst_value, limit=64, collapse_whitespace=True, sqlite_scalar=True
+            )
             if src_name is None:
                 src = src[:8]
             if dst_name is None:
                 dst = dst[:8]
-            rel = human_display(r.get("rel"), limit=48, collapse_whitespace=True)
-            weight = human_display(r.get("weight"), limit=24, collapse_whitespace=True)
+            rel = human_display(
+                r.get("rel"), limit=48, collapse_whitespace=True, sqlite_scalar=True
+            )
+            weight = human_display(
+                r.get("weight"),
+                limit=24,
+                collapse_whitespace=True,
+                sqlite_scalar=True,
+            )
             typer.echo(f"  {src}  --{rel}-->  {dst}  w={weight}")
 
 
@@ -369,18 +433,16 @@ def worldview_cmd(
     json_out: bool = typer.Option(False, "--json", help="Output raw JSON"),
 ) -> None:
     """Compact namespace briefing: facts, entities, procedures, counts."""
-    import json as _json
-
     ns = _ns(namespace)
     facts_cap = clamp_limit(facts_cap, default=12)
     names_cap = clamp_limit(names_cap, default=12)
     with _existing(ns) as st:
         wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
     if json_out:
-        typer.echo(_json.dumps(wv, ensure_ascii=False, default=str, indent=2))
+        typer.echo(json.dumps(wv, ensure_ascii=False, allow_nan=False, indent=2))
         return
     typer.echo(
-        f"namespace  {human_display(wv['namespace'], limit=80, collapse_whitespace=True)}"
+        f"namespace  {human_display(wv['namespace'], limit=80, collapse_whitespace=True, sqlite_scalar=True)}"
     )
     typer.echo(
         f"counts     events={wv['counts']['events']}  memories={wv['counts']['memories']}  sessions={wv['counts']['sessions']}"
@@ -388,20 +450,28 @@ def worldview_cmd(
     typer.echo("")
     typer.echo(f"facts ({len(wv['facts'])})")
     for f in wv["facts"]:
-        fact_id = human_display(f.get("id"), limit=40, collapse_whitespace=True)
+        fact_id = human_display(
+            f.get("id"), limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
         typer.echo(f"  {fact_id[:8]}  {snippet(f.get('content'), 120)}")
     typer.echo("")
     typer.echo(f"names ({len(wv['names'])})")
     for n in wv["names"]:
-        name = human_display(n.get("name"), limit=64, collapse_whitespace=True)
-        kind = human_display(n.get("type"), limit=40, collapse_whitespace=True)
+        name = human_display(
+            n.get("name"), limit=64, collapse_whitespace=True, sqlite_scalar=True
+        )
+        kind = human_display(
+            n.get("type"), limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
         mentions = human_display(n.get("mentions"), limit=24)
         typer.echo(f"  {name:<28} {kind:<12} mentions={mentions}")
     typer.echo("")
     typer.echo(f"procedures ({len(wv['procedures'])})")
     for p in wv["procedures"]:
         name = human_display(p.get("name"), limit=64, collapse_whitespace=True)
-        proc_id = human_display(p.get("id"), limit=40, collapse_whitespace=True)
+        proc_id = human_display(
+            p.get("id"), limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
         trigger_value = p.get("trigger")
         trigger = (
             f"  when: {human_display(trigger_value, limit=120, collapse_whitespace=True)}"
@@ -457,14 +527,18 @@ def procedure_get_cmd(
             f"trigger  {human_display(proc['trigger'], limit=240, collapse_whitespace=True)}"
         )
     typer.echo(
-        f"id       {human_display(proc['id'], limit=160, collapse_whitespace=True)}"
+        f"id       {human_display(proc['id'], limit=160, collapse_whitespace=True, sqlite_scalar=True)}"
     )
     typer.echo(
-        f"created  {human_display(proc['created_at'], limit=80, collapse_whitespace=True)}"
+        f"created  {human_display(proc['created_at'], limit=80, collapse_whitespace=True, sqlite_scalar=True)}"
     )
     typer.echo(f"provenance {human_display(proc['provenance'], limit=4096)}")
     typer.echo("---")
-    typer.echo(human_display(proc["body"], limit=8192, preserve_layout=True))
+    typer.echo(
+        human_display(
+            proc["body"], limit=8192, preserve_layout=True, sqlite_scalar=True
+        )
+    )
 
 
 @procedure_app.command("list")
@@ -484,7 +558,9 @@ def procedure_list_cmd(
         trigger = human_display(
             p.get("trigger", ""), limit=96, collapse_whitespace=True
         )
-        proc_id = human_display(p.get("id"), limit=64, collapse_whitespace=True)
+        proc_id = human_display(
+            p.get("id"), limit=64, collapse_whitespace=True, sqlite_scalar=True
+        )
         typer.echo(f"{name:<28} {trigger:<32} {proc_id[:12]}")
         typer.echo(f"  provenance {human_display(p['provenance'], limit=4096)}")
 
