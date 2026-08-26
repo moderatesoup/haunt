@@ -133,6 +133,17 @@ transform. Existing string `origin` and free-form `meta` data remain readable;
 when they cannot be losslessly upgraded, they are
 `legacy_unstructured`, not synthetic structured provenance.
 
+Legacy SQLite values retain their dynamic type. If an old `origin`, `meta`, or
+other surfaced SQLite value is a BLOB, public JSON represents it losslessly as
+`{"encoding":"base64","data":"..."}` using standard base64, without trying
+to decode it as text; decoding `data` yields the exact stored bytes. Ordinary
+JSON-safe SQLite scalars keep their existing shape, and the read-time encoding
+never changes the database. This rule applies recursively to raw public fields
+and to values copied into `legacy_unstructured` or `invalid_stored`.
+Malformed legacy BLOB metadata remains available through detail/trace but is
+not guessed into typed procedure fields; guarded selectors treat it as no
+match rather than raising.
+
 For ordered import transforms, omitted, explicit `null`, and an empty list are
 distinct: not supplied, explicitly unknown, and known to have no transforms,
 respectively. Validation and idempotency preserve that distinction.

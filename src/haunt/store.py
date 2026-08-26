@@ -25,7 +25,12 @@ from haunt.paths import (
     safe_name,
     tighten_db_files,
 )
-from haunt.provenance import provenance_json, public_provenance, validate_provenance
+from haunt.provenance import (
+    json_safe_sqlite,
+    provenance_json,
+    public_provenance,
+    validate_provenance,
+)
 from haunt.util import (
     clamp_limit,
     clock_sql_column,
@@ -1308,7 +1313,7 @@ class Store:
                 legacy_meta=event.get("meta"),
                 tool_name=event.get("tool_name"),
             )
-            out.append(event)
+            out.append(json_safe_sqlite(event))
         return out
 
     def stats(self) -> dict[str, Any]:
@@ -2087,7 +2092,7 @@ class Store:
         lineage_status = "linked" if linked else (
             "legacy_unlinked" if requested["valid_to"] is not None else "standalone"
         )
-        return {
+        return json_safe_sqlite({
             "ok": True,
             "schema_version": 1,
             "namespace": self.name,
@@ -2095,7 +2100,7 @@ class Store:
             "lineage_status": lineage_status,
             "members": members,
             "corrections": corrections,
-        }
+        })
 
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         """Retrieve full provenance detail for a single memory."""
@@ -2155,7 +2160,7 @@ class Store:
         d["related_memories"] = [dict(r) for r in related]
         d["trace"] = self.trace(memory_id)
 
-        return d
+        return json_safe_sqlite(d)
 
     def browse_memories(
         self,
@@ -2208,7 +2213,7 @@ class Store:
         total = self.conn.execute(count_sql, params).fetchone()[0]
         sql += " ORDER BY m.created_at DESC, m.rowid DESC LIMIT ? OFFSET ?"
         rows = self.conn.execute(sql, params + [limit, offset]).fetchall()
-        return {
+        return json_safe_sqlite({
             "memories": [
                 {
                     **{
@@ -2228,7 +2233,7 @@ class Store:
             "total": total,
             "limit": limit,
             "offset": offset,
-        }
+        })
 
     # ------------------------------------------------------------------
     # worldview: compact per-namespace briefing
@@ -2265,7 +2270,9 @@ class Store:
                        e.origin, e.tool_name, e.provenance
                 FROM memories m
                 JOIN events e ON e.id = m.event_id
-                WHERE m.tier='procedural' AND m.valid_to IS NULL AND e.meta LIKE '%"kind": "procedure"%'
+                WHERE m.tier='procedural' AND m.valid_to IS NULL
+                  AND CASE WHEN json_valid(e.meta)
+                           THEN json_extract(e.meta, '$.kind') END = 'procedure'
                 ORDER BY m.created_at DESC, m.rowid DESC
                 """,
             ).fetchall()
@@ -2295,13 +2302,13 @@ class Store:
             "sessions": stats["sessions"],
         }
 
-        return {
+        return json_safe_sqlite({
             "namespace": self.name,
             "facts": facts,
             "names": name_list,
             "procedures": proc_index,
             "counts": counts,
-        }
+        })
 
     # ------------------------------------------------------------------
     # procedure: named how-tos
@@ -2339,8 +2346,10 @@ class Store:
             JOIN events e ON e.id = m.event_id
             WHERE m.tier='procedural'
               AND m.valid_to IS NULL
-              AND json_extract(e.meta, '$.kind') = 'procedure'
-              AND json_extract(e.meta, '$.name') = ?
+              AND CASE WHEN json_valid(e.meta)
+                       THEN json_extract(e.meta, '$.kind') END = 'procedure'
+              AND CASE WHEN json_valid(e.meta)
+                       THEN json_extract(e.meta, '$.name') END = ?
             ORDER BY m.created_at DESC, m.rowid DESC
             LIMIT 1
             """,
@@ -2349,7 +2358,7 @@ class Store:
         if not row:
             return None
         emeta = loads(row["meta"])
-        return {
+        return json_safe_sqlite({
             "id": row["id"],
             "name": emeta.get("name", name),
             "body": row["content"],
@@ -2362,7 +2371,7 @@ class Store:
                 legacy_meta=row["meta"],
                 tool_name=row["tool_name"],
             ),
-        }
+        })
 
     def procedure_list(self) -> list[dict[str, Any]]:
         """List all active procedures (valid_to IS NULL)."""
@@ -2374,7 +2383,8 @@ class Store:
             JOIN events e ON e.id = m.event_id
             WHERE m.tier='procedural'
               AND m.valid_to IS NULL
-              AND e.meta LIKE '%"kind": "procedure"%'
+              AND CASE WHEN json_valid(e.meta)
+                       THEN json_extract(e.meta, '$.kind') END = 'procedure'
             ORDER BY m.created_at DESC, m.rowid DESC
             """,
         ).fetchall()
@@ -2394,7 +2404,7 @@ class Store:
                     tool_name=r["tool_name"],
                 ),
             })
-        return out
+        return json_safe_sqlite(out)
 
     # ------------------------------------------------------------------
     # contradict: supersede a memory

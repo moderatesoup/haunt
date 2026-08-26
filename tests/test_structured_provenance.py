@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import math
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -12,8 +14,14 @@ import pytest
 from typer.testing import CliRunner
 
 from haunt.cli import app
-from haunt.provenance import IMPORT_FIDELITIES, native_provenance
+from haunt.provenance import (
+    IMPORT_FIDELITIES,
+    json_safe_sqlite,
+    native_provenance,
+    public_provenance,
+)
 from haunt.store import SCHEMA_VERSION, Store, observe as public_observe
+from haunt.util import loads
 
 
 LOGICAL_TABLES = (
@@ -69,6 +77,38 @@ def _logical_counts(store: Store) -> dict[str, int]:
         table: store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         for table in LOGICAL_TABLES
     }
+
+
+def _decode_public_blob(value: Any) -> bytes:
+    assert value.keys() == {"encoding", "data"}
+    assert value["encoding"] == "base64"
+    return base64.b64decode(value["data"], validate=True)
+
+
+@pytest.mark.parametrize("value", [None, 0, 17, -2.5, "meta text", True])
+def test_json_safe_sqlite_preserves_json_safe_sqlite_scalars(value):
+    assert json_safe_sqlite(value) == value
+    legacy = public_provenance(
+        None,
+        origin="legacy",
+        legacy_meta=value,
+    )
+    assert legacy["meta"] == value
+
+
+def test_json_safe_sqlite_losslessly_encodes_blob_memoryview_and_nonfinite_real():
+    raw = b"\x00\xffblob</script>\x80"
+    assert _decode_public_blob(json_safe_sqlite(raw)) == raw
+    assert _decode_public_blob(json_safe_sqlite(bytearray(raw))) == raw
+    assert _decode_public_blob(json_safe_sqlite(memoryview(raw))) == raw
+    assert json_safe_sqlite(math.inf) == {
+        "encoding": "sqlite-real",
+        "data": "+infinity",
+    }
+    fallback = object()
+    assert loads(raw, default=fallback) is fallback
+    assert loads(memoryview(raw), default=fallback) is fallback
+    json.dumps(json_safe_sqlite({"blob": memoryview(raw), "real": math.nan}), allow_nan=False)
 
 
 @pytest.mark.parametrize("fidelity", IMPORT_FIDELITIES)
@@ -497,6 +537,282 @@ def test_provenance_migration_preserves_legacy_origin_and_meta_bytes(provenance_
     }
 
 
+def test_v7_blob_origin_and_meta_migrate_losslessly_across_public_surfaces(
+    provenance_env, monkeypatch
+):
+    blob_origin = b"\xff\x00legacy-origin</script><img src=x onerror=alert(1)>\x80"
+    blob_meta = b"\x00\xfelegacy-meta</script><svg onload=alert(2)>\x81"
+    procedure_origin = b"\x80\x00procedure-origin</script>\xff"
+    procedure_meta = json.dumps(
+        {
+            "kind": "procedure",
+            "name": "blob procedure",
+            "trigger": "when testing blobs",
+        }
+    ).encode("utf-8")
+    with Store("default") as st:
+        legacy = st.observe("legacy blob event")
+        procedure = st.procedure_write("blob procedure", "blob procedure body")
+        st.conn.execute(
+            "UPDATE events SET origin=?, meta=?, provenance=NULL WHERE id=?",
+            (sqlite3.Binary(blob_origin), sqlite3.Binary(blob_meta), legacy.event_id),
+        )
+        st.conn.execute(
+            "UPDATE events SET origin=?, meta=?, provenance=NULL WHERE id=?",
+            (
+                sqlite3.Binary(procedure_origin),
+                sqlite3.Binary(procedure_meta),
+                procedure.event_id,
+            ),
+        )
+        st.conn.execute("UPDATE meta SET value='7' WHERE key='schema_version'")
+        st.conn.commit()
+
+    db_path = provenance_env / "namespaces" / "default.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE events DROP COLUMN provenance")
+    conn.commit()
+    conn.close()
+
+    with Store("default") as st:
+        detail = st.get_memory(legacy.memory_id)
+        browse = st.browse_memories(limit=20)
+        events = st.events(limit=20)
+        trace = st.trace(legacy.memory_id)
+        procedure_get = st.procedure_get("blob procedure")
+        procedure_list = st.procedure_list()
+        worldview = st.worldview()
+        raw_rows = {
+            row["id"]: row
+            for row in st.conn.execute(
+                "SELECT id, typeof(origin) AS origin_type, origin, "
+                "typeof(meta) AS meta_type, meta FROM events "
+                "WHERE id IN (?, ?)",
+                (legacy.event_id, procedure.event_id),
+            ).fetchall()
+        }
+
+    assert detail is not None
+    legacy_provenance = detail["provenance"]
+    assert legacy_provenance["kind"] == "legacy_unstructured"
+    assert _decode_public_blob(legacy_provenance["origin"]) == blob_origin
+    assert _decode_public_blob(legacy_provenance["meta"]) == blob_meta
+    assert _decode_public_blob(detail["origin"]) == blob_origin
+    assert _decode_public_blob(detail["meta"]) == blob_meta
+
+    browsed = next(
+        row for row in browse["memories"] if row["memory_id"] == legacy.memory_id
+    )
+    event = next(row for row in events if row["id"] == legacy.event_id)
+    member = trace["members"][0]
+    for output in (browsed, event, member):
+        assert _decode_public_blob(output["origin"]) == blob_origin
+        assert _decode_public_blob(output["provenance"]["origin"]) == blob_origin
+        assert _decode_public_blob(output["provenance"]["meta"]) == blob_meta
+    assert _decode_public_blob(event["meta"]) == blob_meta
+
+    assert procedure_get is not None
+    listed_procedure = next(
+        row for row in procedure_list if row["name"] == "blob procedure"
+    )
+    worldview_procedure = next(
+        row for row in worldview["procedures"] if row["name"] == "blob procedure"
+    )
+    for output in (procedure_get, listed_procedure, worldview_procedure):
+        assert output["provenance"]["kind"] == "legacy_unstructured"
+        assert _decode_public_blob(output["provenance"]["origin"]) == procedure_origin
+        assert _decode_public_blob(output["provenance"]["meta"]) == procedure_meta
+
+    for event_id, origin_bytes, meta_bytes in (
+        (legacy.event_id, blob_origin, blob_meta),
+        (procedure.event_id, procedure_origin, procedure_meta),
+    ):
+        raw = raw_rows[event_id]
+        assert raw["origin_type"] == "blob"
+        assert bytes(raw["origin"]) == origin_bytes
+        assert raw["meta_type"] == "blob"
+        assert bytes(raw["meta"]) == meta_bytes
+
+    runner = CliRunner()
+    cli_timeline = runner.invoke(
+        app, ["timeline", "-n", "default", "--limit", "20", "--json"]
+    )
+    cli_trace = runner.invoke(app, ["trace", legacy.memory_id, "-n", "default"])
+    cli_worldview = runner.invoke(app, ["worldview", "-n", "default", "--json"])
+    cli_procedure = runner.invoke(
+        app, ["procedure", "get", "blob procedure", "-n", "default"]
+    )
+    for result in (cli_timeline, cli_trace, cli_worldview, cli_procedure):
+        assert result.exit_code == 0, result.output
+        assert "</script>" not in result.output
+        assert "<img" not in result.output
+    cli_outputs = {
+        "timeline": json.loads(cli_timeline.stdout),
+        "trace": json.loads(cli_trace.stdout),
+        "worldview": json.loads(cli_worldview.stdout),
+        "procedure": cli_procedure.stdout,
+    }
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_outputs = [
+        json.loads(mcp_server.memory_timeline(namespace="default", limit=20)),
+        json.loads(mcp_server.memory_trace(legacy.memory_id, namespace="default")),
+        json.loads(mcp_server.memory_worldview(namespace="default")),
+        json.loads(
+            mcp_server.memory_procedure(
+                "get", name="blob procedure", namespace="default"
+            )
+        ),
+        json.loads(mcp_server.memory_procedure("list", namespace="default")),
+    ]
+
+    from tests.dashutil import make_dash_client
+
+    client = make_dash_client()
+    dashboard_responses = [
+        client.get(f"/api/namespace/default/memory/{legacy.memory_id}"),
+        client.get("/api/namespace/default/browse?limit=20"),
+        client.get("/api/namespace/default/timeline?limit=20"),
+        client.get("/api/namespace/default/worldview"),
+        client.get("/api/namespace/default/procedures"),
+    ]
+    for response in dashboard_responses:
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"] == "application/json"
+        assert "</script>" not in response.text
+        assert "<img" not in response.text
+    index = client.get("/")
+    assert index.status_code == 200
+    assert "esc(JSON.stringify(d.provenance" in index.text
+    assert "esc(r.origin" in index.text
+
+    all_outputs = {
+        "detail": detail,
+        "browse": browse,
+        "events": events,
+        "trace": trace,
+        "procedure_get": procedure_get,
+        "procedure_list": procedure_list,
+        "worldview": worldview,
+        "cli": cli_outputs,
+        "mcp": mcp_outputs,
+        "dashboard": [response.json() for response in dashboard_responses],
+    }
+    serialized_outputs = json.dumps(all_outputs, ensure_ascii=False, allow_nan=False)
+    for exact_bytes in (blob_origin, blob_meta, procedure_origin, procedure_meta):
+        assert base64.b64encode(exact_bytes).decode("ascii") in serialized_outputs
+    assert not _contains_key(all_outputs, "confidence")
+
+    with Store("default") as st:
+        after = st.conn.execute(
+            "SELECT origin, meta FROM events WHERE id=?",
+            (legacy.event_id,),
+        ).fetchone()
+    assert bytes(after["origin"]) == blob_origin
+    assert bytes(after["meta"]) == blob_meta
+
+
+def test_non_utf8_legacy_procedure_meta_fails_honest_without_read_surface_crash(
+    provenance_env, monkeypatch
+):
+    opaque_meta = b"\x00\xffprocedure-meta</script><img onerror=alert(4)>\x80"
+    with Store("default") as st:
+        corrupt = st.procedure_write("corrupt procedure", "opaque procedure body")
+        st.conn.execute(
+            "UPDATE events SET meta=?, provenance=NULL WHERE id=?",
+            (sqlite3.Binary(opaque_meta), corrupt.event_id),
+        )
+        st.conn.commit()
+
+        detail = st.get_memory(corrupt.memory_id)
+        trace = st.trace(corrupt.memory_id)
+        procedures = st.procedure_list()
+        worldview = st.worldview()
+        assert st.procedure_get("corrupt procedure") is None
+        raw_meta = st.conn.execute(
+            "SELECT meta FROM events WHERE id=?", (corrupt.event_id,)
+        ).fetchone()["meta"]
+
+    assert detail is not None
+    assert _decode_public_blob(detail["meta"]) == opaque_meta
+    assert _decode_public_blob(detail["provenance"]["meta"]) == opaque_meta
+    assert _decode_public_blob(trace["members"][0]["provenance"]["meta"]) == opaque_meta
+    assert all(row["id"] != corrupt.memory_id for row in procedures)
+    assert all(row["id"] != corrupt.memory_id for row in worldview["procedures"])
+
+    runner = CliRunner()
+    cli_get = runner.invoke(
+        app, ["procedure", "get", "corrupt procedure", "-n", "default"]
+    )
+    assert cli_get.exit_code == 1, cli_get.output
+    assert "not found: corrupt procedure" in cli_get.stdout
+    assert "Traceback" not in cli_get.output
+    cli_trace = runner.invoke(app, ["trace", corrupt.memory_id, "-n", "default"])
+    assert cli_trace.exit_code == 0, cli_trace.output
+    assert _decode_public_blob(
+        json.loads(cli_trace.stdout)["members"][0]["provenance"]["meta"]
+    ) == opaque_meta
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_get = json.loads(
+        mcp_server.memory_procedure(
+            "get", name="corrupt procedure", namespace="default"
+        )
+    )
+    assert mcp_get == {"ok": False, "error": "procedure 'corrupt procedure' not found"}
+    mcp_list = json.loads(mcp_server.memory_procedure("list", namespace="default"))
+    assert mcp_list["ok"] is True
+    assert mcp_list["procedures"] == []
+    assert json.loads(mcp_server.memory_worldview(namespace="default"))[
+        "procedures"
+    ] == []
+
+    from tests.dashutil import make_dash_client
+
+    client = make_dash_client()
+    dashboard_detail = client.get(
+        f"/api/namespace/default/memory/{corrupt.memory_id}"
+    )
+    dashboard_namespace = client.get("/api/namespace/default")
+    dashboard_procedures = client.get("/api/namespace/default/procedures")
+    dashboard_worldview = client.get("/api/namespace/default/worldview")
+    for response in (
+        dashboard_detail,
+        dashboard_namespace,
+        dashboard_procedures,
+        dashboard_worldview,
+    ):
+        assert response.status_code == 200, response.text
+        assert "</script>" not in response.text
+        assert "<img" not in response.text
+    assert _decode_public_blob(dashboard_detail.json()["meta"]) == opaque_meta
+    assert dashboard_procedures.json()["procedures"] == []
+    assert dashboard_worldview.json()["procedures"] == []
+
+    outputs = {
+        "detail": detail,
+        "trace": trace,
+        "procedures": procedures,
+        "worldview": worldview,
+        "mcp": [mcp_get, mcp_list],
+        "dashboard": [
+            dashboard_detail.json(),
+            dashboard_namespace.json(),
+            dashboard_procedures.json(),
+            dashboard_worldview.json(),
+        ],
+    }
+    json.dumps(outputs, ensure_ascii=False, allow_nan=False)
+    assert not _contains_key(outputs, "confidence")
+    assert bytes(raw_meta) == opaque_meta
+
+
 def test_legacy_idempotency_retry_fails_closed_when_attribution_is_unknown(
     provenance_env,
 ):
@@ -541,6 +857,90 @@ def test_corrupt_or_unsupported_stored_envelope_fails_honest(provenance_env):
         "origin": "python",
     }
     assert not _contains_key(detail, "confidence")
+
+
+def test_invalid_stored_provenance_with_blob_origin_and_meta_is_json_safe(
+    provenance_env, monkeypatch
+):
+    blob_origin = b"\xff\x00invalid-origin</script>\x80"
+    blob_meta = b"\x00\xfeinvalid-meta<img src=x onerror=alert(9)>\x81"
+    blob_tool = b"\x80\x00invalid-tool</script>\xff"
+    invalid_provenance = b'{"schema_version":99,"kind":"native"}'
+    with Store("default") as st:
+        result = st.observe("invalid stored blob row")
+        st.conn.execute(
+            "UPDATE events SET origin=?, meta=?, tool_name=?, provenance=? WHERE id=?",
+            (
+                sqlite3.Binary(blob_origin),
+                sqlite3.Binary(blob_meta),
+                sqlite3.Binary(blob_tool),
+                sqlite3.Binary(invalid_provenance),
+                result.event_id,
+            ),
+        )
+        st.conn.commit()
+        outputs = {
+            "detail": st.get_memory(result.memory_id),
+            "browse": st.browse_memories(),
+            "events": st.events(),
+            "trace": st.trace(result.memory_id),
+        }
+        raw = st.conn.execute(
+            "SELECT origin, meta, tool_name, provenance FROM events WHERE id=?",
+            (result.event_id,),
+        ).fetchone()
+
+    detail = outputs["detail"]
+    assert detail["provenance"]["kind"] == "invalid_stored"
+    assert _decode_public_blob(detail["provenance"]["origin"]) == blob_origin
+    assert _decode_public_blob(detail["origin"]) == blob_origin
+    assert _decode_public_blob(detail["meta"]) == blob_meta
+    assert _decode_public_blob(detail["tool_name"]) == blob_tool
+    json.dumps(outputs, ensure_ascii=False, allow_nan=False)
+    assert not _contains_key(outputs, "confidence")
+
+    cli = CliRunner().invoke(
+        app, ["timeline", "-n", "default", "--limit", "20", "--json"]
+    )
+    assert cli.exit_code == 0, cli.output
+    cli_event = next(
+        row
+        for row in json.loads(cli.stdout)["events"]
+        if row["id"] == result.event_id
+    )
+    assert _decode_public_blob(cli_event["origin"]) == blob_origin
+    assert _decode_public_blob(cli_event["meta"]) == blob_meta
+    assert _decode_public_blob(cli_event["tool_name"]) == blob_tool
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_event = next(
+        row
+        for row in json.loads(
+            mcp_server.memory_timeline(namespace="default", limit=20)
+        )["events"]
+        if row["id"] == result.event_id
+    )
+    assert mcp_event == cli_event
+
+    from tests.dashutil import make_dash_client
+
+    client = make_dash_client()
+    for path in (
+        f"/api/namespace/default/memory/{result.memory_id}",
+        "/api/namespace/default/browse",
+        "/api/namespace/default/timeline",
+    ):
+        response = client.get(path)
+        assert response.status_code == 200, response.text
+        assert "</script>" not in response.text
+        assert "<img" not in response.text
+    assert bytes(raw["origin"]) == blob_origin
+    assert bytes(raw["meta"]) == blob_meta
+    assert bytes(raw["tool_name"]) == blob_tool
+    assert bytes(raw["provenance"]) == invalid_provenance
 
 
 def test_invalid_stored_idempotency_retry_fails_closed(provenance_env):
@@ -755,6 +1155,79 @@ def test_purge_removes_provenance_canaries_from_all_tables_and_surfaces(provenan
         "origin": "clean",
         "safe": "yes",
     }
+
+
+def test_purge_erases_blob_provenance_canary_and_its_public_base64_form(
+    provenance_env, monkeypatch
+):
+    blob_canary = b"BLOB-PURGE-CANARY-9d71\x00\xff</script><img onerror=alert(7)>"
+    encoded_canary = base64.b64encode(blob_canary).decode("ascii")
+    with Store("default") as st:
+        target = st.observe("blob purge target")
+        correction = st.contradict(
+            target.memory_id,
+            replacement="blob purge survivor",
+            idempotency_key="blob-purge-correction",
+        )
+        survivor_id = correction["replacement_memory_id"]
+        st.conn.execute(
+            "UPDATE events SET origin=?, meta=?, provenance=NULL WHERE id=?",
+            (
+                sqlite3.Binary(blob_canary),
+                sqlite3.Binary(blob_canary),
+                target.event_id,
+            ),
+        )
+        st.conn.commit()
+        before = st.get_memory(target.memory_id)
+        assert before is not None
+        assert before["provenance"]["origin"]["data"] == encoded_canary
+        purge = st.purge(target.memory_id)
+        assert purge["ok"] is True
+        surfaces = {
+            "detail": st.get_memory(survivor_id),
+            "browse": st.browse_memories(),
+            "events": st.events(),
+            "trace": st.trace(survivor_id),
+            "worldview": st.worldview(),
+        }
+        raw_values: list[Any] = []
+        for table_row in st.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ):
+            table = table_row["name"]
+            if table.replace("_", "").isalnum():
+                raw_values.extend(
+                    value
+                    for row in st.conn.execute(f'SELECT * FROM "{table}"')
+                    for value in tuple(row)
+                )
+
+    serialized = json.dumps(surfaces, ensure_ascii=False, default=str)
+    assert encoded_canary not in serialized
+    assert "BLOB-PURGE-CANARY-9d71" not in serialized
+    for value in raw_values:
+        if isinstance(value, bytes):
+            assert blob_canary not in value
+            assert encoded_canary.encode("ascii") not in value
+        elif isinstance(value, str):
+            assert "BLOB-PURGE-CANARY-9d71" not in value
+            assert encoded_canary not in value
+    assert not _contains_key(surfaces, "confidence")
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    from haunt import mcp_server
+
+    mcp_server._MCP_AUTHORITY = None
+    mcp_trace = mcp_server.memory_trace(survivor_id, namespace="default")
+    assert encoded_canary not in mcp_trace
+    from tests.dashutil import make_dash_client
+
+    dashboard = make_dash_client().get(
+        f"/api/namespace/default/memory/{survivor_id}"
+    )
+    assert dashboard.status_code == 200, dashboard.text
+    assert encoded_canary not in dashboard.text
 
 
 def test_cli_mcp_and_dashboard_share_the_same_envelope_schema(

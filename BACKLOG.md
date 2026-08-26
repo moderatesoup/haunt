@@ -261,6 +261,13 @@ that source metadata measures truth.
   derived job, graph, or index write. Idempotency includes exact canonical
   attribution, including concurrent retry behavior, and fails closed when a
   legacy-null or invalid stored envelope cannot prove exact attribution.
+- Opaque legacy SQLite BLOB values are exposed losslessly through an explicit
+  standard-base64 object at the recursive Store serialization boundary. This
+  includes BLOB `origin`, `meta`, and invalid-stored rows without UTF-8 guesses,
+  while leaving every database byte untouched and keeping ordinary scalar
+  response shapes compatible. Guarded JSON selectors and tolerant stored-meta
+  parsing make malformed BLOB procedure metadata an honest no-match instead of
+  a read-surface failure.
 - `tests/test_structured_provenance.py` covers every fidelity, Unicode source
   and call IDs, unknown fields, parser/version/hash rejection with zero rows,
   byte-preserving migration/restart, corrected-import trace, actual Store/CLI/
@@ -268,11 +275,13 @@ that source metadata measures truth.
   rejection, honest direct-Python defaults, timeline and procedure provenance
   parity, dashboard timeline JSON errors, worldview procedure attribution,
   explicit-null/omitted/empty transform semantics, corrupt stored envelopes,
-  recursive no-confidence assertions, and privacy purge canaries across all
-  tables and serialized surfaces.
-- The dependency-correct Python 3.14/MCP 2.1 full suite passes with 535 tests,
+  recursive no-confidence assertions, schema-v7 BLOB origin/meta migration and
+  restart across Store/CLI/MCP/dashboard/procedure/worldview surfaces, strict
+  JSON serialization, exact base64 recovery, and privacy purge canaries across
+  all tables and serialized surfaces.
+- The dependency-correct Python 3.14/MCP 2.1 full suite passes with 546 tests,
   5 environment/data skips, and 7 declared temporal xfails. The focused E2,
-  E1, E0, hook, host, migration, and FTS compatibility group passes 201 tests
+  E1, E0, hook, host, migration, and FTS compatibility group passes 212 tests
   under Python 3.12/MCP 2.1; that pyenv build cannot load SQLite extensions, so
   its unrelated vector-required tests are not a valid profile.
 

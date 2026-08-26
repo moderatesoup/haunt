@@ -104,3 +104,26 @@ The v8 migration adds the provenance column without rewriting existing
 Haunt does not synthesize import fields from that legacy data. A structurally
 invalid or unsupported non-null stored envelope is labeled `invalid_stored`
 instead of being presented as valid or leaking unvalidated fields.
+
+SQLite uses dynamic value types, so a pre-v8 database may contain a BLOB even
+in the `origin` or `meta` columns. Public JSON never guesses that an opaque BLOB
+is UTF-8. It losslessly represents every `bytes`/`memoryview` value as:
+
+```json
+{"encoding": "base64", "data": "AP9vcGFxdWU="}
+```
+
+`data` is standard RFC 4648 base64; decoding it recovers the exact bytes still
+stored in SQLite. Existing JSON-safe NULL, string, integer, Boolean, and finite
+REAL values retain their prior public shape. A non-finite SQLite REAL uses the
+same explicit form with `encoding: "sqlite-real"` and `data` equal to `nan`,
+`+infinity`, or `-infinity`, because strict JSON has no native representation.
+This encoding applies recursively at the Store boundary, including the raw
+legacy columns and fields copied into `legacy_unstructured` or
+`invalid_stored`; it does not rewrite the database.
+
+When an opaque legacy `meta` value is not valid JSON, typed read features do
+not guess its meaning. In particular, it cannot match a named procedure and is
+omitted from procedure indexes/worldview summaries, while memory detail and
+trace still expose its exact base64 representation. Guarded JSON selectors and
+tolerant legacy parsing keep those reads from becoming server errors.

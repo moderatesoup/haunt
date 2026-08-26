@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import math
 import re
 from datetime import datetime
 from typing import Any, Mapping
@@ -36,6 +38,40 @@ _IMPORT = {
     "original_blob_sha256",
     "transforms",
 }
+
+
+def json_safe_sqlite(value: Any) -> Any:
+    """Losslessly encode SQLite values for public JSON surfaces.
+
+    TEXT/NULL/integer/finite REAL values retain their existing JSON shape.
+    SQLite BLOB values are never guessed as UTF-8; bytes and memoryviews use an
+    explicit base64 envelope. Non-finite REAL values also need an explicit
+    envelope because strict JSON cannot represent them.
+    """
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        return {
+            "encoding": "base64",
+            "data": base64.b64encode(bytes(value)).decode("ascii"),
+        }
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        if math.isnan(value):
+            token = "nan"
+        elif value > 0:
+            token = "+infinity"
+        else:
+            token = "-infinity"
+        return {"encoding": "sqlite-real", "data": token}
+    if isinstance(value, Mapping):
+        return {key: json_safe_sqlite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_sqlite(item) for item in value]
+    raise TypeError(f"unsupported public SQLite value type: {type(value).__name__}")
 
 
 def _optional_text(value: Any, field: str, *, limit: int = _TEXT_MAX) -> str | None:
@@ -233,7 +269,7 @@ def public_provenance(
     if stored is not None:
         try:
             parsed = json.loads(stored)
-        except (TypeError, json.JSONDecodeError):
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
             parsed = None
         if isinstance(parsed, dict):
             try:
@@ -251,13 +287,13 @@ def public_provenance(
         return {
             "schema_version": PROVENANCE_SCHEMA_VERSION,
             "kind": "invalid_stored",
-            "origin": origin,
+            "origin": json_safe_sqlite(origin),
         }
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "kind": "legacy_unstructured",
-        "origin": origin,
-        "meta": legacy_meta,
+        "origin": json_safe_sqlite(origin),
+        "meta": json_safe_sqlite(legacy_meta),
     }
 
 

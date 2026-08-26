@@ -111,12 +111,13 @@ def dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
-def loads(text: str | None, default: Any = None) -> Any:
+def loads(text: Any, default: Any = None) -> Any:
+    """Parse stored JSON without treating opaque legacy SQLite values as text."""
     if not text:
         return {} if default is None else default
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
         return {} if default is None else default
 
 
