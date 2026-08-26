@@ -270,12 +270,23 @@ def format_timeline_block(rows: list[dict[str, Any]], namespace: str) -> str:
 
 
 def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
+    from haunt.provenance import native_provenance
+
     event = detect_event(payload)
     session_id = hook_session(payload)
+    tool_name = kwargs.get("tool_name")
+    call_id = None
+    if tool_name:
+        call_id = (
+            payload.get("tool_call_id")
+            or payload.get("tool_use_id")
+            or payload.get("call_id")
+        )
     store.observe(
         kwargs.pop("content", ""),
         session_id=session_id,
         origin=ORIGIN,
+        channel="cursor_hook",
         meta={"hook": event},
         idempotency_key=hook_idempotency_key(
             payload,
@@ -284,6 +295,13 @@ def _observe(store: Store, payload: dict[str, Any], **kwargs: Any) -> None:
             session_id=session_id,
         ),
         defer_embedding=True,
+        producer_call_id=None if call_id is None else str(call_id),
+        provenance=native_provenance(
+            channel="cursor_hook",
+            origin=ORIGIN,
+            tool=tool_name,
+            call_id=None if call_id is None else str(call_id),
+        ),
         **kwargs,
     )
 

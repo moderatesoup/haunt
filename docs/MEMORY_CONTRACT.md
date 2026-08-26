@@ -114,16 +114,62 @@ supersede and delete (`README.md:95-96`) with a durable correction audit trail.
 ## 2. Provenance is structured attribution, not fact confidence
 
 New observations **MUST** be able to carry a versioned, machine-readable source
-envelope. For native memories, it identifies the channel/origin and any producer
-tool/call IDs that Haunt actually received. For imports, it additionally records
+envelope. For native memories, it identifies the actual entry-point channel,
+origin, and any producer tool/call IDs that Haunt actually received. These
+actual inputs are bounded and validated before any observation-side write, and
+claimed fields must match them exactly. For imports, it additionally records
 the source platform and native ID when known, parser/format version, import time,
 fidelity, original-blob hash/reference when retained, and transform names.
+
+Direct Python observation, procedure, and correction-replacement APIs bind both
+origin and channel to `python` by default. CLI, MCP, dashboard, hooks, and
+evaluation code bind their own actual entry point explicitly. Timeline and
+procedure read surfaces return the same stored envelope rather than dropping or
+reconstructing source fields.
 
 Unknown values **MUST** remain absent or explicitly unknown. Haunt **MUST NOT**
 guess an actor, platform, timestamp precision, source-native ID, fidelity, or
 transform. Existing string `origin` and free-form `meta` data remain readable;
 when they cannot be losslessly upgraded, they are
 `legacy_unstructured`, not synthetic structured provenance.
+
+Legacy SQLite values retain their dynamic type. If an old `origin`, `meta`, or
+other surfaced SQLite value is a BLOB, public JSON represents it losslessly as
+`{"encoding":"base64","data":"..."}` using standard base64, without trying
+to decode it as text; decoding `data` yields the exact stored bytes. Ordinary
+JSON-safe SQLite scalars keep their existing shape, and the read-time encoding
+never changes the database. This rule applies recursively to raw public fields
+and to values copied into `legacy_unstructured` or `invalid_stored`.
+Malformed legacy BLOB metadata remains available through detail/trace but is
+not guessed into typed procedure fields; guarded selectors treat it as no
+match rather than raising.
+
+New non-null structured provenance **MUST** use SQLite `TEXT` storage. A
+non-text value found in a triggerless or corrupt database is never decoded,
+even if its bytes look like valid JSON: reads label it `invalid_stored` and
+idempotent replay fails closed. Public mappings **MUST NOT** rely on JSON's
+lossy string-key coercion. Non-string SQLite keys use Haunt's reserved,
+versioned reversible key codec; ordinary string keys keep their existing shape
+unless they begin with the reserved prefix, in which case they are escaped.
+
+Human CLI output is a bounded presentation of those already-serialized
+values, never a replacement for the machine envelope. It labels BLOB and
+non-finite REAL values explicitly, escapes terminal controls, and accepts every
+JSON-safe scalar/container without assuming timestamp, content, role, tier,
+identifier, or procedure fields are strings.
+Generic dictionaries remain stable JSON and are not inferred to be SQLite
+scalar envelopes. Only explicitly typed scalar presentation sites recognize a
+valid BLOB/REAL envelope. Recall results use the same recursive lossless
+serialization on direct Python, CLI JSON, MCP, per-namespace dashboard, and
+all-namespace dashboard paths, with no `str()` fallback.
+
+For ordered import transforms, omitted, explicit `null`, and an empty list are
+distinct: not supplied, explicitly unknown, and known to have no transforms,
+respectively. Validation and idempotency preserve that distinction.
+
+An idempotency replay succeeds only when stored structured provenance is valid
+and byte-for-byte equal to the newly canonicalized attribution. Legacy-null or
+invalid stored attribution remains readable but cannot be safely replayed.
 
 Import fidelity describes preservation by the import process:
 `lossless`, `lossy`, `reconstructed`, or `derived`. It does not describe whether

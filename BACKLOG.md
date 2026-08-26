@@ -28,7 +28,7 @@ not completion.
 |---|---|---|
 | Evaluation | The optional LongMemEval temporal probe remains external-data-only (`scripts/score_lme_temporal.py:74-154`). E0 now provides a deterministic FTS-only `K=3` regression gate with logical-ID normalization, corpus/config hashes, exact ordered results, Porter morphology, serialized tool-I/O trust metadata, and non-vacuous positive/negative assertions (`src/haunt/frozen_retrieval_eval.py`; `tests/test_frozen_retrieval_eval.py`). | E0 is complete. Pinned hybrid evaluation and calibration remain E6 work. |
 | Correction | `Store.contradict()` updates `memories.valid_to` and may add an unlinked replacement (`src/haunt/store.py:1502-1565`); current recall hides closed rows (`src/haunt/recall.py:93-123`). | An append-only correction record and traversable old-to-new lineage. |
-| Provenance | Events carry session, time, role, tool fields, an `origin` string, and free-form `meta` (`src/haunt/store.py:131-164`, `src/haunt/store.py:569-659`). | A validated, structured source/import envelope and a trace surface. |
+| Provenance | Schema v8 stores a validated v1 source/import envelope on each new event while preserving legacy `origin`/`meta` bytes; detail, browse, timeline, correction trace, CLI, MCP, and dashboard expose the same structured attribution (`src/haunt/provenance.py`; `src/haunt/store.py`; `tests/test_structured_provenance.py`). | E2 implementation is in progress pending independent review. Canonical bundle transport remains E4 work. |
 | Namespace identity | Repository remotes derive collision-resistant names and legacy registrations are reused (`src/haunt/paths.py:56-117`, `src/haunt/paths.py:148-178`). | Explicit aliases, rename/move migration, collision handling, and retirement rules. |
 | Portability | Namespace schema migration is versioned (`src/haunt/store.py:278-321`), but no canonical export/import exists. | A versioned, deterministic, embedding-free round trip. |
 | Retrieval | Recall fuses vector and FTS ranks with RRF and retains component ranks internally (`src/haunt/recall.py:31-78`, `src/haunt/recall.py:243-288`). | A stable explanation contract and a calibrated ability to return no answer. |
@@ -212,7 +212,7 @@ that lineage.
 
 ## E2 — Structure source and import provenance
 
-**Status:** Blocked
+**Status:** Done
 
 **Depends on:** E1
 
@@ -249,6 +249,62 @@ that source metadata measures truth.
   provenance object.
 - A trace test starts at a corrected imported memory and reaches both its
   correction lineage and source envelope.
+
+**Completion evidence (2026-08-25)**
+
+- `src/haunt/provenance.py` defines the bounded schema-v1 native/import
+  envelope, canonical UTC/hash rules, four fidelity values, actual producer
+  matching, actual entry-point channel binding, honest legacy/invalid labels,
+  and no truth-confidence field.
+- Schema v8 adds event provenance without rewriting old `origin` or `meta`;
+  `Store.observe()` validates and canonicalizes it before any session, event,
+  derived job, graph, or index write. Idempotency includes exact canonical
+  attribution, including concurrent retry behavior, and fails closed when a
+  legacy-null or invalid stored envelope cannot prove exact attribution.
+- Schema-v8 insert/update triggers require non-null provenance to use SQLite
+  `TEXT`. Triggerless/corrupt BLOB provenance is labeled `invalid_stored`
+  without a UTF-8 guess and conflicts on replay, even when its bytes contain
+  valid-looking JSON.
+- Opaque legacy SQLite BLOB values are exposed losslessly through an explicit
+  standard-base64 object at the recursive Store serialization boundary. This
+  includes BLOB `origin`, `meta`, and invalid-stored rows without UTF-8 guesses,
+  while leaving every database byte untouched and keeping ordinary scalar
+  response shapes compatible. Guarded JSON selectors and tolerant stored-meta
+  parsing make malformed BLOB procedure metadata an honest no-match instead of
+  a read-surface failure.
+- Human CLI reads use one bounded, terminal-control-safe renderer for the
+  already-serialized values. Timeline, worldview, recall, graph, namespace,
+  and procedure formatting no longer applies string-only operations directly
+  to migrated SQLite dynamic types; JSON output remains exact and unchanged.
+- Recursive public serialization uses a reserved reversible codec for
+  non-string mapping keys and escapes colliding ordinary string keys. Stats,
+  graph, namespace, detail, and recall payloads therefore remain strict JSON
+  without collapsing dynamic SQLite types; generic dictionaries are displayed
+  as stable JSON unless a caller explicitly identifies a serialized scalar.
+- `tests/test_structured_provenance.py` covers every fidelity, Unicode source
+  and call IDs, unknown fields, parser/version/hash rejection with zero rows,
+  byte-preserving migration/restart, corrected-import trace, actual Store/CLI/
+  MCP/dashboard/hook channels, strict UTF-8 input bounds and zero-write
+  rejection, honest direct-Python defaults, timeline and procedure provenance
+  parity, dashboard timeline JSON errors, worldview procedure attribution,
+  explicit-null/omitted/empty transform semantics, corrupt stored envelopes,
+  recursive no-confidence assertions, schema-v7 BLOB origin/meta migration and
+  restart across Store/CLI/MCP/dashboard/procedure/worldview surfaces, strict
+  JSON serialization, exact base64 recovery, exhaustive bounded human CLI
+  rendering, strict/reversible dynamic mapping keys, exact recall values across
+  Python/CLI/MCP/dashboard, and raw plus encoded privacy-purge canaries across
+  shared sessions, all tables, and serialized surfaces.
+- The dependency-correct Python 3.14/MCP 2.1 sqlite-vec full suite passes with
+  566 tests, 2 environment/data skips, and 7 declared temporal xfails. The
+  focused E2/E1/E0/security/authority/clock FTS compatibility group passes 158
+  tests under both Python 3.10 and Python 3.12 with MCP 2.1. Those pyenv builds
+  cannot load SQLite extensions, so their unrelated vector-required full-suite
+  bootstrap failures are not a valid compatibility profile.
+- The final independent GPT-5.6 Terra merge-gate review was CLEAN at
+  `4664ab5722363d1e78cac93d927c79e87f2d8224`. Its isolated Python 3.10 and
+  Python 3.12 MCP 2.1 FTS profiles each passed 149 E2/E1/E0 tests, and its
+  independent corrupt-store, exact-recall, mapping-key, and encoded-purge
+  mutation matrix found no remaining issue.
 
 **Non-goals**
 

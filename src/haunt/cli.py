@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -12,9 +13,15 @@ from haunt.bootstrap import bootstrap, format_report
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
-from haunt.store import Store, UnknownNamespaceError, list_namespaces, open_existing, register_namespace
+from haunt.store import (
+    Store,
+    UnknownNamespaceError,
+    list_namespaces,
+    open_existing,
+    register_namespace,
+)
 from haunt.temporal import TemporalParseError
-from haunt.util import clamp_limit, dumps, format_iso, snippet
+from haunt.util import clamp_limit, dumps, format_iso, human_display, snippet
 
 app = typer.Typer(
     add_completion=False,
@@ -56,8 +63,12 @@ def bootstrap_cmd(
 
 @app.command("init")
 def init_cmd(
-    name: Optional[str] = typer.Argument(None, help="Namespace name (default: inferred)"),
-    repo: Optional[Path] = typer.Option(None, "--repo", help="Repo path recorded in the registry"),
+    name: Optional[str] = typer.Argument(
+        None, help="Namespace name (default: inferred)"
+    ),
+    repo: Optional[Path] = typer.Option(
+        None, "--repo", help="Repo path recorded in the registry"
+    ),
 ) -> None:
     """Create a namespace (one SQLite file)."""
     ns = name or resolve_namespace(None, cwd=repo)
@@ -71,7 +82,9 @@ def init_cmd(
 
 @app.command("observe")
 def observe_cmd(
-    text: str = typer.Argument("", help="Verbatim content (empty ok for tool-only events)"),
+    text: str = typer.Argument(
+        "", help="Verbatim content (empty ok for tool-only events)"
+    ),
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
     tier: str = typer.Option("episodic", "--tier"),
     session: Optional[str] = typer.Option(None, "--session"),
@@ -79,29 +92,53 @@ def observe_cmd(
     tool_name: Optional[str] = typer.Option(None, "--tool-name"),
     tool_input: Optional[str] = typer.Option(None, "--tool-input"),
     tool_output: Optional[str] = typer.Option(None, "--tool-output"),
+    producer_call_id: Optional[str] = typer.Option(None, "--producer-call-id"),
     event_time: Optional[str] = typer.Option(None, "--event-time"),
+    idempotency_key: Optional[str] = typer.Option(None, "--idempotency-key"),
     origin: str = typer.Option("cli", "--origin"),
+    provenance_json: Optional[str] = typer.Option(
+        None,
+        "--provenance-json",
+        help="Versioned source provenance envelope as JSON",
+    ),
 ) -> None:
     """Store a chat turn or tool call as-is. No summarization."""
     ns = _ns(namespace)
-    with Store(ns) as st:
-        result = st.observe(
-            text,
-            role=role,
-            tier=tier,
-            session_id=session,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            tool_output=tool_output,
-            event_time=event_time,
-            origin=origin,
+    try:
+        provenance = (
+            json.loads(provenance_json) if provenance_json is not None else None
         )
+        if provenance is not None and not isinstance(provenance, dict):
+            raise ValueError("provenance must be a JSON object")
+        with Store(ns) as st:
+            result = st.observe(
+                text,
+                role=role,
+                tier=tier,
+                session_id=session,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_output=tool_output,
+                producer_call_id=producer_call_id,
+                event_time=event_time,
+                idempotency_key=idempotency_key,
+                origin=origin,
+                channel="cli",
+                provenance=provenance,
+            )
+    except json.JSONDecodeError as exc:
+        typer.echo(f"error: invalid provenance JSON: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
     ents = ",".join(result.entities[:8]) if result.entities else "-"
     typer.echo(
         f"ok  event={result.event_id}  memory={result.memory_id}  "
         f"ns={result.namespace}  tier={result.tier}  "
         f"session={result.session_id}  embedded={int(result.embedded)}  entities={ents}"
     )
+    typer.echo(f"provenance {dumps(result.provenance)}")
 
 
 @app.command("recall")
@@ -120,6 +157,7 @@ def recall_cmd(
     ),
     tier: Optional[str] = typer.Option(None, "--tier"),
     k: int = typer.Option(8, "--k"),
+    json_out: bool = typer.Option(False, "--json", help="Output stable JSON"),
 ) -> None:
     """Hybrid recall (vec + FTS5 + RRF). Prints score, tier, id, snippet.
 
@@ -128,7 +166,7 @@ def recall_cmd(
     """
     ns = _ns(namespace)
     try:
-        with _existing(ns) as st:
+        with open_existing(ns) as st:
             hits = planned_recall(
                 query,
                 namespace=ns,
@@ -140,16 +178,46 @@ def recall_cmd(
                 k=k,
                 store=st,
             )
-    except (TemporalParseError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
+    except (TemporalParseError, UnknownNamespaceError, ValueError) as exc:
+        if json_out:
+            typer.echo(
+                json.dumps(
+                    {"ok": False, "error": str(exc), "namespace": ns, "query": query},
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                err=True,
+            )
+        else:
+            typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
+    if json_out:
+        typer.echo(
+            json.dumps(
+                {
+                    "namespace": ns,
+                    "query": query,
+                    "hits": [hit.as_dict() for hit in hits],
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+        return
     if not hits:
         typer.echo("no hits")
         return
     typer.echo(f"{'#':<3} {'score':<8} {'tier':<12} {'id':<36} snippet")
     for i, h in enumerate(hits, 1):
+        tier_text = human_display(
+            h.tier, limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        memory_id = human_display(
+            h.memory_id, limit=64, collapse_whitespace=True, sqlite_scalar=True
+        )
         typer.echo(
-            f"{i:<3} {h.score:<8.4f} {h.tier:<12} {h.memory_id:<36} {snippet(h.content, 140)}"
+            f"{i:<3} {h.score:<8.4f} {tier_text:<12} {memory_id:<36} "
+            f"{snippet(h.content, 140)}"
         )
 
 
@@ -167,27 +235,60 @@ def timeline_cmd(
         "write_time is a deprecated alias for storage_time.",
     ),
     limit: int = typer.Option(50, "--limit"),
+    json_out: bool = typer.Option(False, "--json", help="Output stable JSON"),
 ) -> None:
     """Events in clock order (newest first). Default clock is event_time."""
     ns = _ns(namespace)
     limit = clamp_limit(limit, default=50)
     try:
-        with _existing(ns) as st:
+        with open_existing(ns) as st:
             rows = st.events(
                 session_id=session, since=since, until=until, clock=clock, limit=limit
             )
-    except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
+    except (UnknownNamespaceError, ValueError) as exc:
+        if json_out:
+            typer.echo(
+                dumps({"ok": False, "error": str(exc), "namespace": ns}),
+                err=True,
+            )
+        else:
+            typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
+    if json_out:
+        typer.echo(dumps({"namespace": ns, "events": rows}))
+        return
     if not rows:
         typer.echo("no events")
         return
     for r in rows:
-        body = r["content"] or ""
-        if r["tool_name"]:
-            body = f"[tool:{r['tool_name']}] {body}".strip()
+        body = "" if r["content"] is None else snippet(r["content"], 120)
+        if r["tool_name"] is not None and r["tool_name"] != "":
+            tool = human_display(
+                r["tool_name"],
+                limit=48,
+                collapse_whitespace=True,
+                sqlite_scalar=True,
+            )
+            body = snippet(f"[tool:{tool}] {body}", 120)
+        provenance = r["provenance"]
+        source_channel = provenance.get("channel")
+        source_origin = provenance.get("origin")
+        source = (
+            f"{human_display(source_channel, limit=48, collapse_whitespace=True, sqlite_scalar=True) if source_channel is not None and source_channel != '' else 'unknown'}/"
+            f"{human_display(source_origin, limit=80, collapse_whitespace=True, sqlite_scalar=True) if source_origin is not None and source_origin != '' else 'unknown'}"
+        )
+        role = human_display(
+            r["role"], limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        tier = human_display(
+            r["tier"], limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        event_id = human_display(
+            r["id"], limit=64, collapse_whitespace=True, sqlite_scalar=True
+        )
         typer.echo(
-            f"{format_iso(r['event_time'])}  {r['role']:<10} {r['tier']:<12} {r['id']}  {snippet(body, 120)}"
+            f"{format_iso(r['event_time'])}  {role:<10} {tier:<12} "
+            f"{event_id}  source={source}  {body}"
         )
 
 
@@ -201,11 +302,24 @@ def namespaces_cmd() -> None:
     typer.echo(f"{'name':<24} {'events':>7} {'mem':>7} {'sess':>6} {'ents':>6}  db")
     for r in rows:
         err = r.get("error")
+        name = human_display(
+            r.get("name"), limit=48, collapse_whitespace=True, sqlite_scalar=True
+        )
+        db_path = human_display(
+            r.get("db_path"),
+            limit=240,
+            collapse_whitespace=True,
+            sqlite_scalar=True,
+        )
         if err:
-            typer.echo(f"{r['name']:<24}  error: {err}  {r['db_path']}")
+            error = human_display(err, limit=240, collapse_whitespace=True)
+            typer.echo(f"{name:<24}  error: {error}  {db_path}")
         else:
             typer.echo(
-                f"{r['name']:<24} {r['events']:>7} {r['memories']:>7} {r['sessions']:>6} {r['entities']:>6}  {r['db_path']}"
+                f"{name:<24} {human_display(r.get('events'), limit=16):>7} "
+                f"{human_display(r.get('memories'), limit=16):>7} "
+                f"{human_display(r.get('sessions'), limit=16):>6} "
+                f"{human_display(r.get('entities'), limit=16):>6}  {db_path}"
             )
 
 
@@ -235,7 +349,9 @@ def health_cmd(
         )
         s = st.stats()
         typer.echo(f"namespace     {s['namespace']}")
-        typer.echo(f"db            {s['db_path']}  bytes={s['db_size_bytes']}  wal={s['wal']}")
+        typer.echo(
+            f"db            {s['db_path']}  bytes={s['db_size_bytes']}  wal={s['wal']}"
+        )
         typer.echo(
             f"counts        events={s['events']} memories={s['memories']} "
             f"sessions={s['sessions']} entities={s['entities']} relations={s['relations']}"
@@ -268,12 +384,45 @@ def graph_cmd(
         names = {e["id"]: e for e in g["entities"]}
         typer.echo(f"entities ({len(g['entities'])})")
         for e in g["entities"][:40]:
-            typer.echo(f"  {e['name']:<32} {e['type']:<12} last={e['last_seen']}")
+            name_text = human_display(
+                e.get("name"), limit=64, collapse_whitespace=True, sqlite_scalar=True
+            )
+            type_text = human_display(
+                e.get("type"), limit=40, collapse_whitespace=True, sqlite_scalar=True
+            )
+            last_seen = human_display(
+                e.get("last_seen"),
+                limit=80,
+                collapse_whitespace=True,
+                sqlite_scalar=True,
+            )
+            typer.echo(f"  {name_text:<32} {type_text:<12} last={last_seen}")
         typer.echo(f"relations ({len(g['relations'])})")
         for r in g["relations"][:50]:
-            src = names.get(r["src_entity"], {}).get("name", r["src_entity"][:8])
-            dst = names.get(r["dst_entity"], {}).get("name", r["dst_entity"][:8])
-            typer.echo(f"  {src}  --{r['rel']}-->  {dst}  w={r['weight']}")
+            src_name = names.get(r["src_entity"], {}).get("name")
+            dst_name = names.get(r["dst_entity"], {}).get("name")
+            src_value = src_name if src_name is not None else r["src_entity"]
+            dst_value = dst_name if dst_name is not None else r["dst_entity"]
+            src = human_display(
+                src_value, limit=64, collapse_whitespace=True, sqlite_scalar=True
+            )
+            dst = human_display(
+                dst_value, limit=64, collapse_whitespace=True, sqlite_scalar=True
+            )
+            if src_name is None:
+                src = src[:8]
+            if dst_name is None:
+                dst = dst[:8]
+            rel = human_display(
+                r.get("rel"), limit=48, collapse_whitespace=True, sqlite_scalar=True
+            )
+            weight = human_display(
+                r.get("weight"),
+                limit=24,
+                collapse_whitespace=True,
+                sqlite_scalar=True,
+            )
+            typer.echo(f"  {src}  --{rel}-->  {dst}  w={weight}")
 
 
 @app.command("worldview")
@@ -284,31 +433,52 @@ def worldview_cmd(
     json_out: bool = typer.Option(False, "--json", help="Output raw JSON"),
 ) -> None:
     """Compact namespace briefing: facts, entities, procedures, counts."""
-    import json as _json
-
     ns = _ns(namespace)
     facts_cap = clamp_limit(facts_cap, default=12)
     names_cap = clamp_limit(names_cap, default=12)
     with _existing(ns) as st:
         wv = st.worldview(facts_cap=facts_cap, names_cap=names_cap)
     if json_out:
-        typer.echo(_json.dumps(wv, ensure_ascii=False, default=str, indent=2))
+        typer.echo(json.dumps(wv, ensure_ascii=False, allow_nan=False, indent=2))
         return
-    typer.echo(f"namespace  {wv['namespace']}")
-    typer.echo(f"counts     events={wv['counts']['events']}  memories={wv['counts']['memories']}  sessions={wv['counts']['sessions']}")
+    typer.echo(
+        f"namespace  {human_display(wv['namespace'], limit=80, collapse_whitespace=True, sqlite_scalar=True)}"
+    )
+    typer.echo(
+        f"counts     events={wv['counts']['events']}  memories={wv['counts']['memories']}  sessions={wv['counts']['sessions']}"
+    )
     typer.echo("")
     typer.echo(f"facts ({len(wv['facts'])})")
     for f in wv["facts"]:
-        typer.echo(f"  {f['id'][:8]}  {snippet(f['content'], 120)}")
+        fact_id = human_display(
+            f.get("id"), limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        typer.echo(f"  {fact_id[:8]}  {snippet(f.get('content'), 120)}")
     typer.echo("")
     typer.echo(f"names ({len(wv['names'])})")
     for n in wv["names"]:
-        typer.echo(f"  {n['name']:<28} {n['type']:<12} mentions={n['mentions']}")
+        name = human_display(
+            n.get("name"), limit=64, collapse_whitespace=True, sqlite_scalar=True
+        )
+        kind = human_display(
+            n.get("type"), limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        mentions = human_display(n.get("mentions"), limit=24)
+        typer.echo(f"  {name:<28} {kind:<12} mentions={mentions}")
     typer.echo("")
     typer.echo(f"procedures ({len(wv['procedures'])})")
     for p in wv["procedures"]:
-        trigger = f"  when: {p['trigger']}" if p.get("trigger") else ""
-        typer.echo(f"  {p['name']:<28} {p['id'][:8]}{trigger}")
+        name = human_display(p.get("name"), limit=64, collapse_whitespace=True)
+        proc_id = human_display(
+            p.get("id"), limit=40, collapse_whitespace=True, sqlite_scalar=True
+        )
+        trigger_value = p.get("trigger")
+        trigger = (
+            f"  when: {human_display(trigger_value, limit=120, collapse_whitespace=True)}"
+            if trigger_value is not None and trigger_value != ""
+            else ""
+        )
+        typer.echo(f"  {name:<28} {proc_id[:8]}{trigger}")
 
 
 procedure_app = typer.Typer(
@@ -323,13 +493,17 @@ app.add_typer(procedure_app, name="procedure")
 def procedure_write_cmd(
     name: str = typer.Argument(..., help="Procedure name"),
     body: str = typer.Option(..., "--body", "-b", help="Verbatim step-by-step body"),
-    when: Optional[str] = typer.Option(None, "--when", "-w", help="Trigger description"),
+    when: Optional[str] = typer.Option(
+        None, "--when", "-w", help="Trigger description"
+    ),
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
 ) -> None:
     """Store a named procedure."""
     ns = _ns(namespace)
     with Store(ns) as st:
-        r = st.procedure_write(name, body, trigger=when or "", origin="cli")
+        r = st.procedure_write(
+            name, body, trigger=when or "", origin="cli", channel="cli"
+        )
     typer.echo(f"ok  procedure={name}  memory={r.memory_id}  ns={r.namespace}")
 
 
@@ -338,27 +512,40 @@ def procedure_get_cmd(
     name: str = typer.Argument(..., help="Procedure name"),
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
 ) -> None:
-    """Retrieve a named procedure."""
+    """Retrieve a named procedure with source provenance."""
     ns = _ns(namespace)
     with _existing(ns) as st:
         proc = st.procedure_get(name)
     if not proc:
         typer.echo(f"not found: {name}")
         raise typer.Exit(1)
-    typer.echo(f"name     {proc['name']}")
-    if proc.get("trigger"):
-        typer.echo(f"trigger  {proc['trigger']}")
-    typer.echo(f"id       {proc['id']}")
-    typer.echo(f"created  {proc['created_at']}")
-    typer.echo(f"---")
-    typer.echo(proc["body"])
+    typer.echo(
+        f"name     {human_display(proc['name'], limit=160, collapse_whitespace=True)}"
+    )
+    if proc.get("trigger") is not None and proc.get("trigger") != "":
+        typer.echo(
+            f"trigger  {human_display(proc['trigger'], limit=240, collapse_whitespace=True)}"
+        )
+    typer.echo(
+        f"id       {human_display(proc['id'], limit=160, collapse_whitespace=True, sqlite_scalar=True)}"
+    )
+    typer.echo(
+        f"created  {human_display(proc['created_at'], limit=80, collapse_whitespace=True, sqlite_scalar=True)}"
+    )
+    typer.echo(f"provenance {human_display(proc['provenance'], limit=4096)}")
+    typer.echo("---")
+    typer.echo(
+        human_display(
+            proc["body"], limit=8192, preserve_layout=True, sqlite_scalar=True
+        )
+    )
 
 
 @procedure_app.command("list")
 def procedure_list_cmd(
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
 ) -> None:
-    """List all active procedures."""
+    """List all active procedures with source provenance."""
     ns = _ns(namespace)
     with _existing(ns) as st:
         procs = st.procedure_list()
@@ -367,7 +554,15 @@ def procedure_list_cmd(
         return
     typer.echo(f"{'name':<28} {'trigger':<32} id")
     for p in procs:
-        typer.echo(f"{p['name']:<28} {p.get('trigger', ''):<32} {p['id'][:12]}")
+        name = human_display(p.get("name"), limit=64, collapse_whitespace=True)
+        trigger = human_display(
+            p.get("trigger", ""), limit=96, collapse_whitespace=True
+        )
+        proc_id = human_display(
+            p.get("id"), limit=64, collapse_whitespace=True, sqlite_scalar=True
+        )
+        typer.echo(f"{name:<28} {trigger:<32} {proc_id[:12]}")
+        typer.echo(f"  provenance {human_display(p['provenance'], limit=4096)}")
 
 
 @app.command("delete")
@@ -457,6 +652,7 @@ def correct_cmd(
                 idempotency_key=idempotency_key,
                 session_id=session_id,
                 origin=origin,
+                channel="cli",
             )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -566,8 +762,12 @@ def doctor_cmd() -> None:
 def dash_cmd(
     port: int = typer.Option(7340, "--port"),
     host: str = typer.Option("127.0.0.1", "--host"),
-    install_icon: bool = typer.Option(False, "--install-icon", help="Write a desktop shortcut and exit"),
-    no_open: bool = typer.Option(False, "--no-open", help="Do not open the browser automatically"),
+    install_icon: bool = typer.Option(
+        False, "--install-icon", help="Write a desktop shortcut and exit"
+    ),
+    no_open: bool = typer.Option(
+        False, "--no-open", help="Do not open the browser automatically"
+    ),
     allow_remote: bool = typer.Option(
         False,
         "--allow-remote",
@@ -585,7 +785,9 @@ def dash_cmd(
         if result.get("written"):
             typer.echo(f"desktop icon  {result['path']}")
         else:
-            typer.echo(f"desktop icon  skipped ({result.get('reason', 'unsupported platform')})")
+            typer.echo(
+                f"desktop icon  skipped ({result.get('reason', 'unsupported platform')})"
+            )
         return
 
     from haunt.dashboard import check_dashboard_bind, run_dashboard
@@ -597,7 +799,9 @@ def dash_cmd(
         raise typer.Exit(2) from exc
 
     typer.echo(f"haunt dash  http://{host}:{port}  home={haunt_home()}")
-    run_dashboard(host=host, port=port, open_browser=not no_open, allow_remote=allow_remote)
+    run_dashboard(
+        host=host, port=port, open_browser=not no_open, allow_remote=allow_remote
+    )
 
 
 @app.callback(invoke_without_command=True)

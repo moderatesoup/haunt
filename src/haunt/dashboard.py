@@ -19,7 +19,14 @@ from starlette.routing import Route
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.recall import recall, Hit, RRF_K
-from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
+from haunt.store import (
+    Store,
+    UnknownNamespaceError,
+    list_namespaces,
+    list_namespace_rows,
+    namespace_exists,
+    open_existing,
+)
 from haunt.util import clamp_limit
 
 TOKEN_HEADER = "X-Haunt-Token"
@@ -544,6 +551,7 @@ async function openDetail(memId,ns){
   ];
   if(d.tool_name)rows.push(["tool_name",esc(d.tool_name)]);
   let html=rows.map(([l,v])=>`<div class="detail-row"><span class="lbl">${l}</span><span class="val">${v}</span></div>`).join("");
+  html+=`<h2 class="section" style="margin-top:12px;">source provenance</h2><div class="detail-content">${esc(JSON.stringify(d.provenance||{},null,2))}</div>`;
   html+=`<h2 class="section" style="margin-top:12px;">content</h2><div class="detail-content">${esc(d.content||d.event_content||"(empty)")}</div>`;
   if(d.tool_input)html+=`<h2 class="section">tool input</h2><div class="detail-content">${esc(d.tool_input)}</div>`;
   if(d.tool_output)html+=`<h2 class="section">tool output</h2><div class="detail-content">${esc(d.tool_output)}</div>`;
@@ -606,11 +614,12 @@ async function doBrowse(page){
   const data=await j(`/api/namespace/${encodeURIComponent(NS)}/browse?${params}`);
   const mems=data.memories||[];
   if(!mems.length){$("browseResults").innerHTML='<div class="empty">no memories match</div>';$("browseNav").innerHTML="";return;}
-  $("browseResults").innerHTML=`<table><thead><tr><th>created</th><th>tier</th><th>role</th><th>origin</th><th>session</th><th>snippet</th><th></th></tr></thead><tbody>`+
+  $("browseResults").innerHTML=`<table><thead><tr><th>created</th><th>tier</th><th>role</th><th>origin</th><th>source</th><th>session</th><th>snippet</th><th></th></tr></thead><tbody>`+
     mems.map(m=>`<tr class="clickable" onclick="openDetail('${esc(m.memory_id)}','${esc(NS)}')">
       <td>${fmtTime(m.created_at)}</td>
       <td class="${tierCls(m.tier)}">${m.tier}</td>
       <td>${esc(m.role||"")}</td><td>${esc(m.origin||"")}</td>
+      <td>${esc((m.provenance||{}).kind||"unknown")}</td>
       <td style="font-size:11px;color:var(--mut)">${esc((m.session_id||"").slice(0,8))}</td>
       <td class="snip">${esc(snip(m.content||"",160))}</td>
       <td><button style="font-size:11px;padding:2px 8px" onclick="event.stopPropagation();openDetail('${esc(m.memory_id)}','${esc(NS)}')">detail</button></td>
@@ -1059,16 +1068,24 @@ async def api_health(request: Request) -> JSONResponse:
 
 async def api_timeline(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
-    missing = _missing_namespace(name)
-    if missing:
-        return missing
     params = request.query_params
     since = params.get("since") or None
     until = params.get("until") or None
     clock = params.get("clock") or None
     limit = clamp_limit(params.get("limit") or 100, default=100)
-    with Store(name, create=False) as st:
-        events = st.events(since=since, until=until, clock=clock, limit=limit)
+    try:
+        with open_existing(name) as st:
+            events = st.events(
+                since=since,
+                until=until,
+                clock=clock,
+                limit=limit,
+            )
+    except (UnknownNamespaceError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "namespace": name},
+            status_code=400,
+        )
     return JSONResponse({"namespace": name, "events": events})
 
 
@@ -1122,6 +1139,7 @@ async def api_contradict(request: Request) -> JSONResponse:
                 session_id=session_id,
                 reason=reason,
                 idempotency_key=idempotency_key,
+                channel="dashboard",
             )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)

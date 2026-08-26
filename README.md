@@ -71,7 +71,7 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 
 ### What is and isn't automatic
 
-- **Hooks store automatically.** Once `haunt install` runs, prompts and responses are stored verbatim in Cursor and Claude Code. Tool input/output is best-effort redacted, capped per field, and can be skipped with `HAUNT_EXCLUDE_TOOLS`.
+- **Hooks store automatically.** Once `haunt install` runs, prompts and responses are stored verbatim in Cursor and Claude Code. Tool input/output is best-effort redacted, capped per field, and can be skipped with `HAUNT_EXCLUDE_TOOLS`. New writes also carry a versioned source-provenance envelope; hook writes record their actual channel and supplied tool/call IDs.
 - **Recall is NOT automatic.** Neither Cursor nor Claude Code reliably inject recall into the model context. Agents must call `memory_recall` explicitly via MCP unless a `[haunt ns=…]` block is already visible.
 - **sessionStart / SessionStart** may return a worldview card — this may appear as context but is not a guaranteed recall path and is not a kernel.
 - **No-hook IDEs** (Grok Bot, Codex, etc.): call `memory_observe` and `memory_recall` manually via MCP.
@@ -89,7 +89,7 @@ Features:
 - **Browse** memories with filters: tier, origin, session, time range. Paginated.
 - **Search / recall** with hybrid vec+FTS. Results link to detail view. Clicking any result row opens the detail panel.
 - **All-namespaces search**: select "all namespaces" in the sidebar to fan out a single query across every registered namespace. Results are merged by score and each hit shows a namespace badge. API: `GET /api/recall?q=&k=&tier=`.
-- **Memory detail** with source context and correction trace: origin, session_id, event_id, memory_id, role, tier, event_time, valid_from/valid_to, ordered lineage, db_path (absolute), haunt_home, tool name/input/output, related memories from the same session, entity mentions.
+- **Memory detail** with source context and correction trace: structured provenance, origin, session_id, event_id, memory_id, role, tier, event_time, valid_from/valid_to, ordered lineage, db_path (absolute), haunt_home, tool name/input/output, related memories from the same session, entity mentions. Pre-v8 rows are labeled `legacy_unstructured`; their original origin/meta are not guessed into import fields.
 - **Timeline** view: events in time order with since/until day filters. Rows click through to memory detail.
 - **Time-bounded search**: `as_of`, `since`, `until` date filters on recall (both per-namespace and all-namespaces).
 - **Supersede** a memory from the detail panel (append-only correction record plus `valid_to=now`, optional replacement text). Keeps original data — distinct from delete.
@@ -181,13 +181,13 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | `haunt correct MEMORY_ID --idempotency-key KEY [--replacement --reason]` | atomically append a correction and optional verbatim replacement; omitted/null, empty, and whitespace-only replacement values are distinct; a nonempty caller key is required for safe retries |
 | `haunt trace MEMORY_ID` | ordered correction chain from any surviving member, including erased-gap tombstones |
 | `haunt delete MEMORY_ID [-y]` / `haunt delete --event-id EVENT_ID [-y]` | hard-delete a memory (or all memories for an event) and its provenance chain |
-| `haunt timeline [--since --until --clock]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias) |
+| `haunt timeline [--since --until --clock --json]` | events by `event_time` or `storage_time` (`ts` ingest time; `write_time` is a deprecated alias); human rows show source channel/origin and JSON preserves the complete provenance envelope |
 | `haunt namespaces` | list + counts |
 | `haunt health [-n NAMESPACE]` | vec / embed / counts / db path |
-| `haunt worldview [-n NAMESPACE]` | compact namespace briefing: facts, entities, procedures |
+| `haunt worldview [-n NAMESPACE]` | compact namespace briefing: facts, entities, and procedures with source provenance |
 | `haunt procedure write NAME --body BODY` | store a named procedure |
-| `haunt procedure get NAME` | retrieve a named procedure |
-| `haunt procedure list` | list all active procedures |
+| `haunt procedure get NAME` | retrieve a named procedure and its provenance |
+| `haunt procedure list` | list all active procedures and their provenance |
 | `haunt graph [--entity] [--rebuild]` | entities + relations |
 | `haunt dash [--port 7340] [--install-icon] [--no-open] [--allow-remote]` | local memory console (127.0.0.1); prints a launch token required on `/api/*`; `--allow-remote` is unsafe without that token; namespaces are not auth |
 | `haunt install` | bind all known hosts (Cursor, Claude Code): hooks + MCP + rules + skill |
@@ -209,6 +209,10 @@ Every explicit recall hit includes `trusted` and `trust_reason`. Tool input/outp
 `haunt-mcp` is a stdio server. Do not run it directly in a terminal — it reads JSON on stdin. Use it only as an MCP server command in your client config.
 
 Tools: `memory_observe`, `memory_recall`, `memory_purge`, `memory_worldview`, `memory_procedure`, `memory_contradict`, `memory_trace`, `memory_timeline`, `memory_health`, `memory_namespaces`, `memory_session_end`. `memory_contradict` requires a nonempty caller `idempotency_key`; supplying the same key and exact correction payload safely replays the original result. Replacement strings are verbatim: omitted/null means no replacement, while empty and whitespace-only strings create replacements with those exact bytes.
+
+`memory_observe.provenance` accepts a versioned object. Native envelopes use `kind="native"`; Haunt binds the actual entry channel (`mcp` here), `origin`, and supplied producer tool/call ID rather than trusting claimed values. Direct Python, CLI, Cursor hook, Claude Code hook, dashboard correction, and evaluation writes use their own explicit channels. Import envelopes use `kind="import"` and require canonical `imported_at`, `fidelity`, and `original_blob_sha256` (set it to `null` when no original blob exists). Source platform/native ID, format/parser version, and ordered transforms remain absent or null when unknown. Provenance and import fidelity are attribution—not confidence or truth scores.
+
+The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](docs/PROVENANCE.md).
 
 ## Environment variables
 

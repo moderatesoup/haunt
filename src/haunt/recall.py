@@ -16,6 +16,7 @@ import sqlite_vec
 
 from haunt.embed import available as embed_available
 from haunt.embed import embed_one
+from haunt.provenance import json_safe_sqlite
 from haunt.store import Store, open_existing
 from haunt.util import clamp_k, clock_sql_column, iso_or_now, snippet
 
@@ -57,25 +58,27 @@ class Hit:
         return "ordinary-memory" if self.trusted else "untrusted-tool-io"
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "memory_id": self.memory_id,
-            "event_id": self.event_id,
-            "score": round(self.score, 6),
-            "tier": self.tier,
-            "content": self.content,
-            "snippet": snippet(self.content, 200),
-            "role": self.role,
-            "origin": self.origin,
-            "event_time": self.event_time,
-            "ts": self.ts,
-            "valid_from": self.valid_from,
-            "valid_to": self.valid_to,
-            "tool_name": self.tool_name,
-            "trusted": self.trusted,
-            "trust_reason": self.trust_reason,
-            "vec_rank": self.vec_rank,
-            "fts_rank": self.fts_rank,
-        }
+        return json_safe_sqlite(
+            {
+                "memory_id": self.memory_id,
+                "event_id": self.event_id,
+                "score": round(self.score, 6),
+                "tier": self.tier,
+                "content": self.content,
+                "snippet": snippet(self.content, 200),
+                "role": self.role,
+                "origin": self.origin,
+                "event_time": self.event_time,
+                "ts": self.ts,
+                "valid_from": self.valid_from,
+                "valid_to": self.valid_to,
+                "tool_name": self.tool_name,
+                "trusted": self.trusted,
+                "trust_reason": self.trust_reason,
+                "vec_rank": self.vec_rank,
+                "fts_rank": self.fts_rank,
+            }
+        )
 
 
 def _fts_match_query(q: str) -> str | None:

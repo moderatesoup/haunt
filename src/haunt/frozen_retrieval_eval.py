@@ -106,6 +106,7 @@ def _seed(corpus: dict[str, Any]) -> dict[str, str]:
                         idempotency_key=f"frozen-eval:{record['id']}",
                         replacement=record["content"],
                         origin="frozen-retrieval-eval",
+                        channel="frozen_retrieval_eval",
                     )
                 replacement_id = contradicted.get("replacement_memory_id")
                 if not contradicted.get("ok") or not replacement_id:
@@ -122,6 +123,7 @@ def _seed(corpus: dict[str, Any]) -> dict[str, str]:
                 tool_input=record.get("tool_input"),
                 tool_output=record.get("tool_output"),
                 origin="frozen-retrieval-eval",
+                channel="frozen_retrieval_eval",
                 event_time=record["event_time"],
                 valid_from=record.get("valid_from", record["event_time"]),
                 meta=record.get("meta"),
