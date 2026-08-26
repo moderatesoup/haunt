@@ -100,32 +100,46 @@ def test_union_ties_sort_ranked_hits_but_keep_timeline_order(monkeypatch):
     assert [hit.final_rank for hit in hits] == [1, 2, 3, 4]
 
 
-def test_dashboard_all_namespace_ties_use_namespace_then_memory_id(haunt_env, monkeypatch):
-    """Cross-namespace ties do not depend on registry or recall arrival order."""
+def test_dashboard_all_namespace_groups_preserve_local_ranks(haunt_env, monkeypatch):
+    """Namespace groups are deterministic without claiming cross-namespace RRF."""
     from haunt import dashboard
     from tests.dashutil import make_dash_client
 
     observe("DASHBOARD-TIE-ALPHA", namespace="alpha")
     observe("DASHBOARD-TIE-BETA", namespace="beta")
+    alpha_z = _hit("alpha-z", score=1 / 61, fts_rank=1)
+    alpha_a = _hit("alpha-a", score=1 / 61, fts_rank=1)
+    beta_a = _hit("beta-a", score=9 / 61, fts_rank=1)
+    alpha_a.final_rank = 1
+    alpha_z.final_rank = 2
+    beta_a.final_rank = 1
     by_namespace = {
         "alpha": [
-            _hit("alpha-z", score=1 / 61, fts_rank=1),
-            _hit("alpha-a", score=1 / 61, fts_rank=1),
+            alpha_z,
+            alpha_a,
         ],
-        "beta": [_hit("beta-a", score=1 / 61, fts_rank=1)],
+        "beta": [beta_a],
     }
     monkeypatch.setattr(
         dashboard,
-        "recall",
+        "planned_recall",
         lambda query, namespace, **kwargs: by_namespace[namespace],
     )
 
     response = make_dash_client().get("/api/recall?q=DASHBOARD-TIE")
     assert response.status_code == 200
-    hits = response.json()["hits"]
+    data = response.json()
+    assert data["ranking_scope"] == "per_namespace"
+    assert [group["namespace"] for group in data["namespace_groups"]] == [
+        "alpha",
+        "beta",
+    ]
+    hits = data["hits"]
     assert [(hit["namespace"], hit["memory_id"]) for hit in hits] == [
         ("alpha", "alpha-a"),
         ("alpha", "alpha-z"),
         ("beta", "beta-a"),
     ]
-    assert [hit["explanation"]["final_rank"] for hit in hits] == [1, 2, 3]
+    assert [hit["explanation"]["final_rank"] for hit in hits] == [1, 2, 1]
+    # beta's larger local score does not move it ahead of the alpha group.
+    assert hits[-1]["score"] > hits[0]["score"]

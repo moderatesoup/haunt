@@ -29,6 +29,14 @@ RRF_K = 60
 CANDIDATES = 40
 
 
+class RecallResult(list["Hit"]):
+    """List-compatible recall result with execution evidence for empty results."""
+
+    def __init__(self, hits: list["Hit"], *, modalities: dict[str, dict[str, str]]):
+        super().__init__(hits)
+        self.modalities = modalities
+
+
 @dataclass
 class Hit:
     memory_id: str
@@ -50,6 +58,8 @@ class Hit:
     fts_rank_raw: float | None = None
     filter_context: dict[str, Any] | None = None
     final_rank: int | None = None
+    vector_stage: dict[str, str] | None = None
+    fts_stage: dict[str, str] | None = None
 
     @property
     def trusted(self) -> bool:
@@ -67,25 +77,27 @@ class Hit:
         provenance for callers that need to understand how that rank signal was
         produced; it deliberately does not present retrieval as confidence.
         """
-        vector = (
-            {
+        vector = _modality_explanation(
+            self.vector_stage,
+            candidate=self.vec_rank is not None,
+            candidate_reason="returned_vector_candidate",
+            fields={
                 "rank": self.vec_rank,
                 "distance": self.vec_distance,
                 "metric": self.vec_metric,
-                "lower_is_better": True,
-            }
-            if self.vec_rank is not None
-            else None
+                "lower_is_better": True if self.vec_rank is not None else None,
+            },
         )
-        fts = (
-            {
+        fts = _modality_explanation(
+            self.fts_stage,
+            candidate=self.fts_rank is not None,
+            candidate_reason="returned_fts_candidate",
+            fields={
                 "rank": self.fts_rank,
                 "raw_score": self.fts_rank_raw,
-                "metric": "fts5_bm25",
-                "lower_is_better": True,
-            }
-            if self.fts_rank is not None
-            else None
+                "metric": "fts5_bm25" if self.fts_rank is not None else None,
+                "lower_is_better": True if self.fts_rank is not None else None,
+            },
         )
         contributions: list[dict[str, Any]] = []
         for source, rank in (("vector", self.vec_rank), ("fts", self.fts_rank)):
@@ -120,6 +132,12 @@ class Hit:
             "vector": vector,
             "fts": fts,
             "filters": self.filter_context,
+            "references": {
+                "correction_lineage": None,
+                "correction_lineage_status": "unavailable_legacy",
+                "provenance": None,
+                "provenance_status": "legacy_unstructured",
+            },
             "trust": {
                 "trusted": self.trusted,
                 "reason": self.trust_reason,
@@ -145,6 +163,33 @@ class Hit:
             "fts_rank": self.fts_rank,
             "explanation": explanation,
         })
+
+
+def _stage(state: str, reason: str) -> dict[str, str]:
+    """Build one of the explicit per-modality execution states."""
+    return {"state": state, "reason": reason}
+
+
+def _modality_explanation(
+    stage: dict[str, str] | None,
+    *,
+    candidate: bool,
+    candidate_reason: str,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose a candidate, a run without this candidate, or a non-run.
+
+    Legacy callers may construct ``Hit`` directly. Those synthetic hits retain
+    their evidence when present; otherwise they explicitly say that execution
+    provenance was not structured in the legacy object.
+    """
+    if candidate:
+        state = _stage("candidate", candidate_reason)
+    elif stage is None:
+        state = _stage("not_run", "legacy_unstructured")
+    else:
+        state = stage
+    return {**state, **fields}
 
 
 def _fts_match_query(q: str) -> str | None:
@@ -248,10 +293,7 @@ def _fts_hits(
         ORDER BY f.rank, f.id
         LIMIT ?
     """
-    try:
-        rows = conn.execute(sql, [match, *params, limit]).fetchall()
-    except sqlite3.Error:
-        return []
+    rows = conn.execute(sql, [match, *params, limit]).fetchall()
     return [(r["mid"], i + 1, float(r["rnk"])) for i, r in enumerate(rows)]
 
 
@@ -277,16 +319,20 @@ def _vec_hits(
                 WHERE v.embedding MATCH ?
                   AND k = ?
                   AND {where}
-                ORDER BY v.distance, v.id
+                ORDER BY distance
             """
-            try:
-                rows = conn.execute(sql, [blob, limit, *params]).fetchall()
-                return [
-                    (r["mid"], i + 1, float(r["dist"]), "cosine_distance")
-                    for i, r in enumerate(rows)
-                ]
-            except sqlite3.Error:
-                pass
+            # vec0 accepts KNN queries ordered by distance alone. Sort the
+            # returned candidate set in Python to settle exact distance ties;
+            # do not treat a malformed native KNN query as an L2 fallback.
+            rows = conn.execute(sql, [blob, limit, *params]).fetchall()
+            candidates = sorted(
+                ((r["mid"], float(r["dist"])) for r in rows),
+                key=lambda item: (item[1], item[0]),
+            )
+            return [
+                (mid, i + 1, distance, "cosine_distance")
+                for i, (mid, distance) in enumerate(candidates)
+            ]
     sql = f"""
         SELECT m.id AS mid, m.embedding
         FROM memories m
@@ -343,12 +389,36 @@ def recall(
             clock=clock,
             include_untrusted=include_untrusted,
         )
-        fts = _fts_hits(store.conn, query, where, params, CANDIDATES)
+        match = _fts_match_query(query)
+        if match is None:
+            fts = []
+            fts_stage = _stage("not_run", "query_has_no_fts_tokens")
+        else:
+            fts = _fts_hits(store.conn, query, where, params, CANDIDATES)
+            fts_stage = _stage(
+                "ran_not_candidate",
+                "no_fts_candidates" if not fts else "candidate_not_returned_for_hit",
+            )
         vec: list[tuple[str, int, float, str]] = []
-        if use_vectors and embed_available():
+        if not use_vectors:
+            vector_stage = _stage("not_run", "disabled_by_caller")
+        elif not embed_available():
+            vector_stage = _stage("not_run", "embedding_unavailable")
+        else:
             qv = embed_one(query)
             if qv:
                 vec = _vec_hits(store, qv, where, params, CANDIDATES)
+                vector_stage = _stage(
+                    "ran_not_candidate",
+                    "no_vector_candidates"
+                    if not vec
+                    else "candidate_not_returned_for_hit",
+                )
+            else:
+                # No candidate search can run without a query vector. Keep
+                # ran_not_candidate for the branch that actually calls
+                # _vec_hits above.
+                vector_stage = _stage("not_run", "query_embedding_empty")
 
         rrf: dict[str, float] = {}
         vec_rank: dict[str, tuple[int, float, str]] = {}
@@ -398,9 +468,14 @@ def recall(
                     fts_rank_raw=fr[1] if fr else None,
                     filter_context=filter_context,
                     final_rank=final_rank,
+                    vector_stage=vector_stage,
+                    fts_stage=fts_stage,
                 )
             )
-        return hits
+        return RecallResult(
+            hits,
+            modalities={"vector": vector_stage, "fts": fts_stage},
+        )
     finally:
         if own:
             store.close()

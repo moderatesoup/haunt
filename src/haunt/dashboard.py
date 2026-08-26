@@ -18,16 +18,11 @@ from starlette.routing import Route
 
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
-from haunt.recall import recall, Hit, RRF_K
-from haunt.store import (
-    Store,
-    UnknownNamespaceError,
-    list_namespaces,
-    list_namespace_rows,
-    namespace_exists,
-    open_existing,
-)
-from haunt.util import clamp_limit
+from haunt.planner import planned_recall
+from haunt.recall import Hit
+from haunt.store import Store, list_namespaces, list_namespace_rows, namespace_exists
+from haunt.temporal import TemporalParseError, compile as compile_temporal
+from haunt.util import clamp_limit, iso_or_now, normalize_clock
 
 TOKEN_HEADER = "X-Haunt-Token"
 TOKEN_QUERY = "token"
@@ -507,9 +502,9 @@ function eventsTable(rows){
 
 function hitsTable(hits){
   if(!hits.length){$("hits").innerHTML='<div class="empty">no hits</div>';return;}
-  $("hits").innerHTML=`<table><thead><tr><th>#</th><th title="RRF rank signal; not confidence">rrf</th><th>tier</th><th>origin</th>${ALL_NS?'<th>namespace</th>':''}<th>memory_id</th><th>snippet</th><th></th></tr></thead><tbody>`+
+  $("hits").innerHTML=`<table><thead><tr><th>rank</th><th title="RRF rank signal for ranked hits; timeline hits are time-ordered">signal</th><th>tier</th><th>origin</th>${ALL_NS?'<th>namespace</th>':''}<th>memory_id</th><th>snippet</th><th></th></tr></thead><tbody>`+
     hits.map((h,i)=>`<tr class="clickable" onclick="openDetail('${esc(h.memory_id)}','${esc(h.namespace||NS)}')">
-      <td>${i+1}</td><td>${(h.score||0).toFixed(4)}</td>
+      <td>${h.explanation?.final_rank??i+1}</td><td>${h.explanation?.score_semantics==='rrf_rank_signal_not_confidence'?'rrf='+(h.score||0).toFixed(4):'time-order'}</td>
       <td class="${tierCls(h.tier)}">${h.tier}</td>
       <td style="font-size:11px;color:var(--mut)">${esc(h.origin||'')}</td>
       ${ALL_NS?`<td><span class="ns-badge">${esc(h.namespace||'')}</span></td>`:''}
@@ -758,13 +753,13 @@ async function doRecall(){
     data=await j(url);
   }
   const errs=data.errors||[];
-  let meta=(data.hits||[]).length+" hits"+(ALL_NS?" (all namespaces)":"");
+  let meta=data.ok===false?(data.error||"recall failed"):(data.hits||[]).length+" hits"+(ALL_NS?" (all namespaces; ranked per namespace)":"");
   if(errs.length){
     const names=errs.map(e=>e.namespace||"?").join(", ");
     meta+=" — "+errs.length+" namespace"+(errs.length===1?"":"s")+" failed ("+names+")";
   }
   $("recallMeta").textContent=meta;
-  $("recallMeta").style.color=errs.length?"var(--red)":"";
+  $("recallMeta").style.color=(errs.length||data.ok===false)?"var(--red)":"";
   hitsTable(data.hits||[]);
 }
 
@@ -876,7 +871,55 @@ async def api_namespaces(_request: Request) -> JSONResponse:
 def _missing_namespace(name: str) -> JSONResponse | None:
     if namespace_exists(name):
         return None
-    return JSONResponse({"error": f"unknown namespace: {name}"}, status_code=404)
+    return JSONResponse(
+        {"ok": False, "error": f"unknown namespace: {name}", "namespace": name},
+        status_code=404,
+    )
+
+
+def _recall_error(
+    exc: Exception,
+    *,
+    query: str,
+    namespace: str | None = None,
+    status_code: int = 400,
+) -> JSONResponse:
+    """Use the MCP-style error envelope for dashboard recall endpoints."""
+    payload: dict[str, Any] = {"ok": False, "error": str(exc), "query": query}
+    if namespace is not None:
+        payload["namespace"] = namespace
+    return JSONResponse(payload, status_code=status_code)
+
+
+def _validate_recall_request(
+    query: str,
+    *,
+    as_of: str | None,
+    since: str | None,
+    until: str | None,
+    clock: str | None,
+) -> None:
+    """Reject malformed temporal/filter inputs before a namespace fan-out.
+
+    The planner performs the same validation during a normal recall. Doing it
+    here makes all-namespace requests atomic with respect to bad input instead
+    of returning a misleading collection of per-namespace failures.
+    """
+    if clock is not None:
+        normalize_clock(clock)
+    for value in (as_of, since, until):
+        if value:
+            iso_or_now(value)
+    compile_temporal(query)
+
+
+def _local_recall_order(hit: Hit) -> tuple[int, int, float, str]:
+    """Order only within one namespace; never compare RRF across namespaces."""
+    if hit.final_rank is not None:
+        return (0, hit.final_rank, 0.0, hit.memory_id)
+    # Defensive ordering for synthetic/custom callers that did not set a rank.
+    # It stays local to the namespace and does not rewrite that hit's rank.
+    return (1, 0, -hit.score, hit.memory_id)
 
 
 async def api_namespace(request: Request) -> JSONResponse:
@@ -902,10 +945,8 @@ async def api_namespace(request: Request) -> JSONResponse:
 
 
 async def api_recall_all(request: Request) -> JSONResponse:
-    """Cross-namespace recall: fan out to every registered namespace, merge via RRF."""
+    """Recall each namespace independently; RRF values are not global scores."""
     q = request.query_params.get("q") or ""
-    if not q.strip():
-        return JSONResponse({"query": q, "hits": [], "errors": []})
     k = clamp_limit(request.query_params.get("k") or 10, default=10)
     tier = request.query_params.get("tier") or None
     as_of = request.query_params.get("as_of") or None
@@ -913,8 +954,27 @@ async def api_recall_all(request: Request) -> JSONResponse:
     until = request.query_params.get("until") or None
     clock = request.query_params.get("clock") or None
 
-    ns_rows = list_namespace_rows()
-    all_hits: list[tuple[Hit, str]] = []
+    try:
+        _validate_recall_request(
+            q, as_of=as_of, since=since, until=until, clock=clock
+        )
+    except (TemporalParseError, ValueError) as exc:
+        return _recall_error(exc, query=q)
+    if not q.strip():
+        return JSONResponse(
+            {
+                "query": q,
+                "ranking_scope": "per_namespace",
+                "k_per_namespace": k,
+                "namespace_groups": [],
+                "hits": [],
+                "errors": [],
+            }
+        )
+
+    ns_rows = sorted(list_namespace_rows(), key=lambda row: row["name"])
+    namespace_groups: list[dict[str, Any]] = []
+    flattened: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for row in ns_rows:
         ns_name = row["name"]
@@ -922,63 +982,84 @@ async def api_recall_all(request: Request) -> JSONResponse:
             with Store(ns_name, create=False) as st:
                 if st.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0:
                     continue
-                hits = recall(q, namespace=ns_name, k=k, tier=tier,
-                              as_of=as_of, since=since, until=until,
-                              clock=clock, store=st)
-                for h in hits:
-                    all_hits.append((h, ns_name))
+                hits = planned_recall(
+                    q,
+                    namespace=ns_name,
+                    k=k,
+                    tier=tier,
+                    as_of=as_of,
+                    since=since,
+                    until=until,
+                    clock=clock,
+                    store=st,
+                )
+                results: list[dict[str, Any]] = []
+                for h in sorted(hits, key=_local_recall_order):
+                    result = h.as_dict()
+                    result["namespace"] = ns_name
+                    results.append(result)
+                namespace_groups.append({"namespace": ns_name, "hits": results})
+                flattened.extend(results)
         except Exception as exc:
             errors.append({"namespace": ns_name, "error": str(exc)})
 
-    rrf: dict[str, float] = {}
-    hit_map: dict[str, tuple[Hit, str]] = {}
-    for h, ns_name in all_hits:
-        key = f"{ns_name}:{h.memory_id}"
-        hit_map[key] = (h, ns_name)
-        rrf[key] = h.score
-
-    ranked = sorted(
-        rrf.items(),
-        key=lambda item: (
-            -item[1],
-            hit_map[item[0]][1],
-            hit_map[item[0]][0].memory_id,
-        ),
-    )[:k]
-    results = []
-    for final_rank, (key, score) in enumerate(ranked, start=1):
-        h, ns_name = hit_map[key]
-        d = h.as_dict()
-        d["namespace"] = ns_name
-        d["score"] = round(score, 6)
-        d["explanation"]["final_rank"] = final_rank
-        results.append(d)
-
-    return JSONResponse({"query": q, "hits": results, "errors": errors})
+    return JSONResponse(
+        {
+            "query": q,
+            "ranking_scope": "per_namespace",
+            "k_per_namespace": k,
+            "namespace_groups": namespace_groups,
+            # Kept for the existing UI/API shape. This is namespace-grouped,
+            # not a global result ranking, and each final_rank remains local.
+            "hits": flattened,
+            "errors": errors,
+        }
+    )
 
 
 async def api_recall(request: Request) -> JSONResponse:
-    name = resolve_namespace(request.path_params["name"])
+    q = request.query_params.get("q") or ""
+    try:
+        name = resolve_namespace(request.path_params["name"])
+    except ValueError as exc:
+        return _recall_error(exc, query=q)
     missing = _missing_namespace(name)
     if missing:
         return missing
-    q = request.query_params.get("q") or ""
     k = clamp_limit(request.query_params.get("k") or 8, default=8)
     tier = request.query_params.get("tier") or None
     as_of = request.query_params.get("as_of") or None
     since = request.query_params.get("since") or None
     until = request.query_params.get("until") or None
     clock = request.query_params.get("clock") or None
-    with Store(name, create=False) as st:
-        hits = recall(q, namespace=name, k=k, tier=tier,
-                      as_of=as_of, since=since, until=until,
-                      clock=clock, store=st)
+    try:
+        _validate_recall_request(
+            q, as_of=as_of, since=since, until=until, clock=clock
+        )
+        with Store(name, create=False) as st:
+            hits = planned_recall(
+                q,
+                namespace=name,
+                k=k,
+                tier=tier,
+                as_of=as_of,
+                since=since,
+                until=until,
+                clock=clock,
+                store=st,
+            )
+    except (TemporalParseError, ValueError) as exc:
+        return _recall_error(exc, query=q, namespace=name)
+    except Exception as exc:
+        return _recall_error(exc, query=q, namespace=name, status_code=500)
     results = []
     for h in hits:
         d = h.as_dict()
         d["namespace"] = name
         results.append(d)
-    return JSONResponse({"query": q, "hits": results})
+    return JSONResponse(
+        {"query": q, "namespace": name, "ranking_scope": "namespace", "hits": results}
+    )
 
 
 async def api_browse(request: Request) -> JSONResponse:

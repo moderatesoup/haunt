@@ -209,6 +209,8 @@ def _hits_from_events(
                 tool_name=row["tool_name"],
                 origin=row["origin"],
                 filter_context=filter_context,
+                vector_stage={"state": "not_run", "reason": "timeline_time_order"},
+                fts_stage={"state": "not_run", "reason": "timeline_time_order"},
             )
         )
         if len(hits) >= limit:

@@ -109,11 +109,13 @@ def test_all_ns_recall_tier_filter(multi_ns_client):
 
 
 def test_all_ns_recall_k_param(multi_ns_client):
-    """k parameter limits total results."""
+    """k is a per-namespace limit; endpoint does not invent a global rank."""
     r = multi_ns_client.get("/api/recall?q=quantum&k=1")
     assert r.status_code == 200
     data = r.json()
-    assert len(data["hits"]) <= 1
+    assert data["ranking_scope"] == "per_namespace"
+    assert all(len(group["hits"]) <= 1 for group in data["namespace_groups"])
+    assert len(data["hits"]) <= len(data["namespace_groups"])
 
 
 def test_all_ns_recall_includes_origin(multi_ns_client):
@@ -132,6 +134,28 @@ def test_per_ns_recall_includes_namespace(multi_ns_client):
     data = r.json()
     for h in data["hits"]:
         assert h["namespace"] == "alpha"
+    assert data["ranking_scope"] == "namespace"
+
+
+def test_dashboard_recall_rejects_invalid_clock_and_temporal_query(multi_ns_client):
+    """Bad recall input has the same JSON error envelope as MCP recall."""
+    bad_clock = multi_ns_client.get(
+        "/api/namespace/alpha/recall?q=quantum&clock=wrong-clock"
+    )
+    assert bad_clock.status_code == 400
+    assert bad_clock.json() == {
+        "ok": False,
+        "error": bad_clock.json()["error"],
+        "query": "quantum",
+        "namespace": "alpha",
+    }
+    assert "clock must be" in bad_clock.json()["error"]
+
+    bad_date = multi_ns_client.get("/api/recall?q=what+happened+on+2026-02-30")
+    assert bad_date.status_code == 400
+    assert bad_date.json()["ok"] is False
+    assert bad_date.json()["query"] == "what happened on 2026-02-30"
+    assert "invalid date" in bad_date.json()["error"]
 
 
 def test_all_ns_recall_surfaces_corrupt_namespace_errors(haunt_env):

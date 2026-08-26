@@ -48,6 +48,23 @@ def _existing(ns: str) -> Store:
         raise typer.Exit(2) from exc
 
 
+def _recall_json_error(
+    exc: Exception, *, namespace: str | None, query: str
+) -> None:
+    """Keep --json machine-readable even when recall rejects its input."""
+    typer.echo(
+        dumps(
+            {
+                "ok": False,
+                "error": str(exc),
+                "namespace": namespace,
+                "query": query,
+            }
+        )
+    )
+    raise typer.Exit(2)
+
+
 @app.command("bootstrap")
 def bootstrap_cmd(
     reembed: bool = typer.Option(
@@ -178,9 +195,19 @@ def recall_cmd(
     Natural-language time phrases are compiled at query time. Non-temporal
     queries take the existing recall path unchanged.
     """
-    ns = _ns(namespace)
     try:
-        with open_existing(ns) as st:
+        ns = _ns(namespace)
+    except ValueError as exc:
+        if json_out:
+            _recall_json_error(exc, namespace=namespace, query=query)
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    try:
+        # _existing retains the established human diagnostic. JSON callers
+        # need the raw exception so stdout remains a single JSON document.
+        opener = open_existing if json_out else _existing
+        with opener(ns) as st:
             hits = planned_recall(
                 query,
                 namespace=ns,
@@ -194,16 +221,8 @@ def recall_cmd(
             )
     except (TemporalParseError, UnknownNamespaceError, ValueError) as exc:
         if json_out:
-            typer.echo(
-                json.dumps(
-                    {"ok": False, "error": str(exc), "namespace": ns, "query": query},
-                    ensure_ascii=False,
-                    allow_nan=False,
-                ),
-                err=True,
-            )
-        else:
-            typer.echo(f"error: {exc}", err=True)
+            _recall_json_error(exc, namespace=ns, query=query)
+        typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     if json_out:
         typer.echo(
