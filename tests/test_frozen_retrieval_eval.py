@@ -91,6 +91,29 @@ def test_porter_stemming_case_uses_a_morphological_query():
     ]
 
 
+def test_nonprefix_stemming_case_defeats_substring_matching():
+    """The non-prefix fixture shares no prefix relation with the indexed word."""
+    corpus = load_corpus()
+    record = next(
+        record
+        for record in corpus["records"]
+        if record["id"] == "porter_stemming_nonprefix"
+    )
+    case = next(
+        case for case in corpus["cases"] if case["id"] == "porter_stemming_nonprefix"
+    )
+    query = case["query"].lower()
+    words = [word.strip(".,").lower() for word in record["content"].split()]
+
+    # A prefix pair also matches a substring or trigram index, so only a
+    # non-prefix inflection can detect the loss of Porter stemming.
+    assert query not in record["content"].lower()
+    assert not any(query.startswith(word) for word in words)
+    assert evaluate().as_dict()["cases"]["porter_stemming_nonprefix"]["returned"] == [
+        "porter_stemming_nonprefix"
+    ]
+
+
 def test_evaluate_preserves_caller_home(tmp_path, monkeypatch):
     """The public evaluator never mutates the caller's home or environment."""
     caller_home = tmp_path / "caller-home"
