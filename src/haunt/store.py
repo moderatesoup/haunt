@@ -78,14 +78,15 @@ ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
 RECALL_CLASSES = ("tool", "task")
 
-# sessions.meta key naming the ended session a successor continues.
+# sessions.succeeds_session names the ended session a successor continues.
+# Reserved: it is a column the store owns, never a caller-supplied meta key,
+# so a caller cannot forge a succession it does not own. ensure_session
+# reaches the lookup below on every write once the host session id has been
+# ended (the `claude --resume` path), and no index can serve a JSON scan.
 SESSION_SUCCEEDS_KEY = "succeeds_session"
 _OPEN_SUCCESSOR_SESSIONS = f"""
     SELECT id FROM sessions
-    WHERE ended_at IS NULL
-      AND meta IS NOT NULL
-      AND json_valid(meta)
-      AND json_extract(meta, '$.{SESSION_SUCCEEDS_KEY}')=?
+    WHERE ended_at IS NULL AND {SESSION_SUCCEEDS_KEY}=?
     ORDER BY started_at, id
 """
 
@@ -111,7 +112,13 @@ _OPEN_SUCCESSOR_SESSIONS = f"""
 #     partial index's row count tracks only the live set, independent of
 #     how much lineage has accumulated. No column, table, or query result
 #     changes -- read-path speed only. See C10 backlog notes.
-SCHEMA_VERSION = 11
+# 12: sessions.succeeds_session column + partial index, backfilled from the
+#     meta key it replaces and removed from meta. The link was a JSON
+#     predicate no index could serve, scanned on every write once the host
+#     session id was ended; and living in caller-writable meta it was
+#     forgeable. One reserved column is also one place for privacy purge to
+#     rekey, instead of a key hiding in every other session's metadata.
+SCHEMA_VERSION = 12
 SCHEMA_VERSION_KEY = "schema_version"
 PRIVACY_LINEAGE_KEY = "privacy_lineage_head"
 CONTENT_HASH_BACKFILL_BATCH = 1000
@@ -1268,6 +1275,19 @@ def _registry() -> sqlite3.Connection:
     return _connect(registry_path())
 
 
+def _session_meta_json(meta: dict[str, Any] | None) -> str:
+    """Serialize caller session metadata, dropping the reserved succession key.
+
+    Succession is the store's own bookkeeping and lives in the
+    sessions.succeeds_session column. A caller passing the key here is
+    claiming a predecessor it may not own, so the key is dropped rather than
+    stored -- end_session and successor reuse both act on that claim.
+    """
+    if not meta:
+        return dumps({})
+    return dumps({k: v for k, v in meta.items() if k != SESSION_SUCCEEDS_KEY})
+
+
 def _init_namespace_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -1280,7 +1300,8 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             started_at TEXT NOT NULL,
             ended_at TEXT,
             source TEXT,
-            meta TEXT
+            meta TEXT,
+            succeeds_session TEXT
         );
         CREATE TABLE IF NOT EXISTS events (
             id TEXT PRIMARY KEY,
@@ -1698,6 +1719,37 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_memories_current
                 ON memories(tier, created_at)
                 WHERE valid_to IS NULL
+            """
+        )
+    if current < 12:
+        session_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if SESSION_SUCCEEDS_KEY not in session_columns:
+            conn.execute(
+                f"ALTER TABLE sessions ADD COLUMN {SESSION_SUCCEEDS_KEY} TEXT"
+            )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_sessions_succeeds
+                ON sessions({SESSION_SUCCEEDS_KEY})
+                WHERE {SESSION_SUCCEEDS_KEY} IS NOT NULL
+            """
+        )
+        # Move the link out of meta rather than copying it: two carriers
+        # would be two places a privacy purge has to rekey, and the JSON one
+        # ships in every export bundle.
+        conn.execute(
+            f"""
+            UPDATE sessions
+               SET {SESSION_SUCCEEDS_KEY} =
+                       json_extract(meta, '$.{SESSION_SUCCEEDS_KEY}'),
+                   meta = json_remove(meta, '$.{SESSION_SUCCEEDS_KEY}')
+             WHERE meta IS NOT NULL
+               AND json_valid(meta)
+               AND json_type(meta) = 'object'
+               AND json_extract(meta, '$.{SESSION_SUCCEEDS_KEY}') IS NOT NULL
             """
         )
     _ensure_correction_invariant_triggers(conn)
@@ -4624,6 +4676,8 @@ def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str,
     namespace_id = str(identity["namespace_id"])
     db_path = Path(str(identity["db_path"]))
     conn = _registry()
+    backup: _VerifiedRegistryBackup | None = None
+    deregistered = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         aliases = conn.execute(
@@ -4669,6 +4723,15 @@ def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str,
                     f"cannot retire namespace {display!r}; {kinds}"
                 )
             return report
+        # The backup is the fallible step, and it runs while the registry
+        # transaction can still be rolled back. Deregistering first would let
+        # a backup failure leave the label gone, the report discarded, and the
+        # operator holding no output naming the file that survived.
+        backup_source = ReadOnlyStore._from_identity(identity)
+        try:
+            backup = _backup_namespace_database(backup_source, purpose="retire")
+        finally:
+            backup_source.close()
         conn.execute(
             "DELETE FROM repository_bindings WHERE namespace_id=?", (namespace_id,)
         )
@@ -4680,8 +4743,12 @@ def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str,
             "DELETE FROM namespace_identities WHERE namespace_id=?", (namespace_id,)
         )
         conn.commit()
+        deregistered = True
     except Exception:
         conn.rollback()
+        if backup is not None and not deregistered:
+            backup.discard()
+            backup.close()
         raise
     finally:
         conn.close()
@@ -4690,11 +4757,11 @@ def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str,
     report["deregistered"] = True
 
     # Opened from the captured identity, not the label: nothing resolves it
-    # any more, which is exactly what makes this read final.
+    # any more, which is exactly what makes this read final. It is a second
+    # snapshot on purpose -- the backup's predates deregistration and so
+    # cannot show a write that raced it.
     orphan = ReadOnlyStore._from_identity(identity)
-    backup: _VerifiedRegistryBackup | None = None
     try:
-        backup = _backup_namespace_database(orphan, purpose="retire")
         target_ro = open_existing_readonly(str(plan["target"]))
         try:
             _content_digest, diffs = _reconcile_content_state_digest(
@@ -4709,14 +4776,11 @@ def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str,
         }
         report["backup"] = dict(backup)
         report["stranded_rows"] = stranded
-    except Exception:
-        if backup is not None:
-            backup.discard()
-        raise
     finally:
+        # Never discarded here: past the commit the label is gone, so this
+        # backup is the only remaining copy of the namespace.
         orphan.close()
-        if backup is not None:
-            backup.close()
+        backup.close()
     if not stranded:
         _remove_namespace_database(
             db_path, (int(identity["db_device"]), int(identity["db_inode"]))
@@ -5069,7 +5133,7 @@ class Store:
             if not row:
                 self.conn.execute(
                     "INSERT INTO sessions(id, started_at, ended_at, source, meta) VALUES (?,?,?,?,?)",
-                    (session_id, now_iso(), None, source, dumps(meta or {})),
+                    (session_id, now_iso(), None, source, _session_meta_json(meta)),
                 )
                 if commit:
                     self.conn.commit()
@@ -5089,7 +5153,7 @@ class Store:
         sid = new_id()
         self.conn.execute(
             "INSERT INTO sessions(id, started_at, ended_at, source, meta) VALUES (?,?,?,?,?)",
-            (sid, now_iso(), None, source, dumps(meta or {})),
+            (sid, now_iso(), None, source, _session_meta_json(meta)),
         )
         if commit:
             self.set_meta("current_session", sid)
@@ -5121,21 +5185,24 @@ class Store:
         Reused rather than minted per write so a host replaying one ended id
         stays in one session instead of a row per event. The successor's own
         id is opaque: embedding the predecessor's id would survive a privacy
-        purge of it, whereas meta is already sanitized against erased values
-        (see _purge_safe_session_context).
+        purge of it. The predecessor is instead named by the reserved
+        succeeds_session column, which purge rekeys along with every other
+        reference to an erased session.
         """
         open_successors = self._open_successor_sessions(ended_session_id)
         if open_successors:
             return open_successors[-1]
         sid = new_id()
         self.conn.execute(
-            "INSERT INTO sessions(id, started_at, ended_at, source, meta) VALUES (?,?,?,?,?)",
+            "INSERT INTO sessions(id, started_at, ended_at, source, meta, "
+            f"{SESSION_SUCCEEDS_KEY}) VALUES (?,?,?,?,?,?)",
             (
                 sid,
                 now_iso(),
                 None,
                 source,
-                dumps({**(meta or {}), SESSION_SUCCEEDS_KEY: ended_session_id}),
+                _session_meta_json(meta),
+                ended_session_id,
             ),
         )
         if commit:
@@ -6177,7 +6244,7 @@ class Store:
             "relations": count("relations"),
         }
 
-    def purge(self, memory_id: str) -> dict[str, Any]:
+    def purge(self, memory_id: str, *, rebuild: bool = True) -> dict[str, Any]:
         """Hard-delete a memory and clean up all associated data.
 
         Removes: memory row, FTS row, vec row, graph rows tied to the
@@ -6188,6 +6255,12 @@ class Store:
         unlinked, which rebuilds the whole file and so costs time proportional
         to the namespace. `bytes_overwritten` reports whether that finished; it
         is False when a concurrent reader blocked the rebuild.
+
+        `rebuild=False` defers that whole-file rebuild so a caller purging a
+        set can pay for it once. It reports `bytes_overwritten` False and
+        leaves the erasure incomplete -- pages freed before this purge may
+        still hold older copies of the row -- until the caller runs
+        `overwrite_erased_pages()` itself. Nothing else does it for them.
         """
         row = self.conn.execute(
             """
@@ -6220,289 +6293,348 @@ class Store:
         }
 
         # A plain DELETE unlinks the cell and leaves its bytes readable in the
-        # file's free space. secure_delete zeroes them as they are freed. It is
-        # switched on around this transaction only: the pragma is a write
-        # amplifier that every ordinary delete would otherwise pay for, and
-        # purge is rare and already gated.
-        previous_secure_delete = int(
-            self.conn.execute("PRAGMA secure_delete").fetchone()[0]
-        )
-        self.conn.execute("PRAGMA secure_delete=ON")
-
-        try:
-            self.conn.execute("BEGIN IMMEDIATE")
-            self._privacy_purge_thread_id = get_ident()
-            # Privacy erasure is the sole exception to correction immutability.
-            # Replace an erased chain member with a fresh opaque tombstone and
-            # scrub correction request/context fields that could retain it.
-            lineage_rows = self.conn.execute(
-                """
-                SELECT * FROM corrections
-                WHERE target_memory_id=? OR replacement_memory_id=?
-                """,
-                (memory_id, memory_id),
-            ).fetchall()
-            needs_tombstone = any(
-                r["replacement_memory_id"] is not None
-                or r["replacement_tombstone_id"] is not None
-                for r in lineage_rows
-                if r["target_memory_id"] == memory_id
-            ) or any(r["replacement_memory_id"] == memory_id for r in lineage_rows)
-            tombstone: dict[str, Any] | None = None
-            sessions_to_cleanup: dict[str, dict[str, Any]] = {}
-            erased_values = _erasure_context_values(
-                memory_id,
-                event_id,
-                row["content"],
-                row["origin"],
-                row["session_id"],
-                row["event_idempotency_key"],
-                row["event_content"],
-                row["tool_name"],
-                row["tool_input"],
-                row["tool_output"],
-                row["event_meta"],
-                *_provenance_erasure_values(row["event_provenance"]),
-            )
-
-            def track_erased_session(
-                session_id: object, *context_values: object
-            ) -> None:
-                if session_id is None:
-                    return
-                info = sessions_to_cleanup.setdefault(
-                    str(session_id), {"sensitive_values": set(erased_values)}
-                )
-                info["sensitive_values"].update(
-                    _erasure_context_values(*context_values)
-                )
-
-            # A target session ID is erased context even when that session
-            # predates the target and still contains unrelated events.
-            track_erased_session(row["session_id"], *erased_values)
-            if needs_tombstone:
-                tombstone = {
-                    "schema_version": TOMBSTONE_SCHEMA_VERSION,
-                    "tombstone_id": new_id(),
-                    "status": "erased",
-                    "erased_at": now_iso(),
-                }
-                self.conn.execute(
+        # file's free space. secure_delete zeroes them as they are freed, and
+        # the rebuild below runs under it too, so both live inside one scope:
+        # an error anywhere between them must not strand the pragma on this
+        # long-lived writer connection.
+        with self._secure_delete_enabled():
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self._privacy_purge_thread_id = get_ident()
+                # Privacy erasure is the sole exception to correction immutability.
+                # Replace an erased chain member with a fresh opaque tombstone and
+                # scrub correction request/context fields that could retain it.
+                lineage_rows = self.conn.execute(
                     """
-                    INSERT INTO lineage_tombstones(
-                        schema_version, tombstone_id, status, erased_at
-                    ) VALUES (?, ?, ?, ?)
+                    SELECT * FROM corrections
+                    WHERE target_memory_id=? OR replacement_memory_id=?
                     """,
-                    tuple(tombstone.values()),
+                    (memory_id, memory_id),
+                ).fetchall()
+                needs_tombstone = any(
+                    r["replacement_memory_id"] is not None
+                    or r["replacement_tombstone_id"] is not None
+                    for r in lineage_rows
+                    if r["target_memory_id"] == memory_id
+                ) or any(r["replacement_memory_id"] == memory_id for r in lineage_rows)
+                tombstone: dict[str, Any] | None = None
+                sessions_to_cleanup: dict[str, dict[str, Any]] = {}
+                erased_values = _erasure_context_values(
+                    memory_id,
+                    event_id,
+                    row["content"],
+                    row["origin"],
+                    row["session_id"],
+                    row["event_idempotency_key"],
+                    row["event_content"],
+                    row["tool_name"],
+                    row["tool_input"],
+                    row["tool_output"],
+                    row["event_meta"],
+                    *_provenance_erasure_values(row["event_provenance"]),
                 )
-            for correction in lineage_rows:
-                correction_session = correction["session_id"]
-                track_erased_session(
-                    correction_session,
-                    correction["origin"],
-                    correction["session_id"],
-                    correction["reason"],
-                    correction["idempotency_key"],
-                    correction["request_identity"],
-                    correction["target_tombstone_id"],
-                    correction["replacement_tombstone_id"],
-                )
-                if correction["target_memory_id"] == memory_id:
-                    self._sanitize_correction_replacement_event(
-                        correction, erased_memory_id=memory_id
+
+                def track_erased_session(
+                    session_id: object, *context_values: object
+                ) -> None:
+                    if session_id is None:
+                        return
+                    info = sessions_to_cleanup.setdefault(
+                        str(session_id), {"sensitive_values": set(erased_values)}
                     )
-                    has_successor = (
-                        correction["replacement_memory_id"] is not None
-                        or correction["replacement_tombstone_id"] is not None
+                    info["sensitive_values"].update(
+                        _erasure_context_values(*context_values)
                     )
-                    if not has_successor:
-                        self.conn.execute(
-                            "DELETE FROM corrections WHERE id=?", (correction["id"],)
+
+                # A target session ID is erased context even when that session
+                # predates the target and still contains unrelated events.
+                track_erased_session(row["session_id"], *erased_values)
+                if needs_tombstone:
+                    tombstone = {
+                        "schema_version": TOMBSTONE_SCHEMA_VERSION,
+                        "tombstone_id": new_id(),
+                        "status": "erased",
+                        "erased_at": now_iso(),
+                    }
+                    self.conn.execute(
+                        """
+                        INSERT INTO lineage_tombstones(
+                            schema_version, tombstone_id, status, erased_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        tuple(tombstone.values()),
+                    )
+                for correction in lineage_rows:
+                    correction_session = correction["session_id"]
+                    track_erased_session(
+                        correction_session,
+                        correction["origin"],
+                        correction["session_id"],
+                        correction["reason"],
+                        correction["idempotency_key"],
+                        correction["request_identity"],
+                        correction["target_tombstone_id"],
+                        correction["replacement_tombstone_id"],
+                    )
+                    if correction["target_memory_id"] == memory_id:
+                        self._sanitize_correction_replacement_event(
+                            correction, erased_memory_id=memory_id
                         )
-                        continue
+                        has_successor = (
+                            correction["replacement_memory_id"] is not None
+                            or correction["replacement_tombstone_id"] is not None
+                        )
+                        if not has_successor:
+                            self.conn.execute(
+                                "DELETE FROM corrections WHERE id=?", (correction["id"],)
+                            )
+                            continue
+                        self.conn.execute(
+                            """
+                            UPDATE corrections
+                            SET target_memory_id=NULL, target_tombstone_id=?,
+                                origin=NULL, session_id=NULL, reason=NULL,
+                                idempotency_key=NULL, request_identity=NULL,
+                                request_payload=NULL, response_json=NULL
+                            WHERE id=?
+                            """,
+                            (tombstone["tombstone_id"], correction["id"]),
+                        )
+                    if correction["replacement_memory_id"] == memory_id:
+                        self.conn.execute(
+                            """
+                            UPDATE corrections
+                            SET replacement_memory_id=NULL, replacement_tombstone_id=?,
+                                origin=NULL, session_id=NULL, reason=NULL,
+                                idempotency_key=NULL, request_identity=NULL,
+                                request_payload=NULL, response_json=NULL
+                            WHERE id=?
+                            """,
+                            (tombstone["tombstone_id"], correction["id"]),
+                        )
+
+                self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+
+                has_fts = self.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+                ).fetchone()
+                if has_fts:
+                    self.conn.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
+                    # Deleting an FTS5 row drops its content but only writes a
+                    # delete marker into the index; the erased terms stay legible in
+                    # the existing segments. Merging every segment applies the
+                    # markers, which is what frees those pages for secure_delete.
                     self.conn.execute(
-                        """
-                        UPDATE corrections
-                        SET target_memory_id=NULL, target_tombstone_id=?,
-                            origin=NULL, session_id=NULL, reason=NULL,
-                            idempotency_key=NULL, request_identity=NULL,
-                            request_payload=NULL, response_json=NULL
-                        WHERE id=?
-                        """,
-                        (tombstone["tombstone_id"], correction["id"]),
+                        "INSERT INTO memories_fts(memories_fts) VALUES ('optimize')"
                     )
-                if correction["replacement_memory_id"] == memory_id:
-                    self.conn.execute(
-                        """
-                        UPDATE corrections
-                        SET replacement_memory_id=NULL, replacement_tombstone_id=?,
-                            origin=NULL, session_id=NULL, reason=NULL,
-                            idempotency_key=NULL, request_identity=NULL,
-                            request_payload=NULL, response_json=NULL
-                        WHERE id=?
-                        """,
-                        (tombstone["tombstone_id"], correction["id"]),
-                    )
+                    deleted["fts_deleted"] = True
+                has_vec = self.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_memories'"
+                ).fetchone()
+                if has_vec:
+                    self.conn.execute("DELETE FROM vec_memories WHERE id=?", (memory_id,))
+                    deleted["vec_deleted"] = True
 
-            self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-
-            has_fts = self.conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'"
-            ).fetchone()
-            if has_fts:
-                self.conn.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
-                # Deleting an FTS5 row drops its content but only writes a
-                # delete marker into the index; the erased terms stay legible in
-                # the existing segments. Merging every segment applies the
-                # markers, which is what frees those pages for secure_delete.
-                self.conn.execute(
-                    "INSERT INTO memories_fts(memories_fts) VALUES ('optimize')"
-                )
-                deleted["fts_deleted"] = True
-            has_vec = self.conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_memories'"
-            ).fetchone()
-            if has_vec:
-                self.conn.execute("DELETE FROM vec_memories WHERE id=?", (memory_id,))
-                deleted["vec_deleted"] = True
-
-            other_memories = self.conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
-            ).fetchone()[0]
-            from haunt.graph import remove_event_evidence
-
-            rel_count, entity_count = remove_event_evidence(self.conn, event_id)
-            deleted["relations_deleted"] = rel_count
-            deleted["entities_deleted"] = entity_count
-            if other_memories == 0:
-                self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
-                deleted["event_deleted"] = True
-            else:
-                # One event may have more than one materialized memory. The
-                # survivors remain, but neither the shared event's identifier
-                # nor its target-owned context may survive privacy erasure.
-                safe_event_id = new_id()
-                self.conn.execute(
-                    """
-                    INSERT INTO events(
-                        id, idempotency_key, session_id, ts, event_time, role,
-                        content, tool_name, tool_input, tool_output, origin,
-                        tier, meta, provenance
-                    ) VALUES (?, NULL, ?, ?, ?, ?, '', NULL, NULL, NULL, ?, ?, ?, ?)
-                    """,
-                    (
-                        safe_event_id,
-                        row["session_id"],
-                        row["event_ts"],
-                        row["event_time"],
-                        row["event_role"],
-                        PURGE_SAFE_ORIGIN,
-                        row["event_tier"],
-                        dumps({}),
-                        PURGE_SAFE_PROVENANCE,
-                    ),
-                )
-                self.conn.execute(
-                    "UPDATE memories SET event_id=? WHERE event_id=?",
-                    (safe_event_id, event_id),
-                )
-                self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
-                deleted["event_deleted"] = True
-
-            for session_id, session_info in sessions_to_cleanup.items():
-                session_refs = self.conn.execute(
-                    """
-                    SELECT
-                      (SELECT COUNT(*) FROM events WHERE session_id=?) +
-                      (SELECT COUNT(*) FROM corrections WHERE session_id=?)
-                    """,
-                    (session_id, session_id),
+                other_memories = self.conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
                 ).fetchone()[0]
-                started_at, ended_at, safe_source, safe_meta = (
-                    self._purge_safe_session_context(
-                        session_id, session_info["sensitive_values"]
-                    )
-                )
-                if session_refs > 0:
-                    safe_session = self._create_purge_safe_session(
-                        started_at=started_at,
-                        ended_at=ended_at,
-                        source=safe_source,
-                        meta=safe_meta,
-                    )
-                    # Session IDs attached to the target or adjacent correction
-                    # are erased context. Rekey every remaining reference while
-                    # preserving unrelated event content and origins.
-                    self.conn.execute(
-                        "UPDATE events SET session_id=? WHERE session_id=?",
-                        (safe_session, session_id),
-                    )
-                    self.conn.execute(
-                        "UPDATE corrections SET session_id=? WHERE session_id=?",
-                        (safe_session, session_id),
-                    )
-                    self.conn.execute(
-                        "UPDATE meta SET value=? WHERE key='current_session' AND value=?",
-                        (safe_session, session_id),
-                    )
-                    self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-                    deleted["session_deleted"] = True
+                from haunt.graph import remove_event_evidence
+
+                rel_count, entity_count = remove_event_evidence(self.conn, event_id)
+                deleted["relations_deleted"] = rel_count
+                deleted["entities_deleted"] = entity_count
+                if other_memories == 0:
+                    self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+                    deleted["event_deleted"] = True
                 else:
-                    self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                    # One event may have more than one materialized memory. The
+                    # survivors remain, but neither the shared event's identifier
+                    # nor its target-owned context may survive privacy erasure.
+                    safe_event_id = new_id()
                     self.conn.execute(
-                        "DELETE FROM meta WHERE key='current_session' AND value=?",
-                        (session_id,),
+                        """
+                        INSERT INTO events(
+                            id, idempotency_key, session_id, ts, event_time, role,
+                            content, tool_name, tool_input, tool_output, origin,
+                            tier, meta, provenance
+                        ) VALUES (?, NULL, ?, ?, ?, ?, '', NULL, NULL, NULL, ?, ?, ?, ?)
+                        """,
+                        (
+                            safe_event_id,
+                            row["session_id"],
+                            row["event_ts"],
+                            row["event_time"],
+                            row["event_role"],
+                            PURGE_SAFE_ORIGIN,
+                            row["event_tier"],
+                            dumps({}),
+                            PURGE_SAFE_PROVENANCE,
+                        ),
                     )
-                    deleted["session_deleted"] = True
+                    self.conn.execute(
+                        "UPDATE memories SET event_id=? WHERE event_id=?",
+                        (safe_event_id, event_id),
+                    )
+                    self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+                    deleted["event_deleted"] = True
 
-            if tombstone is not None:
-                deleted["lineage_tombstone"] = tombstone
+                for session_id, session_info in sessions_to_cleanup.items():
+                    session_refs = self.conn.execute(
+                        """
+                        SELECT
+                          (SELECT COUNT(*) FROM events WHERE session_id=?) +
+                          (SELECT COUNT(*) FROM corrections WHERE session_id=?)
+                        """,
+                        (session_id, session_id),
+                    ).fetchone()[0]
+                    started_at, ended_at, safe_source, safe_meta = (
+                        self._purge_safe_session_context(
+                            session_id, session_info["sensitive_values"]
+                        )
+                    )
+                    if session_refs > 0:
+                        # The replacement stands in for the erased session, so
+                        # it keeps that session's own place in a succession
+                        # chain unless the predecessor is erased context too.
+                        predecessor = self.conn.execute(
+                            f"SELECT {SESSION_SUCCEEDS_KEY} AS predecessor "
+                            "FROM sessions WHERE id=?",
+                            (session_id,),
+                        ).fetchone()["predecessor"]
+                        if predecessor in session_info["sensitive_values"]:
+                            predecessor = None
+                        safe_session = self._create_purge_safe_session(
+                            started_at=started_at,
+                            ended_at=ended_at,
+                            source=safe_source,
+                            meta=safe_meta,
+                            succeeds=predecessor,
+                        )
+                        # Session IDs attached to the target or adjacent correction
+                        # are erased context. Rekey every remaining reference while
+                        # preserving unrelated event content and origins. A
+                        # successor names its predecessor too, and that row is not
+                        # the purged session's own -- an unrekeyed link republishes
+                        # the erased id, including into every export bundle.
+                        self.conn.execute(
+                            "UPDATE events SET session_id=? WHERE session_id=?",
+                            (safe_session, session_id),
+                        )
+                        self.conn.execute(
+                            "UPDATE corrections SET session_id=? WHERE session_id=?",
+                            (safe_session, session_id),
+                        )
+                        self.conn.execute(
+                            f"UPDATE sessions SET {SESSION_SUCCEEDS_KEY}=? "
+                            f"WHERE {SESSION_SUCCEEDS_KEY}=?",
+                            (safe_session, session_id),
+                        )
+                        self.conn.execute(
+                            "UPDATE meta SET value=? WHERE key='current_session' AND value=?",
+                            (safe_session, session_id),
+                        )
+                        self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                        deleted["session_deleted"] = True
+                    else:
+                        self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                        # Nothing replaces a session with no surviving references,
+                        # so a successor of it is left with no predecessor rather
+                        # than a dangling erased id.
+                        self.conn.execute(
+                            f"UPDATE sessions SET {SESSION_SUCCEEDS_KEY}=NULL "
+                            f"WHERE {SESSION_SUCCEEDS_KEY}=?",
+                            (session_id,),
+                        )
+                        self.conn.execute(
+                            "DELETE FROM meta WHERE key='current_session' AND value=?",
+                            (session_id,),
+                        )
+                        deleted["session_deleted"] = True
 
-            self._prune_erased_only_lineage()
+                if tombstone is not None:
+                    deleted["lineage_tombstone"] = tombstone
 
-            # A hard purge invalidates every bundle made from the preceding
-            # privacy history. The opaque head retains neither erased IDs nor
-            # erased bytes and rotates in the same transaction as deletion.
-            _rotate_privacy_lineage_head(self.conn, self.namespace_id)
+                self._prune_erased_only_lineage()
 
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-        finally:
-            self._privacy_purge_thread_id = None
-        try:
-            deleted["bytes_overwritten"] = self._overwrite_erased_pages()
-        finally:
-            self.conn.execute(f"PRAGMA secure_delete={previous_secure_delete:d}")
+                # A hard purge invalidates every bundle made from the preceding
+                # privacy history. The opaque head retains neither erased IDs nor
+                # erased bytes and rotates in the same transaction as deletion.
+                _rotate_privacy_lineage_head(self.conn, self.namespace_id)
+
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            finally:
+                self._privacy_purge_thread_id = None
+            if rebuild:
+                deleted["bytes_overwritten"] = self.overwrite_erased_pages()
         try:
             touch_namespace(self.name, namespace_id=self.namespace_id)
         except Exception:
             pass
         return deleted
 
-    def _overwrite_erased_pages(self) -> bool:
+    @contextmanager
+    def _secure_delete_enabled(self) -> Iterator[None]:
+        """Zero freed cells for the duration, restoring the connection's mode.
+
+        secure_delete is a write amplifier that every ordinary delete would
+        otherwise pay for, so it is scoped rather than configured; purge is
+        rare and already gated. The restore is emitted as a keyword because
+        SQLite parses the integer 2 as boolean ON: writing the previous value
+        back as a number would silently promote a SQLITE_SECURE_DELETE=FAST
+        build's default to full for the rest of this connection's life.
+        """
+        previous = int(self.conn.execute("PRAGMA secure_delete").fetchone()[0])
+        self.conn.execute("PRAGMA secure_delete=ON")
+        try:
+            yield
+        finally:
+            restored = "FAST" if previous == 2 else f"{previous:d}"
+            self.conn.execute(f"PRAGMA secure_delete={restored}")
+
+    def overwrite_erased_pages(self) -> bool:
         """Rebuild the file without free pages, then drop the WAL's history.
 
-        secure_delete only zeroes what this purge frees. Pages freed earlier —
+        secure_delete only zeroes what a purge frees. Pages freed earlier —
         by an index merge or a page split that relocated the same row — can
         still hold an older copy of it, and only a rebuild removes those. Until
         the checkpoint runs, the erasure also lives solely in the WAL, beside
         the pre-purge frames that still hold the plaintext.
 
+        Public because `purge(rebuild=False)` defers it: a caller erasing a set
+        must call this once at the end or the erasure stays incomplete.
+
         Returns False when a concurrent reader kept the rebuild from running.
-        The checkpoint still happens in that case, so what this purge freed is
+        The checkpoint still happens in that case, so what the purge freed is
         zeroed either way; only the earlier copies stay readable.
         """
         # VACUUM and the truncating checkpoint both rewrite the file and its
         # sidecars; writer opens and closes take this same cross-process lock
-        # before validating them.
-        with _sqlite_configuration_lock():
+        # before validating them. secure_delete is re-entered here rather than
+        # assumed: a deferred rebuild runs outside any purge's scope.
+        with _sqlite_configuration_lock(), self._secure_delete_enabled():
+            # VACUUM materializes the entire rebuilt database in a transient
+            # file when temp_store is FILE, which is SQLite's default: a
+            # plaintext copy of every surviving memory, written under $TMPDIR
+            # rather than the deliberately-0700 HAUNT_HOME, and unlinked
+            # without being zeroed. MEMORY keeps it in this process instead.
+            # The cost is holding the rebuilt image in RAM; a namespace large
+            # enough for that to hurt is one whose plaintext must not be
+            # spilled to a world-readable directory either, so a rebuild that
+            # does not fit is reported as not run rather than spilled.
+            previous_temp_store = int(
+                self.conn.execute("PRAGMA temp_store").fetchone()[0]
+            )
+            self.conn.execute("PRAGMA temp_store=MEMORY")
             try:
                 self.conn.execute("VACUUM")
                 rebuilt = True
-            except sqlite3.OperationalError:
+            except (sqlite3.OperationalError, MemoryError):
                 rebuilt = False
+            finally:
+                self.conn.execute(f"PRAGMA temp_store={previous_temp_store:d}")
             row = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         return rebuilt and row is not None and int(row[0]) == 0
 
@@ -6566,19 +6698,19 @@ class Store:
         ended_at: str | None = None,
         source: Any,
         meta: Any,
+        succeeds: str | None = None,
     ) -> str:
         safe_session = new_id()
         self.conn.execute(
-            """
-            INSERT INTO sessions(id, started_at, ended_at, source, meta)
-            VALUES (?, ?, ?, ?, ?)
-            """,
+            "INSERT INTO sessions(id, started_at, ended_at, source, meta, "
+            f"{SESSION_SUCCEEDS_KEY}) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 safe_session,
                 now_iso() if started_at is None else started_at,
                 ended_at,
                 source,
                 meta,
+                succeeds,
             ),
         )
         return safe_session
@@ -7894,7 +8026,17 @@ def reembed_all_namespaces() -> list[dict[str, Any]]:
         try:
             with Store(row["name"], create=False) as st:
                 report = st.reembed()
-        except (sqlite3.Error, OSError, NamespacePathError) as exc:
+        except (
+            sqlite3.Error,
+            OSError,
+            NamespacePathError,
+            UnknownNamespaceError,
+            NamespaceCollisionError,
+            NamespaceMigrationError,
+        ) as exc:
+            # A namespace deregistered, remapped, or left mid-migration since
+            # list_namespace_rows() read the registry raises one of these
+            # instead; without them one sibling's state ends the whole walk.
             out.append({"namespace": row["name"], "error": str(exc)})
             continue
         report["namespace"] = row["name"]

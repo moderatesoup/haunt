@@ -1584,3 +1584,88 @@ def test_cli_retire_defaults_to_dry_run(reconcile_home):
     )
     assert blocked.exit_code == 2
     assert "error:" in blocked.output
+
+
+def test_retire_backup_failure_leaves_the_namespace_registered(
+    reconcile_home, monkeypatch
+):
+    """A failed backup must not leave the label gone and the file orphaned.
+
+    Deregistration used to commit first, so a backup failure retired the
+    label, discarded the report, and left the operator with no output naming
+    the database that survived at its own path.
+    """
+    register_namespace("bufail-src")
+    with Store("bufail-src") as st:
+        st.observe("drained row")
+    register_namespace("bufail-dst")
+    with Store("bufail-dst") as st:
+        st.observe("dst row")
+    _plan_and_apply("bufail-src", "bufail-dst")
+
+    real_backup = store._backup_namespace_database
+
+    def fail_backup(store_obj, *, purpose):
+        raise NamespaceMigrationError(f"forced {purpose} backup failure")
+
+    monkeypatch.setattr(store, "_backup_namespace_database", fail_backup)
+    with pytest.raises(NamespaceMigrationError, match="forced retire"):
+        store.retire_namespace("bufail-src", into="bufail-dst", apply=True)
+
+    assert store.namespace_exists("bufail-src"), (
+        "a failed backup must not deregister the namespace"
+    )
+    assert _db_path(reconcile_home, "bufail-src").exists()
+    ro = store.open_existing_readonly("bufail-src")
+    try:
+        assert ro.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    finally:
+        ro.close()
+
+    # And the operation still completes once the backup can be taken.
+    monkeypatch.setattr(store, "_backup_namespace_database", real_backup)
+    applied = store.retire_namespace("bufail-src", into="bufail-dst", apply=True)
+    assert applied["retired"] is True
+    assert applied["database_removed"] is True
+
+
+def test_namespace_backup_carries_rows_that_are_still_only_in_the_wal(reconcile_home):
+    """A backup taken while a writer holds uncheckpointed frames is complete.
+
+    Databases run journal_mode=WAL and the backup is a byte copy of a main
+    file, so this is the case where committed rows could silently go missing.
+    They do not: open_existing_readonly copies main and -wal into a private
+    shadow and checkpoints *that* before opening it, so the file the backup
+    copies is already materialized.
+    """
+    register_namespace("walbackup")
+    canary = b"walonlycanaryf3k8"
+    with Store("walbackup") as st:
+        st.observe(f"committed row {canary.decode()}")
+        db_path = _db_path(reconcile_home, "walbackup")
+        assert canary not in db_path.read_bytes(), (
+            "fixture assumption: the row must still be WAL-only"
+        )
+        assert canary in Path(f"{db_path}-wal").read_bytes()
+
+        ro = store.open_existing_readonly("walbackup")
+        try:
+            backup = store._backup_namespace_database(ro, purpose="waltest")
+        finally:
+            ro.close()
+
+    try:
+        assert backup["integrity"] == "ok"
+        copied = sqlite3.connect(
+            f"{Path(backup['path']).as_uri()}?mode=ro&immutable=1", uri=True
+        )
+        try:
+            found = copied.execute(
+                "SELECT COUNT(*) FROM memories WHERE content LIKE ?",
+                (f"%{canary.decode()}%",),
+            ).fetchone()[0]
+        finally:
+            copied.close()
+        assert found == 1, "the backup dropped a committed row that lived in the WAL"
+    finally:
+        backup.close()

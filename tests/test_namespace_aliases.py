@@ -1999,7 +1999,7 @@ def test_e5_references_and_execution_survive_e3_rename_without_purge_leaks(
         assert store.purge(erased_id)["ok"] is True
         assert store.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()[0] == "11"
+        ).fetchone()[0] == "12"
 
     _apply_change("e5-e3-old", "e5-e3-new")
     conn = sqlite3.connect(registry_path())

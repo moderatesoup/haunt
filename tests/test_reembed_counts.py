@@ -191,3 +191,34 @@ def test_reembed_updated_matches_vec_rows_live(haunt_env):
         assert result["updated"] == vec_n
         assert result["total"] == mem_n
         assert result["available"] is True
+
+
+def test_reembed_all_namespaces_isolates_a_sibling_registry_error(
+    tmp_path, monkeypatch
+):
+    """One unopenable namespace must not end the walk over the others.
+
+    UnknownNamespaceError, NamespaceCollisionError and NamespaceMigrationError
+    are what a namespace deregistered, remapped, or left mid-migration since
+    the registry was listed raises; none of them is a sqlite3.Error or OSError.
+    """
+    _fts_only_home(tmp_path, monkeypatch)
+    from haunt import store as store_module
+
+    with store_module.Store("reembed-broken") as st:
+        st.observe("row in the namespace that will not open")
+    with store_module.Store("reembed-intact") as st:
+        st.observe("row that must still be reembedded")
+
+    real_store = store_module.Store
+
+    def flaky_store(name, **kwargs):
+        if name == "reembed-broken":
+            raise store_module.UnknownNamespaceError(name)
+        return real_store(name, **kwargs)
+
+    monkeypatch.setattr(store_module, "Store", flaky_store)
+    reports = {r["namespace"]: r for r in store_module.reembed_all_namespaces()}
+
+    assert "unknown namespace" in reports["reembed-broken"]["error"]
+    assert "error" not in reports["reembed-intact"], reports["reembed-intact"]
