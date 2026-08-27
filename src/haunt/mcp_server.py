@@ -887,7 +887,11 @@ def memory_procedure(
         "Permanently delete a memory and its entire provenance chain: "
         "FTS index, vector embedding, graph relations/entities tied to the event, "
         "and the event itself if no other memories reference it. "
-        "This is a hard purge — the data is gone, not just superseded. "
+        "This is a hard purge, not a supersede: the database file is rebuilt "
+        "without the erased bytes, so the text is no longer readable in it. "
+        "Copies outside that file — exports, backups, filesystem snapshots — "
+        "are untouched; `bytes_overwritten` is false if a concurrent reader "
+        "blocked the rebuild. "
         "Use memory_contradict to supersede (set valid_to) without deleting."
     ),
     annotations=ToolAnnotations(

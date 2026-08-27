@@ -1028,7 +1028,8 @@ def delete_cmd(
     typer.echo(
         f"ok  purged  fts={result['fts_deleted']}  vec={result['vec_deleted']}  "
         f"rels={result['relations_deleted']}  ents={result['entities_deleted']}  "
-        f"event_deleted={result['event_deleted']}"
+        f"event_deleted={result['event_deleted']}  "
+        f"bytes_overwritten={result['bytes_overwritten']}"
     )
 
 

@@ -6259,6 +6259,11 @@ class Store:
         Removes: memory row, FTS row, vec row, graph rows tied to the
         memory's event, and the event itself if no other memories reference it.
         Returns a report of what was deleted.
+
+        Erased bytes are overwritten inside the database file rather than only
+        unlinked, which rebuilds the whole file and so costs time proportional
+        to the namespace. `bytes_overwritten` reports whether that finished; it
+        is False when a concurrent reader blocked the rebuild.
         """
         row = self.conn.execute(
             """
@@ -6287,7 +6292,18 @@ class Store:
             "entities_deleted": 0,
             "event_deleted": False,
             "session_deleted": False,
+            "bytes_overwritten": False,
         }
+
+        # A plain DELETE unlinks the cell and leaves its bytes readable in the
+        # file's free space. secure_delete zeroes them as they are freed. It is
+        # switched on around this transaction only: the pragma is a write
+        # amplifier that every ordinary delete would otherwise pay for, and
+        # purge is rare and already gated.
+        previous_secure_delete = int(
+            self.conn.execute("PRAGMA secure_delete").fetchone()[0]
+        )
+        self.conn.execute("PRAGMA secure_delete=ON")
 
         try:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -6411,6 +6427,13 @@ class Store:
             ).fetchone()
             if has_fts:
                 self.conn.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
+                # Deleting an FTS5 row drops its content but only writes a
+                # delete marker into the index; the erased terms stay legible in
+                # the existing segments. Merging every segment applies the
+                # markers, which is what frees those pages for secure_delete.
+                self.conn.execute(
+                    "INSERT INTO memories_fts(memories_fts) VALUES ('optimize')"
+                )
                 deleted["fts_deleted"] = True
             has_vec = self.conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_memories'"
@@ -6525,10 +6548,39 @@ class Store:
         finally:
             self._privacy_purge_thread_id = None
         try:
+            deleted["bytes_overwritten"] = self._overwrite_erased_pages()
+        finally:
+            self.conn.execute(f"PRAGMA secure_delete={previous_secure_delete:d}")
+        try:
             touch_namespace(self.name, namespace_id=self.namespace_id)
         except Exception:
             pass
         return deleted
+
+    def _overwrite_erased_pages(self) -> bool:
+        """Rebuild the file without free pages, then drop the WAL's history.
+
+        secure_delete only zeroes what this purge frees. Pages freed earlier —
+        by an index merge or a page split that relocated the same row — can
+        still hold an older copy of it, and only a rebuild removes those. Until
+        the checkpoint runs, the erasure also lives solely in the WAL, beside
+        the pre-purge frames that still hold the plaintext.
+
+        Returns False when a concurrent reader kept the rebuild from running.
+        The checkpoint still happens in that case, so what this purge freed is
+        zeroed either way; only the earlier copies stay readable.
+        """
+        # VACUUM and the truncating checkpoint both rewrite the file and its
+        # sidecars; writer opens and closes take this same cross-process lock
+        # before validating them.
+        with _sqlite_configuration_lock():
+            try:
+                self.conn.execute("VACUUM")
+                rebuilt = True
+            except sqlite3.OperationalError:
+                rebuilt = False
+            row = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return rebuilt and row is not None and int(row[0]) == 0
 
     def _sanitize_correction_replacement_event(
         self,

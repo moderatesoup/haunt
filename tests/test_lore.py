@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -102,11 +101,10 @@ def test_graph_extract_entities(haunt_env):
 
 
 def test_cli_smoke(haunt_env):
+    # haunt_env already put HAUNT_EMBED_MODEL and the host model cache into
+    # os.environ, so the child inherits the same resolution as the parent.
     env = os.environ.copy()
     env["HAUNT_HOME"] = str(haunt_env)
-    env["HAUNT_EMBED_MODEL"] = "BAAI/bge-small-en-v1.5"
-    if Path("/workspace/lore/.model-cache").exists():
-        env["HAUNT_MODEL_CACHE"] = "/workspace/lore/.model-cache"
     py = sys.executable
     def run(*args: str) -> str:
         p = subprocess.run(
