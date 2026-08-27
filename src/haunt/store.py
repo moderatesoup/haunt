@@ -84,7 +84,20 @@ RECALL_CLASSES = ("tool", "task")
 # 7: database-enforced append-only corrections outside authorized purge.
 # 8: validated, versioned source provenance on events.
 # 9: explicit recall-residue classification on new events only.
-SCHEMA_VERSION = 9
+# 10: content_hash on memories, populated at admission and backfilled for
+#     existing rows. Measurement only -- phase 1 changes no write
+#     behavior, suppresses nothing, and collapses no rows. See
+#     _content_hash for why normalization is deliberately absent.
+# 11: partial index on memories(tier, created_at) WHERE valid_to IS NULL.
+#     Every "current slice" read (default recall's m.valid_to IS NULL
+#     filter, worldview/procedure_get/procedure_list's tier-scoped current
+#     scans) previously drove a full scan of every memory row ever
+#     written, including every superseded one -- a namespace's correction
+#     history made its own current-fact lookups slower forever. The
+#     partial index's row count tracks only the live set, independent of
+#     how much lineage has accumulated. No column, table, or query result
+#     changes -- read-path speed only. See C10 backlog notes.
+SCHEMA_VERSION = 11
 SCHEMA_VERSION_KEY = "schema_version"
 REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
@@ -222,6 +235,24 @@ PURGE_SAFE_PROVENANCE = provenance_json(
         "origin": PURGE_SAFE_ORIGIN,
     }
 )
+
+# C5: cap retries on a permanently-failing embedding_jobs row (see
+# _embed_max_attempts / process_embedding_jobs). Embedding runs locally with
+# no network hop, so most failures are deterministic (malformed content, a
+# dimension mismatch) rather than transient -- a handful of attempts is
+# enough to ride out a genuine transient blip without letting a poison row
+# retry forever.
+EMBED_MAX_ATTEMPTS_DEFAULT = 5
+
+# C4: rows-per-namespace bound on Store.drain_embedding_queue() (see
+# _embed_drain_limit). Hook writes always queue with defer_embedding=True
+# and nothing upstream of `haunt bootstrap` drains that queue except read
+# traffic hitting recall() -- a namespace that is written to but rarely
+# searched can grow an unbounded backlog. 500 is enough to clear a normal
+# session's worth of deferred writes in one `haunt bootstrap` call without
+# risking an operator's terminal hanging on a pathological backlog (real
+# dogfooded example: 1363 queued rows in one namespace).
+EMBED_DRAIN_LIMIT_DEFAULT = 500
 
 
 class UnknownNamespaceError(ValueError):
@@ -805,6 +836,42 @@ def _vec_loaded(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def _embed_max_attempts() -> int:
+    """HAUNT_EMBED_MAX_ATTEMPTS, clamped. Same style as HAUNT_TOOL_IO_MAX_CHARS
+    (cursor_hook._tool_io_cap) and HAUNT_EMBED_MAX_LEN (embed._max_len): parse,
+    fall back to the default on anything unparsable, then clamp so a bad env
+    value can't disable the cap (<=0, which would make every row selectable
+    forever) or set it so low a single transient failure is treated as
+    permanent.
+    """
+    raw = (os.environ.get("HAUNT_EMBED_MAX_ATTEMPTS") or "").strip()
+    try:
+        value = int(raw) if raw else EMBED_MAX_ATTEMPTS_DEFAULT
+    except ValueError:
+        value = EMBED_MAX_ATTEMPTS_DEFAULT
+    return max(1, min(value, 1000))
+
+
+def _embed_drain_limit() -> int:
+    """HAUNT_EMBED_DRAIN_LIMIT, clamped. Same parse/fallback/clamp style as
+    _embed_max_attempts / HAUNT_TOOL_IO_MAX_CHARS (cursor_hook._tool_io_cap).
+
+    C4: bounds Store.drain_embedding_queue(), the out-of-band backlog drain
+    that runs from `haunt bootstrap` (see bootstrap.py) independently of
+    read/recall traffic. It must never block indefinitely on a huge
+    backlog, so this is the max number of rows one drain call will attempt
+    per namespace before it reports back and stops -- see `stopped_early`
+    / `remaining` in that method's return value for how a caller tells
+    "fully drained" from "drained N, M still queued".
+    """
+    raw = (os.environ.get("HAUNT_EMBED_DRAIN_LIMIT") or "").strip()
+    try:
+        value = int(raw) if raw else EMBED_DRAIN_LIMIT_DEFAULT
+    except ValueError:
+        value = EMBED_DRAIN_LIMIT_DEFAULT
+    return max(1, min(value, 100_000))
+
+
 def init_registry() -> None:
     """Initialize/migrate the registry under the writer sidecar lifecycle lock."""
     with _sqlite_configuration_lock():
@@ -1178,6 +1245,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             valid_from TEXT NOT NULL,
             valid_to TEXT,
             created_at TEXT NOT NULL,
+            content_hash TEXT,
             FOREIGN KEY (event_id) REFERENCES events(id)
         );
         CREATE TABLE IF NOT EXISTS entities (
@@ -1412,6 +1480,45 @@ def _ensure_provenance_type_triggers(conn: sqlite3.Connection) -> None:
         )
 
 
+def _content_hash(content: str) -> str:
+    """SHA-256 hex digest over the exact stored ``content`` bytes (UTF-8).
+
+    Deliberately no normalization: no case-folding, no whitespace-
+    stripping, no Unicode normalization, no semantic similarity. Two
+    memory rows collide here if and only if their stored content is
+    byte-identical. Measured against the dogfooded corpus, normalizing
+    before hashing was found to buy essentially nothing beyond exact-byte
+    matching, while semantic/normalized collapse risks silently treating
+    genuinely distinct facts as duplicates -- the dangerous direction for
+    a verbatim memory store to err toward.
+
+    This is a measurement primitive only (C7 phase 1): nothing reads this
+    hash to suppress, collapse, or short-circuit a write. See
+    SCHEMA_VERSION's v10 note.
+    """
+    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+
+
+def _backfill_content_hashes(conn: sqlite3.Connection) -> int:
+    """Populate content_hash for memory rows written before schema v10.
+
+    Uses the exact same hash function observe() uses at admission, so a
+    backfilled row and a freshly written row with identical content always
+    produce identical hashes. Only ever fills the new column -- `content`
+    itself is never read back out and rewritten. Returns the row count
+    touched.
+    """
+    rows = conn.execute(
+        "SELECT id, content FROM memories WHERE content_hash IS NULL"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE memories SET content_hash=? WHERE id=?",
+            (_content_hash(row["content"]), row["id"]),
+        )
+    return len(rows)
+
+
 def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     """Create tables and run one-time migrations. Not invoked per query."""
     _init_namespace_schema(conn)
@@ -1509,6 +1616,32 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE events ADD COLUMN recall_class TEXT "
                 "CHECK(recall_class IN ('tool', 'task') OR recall_class IS NULL)"
             )
+    if current < 10:
+        memory_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "content_hash" not in memory_columns:
+            conn.execute("ALTER TABLE memories ADD COLUMN content_hash TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_content_hash "
+            "ON memories(content_hash)"
+        )
+        # Unlike v9's recall_class, backfill is both possible and required
+        # here: every existing row's content is already present, so its
+        # hash is deterministically recomputable. This only ever fills the
+        # new column -- it never reads back and rewrites `content` itself.
+        _backfill_content_hashes(conn)
+    if current < 11:
+        # Additive, no backfill needed: an index has no historical rows to
+        # repopulate, only future lookups to speed up. CREATE INDEX builds
+        # it from whatever is already in `memories` right now.
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memories_current
+                ON memories(tier, created_at)
+                WHERE valid_to IS NULL
+            """
+        )
     _ensure_correction_invariant_triggers(conn)
     _ensure_correction_append_only_triggers(conn)
     _ensure_provenance_type_triggers(conn)
@@ -3692,6 +3825,648 @@ def retire_namespace_alias(label: str, *, apply: bool = False) -> dict[str, Any]
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Backlog C3: reconcile namespaces that are already split.
+#
+# E3 (above) deliberately refuses to let a rename/alias repoint an existing,
+# independently populated namespace onto a different one's identity --
+# `_change_namespace_label` raises NamespaceCollisionError the moment
+# `new_label` already resolves to a different namespace_id. That refusal is
+# correct and this code does not weaken it. C3 solves a different problem:
+# two namespaces that already hold real, disjoint content for the same
+# repository (see `_registered_namespace_for_repo` in paths.py for why C1/C2
+# do not auto-heal this).
+#
+# Scope, stated explicitly (see the C3 task/report for the full reasoning):
+#   - One-directional. SOURCE is opened read-only for this call's entire
+#     lifetime and is never written to, never migrated, never backed up
+#     *over*. TARGET gains every SOURCE row it does not already have; TARGET
+#     keeps everything it already had. The registry (labels/aliases/
+#     identities/repository_bindings) is never modified -- both labels
+#     remain independently resolvable after apply, exactly as before, except
+#     TARGET's database now holds the union.
+#   - Embeddings are dropped and re-queued, never copied: `memories.embedding`
+#     is forced NULL on every inserted row and a fresh `embedding_jobs` row
+#     takes its place, so a copied memory is always keyword-searchable
+#     immediately and vector-searchable again once the next drain runs under
+#     TARGET's own configured model. `vec_memories` (the vec0 virtual table)
+#     is never read or written.
+#   - `meta` (per-database schema_version/embed_dim/... configuration) is
+#     never copied; TARGET keeps its own.
+#   - Every other content-bearing table (sessions, events, memories,
+#     entities, relations, entity_mentions, relation_evidence, corrections,
+#     lineage_tombstones) is copied verbatim by primary key, preserving IDs,
+#     timestamps, and correction/provenance lineage exactly. A primary key
+#     present on both sides with byte-identical content (ignoring
+#     `embedding`) is a no-op; present on both sides with *different*
+#     content is a hard, whole-operation refusal -- never a guess, never a
+#     partial merge. Graph rows (entities/relations/mentions/evidence) are
+#     copied by the same id-preserving rule; this does not attempt to
+#     resolve two differently-`id`'d entities that merely share a name --
+#     that is entity resolution, a different and harder problem this does
+#     not claim to solve.
+# ---------------------------------------------------------------------------
+
+_RECONCILE_TABLES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
+    ("sessions", ("id",), frozenset()),
+    ("events", ("id",), frozenset()),
+    ("memories", ("id",), frozenset({"embedding"})),
+    ("entities", ("id",), frozenset()),
+    ("relations", ("id",), frozenset()),
+    ("entity_mentions", ("event_id", "entity_id"), frozenset()),
+    ("relation_evidence", ("event_id", "src_entity", "rel", "dst_entity"), frozenset()),
+    ("lineage_tombstones", ("tombstone_id",), frozenset()),
+    ("corrections", ("id",), frozenset()),
+)
+
+# Columns outside the primary key that are also required to be globally
+# unique (enforced by a partial UNIQUE index). A SOURCE row queued for
+# insertion whose value collides with a *different* TARGET row on one of
+# these is exactly as unsafe as a primary-key collision and refuses the
+# whole operation rather than letting SQLite's own constraint fail mid-write.
+_RECONCILE_SECONDARY_UNIQUE_KEYS: dict[str, tuple[str, ...]] = {
+    "events": ("idempotency_key",),
+    "corrections": (
+        "idempotency_key",
+        "target_memory_id",
+        "target_tombstone_id",
+        "replacement_memory_id",
+        "replacement_tombstone_id",
+    ),
+}
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [
+        str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    ]
+
+
+def _reconcile_sort_key(pk: tuple[Any, ...]) -> tuple[str, ...]:
+    return tuple("" if value is None else str(value) for value in pk)
+
+
+def _fetch_rows_by_pk(
+    conn: sqlite3.Connection, table: str, pk_columns: tuple[str, ...]
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    columns = _table_columns(conn, table)
+    rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+    result: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        record = {column: row[column] for column in columns}
+        pk = tuple(record[column] for column in pk_columns)
+        result[pk] = record
+    return result
+
+
+def _json_safe_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: json_safe_sqlite(value) for key, value in row.items()}
+
+
+def _rows_equal(
+    a: dict[str, Any], b: dict[str, Any], ignore_columns: frozenset[str]
+) -> bool:
+    keys = set(a) | set(b)
+    return all(
+        column in ignore_columns or a.get(column) == b.get(column) for column in keys
+    )
+
+
+@dataclass
+class _TableDiff:
+    table: str
+    to_insert: list[dict[str, Any]]
+    already_present: int
+    colliding_pks: list[tuple[Any, ...]]
+    secondary_collisions: list[tuple[str, Any]]
+
+
+def _diff_reconcile_table(
+    table: str,
+    ignore_columns: frozenset[str],
+    secondary_keys: tuple[str, ...],
+    source_rows: dict[tuple[Any, ...], dict[str, Any]],
+    target_rows: dict[tuple[Any, ...], dict[str, Any]],
+) -> _TableDiff:
+    to_insert: list[dict[str, Any]] = []
+    already_present = 0
+    colliding: list[tuple[Any, ...]] = []
+    for pk in sorted(source_rows, key=_reconcile_sort_key):
+        row = source_rows[pk]
+        existing = target_rows.get(pk)
+        if existing is None:
+            to_insert.append(row)
+        elif _rows_equal(row, existing, ignore_columns):
+            already_present += 1
+        else:
+            colliding.append(pk)
+    secondary_collisions: list[tuple[str, Any]] = []
+    for column in secondary_keys:
+        target_values = {
+            row[column] for row in target_rows.values() if row.get(column) is not None
+        }
+        for row in to_insert:
+            value = row.get(column)
+            if value is not None and value in target_values:
+                secondary_collisions.append((column, value))
+    return _TableDiff(table, to_insert, already_present, colliding, secondary_collisions)
+
+
+def _reconcile_content_state_digest(
+    source_conn: sqlite3.Connection, target_conn: sqlite3.Connection
+) -> tuple[str, dict[str, _TableDiff]]:
+    """Diff every mergeable table and return a digest bound to every row read.
+
+    The digest covers full row content (JSON-safe-encoded, so BLOB columns
+    such as ``corrections.request_payload`` hash safely) on both sides, not
+    just the rows that would move -- any change to either namespace's
+    existing content between a dry-run and its apply must be detected, not
+    only a change to what would be inserted.
+    """
+    diffs: dict[str, _TableDiff] = {}
+    per_table_digest: dict[str, Any] = {}
+    for table, pk_columns, ignore_columns in _RECONCILE_TABLES:
+        source_columns = _table_columns(source_conn, table)
+        target_columns = _table_columns(target_conn, table)
+        if source_columns != target_columns:
+            raise NamespaceMigrationError(
+                f"{table!r} column layout differs between the two namespaces "
+                "even though both report the current schema version; "
+                "refusing to guess a mapping"
+            )
+        source_rows = _fetch_rows_by_pk(source_conn, table, pk_columns)
+        target_rows = _fetch_rows_by_pk(target_conn, table, pk_columns)
+        diffs[table] = _diff_reconcile_table(
+            table,
+            ignore_columns,
+            _RECONCILE_SECONDARY_UNIQUE_KEYS.get(table, ()),
+            source_rows,
+            target_rows,
+        )
+        per_table_digest[table] = {
+            "source": sorted(
+                _canonical_json({"pk": list(pk), "row": _json_safe_row(row)})
+                for pk, row in source_rows.items()
+            ),
+            "target": sorted(
+                _canonical_json({"pk": list(pk), "row": _json_safe_row(row)})
+                for pk, row in target_rows.items()
+            ),
+        }
+    return _state_digest(per_table_digest), diffs
+
+
+def _reconcile_unsafe_reasons(diffs: dict[str, _TableDiff]) -> list[str]:
+    reasons: list[str] = []
+    for table, diff in diffs.items():
+        if diff.colliding_pks:
+            reasons.append(
+                f"{table}: {len(diff.colliding_pks)} row(s) share an id with "
+                "different content"
+            )
+        if diff.secondary_collisions:
+            reasons.append(
+                f"{table}: {len(diff.secondary_collisions)} row(s) collide on a "
+                "unique column other than id"
+            )
+    return reasons
+
+
+def _plan_namespace_reconciliation(source_label: str, target_label: str) -> dict[str, Any]:
+    """Plan a one-directional SOURCE-into-TARGET content reconciliation.
+
+    Strictly read-only: opens both namespaces through the same zero-write
+    snapshot path ordinary recall uses and never writes anything, including
+    no backup. Raises UnknownNamespaceError, NamespaceCollisionError, or
+    NamespaceMigrationError instead of ever returning an unsafe plan --
+    apply() cannot be reached without a plan_digest, and dry-run never
+    manufactures one for an unsafe state.
+    """
+    source_display = safe_name(source_label)
+    target_display = safe_name(target_label)
+    source_store = open_existing_readonly(source_display)
+    try:
+        target_store = open_existing_readonly(target_display)
+        try:
+            if source_store.namespace_id == target_store.namespace_id:
+                raise NamespaceMigrationError(
+                    f"{source_display!r} and {target_display!r} already resolve to "
+                    "the same namespace; nothing to reconcile"
+                )
+            for role, store in (("source", source_store), ("target", target_store)):
+                if store.schema_version != SCHEMA_VERSION:
+                    raise NamespaceMigrationError(
+                        f"{role} namespace {store.name!r} is at schema version "
+                        f"{store.schema_version}, expected {SCHEMA_VERSION}; open it "
+                        "normally (for example `haunt namespaces`) to complete its "
+                        "pending migration before reconciling"
+                    )
+            content_digest, diffs = _reconcile_content_state_digest(
+                source_store.conn, target_store.conn
+            )
+            unsafe_reasons = _reconcile_unsafe_reasons(diffs)
+            if unsafe_reasons:
+                raise NamespaceCollisionError(
+                    f"cannot safely reconcile {source_display!r} into "
+                    f"{target_display!r}: " + "; ".join(unsafe_reasons)
+                )
+            report: dict[str, Any] = {
+                "action": "reconcile",
+                "mode": "dry-run",
+                "source": source_display,
+                "target": target_display,
+                "source_namespace_id": source_store.namespace_id,
+                "target_namespace_id": target_store.namespace_id,
+                "source_db_path": str(source_store.db_path),
+                "target_db_path": str(target_store.db_path),
+                "schema_version": SCHEMA_VERSION,
+                "tables": {
+                    table: {
+                        "insert_into_target": len(diff.to_insert),
+                        "already_consistent": diff.already_present,
+                        "colliding_ids": [list(pk) for pk in diff.colliding_pks],
+                        "secondary_collisions": [
+                            {"column": column, "value": json_safe_sqlite(value)}
+                            for column, value in diff.secondary_collisions
+                        ],
+                    }
+                    for table, diff in diffs.items()
+                },
+                "total_rows_to_insert": sum(
+                    len(diff.to_insert) for diff in diffs.values()
+                ),
+            }
+            report["content_state_digest"] = content_digest
+            operation = {key: value for key, value in report.items() if key != "mode"}
+            report["plan_digest"] = _state_digest(
+                {"protocol": "haunt-namespace-reconcile-v1", "operation": operation}
+            )
+            return report
+        finally:
+            target_store.close()
+    finally:
+        source_store.close()
+
+
+def _backup_namespace_database(store: "ReadOnlyStore", *, purpose: str) -> _VerifiedRegistryBackup:
+    """Create and verify a private backup of one namespace database file.
+
+    Mirrors `_backup_registry`'s descriptor-relative verification exactly,
+    applied to a full namespace database instead of the small registry file.
+    Reads through the caller's already-open zero-write snapshot connection
+    (see `open_existing_readonly`), so a live WAL writer can never produce a
+    torn copy. The backup lands under the same private `<HAUNT_HOME>/backups`
+    directory `_backup_registry` uses, mode 0600, alongside a sha256 and a
+    verified `PRAGMA integrity_check` result.
+    """
+    backup_root, backup_root_fd = _private_backup_root()
+    fd = -1
+    final_fd = -1
+    temp_name: str | None = None
+    final_name: str | None = None
+    backup_identity: tuple[int, int] | None = None
+    try:
+        _registry_backup_hook("before_create", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        temp_name = f".namespace-backup-{new_id()}.db"
+        fd = os.open(
+            temp_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | required_o_nofollow()
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=backup_root_fd,
+        )
+        os.fchmod(fd, 0o600)
+        created = os.fstat(fd)
+        backup_identity = int(created.st_dev), int(created.st_ino)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
+        assert isinstance(store.conn, _SidecarGuardedConnection)
+        store.conn.copy_primary_to_fd(fd)
+        os.fsync(fd)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
+        _registry_backup_hook("before_link", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        _relative_regular_file(backup_root_fd, temp_name, fd)
+        final_name = f"namespace-{safe_name(store.name)}-{purpose}-{new_id()}.db"
+        os.link(
+            temp_name,
+            final_name,
+            src_dir_fd=backup_root_fd,
+            dst_dir_fd=backup_root_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temp_name, dir_fd=backup_root_fd)
+        temp_name = None
+        os.fsync(backup_root_fd)
+        final_fd = os.open(
+            final_name,
+            os.O_RDONLY | required_o_nofollow() | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=backup_root_fd,
+        )
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("namespace backup identity changed")
+        digest = _held_file_sha256(final_fd)
+        os.fsync(final_fd)
+        _registry_backup_hook("before_final_verify", backup_root)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("namespace backup identity changed")
+        final = backup_root / final_name
+        verified = _held_sqlite_integrity(final_fd, backup_identity)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("namespace backup identity changed")
+        if verified != "ok" or _held_file_sha256(final_fd) != digest:
+            raise NamespaceMigrationError("namespace backup verification failed")
+        os.fsync(final_fd)
+        os.fsync(backup_root_fd)
+        _verify_private_backup_root(backup_root, backup_root_fd)
+        if _relative_regular_file(backup_root_fd, final_name, final_fd) != backup_identity:
+            raise NamespaceMigrationError("namespace backup identity changed")
+        return _VerifiedRegistryBackup(
+            {
+                "path": str(final),
+                "sha256": digest,
+                "integrity": verified,
+                "namespace": store.name,
+            },
+            backup_root=backup_root,
+            backup_root_fd=os.dup(backup_root_fd),
+            final_name=final_name,
+            final_fd=os.dup(final_fd),
+            identity=backup_identity,
+        )
+    except Exception:
+        _unlink_relative_identity(backup_root_fd, temp_name, backup_identity)
+        _unlink_relative_identity(backup_root_fd, final_name, backup_identity)
+        try:
+            os.fsync(backup_root_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if final_fd >= 0:
+            os.close(final_fd)
+        if fd >= 0:
+            os.close(fd)
+        os.close(backup_root_fd)
+
+
+def _reconcile_requeue_embedding(
+    source_conn: sqlite3.Connection,
+    target_conn: sqlite3.Connection,
+    values: dict[str, Any],
+    *,
+    source_embedded: bool,
+    source_has_embedding_jobs: bool,
+) -> None:
+    """Mirror SOURCE's embed-capture outcome onto a freshly-copied TARGET row.
+
+    reconcile() always nulls out `memories.embedding` on copy (vectors are
+    never carried across a possibly differently-configured model/dim --
+    see the module comment above `_RECONCILE_TABLES`), so a naive "always
+    enqueue" would defeat any capture policy (`skip_embedding` /
+    `HAUNT_EMBED_EXCLUDE_TOOLS`, see observe()'s C6 docstring) SOURCE
+    applied at admission: a row deliberately captured-but-never-embedded in
+    SOURCE would get queued in TARGET and silently embedded on the next
+    drain -- putting exactly the tool exhaust the policy excludes into the
+    vector index.
+
+    This function never re-derives the policy from today's env (reconcile
+    writes raw SQL and never calls observe(), which is the only place the
+    policy is actually evaluated) -- that could disagree with the decision
+    actually made at admission, since env can change between then and now
+    and SOURCE/TARGET can even be different hosts. Instead it preserves
+    whatever SOURCE's own state already says:
+
+      - SOURCE had a non-NULL `embedding` (`source_embedded`) -> enqueue.
+        It was embedded, and the caller just dropped that embedding, so
+        TARGET genuinely needs to (re)compute it under TARGET's own model.
+      - SOURCE had no embedding but an `embedding_jobs` row -> copy that
+        row verbatim, `attempts`/`last_error`/`queued_at` included, rather
+        than a fresh `INSERT ... queued_at=now`. Copying `attempts` as-is
+        (never resetting to 0) matters most for a row already at or past
+        HAUNT_EMBED_MAX_ATTEMPTS: max_attempts is evaluated dynamically
+        from env at drain time (_embed_max_attempts()), never persisted,
+        so a copied exhausted row is still excluded from TARGET's
+        process_embedding_jobs SELECT immediately -- it does not get a
+        fresh retry budget just for having been copied. A row still under
+        the cap keeps its real remaining budget (max_attempts - attempts)
+        instead of extra tries for free.
+      - SOURCE had neither -> do not enqueue. That is the policy-excluded
+        case (skip_embedding at admission) or blank content; TARGET must
+        preserve the exclusion, not resurrect it.
+
+    `source_has_embedding_jobs` guards a real regression the naive
+    version of this fix introduced: SOURCE is a ReadOnlyStore connection
+    (see open_existing_readonly), which deliberately never runs schema
+    migration on open -- "do not repair a corrupt/old database while
+    reading it" (ReadOnlyStore's own class docstring). A namespace old
+    enough to predate `embedding_jobs` (exactly the shape C3 exists to
+    reconcile: a long-lived legacy database like `ironscope`) can
+    genuinely lack that table on disk if it was never since opened by a
+    writer running current code. The pre-fix code never queried SOURCE at
+    all -- it only ever wrote to TARGET, which open_existing always
+    migrates -- so it had no dependency on SOURCE's embedding_jobs
+    existing. Querying it unconditionally would turn a merely-old,
+    perfectly valid SOURCE database into a hard crash (`sqlite3
+    .OperationalError: no such table: embedding_jobs`) for the whole
+    reconcile apply. The caller checks existence once via
+    `_table_columns` (PRAGMA table_info tolerates a missing table,
+    returning `[]` rather than raising) instead of a query here per row.
+    Missing table -> treated exactly like "no job row": don't enqueue,
+    consistent with "no positive signal that SOURCE wanted embedding".
+    """
+    memory_id = values["id"]
+    if source_embedded:
+        target_conn.execute(
+            """
+            INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
+            VALUES (?, ?)
+            """,
+            (memory_id, values["created_at"]),
+        )
+        return
+    if not source_has_embedding_jobs:
+        return
+    source_job = source_conn.execute(
+        "SELECT queued_at, attempts, last_error FROM embedding_jobs WHERE memory_id=?",
+        (memory_id,),
+    ).fetchone()
+    if source_job is None:
+        return
+    target_conn.execute(
+        """
+        INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at, attempts, last_error)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            memory_id,
+            source_job["queued_at"],
+            source_job["attempts"],
+            source_job["last_error"],
+        ),
+    )
+
+
+def _execute_reconciliation_writes(
+    source_conn: sqlite3.Connection, target_conn: sqlite3.Connection
+) -> dict[str, dict[str, int]]:
+    """Diff every table fresh, one last time, and copy SOURCE's new rows.
+
+    The caller must already hold TARGET inside a write transaction
+    (``BEGIN IMMEDIATE`` .. commit/rollback). This is the final safety gate:
+    it never trusts an earlier plan's row-level conclusions, only its own
+    fresh read of both databases at this exact moment. Raises
+    NamespaceCollisionError/NamespaceMigrationError and writes nothing if any
+    table still has an unresolved collision right now, even though an
+    earlier dry-run reported none.
+    """
+    _content_digest, diffs = _reconcile_content_state_digest(source_conn, target_conn)
+    unsafe_reasons = _reconcile_unsafe_reasons(diffs)
+    if unsafe_reasons:
+        raise NamespaceCollisionError(
+            "cannot safely reconcile: " + "; ".join(unsafe_reasons)
+        )
+    # Checked once, not per row: SOURCE is a never-migrated read-only
+    # connection (see _reconcile_requeue_embedding's docstring), so a
+    # legacy database old enough to predate embedding_jobs must not crash
+    # the whole apply just because this fix now looks at it.
+    # _table_columns tolerates a missing table (PRAGMA table_info returns
+    # `[]` rather than raising).
+    source_has_embedding_jobs = bool(_table_columns(source_conn, "embedding_jobs"))
+    table_results: dict[str, dict[str, int]] = {}
+    for table, _pk_columns, _ignore in _RECONCILE_TABLES:
+        diff = diffs[table]
+        columns = _table_columns(target_conn, table)
+        placeholders = ",".join("?" for _ in columns)
+        column_list = ",".join(columns)
+        inserted = 0
+        for row in diff.to_insert:
+            values = dict(row)
+            source_embedded = False
+            if table == "memories":
+                source_embedded = values.get("embedding") is not None
+                values["embedding"] = None
+            target_conn.execute(
+                f"INSERT INTO {table}({column_list}) VALUES ({placeholders})",
+                tuple(values[column] for column in columns),
+            )
+            inserted += 1
+            if table == "memories":
+                target_conn.execute(
+                    "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
+                    (values["id"], values["content"]),
+                )
+                _reconcile_requeue_embedding(
+                    source_conn,
+                    target_conn,
+                    values,
+                    source_embedded=source_embedded,
+                    source_has_embedding_jobs=source_has_embedding_jobs,
+                )
+        table_results[table] = {
+            "inserted": inserted,
+            "already_consistent": diff.already_present,
+        }
+    return table_results
+
+
+def _apply_namespace_reconciliation(
+    source_label: str, target_label: str, *, plan_digest: str
+) -> dict[str, Any]:
+    plan = _plan_namespace_reconciliation(source_label, target_label)
+    if plan_digest != plan["plan_digest"]:
+        raise NamespaceMigrationError(
+            "reconciliation plan digest does not match the current state of "
+            "either namespace; run the dry-run again"
+        )
+    source_display = str(plan["source"])
+    target_display = str(plan["target"])
+    source_ro = open_existing_readonly(source_display)
+    source_backup: _VerifiedRegistryBackup | None = None
+    target_backup: _VerifiedRegistryBackup | None = None
+    committed = False
+    table_results: dict[str, dict[str, int]] = {}
+    try:
+        source_backup = _backup_namespace_database(source_ro, purpose="reconcile-source")
+        target_ro = open_existing_readonly(target_display)
+        try:
+            target_backup = _backup_namespace_database(target_ro, purpose="reconcile-target")
+        finally:
+            target_ro.close()
+        target_store = open_existing(target_display)
+        try:
+            target_store.conn.execute("BEGIN IMMEDIATE")
+            try:
+                table_results = _execute_reconciliation_writes(
+                    source_ro.conn, target_store.conn
+                )
+            except Exception:
+                target_store.conn.rollback()
+                raise
+            target_store.conn.commit()
+            committed = True
+        finally:
+            target_store.close()
+        source_backup.verify_for_record()
+        target_backup.verify_for_record()
+        return {
+            **plan,
+            "mode": "apply",
+            "applied": True,
+            "source_backup": dict(source_backup),
+            "target_backup": dict(target_backup),
+            "rows_inserted": table_results,
+        }
+    except Exception:
+        if not committed:
+            if source_backup is not None:
+                source_backup.discard()
+            if target_backup is not None:
+                target_backup.discard()
+        raise
+    finally:
+        source_ro.close()
+        if source_backup is not None:
+            source_backup.close()
+        if target_backup is not None:
+            target_backup.close()
+
+
+def reconcile_namespaces(
+    source: str,
+    target: str,
+    *,
+    apply: bool = False,
+    plan_digest: str | None = None,
+) -> dict[str, Any]:
+    """Plan or apply backlog C3: copy SOURCE's content into TARGET.
+
+    Operator-invoked only -- nothing in hooks, MCP, or bootstrap calls this.
+    Dry-run (``apply=False``, the default) performs zero writes and returns a
+    plan with a ``plan_digest`` bound to the exact current content of both
+    namespaces. ``apply=True`` requires that exact digest and refuses
+    (``NamespaceMigrationError``) if either namespace's content has changed
+    since, including a change caused by an earlier apply of this same
+    digest: a completed reconciliation is idempotent when the whole
+    dry-run-then-apply cycle is repeated, but literally replaying one
+    already-applied digest is refused rather than silently treated as a
+    no-op, consistent with `change_namespace_label`'s digest contract.
+    """
+    if not apply:
+        return _plan_namespace_reconciliation(source, target)
+    if not plan_digest:
+        raise NamespaceMigrationError(
+            "apply requires the plan_digest returned by a preceding dry-run"
+        )
+    with _namespace_migration_lock():
+        return _apply_namespace_reconciliation(source, target, plan_digest=plan_digest)
+
+
 def verbatim_text(
     content: str = "",
     tool_name: str | None = None,
@@ -4072,6 +4847,35 @@ class Store:
         valid_to: str | None = None,
         idempotency_key: str | None = None,
         defer_embedding: bool = False,
+        # C6 capture policy: the row is still written in full (event +
+        # memory + FTS) but is never embedded and never enqueued into
+        # embedding_jobs -- see the two sites gated on this flag below.
+        #
+        # Placement: observe() is the single entry point shared by the CLI,
+        # the MCP memory_observe tool, and both hooks, so this is a
+        # capability observe() exposes rather than a policy it decides for
+        # itself. Deriving "skip this" from tool_name/role/tier *inside*
+        # observe() would apply to every caller uniformly, including a
+        # direct memory_observe MCP call -- a user who explicitly asks to
+        # store something with tool_name="Bash" would then be silently
+        # opted out of embedding it, with no way to tell from the MCP
+        # response alone why. Requiring an explicit, caller-supplied flag
+        # keeps that decision with the caller that actually knows the
+        # policy context (today: HAUNT_EXCLUDE_TOOLS's sibling
+        # HAUNT_EMBED_EXCLUDE_TOOLS and the fixed session-start ceremony
+        # row, both applied in claude_hook.py / cursor_hook.py) and leaves
+        # every other caller's behavior, including MCP and CLI, unchanged
+        # by default.
+        #
+        # Reversibility: a skip_embedding row is never added to
+        # embedding_jobs, so process_embedding_jobs's queue drain can never
+        # pick it up -- excluded stays excluded under normal operation.
+        # Store.reembed() (a full, explicit, operator-triggered rebuild) is
+        # the deliberate exception: it re-embeds every row in `memories`
+        # regardless of embedding_jobs membership, so it also covers
+        # previously-excluded rows. That is the escape hatch today; there
+        # is no per-row "un-exclude just this one" command.
+        skip_embedding: bool = False,
         commit: bool = True,
     ) -> ObserveResult:
         # Provenance is validated before sessions, events, embedding jobs, or
@@ -4096,6 +4900,12 @@ class Store:
         if tier not in TIERS:
             raise ValueError(f"tier must be one of {TIERS}")
         text = verbatim_text(content, tool_name, tool_input, tool_output)
+        # C7 phase 1: measurement only. This hash is never read back to
+        # suppress, collapse, or short-circuit a write -- it is purely an
+        # indexed column that feeds Store.stats() duplicate counting. It
+        # is a separate mechanism from the idempotency-key replay check
+        # below, which is what actually changes what gets written.
+        content_hash = _content_hash(text)
         idem = (idempotency_key or "").strip() or None
         if idem and len(idem) > 512:
             raise ValueError("idempotency_key must be 512 characters or fewer")
@@ -4144,8 +4954,17 @@ class Store:
             )
             blob = None
             embedded = False
+            # skip_embedding forces the same "no vector" path as
+            # defer_embedding below, but -- unlike defer_embedding, which
+            # only *delays* embedding to the background queue -- it also
+            # suppresses the embedding_jobs enqueue a few lines down
+            # (embedding_queued). A deferred row is picked up by the next
+            # drain; a skip_embedding row is not queued at all, so it stays
+            # excluded until something explicitly re-embeds it.
             vec = (
-                None if defer_embedding else (embed_one(text) if text.strip() else None)
+                None
+                if (defer_embedding or skip_embedding)
+                else (embed_one(text) if text.strip() else None)
             )
             if vec is not None:
                 blob = sqlite_vec.serialize_float32(vec)
@@ -4162,16 +4981,23 @@ class Store:
             self.conn.execute(
                 """
                 INSERT INTO memories(
-                    id, event_id, tier, content, embedding, valid_from, valid_to, created_at
-                ) VALUES (?,?,?,?,?,?,?,?)
+                    id, event_id, tier, content, embedding, valid_from, valid_to, created_at,
+                    content_hash
+                ) VALUES (?,?,?,?,?,?,?,?,?)
                 """,
-                (memory_id, event_id, tier, text, blob, vf, vt, ts),
+                (memory_id, event_id, tier, text, blob, vf, vt, ts, content_hash),
             )
+            # Unconditional -- runs regardless of skip_embedding (or
+            # defer_embedding, or blob). This is what makes a capture-policy
+            # exclusion reversible in practice: the row stays fully
+            # keyword-searchable even though it is never vector-searchable.
             self.conn.execute(
                 "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
                 (memory_id, text),
             )
-            embedding_queued = bool(blob is None and text.strip())
+            embedding_queued = bool(
+                blob is None and text.strip() and not skip_embedding
+            )
             if embedding_queued:
                 self.conn.execute(
                     """
@@ -4301,20 +5127,47 @@ class Store:
         )
 
     def process_embedding_jobs(self, *, limit: int = 64) -> dict[str, Any]:
-        """Embed queued hook writes in a persistent, model-owning process."""
+        """Embed queued hook writes in a persistent, model-owning process.
+
+        C5: two failure-isolation guarantees on top of the historical
+        behavior, both required because this queue is unattended -- nothing
+        upstream retries a call that comes back empty-handed.
+
+        - A row at or over HAUNT_EMBED_MAX_ATTEMPTS is excluded by the
+          SELECT below, so a permanently-failing row can no longer sit at
+          the head of the queue (ordered by queued_at) and block every job
+          behind it forever. It is still counted via `exhausted` in the
+          return value so the backlog stays discoverable instead of
+          silently stuck -- see one real namespace that had 1363 of 1491
+          rows wedged this way.
+        - embed_texts() is tried once for the whole batch first (the fast,
+          common path: one model call for up to `limit` rows). Only if that
+          raises, or returns something that doesn't line up 1:1 with the
+          batch, do we fall back to embedding each row with its own model
+          call (_embed_rows_individually). That isolates one poison row to
+          its own attempts/last_error instead of failing every row queued
+          alongside it, without paying the per-row cost on the common path.
+        """
         cap = clamp_limit(limit, default=64)
+        max_attempts = _embed_max_attempts()
         queued = self.conn.execute(
             """
             SELECT j.memory_id, m.content
             FROM embedding_jobs j
             JOIN memories m ON m.id=j.memory_id
+            WHERE j.attempts < ?
             ORDER BY j.queued_at ASC, j.rowid ASC
             LIMIT ?
             """,
-            (cap,),
+            (max_attempts, cap),
         ).fetchall()
         if not queued:
-            return {"queued": 0, "processed": 0, "failed": 0}
+            return {
+                "queued": 0,
+                "processed": 0,
+                "failed": 0,
+                "exhausted": self._exhausted_embedding_jobs(max_attempts),
+            }
         es = embed_state()
         if not es.available:
             return {
@@ -4322,49 +5175,57 @@ class Store:
                 "processed": 0,
                 "failed": 0,
                 "available": False,
+                "exhausted": self._exhausted_embedding_jobs(max_attempts),
             }
+
+        batch_error: str | None = None
+        vectors: dict[str, list[float]] = {}
+        errors: dict[str, str] = {}
         try:
-            vectors = embed_texts(
+            batch = embed_texts(
                 [row["content"] if row["content"] else " " for row in queued]
             )
         except Exception as exc:
-            message = str(exc)[:1000]
-            self.conn.executemany(
-                """
-                UPDATE embedding_jobs
-                SET attempts=attempts+1, last_error=? WHERE memory_id=?
-                """,
-                [(message, row["memory_id"]) for row in queued],
-            )
-            self.conn.commit()
-            return {
-                "queued": len(queued),
-                "processed": 0,
-                "failed": len(queued),
-                "error": message,
-            }
-        if not vectors:
-            message = "embedding backend returned no vectors"
-            self.conn.executemany(
-                """
-                UPDATE embedding_jobs
-                SET attempts=attempts+1, last_error=? WHERE memory_id=?
-                """,
-                [(message, row["memory_id"]) for row in queued],
-            )
-            self.conn.commit()
-            return {
-                "queued": len(queued),
-                "processed": 0,
-                "failed": len(queued),
-                "error": message,
-            }
+            batch = None
+            batch_error = str(exc)[:1000]
+        if batch is not None and len(batch) == len(queued):
+            vectors = {row["memory_id"]: vec for row, vec in zip(queued, batch)}
+        else:
+            if batch_error is None:
+                batch_error = (
+                    "embedding backend returned no vectors"
+                    if not batch
+                    else (
+                        f"embedding backend returned {len(batch)} vectors "
+                        f"for {len(queued)} inputs"
+                    )
+                )
+            # The batch call failed as a whole (raised, returned nothing, or
+            # returned a mismatched count -- any of which makes positional
+            # zip() pairing unsafe). Fall back to one embed call per row so
+            # a single poison row cannot fail its batch-mates too.
+            vectors, errors = self._embed_rows_individually(queued)
 
         ensure_vec_table(self.conn, es.dim, commit=False)
         processed = 0
         failed = 0
-        for row, vec in zip(queued, vectors):
+        for row in queued:
             memory_id = row["memory_id"]
+            vec = vectors.get(memory_id)
+            if vec is None:
+                message = errors.get(
+                    memory_id,
+                    batch_error or "embedding backend returned no vector",
+                )
+                self.conn.execute(
+                    """
+                    UPDATE embedding_jobs
+                    SET attempts=attempts+1, last_error=? WHERE memory_id=?
+                    """,
+                    (message[:1000], memory_id),
+                )
+                failed += 1
+                continue
             try:
                 if len(vec) != es.dim:
                     raise ValueError(
@@ -4394,17 +5255,6 @@ class Store:
                     (str(exc)[:1000], memory_id),
                 )
                 failed += 1
-        if len(vectors) < len(queued):
-            missing = queued[len(vectors) :]
-            message = "embedding backend returned fewer vectors than inputs"
-            self.conn.executemany(
-                """
-                UPDATE embedding_jobs
-                SET attempts=attempts+1, last_error=? WHERE memory_id=?
-                """,
-                [(message, row["memory_id"]) for row in missing],
-            )
-            failed += len(missing)
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_model', ?)",
             (es.model_id,),
@@ -4414,11 +5264,174 @@ class Store:
             (str(es.dim),),
         )
         self.conn.commit()
-        return {
+        result: dict[str, Any] = {
             "queued": len(queued),
             "processed": processed,
             "failed": failed,
             "available": True,
+            "exhausted": self._exhausted_embedding_jobs(max_attempts),
+        }
+        if batch_error is not None and processed == 0 and failed == len(queued):
+            result["error"] = batch_error
+        return result
+
+    def _embed_rows_individually(
+        self, queued: list[sqlite3.Row]
+    ) -> tuple[dict[str, list[float]], dict[str, str]]:
+        """Embed each queued row with its own embed_texts() call.
+
+        Fallback only: process_embedding_jobs tries the whole batch in one
+        call first and only reaches here when that failed outright. One
+        model call per row is slower, but it means a single malformed row
+        raises (and gets attempts+1 / last_error) without taking its
+        batch-mates down with it. Returns (memory_id -> vector for rows that
+        embedded, memory_id -> error message for rows that did not); every
+        input row lands in exactly one of the two.
+        """
+        vectors: dict[str, list[float]] = {}
+        errors: dict[str, str] = {}
+        for row in queued:
+            content = row["content"] if row["content"] else " "
+            try:
+                one = embed_texts([content])
+            except Exception as exc:
+                errors[row["memory_id"]] = str(exc)[:1000]
+                continue
+            if not one:
+                errors[row["memory_id"]] = "embedding backend returned no vectors"
+                continue
+            vectors[row["memory_id"]] = one[0]
+        return vectors, errors
+
+    def _exhausted_embedding_jobs(self, max_attempts: int) -> int:
+        """Count rows parked at/over the attempts cap.
+
+        These are excluded from process_embedding_jobs's SELECT, so this
+        count is how a permanently-failed row stays discoverable (e.g. via
+        `haunt doctor` or a health check) instead of just silently vanishing
+        from the queue's view.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs WHERE attempts >= ?",
+            (max_attempts,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def _pending_embedding_jobs(self, max_attempts: int) -> int:
+        """Count rows still eligible for process_embedding_jobs's SELECT
+        (attempts < max_attempts) -- the complement of
+        _exhausted_embedding_jobs. The pre-existing `embedding_jobs` count
+        in stats() (raw COUNT(*) over the whole table) always equals this
+        plus _exhausted_embedding_jobs.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs WHERE attempts < ?",
+            (max_attempts,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def _vec_memories_count(self) -> int | None:
+        """Rows in vec_memories, or None when there is no usable vector
+        index to count.
+
+        None covers two situations stats() must not conflate with "zero
+        embedded, otherwise healthy": (a) this connection has no sqlite-vec
+        extension loaded at all (real FTS-only mode -- HAUNT_FTS_ONLY=1 or
+        HAUNT_EMBED_MODEL=off), and (b) the extension is loaded but
+        ensure_vec_table() has never run successfully, so the vec0 virtual
+        table does not exist yet. (b) is the C4 bug report's second
+        namespace: 313/313 rows unembedded, no vec_memories table at all,
+        yet still answering recall as though it were healthy -- silently
+        degraded to FTS-only with no signal to the caller.
+        """
+        if not self.vec_ok():
+            return None
+        try:
+            row = self.conn.execute("SELECT COUNT(*) FROM vec_memories").fetchone()
+        except sqlite3.Error:
+            return None
+        return int(row[0]) if row else 0
+
+    def drain_embedding_queue(
+        self, *, max_rows: int | None = None, batch_size: int = 64
+    ) -> dict[str, Any]:
+        """Bounded, synchronous drain of this namespace's embedding_jobs
+        backlog: calls process_embedding_jobs in a loop until the queue is
+        actually empty, a row bound is hit, or a call makes no progress.
+
+        C4 defect this closes: hook writes always pass defer_embedding=True
+        (see observe()), so a hook-driven write never reaches the
+        `commit and not defer_embedding` drain inside observe(). Before
+        this method, the only other caller of process_embedding_jobs was
+        recall() -- so the queue shrank only as a side effect of read
+        traffic, and a namespace that is written to but rarely searched
+        grew an unbounded backlog (see EMBED_DRAIN_LIMIT_DEFAULT's
+        docstring for real numbers from the dogfooded corpus). This method
+        is the out-of-band drain entry point: bootstrap.py calls it once
+        per namespace from `haunt bootstrap`, independent of any recall.
+
+        HARD CONSTRAINT: never call this from a hook's synchronous path.
+        Hooks run under a watchdog with a short timeout and embedding is
+        slow; this loop can legitimately run for a while against a real
+        backlog. It exists to be invoked from an explicit, out-of-band
+        operator command only.
+
+        Bounded by HAUNT_EMBED_DRAIN_LIMIT rows per call (see
+        _embed_drain_limit) so it cannot block indefinitely on a huge
+        backlog -- the return value's `stopped_early` / `remaining` let a
+        caller tell "fully drained" from "drained 500, 863 still queued".
+        The loop also stops the instant a batch makes zero progress
+        (processed == failed == 0 while rows are still queued): that is
+        what process_embedding_jobs reports when no embed backend is
+        available at all, which happens without HAUNT_FTS_ONLY ever being
+        set -- observe() still enqueues embedding_jobs rows whenever
+        embedding comes back empty, so a namespace can have a real backlog
+        with nothing able to drain it. Those rows never get their
+        `attempts` touched in that branch, so re-selecting them on another
+        iteration would just spin without changing anything.
+        """
+        bound = max(0, int(max_rows if max_rows is not None else _embed_drain_limit()))
+        batch = max(1, int(batch_size))
+        max_attempts = _embed_max_attempts()
+        processed = 0
+        failed = 0
+        batches = 0
+        available = True
+        while processed + failed < bound:
+            budget = bound - (processed + failed)
+            report = self.process_embedding_jobs(limit=min(batch, budget))
+            batches += 1
+            available = report.get("available", available)
+            if not report.get("queued"):
+                # SELECT came back empty: nothing left under the attempts
+                # cap. Fully drained (modulo whatever is exhausted).
+                break
+            processed += report.get("processed", 0)
+            failed += report.get("failed", 0)
+            if not report.get("processed") and not report.get("failed"):
+                # No progress possible right now -- e.g. no embed backend
+                # available, the one branch of process_embedding_jobs that
+                # returns without touching `attempts`. Looping again would
+                # just re-select the same rows forever.
+                break
+        remaining = self._pending_embedding_jobs(max_attempts)
+        exhausted = self._exhausted_embedding_jobs(max_attempts)
+        if remaining == 0:
+            stop_reason = "drained"
+        elif not available:
+            stop_reason = "blocked"
+        else:
+            stop_reason = "bound"
+        return {
+            "processed": processed,
+            "failed": failed,
+            "batches": batches,
+            "remaining": remaining,
+            "exhausted": exhausted,
+            "available": available,
+            "bound": bound,
+            "stop_reason": stop_reason,
+            "stopped_early": remaining > 0,
         }
 
     def embeddings_stale(self) -> bool:
@@ -4578,6 +5591,61 @@ class Store:
         wal = db.with_suffix(db.suffix + "-wal")
         if wal.exists():
             size += wal.stat().st_size
+        # C4 embedding-coverage fields. `embedding_jobs` above is the raw
+        # table count and is left exactly as-is (existing consumers depend
+        # on it); embedding_pending + embedding_exhausted always sum to it.
+        # vector_index is the "is there anything usable to search" signal:
+        # False both for real FTS-only namespaces (no sqlite-vec extension
+        # loaded) and for a namespace where the extension is loaded but
+        # vec_memories was never created (nothing has ever embedded
+        # successfully yet) -- see _vec_memories_count. Without this flag,
+        # both of those look identical to "fully embedded, nothing queued".
+        #
+        # C-series capture policy caveat: memories_embedded +
+        # embedding_pending + embedding_exhausted does NOT always sum to
+        # `memories`. A row admitted with skip_embedding=True (the C6
+        # capture policy -- see observe()) is written in full but
+        # deliberately gets neither a non-NULL `embedding` nor an
+        # `embedding_jobs` row, and the same is true of a row with
+        # blank/whitespace-only content -- both are a fourth, currently
+        # unlabeled bucket ("will never be embedded, by design") absent
+        # from all three counters above. Nothing in this repo computes a
+        # coverage percentage from these fields today, but anyone who
+        # later does (e.g. memories_embedded / memories * 100) will land
+        # short of 100% forever on a namespace with policy-excluded rows,
+        # even once every embeddable row really is embedded. If that
+        # bucket ever needs its own counter, it is `memories` rows with
+        # `embedding IS NULL` and no matching `embedding_jobs` row.
+        max_attempts = _embed_max_attempts()
+        vec_count = self._vec_memories_count()
+        # C7 phase 1: content_hash only exists once a writer has completed
+        # the v10 migration (_ensure_namespace_schema). ReadOnlyStore never
+        # migrates -- see its class docstring -- so a database that has
+        # never yet been opened by a writer at this code version would
+        # otherwise make this raise "no such column: content_hash" instead
+        # of reporting an honest zero.
+        memory_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        duplicate_memories = 0
+        duplicate_content_values = 0
+        if "content_hash" in memory_columns:
+            dup_row = self.conn.execute(
+                """
+                SELECT COALESCE(SUM(n - 1), 0) AS dup_memories,
+                       COUNT(*) AS dup_values
+                FROM (
+                    SELECT COUNT(*) AS n
+                    FROM memories
+                    WHERE content_hash IS NOT NULL
+                    GROUP BY content_hash
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()
+            duplicate_memories = int(dup_row["dup_memories"] or 0)
+            duplicate_content_values = int(dup_row["dup_values"] or 0)
         return json_safe_sqlite(
             {
                 "namespace": self.name,
@@ -4595,6 +5663,13 @@ class Store:
                 "last_write": last["ts"] if last else None,
                 "last_event_time": last["event_time"] if last else None,
                 "wal": True,
+                "memories_embedded": vec_count if vec_count is not None else 0,
+                "embedding_pending": self._pending_embedding_jobs(max_attempts),
+                "embedding_exhausted": self._exhausted_embedding_jobs(max_attempts),
+                "vector_index": vec_count is not None,
+                "vector_index_version": self.vec_version(),
+                "duplicate_memories": duplicate_memories,
+                "duplicate_content_values": duplicate_content_values,
             }
         )
 
@@ -5260,10 +6335,6 @@ class Store:
         if requested is None:
             return {"ok": False, "error": "memory not found"}
 
-        correction_rows = self.conn.execute(
-            "SELECT * FROM corrections ORDER BY corrected_at, rowid"
-        ).fetchall()
-
         def node(row: sqlite3.Row, prefix: str) -> tuple[str, str] | None:
             memory = row[f"{prefix}_memory_id"]
             if memory is not None:
@@ -5273,21 +6344,45 @@ class Store:
                 return ("tombstone", str(tombstone))
             return None
 
-        incoming: dict[tuple[str, str], sqlite3.Row] = {}
-        outgoing: dict[tuple[str, str], sqlite3.Row] = {}
-        for correction in correction_rows:
-            target = node(correction, "target")
-            replacement = node(correction, "replacement")
-            if target is not None:
-                outgoing[target] = correction
-            if replacement is not None:
-                incoming[replacement] = correction
+        # A normal correction's target/replacement is unique across the
+        # entire table: idx_corrections_target_memory,
+        # idx_corrections_target_tombstone, idx_corrections_replacement_memory,
+        # and idx_corrections_replacement_tombstone are all UNIQUE partial
+        # indexes over these four columns (see _ensure_namespace_schema's v4
+        # migration), and the invariant trigger enforces that every row sets
+        # exactly one target column and at most one replacement column. So at
+        # most one correction row can ever target a given node, and at most
+        # one can ever have it as a replacement -- each lookup below is one
+        # indexed point query, not a scan. Walking an N-link chain this way
+        # costs O(N) point lookups instead of loading every correction this
+        # namespace has ever recorded, no matter how short the requested
+        # chain is or how much unrelated lineage exists alongside it.
+        def correction_targeting(target: tuple[str, str]) -> sqlite3.Row | None:
+            kind, ident = target
+            column = "target_memory_id" if kind == "memory" else "target_tombstone_id"
+            return self.conn.execute(
+                f"SELECT * FROM corrections WHERE {column}=?", (ident,)
+            ).fetchone()
+
+        def correction_replacing(replacement: tuple[str, str]) -> sqlite3.Row | None:
+            kind, ident = replacement
+            column = (
+                "replacement_memory_id"
+                if kind == "memory"
+                else "replacement_tombstone_id"
+            )
+            return self.conn.execute(
+                f"SELECT * FROM corrections WHERE {column}=?", (ident,)
+            ).fetchone()
 
         start = ("memory", memory_id)
         seen: set[tuple[str, str]] = set()
-        while start in incoming and start not in seen:
+        while start not in seen:
+            incoming_correction = correction_replacing(start)
+            if incoming_correction is None:
+                break
             seen.add(start)
-            predecessor = node(incoming[start], "target")
+            predecessor = node(incoming_correction, "target")
             if predecessor is None:
                 break
             start = predecessor
@@ -5298,6 +6393,7 @@ class Store:
         seen.clear()
         while current not in seen:
             seen.add(current)
+            outgoing_correction = correction_targeting(current)
             if current[0] == "tombstone":
                 tomb = self.conn.execute(
                     """
@@ -5330,7 +6426,7 @@ class Store:
                     legacy_meta=member.pop("meta"),
                     tool_name=member.get("tool_name"),
                 )
-                if current in outgoing:
+                if outgoing_correction is not None:
                     member["status"] = "superseded"
                 elif member["valid_to"] is not None:
                     member["status"] = "legacy_unlinked"
@@ -5338,24 +6434,23 @@ class Store:
                     member["status"] = "current"
                 members.append(member)
 
-            correction = outgoing.get(current)
-            if correction is None:
+            if outgoing_correction is None:
                 break
             corrections.append(
                 {
-                    "correction_id": correction["id"],
-                    "corrected_at": correction["corrected_at"],
-                    "origin": correction["origin"],
-                    "session_id": correction["session_id"],
-                    "reason": correction["reason"],
+                    "correction_id": outgoing_correction["id"],
+                    "corrected_at": outgoing_correction["corrected_at"],
+                    "origin": outgoing_correction["origin"],
+                    "session_id": outgoing_correction["session_id"],
+                    "reason": outgoing_correction["reason"],
                 }
             )
-            successor = node(correction, "replacement")
+            successor = node(outgoing_correction, "replacement")
             if successor is None:
                 break
             current = successor
 
-        linked = bool(corrections or incoming.get(("memory", memory_id)))
+        linked = bool(corrections or correction_replacing(("memory", memory_id)))
         lineage_status = (
             "linked"
             if linked

@@ -19,6 +19,7 @@ from typing import Any
 
 from haunt.cursor_hook import (
     _as_text,
+    _embed_excluded,
     _is_memory_tool,
     _prepare_tool_io,
     _tool_excluded,
@@ -26,7 +27,7 @@ from haunt.cursor_hook import (
     format_worldview_card,
     hook_idempotency_key,
 )
-from haunt.paths import infer_namespace, safe_name
+from haunt.paths import infer_namespace, infer_namespace_context, safe_name
 from haunt.recall import recall
 from haunt.store import Store
 
@@ -57,6 +58,18 @@ def _hook_namespace(payload: dict[str, Any]) -> str:
     if env:
         return safe_name(env)
     return infer_namespace(_hook_cwd(payload))
+
+
+def _hook_namespace_context(payload: dict[str, Any]) -> tuple[str, str | None]:
+    """Like _hook_namespace, but also returns the repository to register.
+
+    An explicit HAUNT_NAMESPACE is a deliberate override, not an inference,
+    so it never auto-binds a repository -- matching _hook_namespace above.
+    """
+    env = os.environ.get("HAUNT_NAMESPACE")
+    if env:
+        return safe_name(env), None
+    return infer_namespace_context(_hook_cwd(payload))
 
 
 def _hook_session(payload: dict[str, Any]) -> str | None:
@@ -159,6 +172,11 @@ def _handle_session_start(
         tier="coordinate",
         # SessionStart is host lifecycle residue, not a text-derived guess.
         recall_class="task",
+        # Fixed ceremony row, not user content: keyed on role/tier (both
+        # already literal right above), not the "haunt session start"
+        # string -- see cursor_hook._handle_session_start for the full
+        # rationale (same policy, same shape, mirrored across both hosts).
+        skip_embedding=True,
     )
     wv = store.worldview()
     card = format_worldview_card(wv)
@@ -205,6 +223,7 @@ def _handle_post_tool_use(store: Store, payload: dict[str, Any]) -> dict[str, An
         tool_name=name,
         tool_input=tool_input,
         tool_output=tool_output,
+        skip_embedding=_embed_excluded(name),
     )
     return {}
 
@@ -223,8 +242,8 @@ def detect_event(payload: dict[str, Any]) -> str:
 def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     """Dispatch one Claude Code hook payload. Fail-open on errors."""
     event = detect_event(payload)
-    ns = _hook_namespace(payload)
-    with Store(ns) as store:
+    ns, repo_path = _hook_namespace_context(payload)
+    with Store(ns, repo_path) as store:
         if event == "UserPromptSubmit":
             return _handle_user_prompt_submit(store, payload, ns)
         if event == "Stop":

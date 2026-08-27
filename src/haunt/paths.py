@@ -1443,7 +1443,51 @@ def namespace_for_repo_identity(identity: str) -> str:
 def _registered_namespace_for_repo(
     *, remote_identity: str | None, repo_root: Path | None
 ) -> str | None:
-    """Preserve an existing namespace already registered to this repository."""
+    """Preserve an existing namespace already registered to this repository.
+
+    Deliberately does NOT match a registry row whose ``repo_path`` is blank
+    (backlog C1's stated acceptance criterion: "reuse matches repositories
+    whose registry row predates the fix"). This was investigated and found
+    unsafe to implement, not merely unimplemented -- see the reasoning
+    below, kept here because the next person to look at this will be
+    tempted by the same shortcut.
+
+    A blank-repo_path row (every hook/MCP-created namespace, before the
+    repo_path threading fix landed) stores *nothing* that ties it to a
+    repository: no remote identity, no path, and its ``db_path`` is derived
+    solely from its own name, so it carries no independent signal either.
+    The only remaining candidate is the row's human-chosen *name* against
+    the current checkout's directory basename -- e.g. matching a blank
+    ``ironscope`` row because the working directory is also named
+    "ironscope". That is a coincidence-of-labels heuristic, not an identity
+    match: two unrelated repositories routinely share a clone-directory
+    name (`notes`, `api`, `app`, `backend`, ...), and a false-positive match
+    would silently commingle two repositories' memory under one namespace
+    going forward -- an active-contamination failure with no clean undo,
+    which is strictly worse than the duplicate namespace it would be
+    "fixing" (a duplicate is inert and inspectable; a bad merge is not, and
+    it keeps absorbing new rows from both repositories until someone
+    notices).
+
+    Compare this to backlog C3 ("reconcile namespaces that are already
+    split"), which is explicitly scoped to heal exactly this situation and
+    is explicitly operator-invoked, dry-run-first, and reversible/backed-up
+    -- because merging two namespaces is recognized there as needing those
+    safety rails. An automatic, silent match at inference time cannot offer
+    any of them: no dry run, nothing to back up before the first write
+    lands in the wrong place, and no way to tell which rows came from which
+    repository afterward in order to undo it. So this function leaves a
+    blank-repo_path row alone. The caller falls through to minting a fresh,
+    uniquely-identity-derived namespace instead (see infer_namespace_context
+    below) -- a one-time, honest fork per pre-existing blank row, not a
+    guess. Once that fresh namespace exists, register_namespace() records
+    its repository_bindings row immediately, so this only ever costs one
+    fork per legacy repository, never a growing one
+    (test_blank_repo_path_row_forks_once_then_stabilizes in
+    tests/test_repo_binding.py covers that stability). Healing the
+    resulting split is C3's job, with an operator and a dry run, not this
+    function's.
+    """
     path = registry_path()
     if not path.is_file():
         return None
@@ -1556,6 +1600,9 @@ def _registered_namespace_for_repo(
     for row in rows:
         stored = str(row["repo_path"] or "").strip()
         if not stored:
+            # Intentional: see this function's docstring for why a blank
+            # repo_path is never treated as a match, even when only one
+            # such row exists.
             continue
         if remote_identity and repository_identity(stored) == remote_identity:
             return safe_name(str(row["name"]))
@@ -1596,12 +1643,23 @@ def _git_repo_context(root: Path) -> tuple[str | None, Path | None]:
     return remote_url, repo_root
 
 
-def infer_namespace(cwd: Path | None = None) -> str:
-    """Infer from remote identity, preserving a matching legacy registration."""
+def infer_namespace_context(cwd: Path | None = None) -> tuple[str, str | None]:
+    """Infer the namespace together with the repository to record for it.
+
+    Returns ``(namespace, repo_path)``. ``repo_path`` is a value safe to pass
+    straight through to ``register_namespace()`` / ``Store(..., repo_path=...)``:
+    the repository root when *cwd* sits inside a git working tree, or
+    ``None`` when it does not. Callers that construct a ``Store`` must pass
+    ``repo_path`` through even when it is ``None`` -- that is how namespace
+    creation "explicitly records that there was none" instead of silently
+    discarding the git context computed here (see backlog C1). Explicit
+    selection (``HAUNT_NAMESPACE``) never auto-binds a repository: it is a
+    deliberate override, not an inference.
+    """
     env = os.environ.get("HAUNT_NAMESPACE")
     if env:
         registered = _registered_alias(env)
-        return registered[0] if registered else safe_name(env)
+        return (registered[0] if registered else safe_name(env)), None
     if cwd is None:
         proj = os.environ.get("CURSOR_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR")
         root = Path(proj).expanduser().resolve() if proj else Path.cwd().resolve()
@@ -1613,15 +1671,51 @@ def infer_namespace(cwd: Path | None = None) -> str:
         remote_identity=identity,
         repo_root=repo_root,
     )
+    repo_path = str(repo_root) if repo_root is not None else None
     if registered:
-        return registered
+        # _registered_namespace_for_repo() only returns a name here via an
+        # exact repository_bindings match or a legacy row whose repo_path
+        # is already known to correspond to this repository -- never a
+        # blank-repo_path row (see that function's docstring for why a
+        # blank row is never treated as a match). Returning repo_path here
+        # regardless still matters: it is what lets the caller's
+        # Store()/register_namespace() call create the repository_bindings
+        # row the *first* time a legacy, pre-fix registration is confirmed
+        # (e.g. by remote identity), and keeps it fresh afterward.
+        return registered, repo_path
     if identity:
-        return namespace_for_repo_identity(identity)
+        # No exact match was found above, including among blank-repo_path
+        # rows -- deliberately; see _registered_namespace_for_repo(). This
+        # mints (or re-derives) the identity-formula name, which is unique
+        # per repository rather than shared, so at worst this costs one
+        # honest, one-time fork for a repository whose only prior
+        # registration predates repo_path tracking. Healing that split is
+        # backlog C3, not this function.
+        return namespace_for_repo_identity(identity), repo_path
+    # No repository identity was found. Never let a bare directory silently
+    # mint (or keep re-targeting) a namespace (backlog C2):
+    #  - the home directory must never become a namespace name, even if a
+    #    stale one already exists for it (that is the bug, not data worth
+    #    preserving going forward);
+    #  - any other non-repository directory may only *reuse* a namespace
+    #    already registered under its exact basename -- never mint a new
+    #    one. This is what keeps a legitimately in-use, directory-derived
+    #    namespace (e.g. one created before this fix) resolving to itself.
+    if _is_user_home(root):
+        return "default", None
     if repo_root:
-        return safe_name(repo_root.name)
+        return safe_name(repo_root.name), repo_path
     if root.name and root.name not in {".", "/", ""}:
-        return safe_name(root.name)
-    return "default"
+        candidate = safe_name(root.name)
+        existing = _registered_alias(candidate)
+        if existing:
+            return existing[0], None
+    return "default", None
+
+
+def infer_namespace(cwd: Path | None = None) -> str:
+    """Infer from remote identity, preserving a matching legacy registration."""
+    return infer_namespace_context(cwd)[0]
 
 
 def resolve_namespace(name: str | None = None, cwd: Path | None = None) -> str:

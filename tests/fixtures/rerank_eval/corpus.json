@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "id": "wifi_password",
+      "namespace": "c12-eval",
+      "content": "The office guest wifi password is foxtrot ninety one.",
+      "event_time": "2025-01-05T09:00:00+00:00"
+    },
+    {
+      "id": "printer_toner",
+      "namespace": "c12-eval",
+      "content": "Replacement toner cartridges for the second floor printer are kept in the supply closet.",
+      "event_time": "2025-01-06T09:00:00+00:00"
+    },
+    {
+      "id": "parking_spot",
+      "namespace": "c12-eval",
+      "content": "Visitor parking spot number twelve is reserved for the auditor this week.",
+      "event_time": "2025-01-07T09:00:00+00:00"
+    },
+    {
+      "id": "standup_time",
+      "namespace": "c12-eval",
+      "content": "The daily engineering standup meeting happens at nine thirty each morning.",
+      "event_time": "2025-01-08T09:00:00+00:00"
+    },
+    {
+      "id": "rate_limit_note_1",
+      "namespace": "c12-eval",
+      "content": "API rate limit is five hundred requests per minute per API key.",
+      "event_time": "2025-02-01T09:00:00+00:00"
+    },
+    {
+      "id": "rate_limit_note_2",
+      "namespace": "c12-eval",
+      "content": "The API rate limit is five hundred requests per minute for each API key.",
+      "event_time": "2025-02-01T09:05:00+00:00"
+    },
+    {
+      "id": "rate_limit_note_3",
+      "namespace": "c12-eval",
+      "content": "Reminder: API rate limit stands at five hundred requests per minute per key.",
+      "event_time": "2025-02-01T09:10:00+00:00"
+    },
+    {
+      "id": "burst_limit_note",
+      "namespace": "c12-eval",
+      "content": "Separately, the API burst limit allows fifty requests per second before throttling.",
+      "event_time": "2025-02-01T09:15:00+00:00"
+    },
+    {
+      "id": "retro_note_1",
+      "namespace": "c12-eval",
+      "content": "Sprint retro action item: improve flaky test coverage in the payments module.",
+      "event_time": "2025-02-10T09:00:00+00:00"
+    },
+    {
+      "id": "retro_note_2",
+      "namespace": "c12-eval",
+      "content": "Action item from sprint retro: improve flaky test coverage in the payments module.",
+      "event_time": "2025-02-10T09:05:00+00:00"
+    },
+    {
+      "id": "retro_note_3",
+      "namespace": "c12-eval",
+      "content": "From the sprint retro, action item is to improve flaky test coverage in payments.",
+      "event_time": "2025-02-10T09:10:00+00:00"
+    },
+    {
+      "id": "retro_distinct_note",
+      "namespace": "c12-eval",
+      "content": "Also from that sprint retro: rotate the on call schedule to three week cycles going forward, a separate action item.",
+      "event_time": "2025-02-10T09:15:00+00:00"
+    },
+    {
+      "id": "postmortem_note_1",
+      "namespace": "c12-eval",
+      "content": "Postmortem summary: the outage was caused by a database connection pool exhaustion.",
+      "event_time": "2025-03-01T09:00:00+00:00"
+    },
+    {
+      "id": "postmortem_note_2",
+      "namespace": "c12-eval",
+      "content": "Summary of the postmortem: outage caused by database connection pool exhaustion.",
+      "event_time": "2025-03-01T09:05:00+00:00"
+    },
+    {
+      "id": "postmortem_note_3",
+      "namespace": "c12-eval",
+      "content": "Postmortem: the root cause was clearly database connection pool exhaustion during the outage.",
+      "event_time": "2025-03-01T09:10:00+00:00"
+    },
+    {
+      "id": "postmortem_distinct_note",
+      "namespace": "c12-eval",
+      "content": "Separately, the postmortem also recommends adding autoscaling alerts for database connection pool usage, a distinct follow up action.",
+      "event_time": "2025-03-01T09:15:00+00:00"
+    },
+    {
+      "id": "budget_note_1",
+      "namespace": "c12-eval",
+      "content": "Q3 marketing budget of eighty thousand dollars was approved by finance.",
+      "event_time": "2025-04-01T09:00:00+00:00"
+    },
+    {
+      "id": "budget_note_2",
+      "namespace": "c12-eval",
+      "content": "Finance approved the Q3 marketing budget of eighty thousand dollars.",
+      "event_time": "2025-04-01T09:05:00+00:00"
+    },
+    {
+      "id": "budget_note_3",
+      "namespace": "c12-eval",
+      "content": "The Q3 marketing budget of eighty thousand dollars formally and finally received finance approval this week.",
+      "event_time": "2025-04-01T09:10:00+00:00"
+    },
+    {
+      "id": "budget_distinct_note",
+      "namespace": "c12-eval",
+      "content": "Separately, finance also approved a ten thousand dollar contingency reserve for Q3, a distinct budget line.",
+      "event_time": "2025-04-01T09:15:00+00:00"
+    }
+  ],
+  "cases": [
+    {
+      "id": "clear_wifi_password",
+      "class": "clear_top1",
+      "namespace": "c12-eval",
+      "query": "office guest wifi password",
+      "relevant": ["wifi_password"]
+    },
+    {
+      "id": "clear_printer_toner",
+      "class": "clear_top1",
+      "namespace": "c12-eval",
+      "query": "second floor printer toner cartridges supply closet",
+      "relevant": ["printer_toner"]
+    },
+    {
+      "id": "clear_parking_spot",
+      "class": "clear_top1",
+      "namespace": "c12-eval",
+      "query": "visitor parking spot auditor",
+      "relevant": ["parking_spot"]
+    },
+    {
+      "id": "clear_standup_time",
+      "class": "clear_top1",
+      "namespace": "c12-eval",
+      "query": "daily engineering standup meeting time",
+      "relevant": ["standup_time"]
+    },
+    {
+      "id": "ambiguous_rate_limit",
+      "class": "ambiguous",
+      "namespace": "c12-eval",
+      "query": "API rate limit requests per minute per key",
+      "relevant": ["rate_limit_note_1", "burst_limit_note"]
+    },
+    {
+      "id": "ambiguous_retro_action_item",
+      "class": "ambiguous",
+      "namespace": "c12-eval",
+      "query": "sprint retro action item payments test coverage",
+      "relevant": ["retro_note_1", "retro_distinct_note"]
+    },
+    {
+      "id": "ambiguous_postmortem",
+      "class": "ambiguous",
+      "namespace": "c12-eval",
+      "query": "postmortem outage database connection pool exhaustion",
+      "relevant": ["postmortem_note_1", "postmortem_distinct_note"]
+    },
+    {
+      "id": "ambiguous_budget_approval",
+      "class": "ambiguous",
+      "namespace": "c12-eval",
+      "query": "Q3 marketing budget finance approved eighty thousand dollars",
+      "relevant": ["budget_note_1", "budget_distinct_note"]
+    }
+  ]
+}
