@@ -18,7 +18,7 @@ from typing import Any
 from haunt.paths import infer_namespace, infer_namespace_context, safe_name
 from haunt.recall import Hit, recall
 from haunt.store import Store
-from haunt.util import snippet
+from haunt.util import env_int, snippet
 
 ORIGIN = "cursor-hook"
 
@@ -250,7 +250,7 @@ def _tool_excluded(name: str) -> bool:
 # skip_embedding=True), just never embedded or enqueued into
 # embedding_jobs. The record stays complete and keyword-searchable; only
 # vector-index capacity is saved.
-EMBED_EXCLUDE_TOOLS_DEFAULT = "Bash,Read"
+EMBED_EXCLUDE_TOOLS_DEFAULT = "Bash,Read,Shell"
 
 
 def _embed_excluded(name: str) -> bool:
@@ -259,10 +259,13 @@ def _embed_excluded(name: str) -> bool:
     Same glob syntax as _tool_excluded, but a different default: an unset
     HAUNT_EMBED_EXCLUDE_TOOLS means "use EMBED_EXCLUDE_TOOLS_DEFAULT", not
     "exclude nothing" -- a user has to set it to "" explicitly to embed
-    every tool. The default excludes Bash and Read because, measured on a
-    dogfooded corpus, tool rows are ~80% of all memory and Bash alone is
+    every tool. The default excludes Bash, Read, and Shell because, measured
+    on a dogfooded corpus, tool rows are ~80% of all memory and Bash alone is
     ~76% of those (Read ~14%) -- almost entirely raw shell/file output that
-    FTS keyword search already covers as well as a vector index would.
+    FTS keyword search already covers as well as a vector index would. Shell
+    is Cursor's name for the same shell output Claude Code reports as Bash
+    (_handle_after_shell); without it the identical bytes were embedded under
+    one host and skipped under the other.
     """
     raw = os.environ.get("HAUNT_EMBED_EXCLUDE_TOOLS")
     if raw is None:
@@ -273,12 +276,9 @@ def _embed_excluded(name: str) -> bool:
 
 
 def _tool_io_cap() -> int:
-    raw = (os.environ.get("HAUNT_TOOL_IO_MAX_CHARS") or "").strip()
-    try:
-        value = int(raw) if raw else TOOL_IO_MAX_CHARS_DEFAULT
-    except ValueError:
-        value = TOOL_IO_MAX_CHARS_DEFAULT
-    return max(256, min(value, 100_000))
+    return env_int(
+        "HAUNT_TOOL_IO_MAX_CHARS", default=TOOL_IO_MAX_CHARS_DEFAULT, lo=256, hi=100_000
+    )
 
 
 def _cap_tool_io(text: str) -> str:
@@ -297,20 +297,17 @@ def _prepare_tool_io(tool_input: str, tool_output: str) -> tuple[str, str]:
 
 
 def _recall_block_cap() -> int:
-    """HAUNT_RECALL_BLOCK_MAX_CHARS, clamped. Same parse/fallback/clamp
-    idiom as HAUNT_TOOL_IO_MAX_CHARS just above (_tool_io_cap): parse, fall
-    back to the default on anything unparsable, then clamp so a bad env
-    value can't disable the budget or set it below what one header plus
-    one hit line needs (each line is already bounded to roughly 200 chars
-    by the fixed 160-char snippet() call below, so 500 always leaves room
-    for at least one full line and the dropped-count marker).
+    """HAUNT_RECALL_BLOCK_MAX_CHARS, clamped (util.env_int). The 500 floor is
+    what one header plus one hit line needs: each line is already bounded to
+    roughly 200 chars by the fixed 160-char snippet() call below, so 500
+    always leaves room for a full line and the dropped-count marker.
     """
-    raw = (os.environ.get("HAUNT_RECALL_BLOCK_MAX_CHARS") or "").strip()
-    try:
-        value = int(raw) if raw else RECALL_BLOCK_MAX_CHARS_DEFAULT
-    except ValueError:
-        value = RECALL_BLOCK_MAX_CHARS_DEFAULT
-    return max(500, min(value, 100_000))
+    return env_int(
+        "HAUNT_RECALL_BLOCK_MAX_CHARS",
+        default=RECALL_BLOCK_MAX_CHARS_DEFAULT,
+        lo=500,
+        hi=100_000,
+    )
 
 
 def _drop_marker(dropped: int, cap: int) -> str:
@@ -539,7 +536,17 @@ def _handle_after_thought(store: Store, payload: dict[str, Any]) -> dict[str, An
         return {}
     text = _as_text(payload.get("text"))
     if text.strip():
-        _observe(store, payload, content=text, role="system", tier="coordinate")
+        # Opt-in reasoning residue, one row per thought: captured in full and
+        # keyword-searchable like any other row, but no more worth vector
+        # capacity than the session ceremony row it mirrors.
+        _observe(
+            store,
+            payload,
+            content=text,
+            role="system",
+            tier="coordinate",
+            skip_embedding=True,
+        )
     return {}
 
 

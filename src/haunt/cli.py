@@ -12,6 +12,7 @@ import typer
 
 from haunt import __version__
 from haunt.bootstrap import bootstrap, format_report
+from haunt.budget import apply_recall_budget
 from haunt.embed import state as embed_state
 from haunt.paths import (
     NamespacePathError,
@@ -360,10 +361,14 @@ def recall_cmd(
         else:
             raise
     if json_out:
+        bounded_hits, recall_budget = apply_recall_budget(
+            [hit.as_dict() for hit in hits], k=k
+        )
         payload = {
             "namespace": ns,
             "query": query,
-            "hits": [hit.as_dict() for hit in hits],
+            "hits": bounded_hits,
+            "recall_budget": recall_budget,
         }
         execution = execution_metadata(hits)
         if execution is not None:
@@ -752,6 +757,15 @@ def health_cmd(
             f"sessions={s['sessions']} entities={s['entities']} relations={s['relations']}"
         )
         typer.echo(f"tiers         {s['tiers']}")
+        typer.echo(
+            f"embedding     embedded={s['memories_embedded']} "
+            f"pending={s['embedding_pending']} exhausted={s['embedding_exhausted']} "
+            f"index={s['vector_index']}"
+        )
+        typer.echo(
+            f"duplicates    memories={s['duplicate_memories']} "
+            f"content={s['duplicate_content_values']}"
+        )
         typer.echo(f"last write    {s['last_write']}")
 
 

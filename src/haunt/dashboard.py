@@ -17,6 +17,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from haunt.budget import apply_recall_budget
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
@@ -1089,6 +1090,17 @@ async def api_recall_all(request: Request) -> JSONResponse:
             group["error"] = error
         namespace_groups.append(group)
 
+    # One budget for the whole fan-out rather than one per namespace: this
+    # endpoint answers from every registered namespace at once, so a
+    # per-namespace cap would multiply by however many exist. Groups are
+    # rebuilt from what survived so a group can never disagree with `hits`.
+    bounded_hits, recall_budget = apply_recall_budget(flattened, k=k)
+    kept: dict[str, list[dict[str, Any]]] = {}
+    for hit in bounded_hits:
+        kept.setdefault(str(hit.get("namespace")), []).append(hit)
+    for group in namespace_groups:
+        group["hits"] = kept.get(group["namespace"], [])
+
     return JSONResponse(
         {
             "query": q,
@@ -1097,7 +1109,8 @@ async def api_recall_all(request: Request) -> JSONResponse:
             "namespace_groups": namespace_groups,
             # Kept for the existing UI/API shape. This is namespace-grouped,
             # not a global result ranking, and each final_rank remains local.
-            "hits": flattened,
+            "hits": bounded_hits,
+            "recall_budget": recall_budget,
             "errors": errors,
         }
     )
@@ -1147,11 +1160,13 @@ async def api_recall(request: Request) -> JSONResponse:
         d = h.as_dict()
         d["namespace"] = name
         results.append(d)
+    bounded_hits, recall_budget = apply_recall_budget(results, k=k)
     payload: dict[str, Any] = {
         "query": q,
         "namespace": name,
         "ranking_scope": "namespace",
-        "hits": results,
+        "hits": bounded_hits,
+        "recall_budget": recall_budget,
     }
     execution = execution_metadata(hits)
     if execution is not None:

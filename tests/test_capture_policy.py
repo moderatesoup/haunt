@@ -8,7 +8,8 @@ HAUNT_EMBED_EXCLUDE_TOOLS (new) is a separate, narrower control: matching
 tool rows are still captured in full (event + memory row + FTS entry) but
 are never embedded and never enqueued into embedding_jobs. The record stays
 complete and keyword-searchable; only vector-index capacity is saved.
-Session-start ceremony rows get the same treatment unconditionally.
+Session-start ceremony and stored-thought rows get the same treatment
+unconditionally.
 """
 
 from __future__ import annotations
@@ -269,6 +270,80 @@ def test_session_start_ceremony_not_embedded_either_host(policy_env):
             )
             # Still fully captured and keyword-searchable.
             assert _fts_matches(store, "haunt")
+
+
+def test_shell_output_follows_the_same_embed_policy_under_both_hosts(policy_env):
+    """Cursor's afterShellExecution rows are tagged "Shell" and Claude Code's
+    are tagged "Bash", but both are the same raw shell output. A default that
+    named only Bash embedded one host's copy and skipped the other's."""
+    from haunt.claude_hook import run as run_claude
+    from haunt.cursor_hook import run as run_cursor
+    from haunt.store import Store
+
+    run_cursor(
+        json.dumps(
+            {
+                "hook_event_name": "afterShellExecution",
+                "conversation_id": "shell-cursor",
+                "command": "ls -la",
+                "output": "SHELL-POLICY-TOKEN-CURSOR",
+            }
+        )
+    )
+    run_claude(
+        json.dumps(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "shell-claude",
+                "tool_use_id": "shell-claude-call",
+                "tool_name": "Bash",
+                "tool_response": "SHELL-POLICY-TOKEN-CLAUDE",
+            }
+        )
+    )
+
+    with Store("policy-test", create=False) as store:
+        for session_id, token in (
+            ("shell-cursor", "SHELL-POLICY-TOKEN-CURSOR"),
+            ("shell-claude", "SHELL-POLICY-TOKEN-CLAUDE"),
+        ):
+            memory_id = _memory_id_for_event(store, session_id)
+            mem = _memory_row(store, memory_id)
+            assert token in mem["content"], "verbatim content must be captured"
+            assert mem["embedding"] is None
+            assert not _queued(store, memory_id), (
+                f"{session_id} shell output must not be enqueued for embedding"
+            )
+            assert _fts_matches(store, token)
+
+
+def test_stored_thoughts_are_captured_but_not_embedded(policy_env, monkeypatch):
+    """HAUNT_STORE_THOUGHTS rows are the same role=system/tier=coordinate
+    shape as the session-start ceremony row, and get the same treatment:
+    captured in full and keyword-searchable, never vector-indexed."""
+    from haunt.cursor_hook import run as run_cursor
+    from haunt.store import Store
+
+    monkeypatch.setenv("HAUNT_STORE_THOUGHTS", "1")
+    run_cursor(
+        json.dumps(
+            {
+                "hook_event_name": "afterAgentThought",
+                "conversation_id": "thought-session",
+                "text": "THOUGHT-POLICY-TOKEN considering the next step",
+            }
+        )
+    )
+
+    with Store("policy-test", create=False) as store:
+        memory_id = _memory_id_for_event(store, "thought-session")
+        mem = _memory_row(store, memory_id)
+        assert "THOUGHT-POLICY-TOKEN" in mem["content"]
+        assert mem["embedding"] is None
+        assert not _queued(store, memory_id), (
+            "stored thoughts must not be enqueued for embedding"
+        )
+        assert _fts_matches(store, "THOUGHT-POLICY-TOKEN")
 
 
 # ---------------------------------------------------------------------------
