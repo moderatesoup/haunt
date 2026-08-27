@@ -317,8 +317,8 @@ The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](
 | `HAUNT_RECALL_MAX_CHARS` | `24000` | maximum serialized characters of the `hits` list in one retrieval response — MCP `memory_recall`/`memory_timeline`, `haunt recall --json`, dashboard recall (clamped 2000–200000); see `recall_budget` in the response for what the budget did |
 | `HAUNT_RECALL_BLOCK_MAX_CHARS` | `4000` | maximum characters in the `[haunt ns=...]` block both hooks inject as automatic per-prompt context (clamped 500–100000) |
 | `HAUNT_MODEL_CACHE` | `$HAUNT_HOME/models` | model download directory |
-| `HAUNT_RERANK_ENABLED` | unset | set to `1` to enable the deterministic lexical MMR diversity rerank (`haunt.rerank`) over `recall()` output. **Off by default, and wired into no call site today** (not the CLI, MCP, hooks, or dashboard) — setting this currently changes nothing |
-| `HAUNT_RERANK_LAMBDA` | `0.5` | relevance/diversity tradeoff for that reranker (clamped 0–1; `1.0` relevance only, `0.0` diversity only). Has no effect while the reranker is unwired — see `HAUNT_RERANK_ENABLED` |
+| `HAUNT_RERANK_ENABLED` | unset | set to `1` to enable the deterministic lexical MMR diversity rerank (`haunt.rerank`) inside `recall()`, so CLI, MCP, hooks and dashboard all rerank together. **Off by default**; on, recall fuses a wider candidate pool, trims it to `k` by MMR, and each hit's `explanation.ordering` reports that stage with the fusion rank it moved from in `explanation.rrf_rank` |
+| `HAUNT_RERANK_LAMBDA` | `0.3` | relevance/diversity tradeoff for that reranker (clamped 0–1; `1.0` relevance only, `0.0` diversity only). Only read when `HAUNT_RERANK_ENABLED` is on |
 
 ## Layout
 

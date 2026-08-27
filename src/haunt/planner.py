@@ -176,6 +176,23 @@ def _clocks(clock: str) -> tuple[str, ...]:
     return (c,)
 
 
+def _recall_order(hit: Hit) -> tuple[int, float, str]:
+    """Sort key preserving the order recall() returned a hit in.
+
+    recall() owns ranking and an enabled rerank stage replaces RRF order
+    with its own, so re-deriving order from ``score`` here would silently
+    undo it. With no such stage final_rank is assigned in exactly
+    ``(-score, memory_id)`` order, so this key reproduces it. A Hit built
+    by hand rather than by recall() carries no final_rank and falls back to
+    that score order.
+    """
+    return (
+        hit.final_rank if hit.final_rank is not None else 0,
+        -hit.score,
+        hit.memory_id,
+    )
+
+
 def _aggregate_execution(
     strategy: str,
     runs: list[tuple[str, list[Hit]]],
@@ -454,7 +471,7 @@ def run_recall(
             prev = merged.get(h.memory_id)
             if prev is None or h.score > prev.score:
                 merged[h.memory_id] = h
-    ranked = sorted(merged.values(), key=lambda h: (-h.score, h.memory_id))
+    ranked = sorted(merged.values(), key=_recall_order)
     hits = ranked[:k]
     for final_rank, hit in enumerate(hits, start=1):
         hit.final_rank = final_rank
@@ -503,7 +520,7 @@ def run_union(
             by_id[h.memory_id] = h
     ranked = sorted(
         (hit for hit in by_id.values() if hit.vec_rank is not None or hit.fts_rank is not None),
-        key=lambda hit: (-hit.score, hit.memory_id),
+        key=_recall_order,
     )
     # Unranked timeline rows remain in their already chronological order.
     timeline_hits = [
