@@ -1206,8 +1206,31 @@ Plain facts, each re-checkable.
   vectors identical at min cosine 1.0000000000, max absolute difference
   3.257e-07.
 - Test suite wall clock: 377-590s down to 102-165s.
-- A hybrid n=500 LongMemEval run is **in progress and not complete**. There is
-  no result yet. Do not cite one.
+- Hybrid n=500 LongMemEval, judge-free, k=10, BAAI/bge-m3, embedding coverage
+  246738/246750 (1.0000) with an empty queue, so this is a real hybrid run and
+  not an FTS-only run under a hybrid label. 7.07h wall clock, 98.8% of it
+  embedding.
+
+  | set | n | @1 | @3 | @5 | @10 | MRR | misses |
+  |---|---|---|---|---|---|---|---|
+  | working | 350 | 0.900 | 0.951 | 0.974 | 0.989 | 0.930 | 4 |
+  | held-out | 150 | 0.940 | 0.980 | 0.987 | 0.993 | 0.961 | 1 |
+
+  Against the FTS-only baseline on clean `main` (working 0.851/0.960,
+  held-out 0.887/0.973) both sets improve on both metrics. Held-out scoring
+  above working is the generalization evidence: no change was tuned toward
+  the diagnostic set.
+
+  Held-out reaches @10 1.000 on knowledge-update, multi-session,
+  single-session-assistant and single-session-preference.
+  `single-session-preference`, the weakest FTS type and the measurement
+  behind issue #37, moves from 0.444/0.889 to 0.778/1.000.
+
+  All 5 remaining misses across both sets are `ranking_fusion` -- gold in the
+  candidate pool, ranked below k. Three of them (`gpt4_59149c78`, `eac54add`,
+  `gpt4_8279ba03`) are already in the eight known-temporal-miss IDs hardcoded
+  in `scripts/score_lme_temporal.py`, i.e. the documented implicit-English-time
+  limitation. The other two share no mechanism. **No new trend to file.**
 
 ### Closed and disproven claims
 
