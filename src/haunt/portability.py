@@ -33,9 +33,10 @@ from haunt.paths import (
     safe_name,
 )
 from haunt.provenance import validate_provenance
-from haunt.graph import _refresh_relation
+from haunt.graph import ENTITY_TYPES, _refresh_relation
 from haunt.store import (
     RECALL_CLASSES,
+    TIERS,
     SCHEMA_VERSION,
     PRIVACY_LINEAGE_KEY,
     _claim_fresh_namespace_db_with_configuration_lock,
@@ -1192,6 +1193,7 @@ def _validate_records_in_scratch(
         _ensure_namespace_schema(conn)
         check_deadline()
         _validate_structured_provenance(records["events"], check_deadline)
+        _validate_enumerated_columns(records, check_deadline)
         _validate_record_references(records, check_deadline)
         _apply_records(
             conn,
@@ -1343,6 +1345,27 @@ def _validate_structured_provenance(
         recall_class = event["recall_class"]
         if recall_class is not None and recall_class not in RECALL_CLASSES:
             raise ImportBundleError("invalid recall_class")
+
+
+def _validate_enumerated_columns(
+    records: Mapping[str, Sequence[Mapping[str, Any]]],
+    check_deadline: Callable[[], None],
+) -> None:
+    """Reject enum values no destination CHECK constraint would catch.
+
+    ``events.tier``, ``memories.tier`` and ``entities.type`` are plain TEXT,
+    so an import is the only gate between a crafted bundle and every reader
+    that treats those columns as a known vocabulary.
+    """
+    for table in ("events", "memories"):
+        for record in records[table]:
+            check_deadline()
+            if record["tier"] not in TIERS:
+                raise ImportBundleError(f"invalid {table}.tier")
+    for entity in records["entities"]:
+        check_deadline()
+        if entity["type"] not in ENTITY_TYPES:
+            raise ImportBundleError("invalid entities.type")
 
 
 def _same_sqlite_value(left: Any, right: Any) -> bool:
