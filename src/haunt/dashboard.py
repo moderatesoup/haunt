@@ -13,12 +13,23 @@ from urllib.parse import urlencode, urlparse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
+from haunt.portability import (
+    MEDIA_TYPE,
+    ExportError,
+    ImportBundleError,
+    ImportConflictError,
+    ImportLimitError,
+    build_namespace_export,
+    canonical_export_bytes,
+    import_namespace_bytes,
+    resolve_import_limits,
+)
 from haunt.recall import BACKEND_ERROR_CODE, Hit, execution_metadata, is_retrieval_backend_error
 from haunt.store import (
     Store,
@@ -1218,6 +1229,126 @@ async def api_timeline(request: Request) -> JSONResponse:
     return JSONResponse({"namespace": name, "events": events})
 
 
+async def api_namespace_export(request: Request) -> Response:
+    """Authenticated download; the read path never creates a namespace."""
+    name = resolve_namespace(request.path_params["name"])
+    missing = _missing_namespace(name)
+    if missing:
+        return missing
+    try:
+        bundle = build_namespace_export(
+            name, cut=request.query_params.get("cut") or None
+        )
+        raw = canonical_export_bytes(bundle)
+    except (ExportError, UnknownNamespaceError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "namespace": name},
+            status_code=400,
+        )
+    # Canonical labels are already safe-name normalized, but strip header
+    # metacharacters again at the response boundary. Never reflect raw path
+    # parameters into Content-Disposition.
+    canonical = str(bundle["namespace"]["canonical_label"])
+    filename = "".join(
+        char for char in canonical if char.isalnum() or char in "-_."
+    )[:80] or "namespace"
+    return Response(
+        raw,
+        media_type=MEDIA_TYPE.split(";", 1)[0],
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}.haunt.json"',
+            "X-Haunt-Semantic-Digest": str(bundle["manifest"]["semantic_digest"]),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _dashboard_import_limits(request: Request):
+    params = request.query_params
+
+    def integer(name: str) -> int | None:
+        value = params.get(name)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ImportLimitError(f"{name} must be a positive integer") from exc
+
+    timeout_raw = params.get("timeout_seconds")
+    try:
+        timeout = None if timeout_raw is None else float(timeout_raw)
+    except ValueError as exc:
+        raise ImportLimitError("timeout_seconds must be finite and positive") from exc
+    return resolve_import_limits(
+        input_bytes=integer("input_bytes"),
+        decompressed_bytes=integer("decompressed_bytes"),
+        records=integer("records"),
+        record_bytes=integer("record_bytes"),
+        json_depth=integer("json_depth"),
+        collection_items=integer("collection_items"),
+        timeout_seconds=timeout,
+    )
+
+
+async def api_namespace_import(request: Request) -> JSONResponse:
+    """Launch-token admin mutation with strict Origin, media type, and size."""
+    origin = request.headers.get("origin")
+    if not origin or not request_origin_is_trusted(origin, request):
+        return JSONResponse(
+            {"ok": False, "error": "trusted Origin header is required"},
+            status_code=403,
+        )
+    content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if content_type not in {
+        "application/json",
+        MEDIA_TYPE.split(";", 1)[0].lower(),
+    }:
+        return JSONResponse(
+            {"ok": False, "error": "content-type must be a Haunt namespace JSON bundle"},
+            status_code=415,
+        )
+    try:
+        limits = _dashboard_import_limits(request)
+    except ImportLimitError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > limits.input_bytes:
+                raise ImportLimitError(
+                    f"declared input bytes exceed {limits.input_bytes}"
+                )
+        except ImportLimitError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=413)
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "error": "invalid content-length"}, status_code=400
+            )
+    chunks: list[bytes] = []
+    actual = 0
+    async for chunk in request.stream():
+        actual += len(chunk)
+        if actual > limits.input_bytes:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": f"actual input bytes exceed {limits.input_bytes}",
+                },
+                status_code=413,
+            )
+        chunks.append(bytes(chunk))
+    try:
+        report = import_namespace_bytes(b"".join(chunks), limits=limits)
+    except ImportConflictError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+    except ImportLimitError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=413)
+    except ImportBundleError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return JSONResponse({"ok": True, **report})
+
+
 async def api_contradict(request: Request) -> JSONResponse:
     ct = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
     if ct != "application/json":
@@ -1295,6 +1426,8 @@ routes = [
     Route("/api/namespace/{name}/recall", api_recall),
     Route("/api/namespace/{name}/browse", api_browse),
     Route("/api/namespace/{name}/timeline", api_timeline),
+    Route("/api/namespace/{name}/export", api_namespace_export),
+    Route("/api/import", api_namespace_import, methods=["POST"]),
     Route("/api/namespace/{name}/memory/{memory_id}", api_memory_detail),
     Route("/api/namespace/{name}/memory/{memory_id}", api_memory_delete, methods=["DELETE"]),
     Route("/api/namespace/{name}/memory/{memory_id}/contradict", api_contradict, methods=["POST"]),

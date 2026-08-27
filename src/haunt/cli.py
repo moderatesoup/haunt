@@ -20,6 +20,13 @@ from haunt.paths import (
     resolve_namespace,
 )
 from haunt.planner import planned_recall
+from haunt.portability import (
+    ExportError,
+    ImportBundleError,
+    export_namespace_path,
+    import_namespace_path,
+    resolve_import_limits,
+)
 from haunt.recall import BACKEND_ERROR_CODE, execution_metadata, is_retrieval_backend_error
 from haunt.store import (
     AliasRetirementError,
@@ -88,6 +95,82 @@ def _recall_json_error(
         )
     )
     raise typer.Exit(2)
+
+
+@app.command("export")
+def export_cmd(
+    output: Path = typer.Argument(..., help="New canonical JSON bundle path"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n"),
+    cut: Optional[str] = typer.Option(
+        None,
+        "--cut",
+        help="Explicit UTC temporal cut (default: stable durable high-water mark)",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Output stable JSON report"),
+) -> None:
+    """Export durable namespace semantics without embeddings or local paths."""
+    ns = _ns(namespace)
+    typer.echo(
+        "warning: export contains potentially sensitive verbatim namespace data",
+        err=True,
+    )
+    try:
+        report = export_namespace_path(ns, output, cut=cut)
+    except (ExportError, NamespacePathError, OSError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if json_out:
+        typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return
+    typer.echo(f"namespace       {report['namespace']}")
+    typer.echo(f"namespace id    {report['namespace_id']}")
+    typer.echo(f"temporal cut    {report['temporal_cut']}")
+    typer.echo(f"semantic digest {report['semantic_digest']}")
+    typer.echo(f"bytes            {report['bytes']}")
+    typer.echo(f"output           {report['path']}")
+
+
+@app.command("import")
+def import_cmd(
+    bundle: Path = typer.Argument(..., help="Canonical Haunt namespace bundle"),
+    timeout: float = typer.Option(30.0, "--timeout", help="Finite import timeout seconds"),
+    input_bytes: Optional[int] = typer.Option(None, "--input-bytes"),
+    decompressed_bytes: Optional[int] = typer.Option(None, "--decompressed-bytes"),
+    records: Optional[int] = typer.Option(None, "--records"),
+    record_bytes: Optional[int] = typer.Option(None, "--record-bytes"),
+    json_depth: Optional[int] = typer.Option(None, "--json-depth"),
+    collection_items: Optional[int] = typer.Option(None, "--collection-items"),
+    json_out: bool = typer.Option(False, "--json", help="Output stable JSON report"),
+) -> None:
+    """Validate fully, then transactionally import one canonical namespace."""
+    try:
+        limits = resolve_import_limits(
+            input_bytes=input_bytes,
+            decompressed_bytes=decompressed_bytes,
+            records=records,
+            record_bytes=record_bytes,
+            json_depth=json_depth,
+            collection_items=collection_items,
+        )
+        report = import_namespace_path(
+            bundle, limits=limits, timeout_seconds=timeout
+        )
+    except (ImportBundleError, NamespacePathError, OSError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if json_out:
+        typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return
+    typer.echo(f"namespace       {report['namespace']}")
+    typer.echo(f"namespace id    {report['namespace_id']}")
+    typer.echo(f"semantic digest {report['semantic_digest']}")
+    typer.echo(f"created          {report['created_namespace']}")
+    typer.echo(f"deduplicated     {report['deduplicated']}")
+    typer.echo(f"inserted         {sum(report['inserted'].values())}")
+    typer.echo(
+        "limits           "
+        + " ".join(f"{key}={value}" for key, value in report["limits"].items())
+    )
 
 
 @app.command("bootstrap")
