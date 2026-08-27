@@ -13,6 +13,8 @@ haunt is **local-only**. All data (SQLite databases, embeddings, models) stays o
 - Loopback bind (default 127.0.0.1) injects the token into the console HTML so the local UI works. **`--allow-remote` / a non-loopback bind does not embed the token in HTML.** GET `/` with a trusted Host is not enough to obtain `X-Haunt-Token`. The token is printed only on `haunt dash` stdout for the operator who launched it.
 - Cookie-less mutation routes (`DELETE` memory, `POST` contradict) also validate `Origin` when present. Same-origin and missing-Origin local TestClient requests still work. Cross-origin form posts are rejected.
 - `haunt dash` mints a random launch token at start and prints it. `--allow-remote` without that token configured refuses to start (or every `/api` route returns 401).
+- `GET /` carries a per-response `Content-Security-Policy` whose `script-src` is a nonce on the single inline `<script>`. The console has no inline event handlers (clicks are delegated off `data-act`), so `script-src` never needs `'unsafe-inline'`. `style-src` does allow inline styles: a nonce cannot cover `style=` attributes, and styles are not an execution vector under `default-src 'none'`. Every other response carries `default-src 'none'` and `nosniff`.
+- Stored values are escaped at every point the console writes them into `innerHTML`. That is defence in depth, not the only gate — see import validation below.
 - **`--allow-remote` is unsafe without the token.** It exposes the local memory admin API on the network. Anyone who has the token can read and mutate every namespace. **Namespaces are still not authorization** — see below.
 
 Do not add Docker, Postgres, or HTTP team-tier auth. This is a local-first console.
@@ -21,6 +23,11 @@ The canonical export download is covered by the same token gate. Dashboard
 import is an administrative mutation and additionally requires a trusted
 `Origin`, an accepted JSON media type, and a bounded body. The HTML console has
 no import/paste control in v1; callers use the authenticated API deliberately.
+
+Import also validates the enumerated columns the destination schema cannot police —
+`events.tier`, `memories.tier`, `entities.type` are plain TEXT with no CHECK
+constraint. A bundle carrying a value outside those vocabularies is rejected before
+any destination database is touched.
 
 ## Secret redaction
 
