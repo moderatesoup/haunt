@@ -1112,51 +1112,36 @@ cross-encoder as deliberately not wired.
 
 ## Reconciliation register (2026-08-27)
 
-Verified against `main` `ed806b2` and `integration/all-work` `d1aec40`. This
-register supersedes every prior audit of this repository. **Audits written
+Verified against `main` `ed806b2` and `integration/all-work` `d1aec40`, then
+extended by a late pass at `integration/all-work` `413f8b9` that closed 19 of
+these rows, added six new ones (L11-L16), and recorded the verification
+evidence below. This register supersedes every prior audit of this repository. **Audits written
 against `88f607f` are 15 commits stale** — that revision is 15 commits behind
 `main`, and most of what those audits report was fixed in between. The closed
 table below is the list; do not re-open anything in it without new evidence.
 
-`Checked` reads: `verified` — citation re-checked at `d1aec40` during this
-reconciliation; `operator` — re-checked directly by the operator; `unverified` —
-carried from the source ledger and **not** independently re-checked, so treat
-both the citation and the finding as unconfirmed.
+`Checked` reads: `verified` — citation re-checked during this reconciliation, at
+`d1aec40` for R1-R30 and M1-M3, at `413f8b9` for L11-L16; `operator` —
+re-checked directly by the operator; `unverified` — carried from the source
+ledger and **not** independently re-checked, so treat both the citation and the
+finding as unconfirmed.
 
 ### Open items
 
 | ID | Item | Severity | Evidence | Checked |
 |---|---|---|---|---|
-| R6 | E6 integrity guard diffs the whole tree against a pinned revision, so any concurrent runtime change fires it; `E0_BASE_REVISION` is pinned to current `main`, so the next merge breaks it. It also shells `git` with `cwd=ROOT` (unrunnable from an installed wheel: no `.git`, returncode != 0, `diff_empty=False`) and CI's depth-1 `actions/checkout@v4` graft appears to add every file. All three must be handled. | BLOCKER | `src/haunt/abstention_eval.py:49`, `:642-656`, raised at `:1290-1295` | verified |
-| M1 | E4 import validates `recall_class` but never `tier`; `events.tier`, `memories.tier`, and `entities.type` carry no CHECK; the dashboard interpolates several of those fields raw into `innerHTML`. A crafted bundle yields stored XSS. Fix both halves. | HIGH | import `src/haunt/portability.py:38`, `:1344`, `:146`, `:154`; schema `src/haunt/store.py:1318`, `:1326`, `:1338`; raw sinks `src/haunt/dashboard.py:528`, `:635`, `:667`, `:669`, `:712`, plus `tierCls` (`:371`, returns `"t-"+t` verbatim) used unescaped in `class="..."` at `:518`, `:528`, `:635`, `:712` | operator |
-| R2 | Embedding model download is unpinned (no `revision=`) and a bare `except Exception` redirects to a **different** repo (`BGE_M3_QUANT_REPO`) on any failure including transient network; those ONNX bytes are then loaded by onnxruntime. The only finding where a remote party gains code-adjacent influence. The fix exists in-repo: reuse E6's SHA-locked per-file manifest (`verify_local_hybrid_cache`). | HIGH | `src/haunt/embed.py:159-185` (fallback at `:175`) | verified |
-| R4 | C3 reconcile takes its verified backups **before** acquiring the write lock. A concurrent `observe()` in that window lands in the merged database but not the backup, so the documented recovery silently discards it. | HIGH | backups `src/haunt/store.py:4525`, `:4528`; `BEGIN IMMEDIATE` at `:4533` | operator |
-| R5 | `bootstrap`'s fan-out over all namespaces has no per-namespace `try`/`except`, and the C-series added a 500-row embed drain inside it. One corrupt or locked namespace stops every later namespace from draining **and** skips `install_desktop_icon()` and `install_all_hosts()`. `reembed_all_namespaces` has the same unprotected loop. | HIGH | `src/haunt/bootstrap.py:224-247`, skipped installs at `:248-255`; `src/haunt/store.py:7649-7653`. Correct pattern already in-repo at `src/haunt/store.py:7622-7636` and `src/haunt/dashboard.py:1002-1010` | operator |
-| M2 | No `Content-Security-Policy` header anywhere in the dashboard. Would neutralize the whole M1/M3 class. | MEDIUM | zero matches for `Content-Security-Policy` in `src/haunt/` | verified |
 | R7 | `content_hash` is NULL after an E4 import into a fresh home. `portability.py` has zero `content_hash` references and the C7 backfill runs only in the `current < 10` migration step, which never fires on a fresh v11 database. C7 duplicate measurement silently reads zero in any imported namespace. Not data loss — recomputable. | MEDIUM | `src/haunt/portability.py` (0 hits); `_backfill_content_hashes` reached only at `src/haunt/store.py:1703-1717` | verified |
-| R13 | The CI fixture defeats `HAUNT_FTS_ONLY`: `conftest` deletes the variable CI sets and forces `BAAI/bge-small-en-v1.5` behind a `MODEL_CACHE` guard pointing at a dead `/workspace/lore` path. Every `haunt_env` test downloads a model instead of exercising the FTS-only path CI claims to test. | MEDIUM | `tests/conftest.py:10`, `:41`, `:42`, `:44` vs `.github/workflows/ci.yml:25` | verified |
-| R19 | C7/C4 metrics are invisible from the CLI. `duplicate_memories`, `duplicate_content_values`, `memories_embedded`, and `vector_index` exist in `stats()` but `health_cmd` prints a hand-picked subset excluding all of them. CLI-only: MCP `memory_health` returns `stats` whole and the dashboard sets `health["stats"]`. C7 phase 1's deliverable is unreachable without MCP. | MEDIUM (raised) | `src/haunt/cli.py:691-724`; already correct at `src/haunt/mcp_server.py:906` and `src/haunt/dashboard.py:1200-1210` | verified |
-| R20 | No CLI affordance to remove the drained namespace after reconcile. The commit message's own final operator step has no command; `retire-alias` handles only noncanonical aliases. Leaves the dashboard showing stale entries. | MEDIUM (raised) | `src/haunt/cli.py:619-644` (reconcile), `:677` (retire-alias) | verified |
 | R8 | Remote-less repositories still collide on the directory leaf name: two local-only repositories named `api` share one memory database. Misses worktrees and pre-`git remote add` repositories. | MEDIUM | fallback at `src/haunt/paths.py:1707` `safe_name(repo_root.name)` | unverified |
 | R9 | Prompt injection is mitigated at the highest-volume channel only, not closed. `trusted=False` covers raw tool I/O; assistant replies and user prompts replay verbatim into the next session's `additionalContext` with no data/instruction delimiter. Laundering path: poisoned page to tool output (excluded) to assistant summary (stored trusted) to replay. | MEDIUM | `src/haunt/recall.py:138`; hook injection in `src/haunt/claude_hook.py`, `src/haunt/cursor_hook.py` | unverified |
-| R11 | `haunt recall --json`, the dashboard `/api/recall` (which fans out over **all** namespaces), and MCP `memory_timeline` are uncapped — the same injection surface C11 was written for. The sole cap site is MCP `memory_recall`. | MEDIUM | `src/haunt/cli.py:295`; `src/haunt/dashboard.py`; `src/haunt/mcp_server.py:831` (sole cap) | unverified |
-| R16 | No reconcile concurrency test; writing one would have failed. The lock in reconcile serializes migrations, not `observe()`. This is the missing test that finds R4. | MEDIUM | `tests/test_namespace_reconcile.py` (zero threading) | unverified |
-| R22 | `rerank.py` ships with zero production callers (1,055 lines across module, tests, and fixture) and `HAUNT_RERANK_ENABLED` changes nothing. Its own measurement shows the shipped `lambda=0.5` is strictly dominated by 0.2-0.3. Not a defect as framed — the README and the module both self-document the unwired state. Disposition decided, see D1. | MEDIUM | `README.md:319-320`; `src/haunt/rerank.py:30-32`, `:165-171`; no importer in `src/` outside `rerank_eval.py` | verified |
 | R1 | Inspection surfaces (timeline, health, worldview, trace, procedure get/list, and eight dashboard GET routes) open a **read-write** connection and take the writer lifecycle lock: they need write permission and serialize concurrent inspection. Entity surrogate UUIDs are not stable across a rebuild. **Not** a per-read rebuild — `_ensure_graph_evidence` is a version-gated one-shot backfill returning immediately once `graph_evidence_version == "1"`; measured steady-state mutation is zero. **Not** an undocumented invariant violation — `README.md:130-136` and `docs/MEMORY_CONTRACT.md:211-217` scope the read-only requirement to recall, and `MEMORY_CONTRACT.md:206-208` names timeline/trace/detail as a different class. Read-only media fail at WAL configuration first. GitHub issue #84. | LOW-MEDIUM (downgraded from HIGHEST) | `src/haunt/store.py:4886-4897`, `_rebuild_graph_with_configuration_lock` at `:5911` | operator |
-| R3 | Closed sessions accept new events in the **explicit-`session_id` branch only**: it selects `id, ended_at` and returns without testing `ended_at`. The implicit branch already checks correctly. Scope-limited: nothing reads `ended_at` for filtering or bounding, and E4 nulls it past the export cut, i.e. treats it as informational. Not permanent corruption. | LOW-MEDIUM (downgraded from HIGH) | `src/haunt/store.py:4926-4937`; correct branch at `:4941-4943` | operator |
 | R12 | Dashboard async routes block the event loop (no `to_thread`/`run_in_threadpool` anywhere) and re-embed the same query once per namespace with no query-vector cache. Latency only, single user. | LOW-MEDIUM | `src/haunt/dashboard.py` recall routes; `src/haunt/recall.py` `embed_one` | unverified |
-| R14 | C3 source-side digest TOCTOU: the digest is verified against one snapshot and rows are copied from a different one. Cannot corrupt (collision checks re-run) but breaks the stated "state drift is refused" contract. | LOW-MEDIUM | `src/haunt/store.py` reconcile digest vs copy | unverified |
-| M3 | `esc()` is the wrong escaper for inline handler attributes: it maps `'` to `&#39;`, which the HTML parser decodes back to `'` before JS parses. Not exploitable today (ids are generated, namespaces pass `SAFE_NS`) but it is not a fix. Prefer `data-` attributes plus delegated listeners. | LOW-MEDIUM (latent) | `src/haunt/dashboard.py:369` (`esc`), used in `onclick` at `:516`, `:526`, `:533`, `:580`, `:633`, `:640`, `:656`, `:709` | verified |
 | R24 | E4 default limits are not co-feasible: `_StrictJSONParser` runs at ~5 MB/s, so the default 64 MiB input cap consumes ~13 s of the default 30 s timeout. See the E4 gap list. | LOW-MEDIUM | `src/haunt/portability.py:679`, `:86`, `:92`, `:95` | verified |
-| R10 | The C11 recall cap bounds the sum of the parts, not the serialized array: the JSON list separators add roughly `2n` characters. Measured overrun: cap 24,000 at k=100 returns 24,652 (652 over); at the 2,000 floor, 2,299 (299 over, ~15%). Envelope exclusion is deliberate and documented; the genuine defect is the internal contradiction — `_apply_recall_budget`'s own rationale asserts the serialized result never exceeds the cap, and `README.md:284` states it absolutely. | LOW (downgraded from MEDIUM) | `src/haunt/mcp_server.py:423-426` (deliberate envelope note), `:649`, `:661`, `:676`; `README.md:284` | verified |
 | R15 | The `execution` block is computed from unbounded hits rather than `bounded_hits`. | LOW | `src/haunt/mcp_server.py:831` region | unverified |
-| R17 | The Cursor shell hook tags `tool_name="Shell"` but `EMBED_EXCLUDE_TOOLS_DEFAULT` is `"Bash,Read"`, so Cursor shell output embeds while Claude Code Bash output does not. `README.md` already uses `Shell` as an example for the sibling variable, so the name was known. One-token fix; live corpus is `Shell`=3 rows against `Bash`=8,289 (75.3%). | LOW impact / trivial fix | `src/haunt/cursor_hook.py:582`, `:585` vs `:253` | verified |
-| R18 | `HAUNT_STORE_THOUGHTS` rows omit `skip_embedding` while structurally identical ceremony rows use it. Opt-in variable. | LOW | `src/haunt/cursor_hook.py` thoughts handler vs ceremony write | unverified |
 | R21 | No ruff or mypy configuration and no CI gate. Current state: ruff 13 findings (7 `F401`, 5 `F841`, 1 `E741`; only one in `src/` — `desktop.py:5` unused `os`); mypy 1.11.2 reports 57 errors across 11 files, about 17 from `MCPNamespaceAccess` attribute/assignment. | LOW code risk / MEDIUM process | `pyproject.toml` (no `[tool.ruff]`/`[tool.mypy]`); `.github/workflows/ci.yml` runs neither | unverified |
 | R23 | E4's purge-lineage claim is overstated in the PR and doc wording. See the E4 gap list; the test itself is honest. | LOW code / MEDIUM honesty | `tests/test_portability.py:1305-1319` | verified |
-| R28 | Triplicated environment parse/clamp idiom. The docstrings say "same idiom as", so a shared helper was consciously skipped; C11 added the third copy. | LOW | `src/haunt/cursor_hook.py` (x2), `src/haunt/mcp_server.py` | unverified |
 
-28 open items above. R6 is the only merge blocker.
+9 open items above. Nothing here is a merge blocker: R6 was the only one and
+it is fixed and closed below.
 
 ### LongMemEval retrieval (2026-08-27)
 
@@ -1188,13 +1173,49 @@ power check in L8.
 | L9 | Embedding ingest wastes throughput on padding: `tokenizers` pads each batch to its longest member, so a randomly ordered batch of 100 turns is almost always padded to 512, roughly 2.6x the tokens actually needed. Length-sorting before batching measured 3.34x (3.14 to 10.49 texts/s at batch=16) with vectors unchanged (min cosine 1.00000000, max absolute difference 6.6e-07). This affects every user's ingest, not only the benchmark. Fix in progress. | MEDIUM (performance, all users) | `perf/embed-batching` `6198083` | operator |
 | L10 | `answer_substring_proxy` is not a retrieval signal for `single-session-preference`. It reads 0.000 at every cutoff because the benchmark's preference answers are free-form rationales that never appear in the haystack. Scoring artifact; do not treat it as a miss. | n/a (scoring artifact) | working n=350, all cutoffs | operator |
 
-10 LongMemEval items, none of them a merge blocker. 38 open in the register.
+10 LongMemEval items, none of them a merge blocker.
+
+### Late findings (2026-08-27)
+
+Found after the reconciliation above, during integration and the cleanup pass.
+IDs continue the L-series. None is a merge blocker.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L11 | The `test-hybrid` job was authored and exercised on macOS only and has never run on Linux. Its first CI run is a cold `actions/cache` miss that downloads bge-small (~64 MB) before the key populates. The key is a bare literal with no `restore-keys`, so if the embedding model pin ever changes that key must be bumped or the job silently reuses the wrong cached model. | LOW (operational) | `.github/workflows/ci.yml:61-86`, key at `:78` | verified |
+| L12 | Purge is now O(namespace), not O(row): `VACUUM` rebuilds the whole namespace file. Acceptable for a gated, confirmed delete, but `haunt delete --event-id` calls `purge()` once per memory on that event, so the rebuild runs once per memory — that is where it surfaces first. `bytes_overwritten` in the purge report says whether the rebuild actually completed (false when a concurrent reader blocks `VACUUM`); the purge's own bytes are zeroed either way. | LOW-MEDIUM (performance) | `src/haunt/store.py:6484-6508`; per-memory loop at `src/haunt/cli.py:1003-1009` | verified |
+| L13 | `drain_embedding_queue(batch_size=N)` silently clamps N to 100, via `clamp_limit`'s `LIMIT_MAX`. Undocumented kwarg and no production caller sets it — `bootstrap` calls with no arguments. `README.md` is **not** wrong: it documents `HAUNT_EMBED_DRAIN_LIMIT`, which controls `max_rows` and genuinely reaches 100,000. A one-line docstring note is the whole fix. | LOW | `src/haunt/store.py:5714-5715`, clamp at `:5510`; `LIMIT_MAX` at `src/haunt/util.py:154`; `README.md:312` | verified |
+| L14 | `_load_fastembed` remains unpinned: fastembed exposes no revision knob, so `TextEmbedding(model_name=...)` takes whatever the hub serves. A separate download path from the one the R2 BGE-M3 revision pin closed. | LOW (supply chain) | `src/haunt/embed.py:367-374` | verified |
+| L15 | `tests/test_correction_lineage.py::test_concurrent_corrections_do_not_fork` failed once at machine load ~97 with `NamespacePathError: SQLite zero-write read observed storage drift`. Passed 5/5 in isolation at the same load, and in the clean-load full suite. Cause not established. Not a merge blocker; re-check if it recurs. | LOW | `tests/test_correction_lineage.py:359`; one observed failure, not reproduced | operator |
+| L16 | Hooks fail **open** on exception, but there is no timeout at all, so a hang is not covered: a contended SQLite lock or a slow disk holds the turn until the host's own hook timeout fires. `SECURITY.md`/`README.md` wording was corrected to "a hook *error* never blocks", which is honest, but the underlying gap remains. Found during the cleanup pass and deliberately not fixed there — behaviour change, out of scope. | LOW-MEDIUM | `SECURITY.md:117-119`; `README.md:158`; no `timeout`/`signal` in `src/haunt/claude_hook.py` or `src/haunt/cursor_hook.py` | verified |
+
+6 late findings. 25 open in the register.
+
+### Verification evidence (2026-08-27)
+
+Plain facts, each re-checkable.
+
+- Full suite on the integrated tree: 1157 passed, 1 skipped, 7 xfailed, 0
+  failed, of 1165 collected.
+- Retrieval regression against clean `main` `ed806b2`, judge-free LongMemEval
+  FTS-only `k=10`, n=500 on the seeded 350 working / 150 held-out split: **0 of
+  180 numeric fields differ**. Confirmed independently three times — at 7
+  branches, at 8 branches with the reranker wired into `recall()`, and on the
+  final tree after the cleanup pass.
+- Cleanup pass: 493 lines removed, 223 added, across 13 files (270 net).
+- Embedding ingest: 1.98x faster through the shipped `embed_texts()` path,
+  vectors identical at min cosine 1.0000000000, max absolute difference
+  3.257e-07.
+- Test suite wall clock: 377-590s down to 102-165s.
+- A hybrid n=500 LongMemEval run is **in progress and not complete**. There is
+  no result yet. Do not cite one.
 
 ### Closed and disproven claims
 
-Do not schedule work against any row here. Each was checked against current code
-at `d1aec40`, not against a PR title or a prior audit. Citations are by symbol
-rather than line, because line numbers have drifted since the audits.
+Do not schedule work against any row here. Each was checked against current
+code, not against a PR title or a prior audit: the original rows at `d1aec40`,
+citing symbols rather than lines because line numbers had drifted since the
+audits; the late-pass rows at `413f8b9`, citing lines at that revision.
 
 | Claim | Verdict | Closing evidence |
 |---|---|---|
@@ -1234,8 +1255,30 @@ rather than line, because line numbers have drifted since the audits.
 | R30 — camelCase identifiers unsearchable by parts | DROPPED | deliberate, tested (`tests/test_identifier_tokenization.py`), and documented. Keep as a known limit |
 | Stored XSS via `session_id` in the dashboard | **FIXED, but the class is not closed** | that specific sink is escaped and ~30 `innerHTML` sinks were swept. Other stored values are still raw — see M1 |
 | E4 import sets `graph_evidence_version='1'` | CORRECT BY DESIGN | `src/haunt/portability.py:1453-1455`. A restored bundle is correctly not re-derived by R1's backfill. Do not "fix" this |
+| R6 — E6 integrity guard diffs the whole tree against a pinned revision (the merge blocker) | FIXED | attribution is now per commit over E6's own evidence paths, plus uncommitted edits to them (`_e6_attributed_diff`, `src/haunt/abstention_eval.py:618-645`). `E0_BASE_REVISION` is gone, so a later merge cannot break it; a shallow clone reports `history_attributable: false` instead of claiming every file; `_git` raises rather than returning a false clean when git is unrunnable (`:597-615`) |
+| R2 — embedding model download unpinned, bare `except` redirects to a different repo | FIXED | `BGE_M3_REVISION` pinned (`src/haunt/embed.py:43`); the fallback catches only repo/revision-unavailable hub errors, not timeouts or 5xx (`:166-188`, `:225`), and is opt-in behind `HAUNT_EMBED_QUANT_FALLBACK`, otherwise re-raising (`:234-235`); the cache records which repo produced its bytes (`:191`) |
+| R3 — closed sessions accept new events on the explicit-`session_id` path | FIXED | an ended id now routes to `_successor_session` rather than being ignored (`src/haunt/store.py:5077-5080`, `:5111`); `end_session` closes successors alongside the id it was given (`:5145-5180`) |
+| R4 — reconcile takes its verified backups before acquiring the write lock | FIXED | the TARGET backup runs inside the merge's own `BEGIN IMMEDIATE` (`src/haunt/store.py:4492-4499`); SOURCE reads one frozen read-only snapshot for both its backup and the copy (`:4489`) |
+| R5 — namespace fan-out has no per-namespace isolation | FIXED | `bootstrap` catches `sqlite3.Error`/`OSError`/`NamespacePathError` per namespace and continues (`src/haunt/bootstrap.py:177-183`), so `install_desktop_icon()` and `install_all_hosts()` at `:192-199` are always reached; `reembed_all_namespaces` matches (`src/haunt/store.py:7897-7900`) |
+| R10 — the recall budget bounds the sum of the parts, not the serialized list | FIXED | `apply_recall_budget` measures `len(serialize(hits))` and charges the `", "` separator per kept hit (`src/haunt/budget.py:66`, `:70`, `:251`) |
+| R11 — `haunt recall --json`, dashboard `/api/recall`, and MCP `memory_timeline` are uncapped | FIXED | one budget on every retrieval surface: `src/haunt/cli.py:368`, `src/haunt/dashboard.py:1093` (fan-out budgeted once, not per namespace), `:1159`, `src/haunt/mcp_server.py:525`, `:567` |
+| R13 — the CI fixture defeats `HAUNT_FTS_ONLY` and guards on a dead `MODEL_CACHE` path | FIXED | ambient `HAUNT_FTS_ONLY`/`HAUNT_EMBED_MODEL` now win (`tests/conftest.py:54-73`) and the cache is resolved from `models_dir()` before `HAUNT_HOME` moves (`:12-29`), so no second absolute path can rot. That leaves sqlite-vec and embeddings without coverage, so a `test-hybrid` job runs the suite against them (`.github/workflows/ci.yml:61-86`) — see L11 |
+| R14 — C3 source-side digest TOCTOU | FIXED | `_execute_reconciliation_writes` compares the digest of its own in-transaction read against the plan's and refuses a mismatch (`src/haunt/store.py:4406-4415`) |
+| R16 — no reconcile concurrency test | FIXED | racing writer added, asserting every TARGET row the merge reads is covered by that merge's backup (`tests/test_namespace_reconcile.py:647-695`); verified failing against the pre-fix functions and passing after |
+| R17 — Cursor `Shell` output embeds while Claude Code `Bash` output does not | FIXED | `EMBED_EXCLUDE_TOOLS_DEFAULT = "Bash,Read,Shell"` (`src/haunt/cursor_hook.py:239`) |
+| R18 — `HAUNT_STORE_THOUGHTS` rows omit `skip_embedding` | FIXED | `src/haunt/cursor_hook.py:534` |
+| R19 — C7/C4 metrics are invisible from the CLI | FIXED | `health_cmd` prints `memories_embedded`, `vector_index`, `duplicate_memories`, and `duplicate_content_values` (`src/haunt/cli.py:755-761`) |
+| R20 — no CLI affordance to remove the drained namespace after reconcile | FIXED | `haunt namespace retire LABEL --into TARGET` (`src/haunt/cli.py:692-709`, `retire_namespace` at `src/haunt/store.py:4591`): dry-run by default, refuses while any row is still unique to LABEL, verifies a backup, then drops identity/aliases/bindings and unlinks the database |
+| R22 — `rerank.py` ships with zero production callers | D1 EXECUTED | wired into `recall()` between fusion and the returned `k`, still off by default (`src/haunt/recall.py:646-655`, `:744`); default `HAUNT_RERANK_LAMBDA` corrected to `0.3`, and both variables documented (`README.md:322-323`) |
+| R28 — triplicated environment parse/clamp idiom | FIXED | `util.env_int`/`util.env_flag` (`src/haunt/util.py:20`, `:31`), used from `budget.py:53`, `cursor_hook.py:265`, `:291`, `embed.py`, and `store.py:918` |
+| M1 — E4 import never validates `tier`; the dashboard interpolates it raw | FIXED | `_validate_enumerated_columns` rejects unknown `events.tier`, `memories.tier`, and `entities.type` (`src/haunt/portability.py:1350-1368`); `tierCls` returns `""` off-vocabulary instead of `"t-"+t` (`src/haunt/dashboard.py:384`), and its remaining attribute uses are escaped |
+| M2 — no `Content-Security-Policy` header anywhere in the dashboard | FIXED | `default-src 'none'; script-src 'nonce-...'` with a fresh per-response nonce (`src/haunt/dashboard.py:52-56`, `:919-924`). `style-src` stays `'unsafe-inline'`, documented at `:52` |
+| M3 — `esc()` is the wrong escaper for inline handler attributes | FIXED | every `onclick="..."` attribute replaced by `data-act` plus one delegated `click` listener (`src/haunt/dashboard.py:806-829`), which is also what lets M2's nonce work; the three surviving `onclick` hits are JS property assignments, not attributes |
+| E0's only stemming case was a literal prefix, so the gate could not observe stemming | FIXED | `porter_stemming_nonprefix` added — query "study" against the indexed "studies", neither a prefix nor a substring of the other (`tests/fixtures/retrieval_eval/corpus.json:29`, `tests/test_frozen_retrieval_eval.py:100-103`). Mutation-confirmed load-bearing: under `trigram` it is the one case in the corpus that mismatches baseline. Baseline relocked; `config_sha256` unchanged because the retrieval contract is unchanged |
+| E0 scored reranked retrieval against a baseline frozen without reranking | FIXED | `frozen_retrieval_eval` pins `HAUNT_RERANK_ENABLED` out of the isolated environment it already owns (`src/haunt/frozen_retrieval_eval.py:263-265`). Gate produces the frozen result with the flag unset and with it set, so no relock |
+| `memory_purge` claimed erasure while plain DELETEs left the bytes readable | FIXED | a canary planted before a purge was still readable 8 times in the raw database, twice in live `memories_fts_data` rows. Purge now runs under `PRAGMA secure_delete=ON` (`src/haunt/store.py:6230`), merges the FTS index (`:6359`), then rebuilds the file and truncates the WAL (`:6502-6506`). All three mutation-verified load-bearing: removing any one puts the canary back. `bytes_overwritten` (`:6475`) reports false rather than claiming a rebuild a concurrent reader blocked. Cost is L12 |
 
-36 closed rows.
+58 closed rows.
 
 ### Decisions (do not re-litigate)
 
@@ -1274,8 +1317,12 @@ rather than line, because line numbers have drifted since the audits.
   `idx_memories_current` partial index (C10). No duplicate version numbers;
   `SCHEMA_VERSION = 11` (`src/haunt/store.py:101`).
 - `portability`, `rerank`, and `abstention_eval` all co-import.
-- The full suite on the integrated tree passes except four failures, all in
-  `tests/test_abstention_feasibility.py`, all caused by R6.
+- `integration/all-work` `413f8b9` adds the E6 guard, store-correctness,
+  dashboard-XSS, surface-polish, resilience, embed-batching, E0-gate,
+  rerank-wiring, test-environment, and cleanup branches on top of `d1aec40`.
+- The full suite on the integrated tree passes: 1157 passed, 1 skipped, 7
+  xfailed, 0 failed. The four `tests/test_abstention_feasibility.py` failures
+  are gone with R6.
 - E4 determinism confirmed: two exports differ only in
   `creation.exported_at` (the contract's permitted volatile field); with a
   pinned `exported_at` they are byte-identical.
