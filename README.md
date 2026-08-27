@@ -305,6 +305,7 @@ The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
 | `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
 | `HAUNT_OFFLINE` | unset | set to `1` to prohibit embedding backend initialization/download; FTS recall remains available |
+| `HAUNT_EMBED_QUANT_FALLBACK` | unset | set to `1` to allow falling back to the third-party `onnx-community/bge-m3-ONNX` quantized build when `BAAI/bge-m3` itself is unreachable. Off by default: the two repos are different publishers, and both are pinned to a fixed revision |
 | `HAUNT_EMBED_MAX_ATTEMPTS` | `5` | maximum embedding attempts for a queued row before it stops being retried (clamped 1–1000) |
 | `HAUNT_EMBED_DRAIN_LIMIT` | `500` | maximum `embedding_jobs` rows one `haunt bootstrap` drain attempts per namespace per run (clamped 1–100000) |
 | `HAUNT_NAMESPACE` | inferred from full git remote | override and bind the project namespace |
