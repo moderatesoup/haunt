@@ -207,3 +207,73 @@ def test_memory_session_end_open_session_succeeds(fts_env):
             "SELECT ended_at FROM sessions WHERE id=?", (sid,)
         ).fetchone()
     assert row is not None and row["ended_at"]
+
+
+def test_ended_session_never_takes_another_event(fts_env):
+    """A caller replaying an ended id (claude --resume, a late hook, an
+    explicit --session) must not have its write attributed to the closed
+    session, and must not silently clear what end_session recorded."""
+    from haunt.store import Store
+
+    with Store("default") as st:
+        sid = st.ensure_session("resumed-sess")
+        first = st.observe("before the end", session_id=sid)
+        ended_at = st.end_session(sid)["ok"] and st.conn.execute(
+            "SELECT ended_at FROM sessions WHERE id=?", (sid,)
+        ).fetchone()["ended_at"]
+
+        after = st.observe("after the end", session_id=sid)
+        row = st.conn.execute(
+            "SELECT ended_at FROM sessions WHERE id=?", (sid,)
+        ).fetchone()
+        attributed = st.conn.execute(
+            "SELECT session_id FROM events WHERE id=?", (after.event_id,)
+        ).fetchone()["session_id"]
+        successor = st.conn.execute(
+            "SELECT ended_at, meta FROM sessions WHERE id=?", (after.session_id,)
+        ).fetchone()
+
+    assert first.session_id == sid
+    assert after.session_id != sid, "an ended session must not take another event"
+    assert attributed == after.session_id
+    assert row["ended_at"] == ended_at, "end_session's record must stand"
+    assert successor["ended_at"] is None
+    assert json.loads(successor["meta"])["succeeds_session"] == sid
+
+
+def test_replayed_ended_session_reuses_one_successor(fts_env):
+    """Every write after the end shares one successor, not a row per event."""
+    from haunt.store import Store
+
+    with Store("default") as st:
+        sid = st.ensure_session("replayed-sess")
+        st.observe("before", session_id=sid)
+        st.end_session(sid)
+        successors = {
+            st.observe(f"after {i}", session_id=sid).session_id for i in range(3)
+        }
+        total = st.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+    assert len(successors) == 1
+    assert total == 2
+
+
+def test_end_session_closes_the_successor_too(fts_env):
+    """Otherwise ending stays advisory: the next replay refills the successor."""
+    from haunt.store import Store
+
+    with Store("default") as st:
+        sid = st.ensure_session("advisory-sess")
+        st.end_session(sid)
+        successor = st.observe("after the end", session_id=sid).session_id
+
+        result = st.end_session(sid)
+        open_rows = st.conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL"
+        ).fetchone()[0]
+        again = st.observe("after the second end", session_id=sid).session_id
+
+    assert result["ok"] is True
+    assert result["sessions_ended"] == [successor]
+    assert open_rows == 0
+    assert again not in (sid, successor)

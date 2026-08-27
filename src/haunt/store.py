@@ -76,6 +76,17 @@ ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
 RECALL_CLASSES = ("tool", "task")
 
+# sessions.meta key naming the ended session a successor continues.
+SESSION_SUCCEEDS_KEY = "succeeds_session"
+_OPEN_SUCCESSOR_SESSIONS = f"""
+    SELECT id FROM sessions
+    WHERE ended_at IS NULL
+      AND meta IS NOT NULL
+      AND json_valid(meta)
+      AND json_extract(meta, '$.{SESSION_SUCCEEDS_KEY}')=?
+    ORDER BY started_at, id
+"""
+
 # 1: one-time normalize of offset/naive clocks to UTC microseconds.
 # 2: graph evidence tables + hook idempotency key.
 # 3: durable queue for hook-deferred embeddings.
@@ -4444,7 +4455,10 @@ def _reconcile_requeue_embedding(
 
 
 def _execute_reconciliation_writes(
-    source_conn: sqlite3.Connection, target_conn: sqlite3.Connection
+    source_conn: sqlite3.Connection,
+    target_conn: sqlite3.Connection,
+    *,
+    expected_content_digest: str,
 ) -> dict[str, dict[str, int]]:
     """Diff every table fresh, one last time, and copy SOURCE's new rows.
 
@@ -4455,8 +4469,18 @@ def _execute_reconciliation_writes(
     NamespaceCollisionError/NamespaceMigrationError and writes nothing if any
     table still has an unresolved collision right now, even though an
     earlier dry-run reported none.
+
+    The digest of that fresh read is what makes "state drift is refused" a
+    real guarantee rather than a claim about an earlier, already-discarded
+    snapshot: SOURCE is re-opened for the copy, so the plan verified one
+    snapshot and the copy would otherwise read another.
     """
-    _content_digest, diffs = _reconcile_content_state_digest(source_conn, target_conn)
+    content_digest, diffs = _reconcile_content_state_digest(source_conn, target_conn)
+    if content_digest != expected_content_digest:
+        raise NamespaceMigrationError(
+            "namespace content changed between the plan and the copy; run the "
+            "dry-run again"
+        )
     unsafe_reasons = _reconcile_unsafe_reasons(diffs)
     if unsafe_reasons:
         raise NamespaceCollisionError(
@@ -4523,18 +4547,28 @@ def _apply_namespace_reconciliation(
     committed = False
     table_results: dict[str, dict[str, int]] = {}
     try:
+        # SOURCE's backup and the copy read the same frozen snapshot
+        # (open_existing_readonly), so they cannot disagree. TARGET's must be
+        # taken from inside the write transaction: a concurrent observe()
+        # landing between an earlier backup and the merge would be present in
+        # the merged database and absent from the backup, so the documented
+        # restore would silently discard it.
         source_backup = _backup_namespace_database(source_ro, purpose="reconcile-source")
-        target_ro = open_existing_readonly(target_display)
-        try:
-            target_backup = _backup_namespace_database(target_ro, purpose="reconcile-target")
-        finally:
-            target_ro.close()
         target_store = open_existing(target_display)
         try:
             target_store.conn.execute("BEGIN IMMEDIATE")
             try:
+                target_ro = open_existing_readonly(target_display)
+                try:
+                    target_backup = _backup_namespace_database(
+                        target_ro, purpose="reconcile-target"
+                    )
+                finally:
+                    target_ro.close()
                 table_results = _execute_reconciliation_writes(
-                    source_ro.conn, target_store.conn
+                    source_ro.conn,
+                    target_store.conn,
+                    expected_content_digest=str(plan["content_state_digest"]),
                 )
             except Exception:
                 target_store.conn.rollback()
@@ -4596,6 +4630,167 @@ def reconcile_namespaces(
         )
     with _namespace_migration_lock():
         return _apply_namespace_reconciliation(source, target, plan_digest=plan_digest)
+
+
+def _remove_namespace_database(db_path: Path, identity: tuple[int, int]) -> None:
+    """Unlink a deregistered database and its sidecars by recorded identity.
+
+    Identity-checked like `_FreshNamespaceClaim.close`: a path that no longer
+    names the file the registry recorded is left alone. Held under the writer
+    lifecycle lock so a concurrent opener cannot validate a sidecar between
+    the check and the unlink.
+    """
+    with _sqlite_configuration_lock():
+        try:
+            current = db_path.lstat()
+        except OSError:
+            return
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (int(current.st_dev), int(current.st_ino)) != identity
+        ):
+            return
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(str(db_path) + suffix).unlink(missing_ok=True)
+        db_path.unlink()
+
+
+def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str, Any]:
+    """Deregister and remove a namespace ``into`` already holds every row of.
+
+    This is the operator step `reconcile_namespaces` deliberately leaves
+    undone: reconcile never touches the registry, so the drained label keeps
+    resolving and keeps taking new writes. Removing the database file is part
+    of the affordance rather than an extra -- a registry-only retirement
+    leaves the drained file at the label's own path, where the next
+    `register_namespace` of that label adopts it and re-splits the repository
+    C3 just healed.
+
+    Dry-run by default, like `retire_namespace_alias`. Apply refuses while any
+    row is still unique to this namespace, backs the database up under
+    `<HAUNT_HOME>/backups` first, and re-reads drainage after deregistration:
+    a write that raced it keeps its file, which `register_namespace` re-adopts
+    under the same label so the operator can reconcile again.
+    """
+    display = safe_name(label)
+    identity = resolve_namespace_identity(display)
+    if identity is None:
+        raise UnknownNamespaceError(display)
+    plan = _plan_namespace_reconciliation(display, into)
+    blockers: list[dict[str, str]] = []
+    if plan["total_rows_to_insert"]:
+        blockers.append(
+            {
+                "kind": "undrained-rows",
+                "reference": (
+                    f"{plan['total_rows_to_insert']} row(s) absent from "
+                    f"{plan['target']}"
+                ),
+            }
+        )
+    namespace_id = str(identity["namespace_id"])
+    db_path = Path(str(identity["db_path"]))
+    conn = _registry()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        aliases = conn.execute(
+            "SELECT normalized_label, label FROM namespace_aliases WHERE namespace_id=?",
+            (namespace_id,),
+        ).fetchall()
+        alias_norms = sorted(str(row["normalized_label"]) for row in aliases)
+        if alias_norms:
+            placeholders = ",".join("?" for _ in alias_norms)
+            for dependent in conn.execute(
+                f"""SELECT label FROM namespace_aliases
+                    WHERE namespace_id!=? AND source_alias_norm IN ({placeholders})""",
+                (namespace_id, *alias_norms),
+            ).fetchall():
+                blockers.append(
+                    {"kind": "dependent-alias", "label": str(dependent["label"])}
+                )
+        report: dict[str, Any] = {
+            "action": "retire-namespace",
+            "mode": "apply" if apply else "dry-run",
+            "namespace": str(identity["canonical_label"]),
+            "namespace_id": namespace_id,
+            "into": str(plan["target"]),
+            "labels": sorted(str(row["label"]) for row in aliases),
+            "db_path": str(db_path),
+            "undrained_rows": {
+                table: int(info["insert_into_target"])
+                for table, info in plan["tables"].items()
+                if info["insert_into_target"]
+            },
+            "safe": not blockers,
+            "blockers": blockers,
+            "operator_caveat": (
+                "External editor/host configuration is not recorded in the registry; "
+                "inspect and update it before retiring this namespace."
+            ),
+        }
+        if blockers or not apply:
+            conn.rollback()
+            if blockers and apply:
+                kinds = ", ".join(blocker["kind"] for blocker in blockers)
+                raise AliasRetirementError(
+                    f"cannot retire namespace {display!r}; {kinds}"
+                )
+            return report
+        conn.execute(
+            "DELETE FROM repository_bindings WHERE namespace_id=?", (namespace_id,)
+        )
+        conn.execute(
+            "DELETE FROM namespace_aliases WHERE namespace_id=?", (namespace_id,)
+        )
+        conn.execute("DELETE FROM namespaces WHERE db_path=?", (str(db_path),))
+        conn.execute(
+            "DELETE FROM namespace_identities WHERE namespace_id=?", (namespace_id,)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    for alias_label in report["labels"]:
+        _forget_registered_alias(alias_label)
+    report["deregistered"] = True
+
+    # Opened from the captured identity, not the label: nothing resolves it
+    # any more, which is exactly what makes this read final.
+    orphan = ReadOnlyStore._from_identity(identity)
+    backup: _VerifiedRegistryBackup | None = None
+    try:
+        backup = _backup_namespace_database(orphan, purpose="retire")
+        target_ro = open_existing_readonly(str(plan["target"]))
+        try:
+            _content_digest, diffs = _reconcile_content_state_digest(
+                orphan.conn, target_ro.conn
+            )
+        finally:
+            target_ro.close()
+        stranded = {
+            table: len(diff.to_insert) + len(diff.colliding_pks)
+            for table, diff in diffs.items()
+            if diff.to_insert or diff.colliding_pks
+        }
+        report["backup"] = dict(backup)
+        report["stranded_rows"] = stranded
+    except Exception:
+        if backup is not None:
+            backup.discard()
+        raise
+    finally:
+        orphan.close()
+        if backup is not None:
+            backup.close()
+    if not stranded:
+        _remove_namespace_database(
+            db_path, (int(identity["db_device"]), int(identity["db_inode"]))
+        )
+    report["database_removed"] = not stranded and not db_path.exists()
+    report["retired"] = True
+    return report
 
 
 def verbatim_text(
@@ -4923,6 +5118,17 @@ class Store:
         *,
         commit: bool = True,
     ) -> str:
+        """Return the open session to attribute a write to.
+
+        The implicit branch below already declines an ended session; the
+        explicit one selected `ended_at` and ignored it. A caller replaying
+        an ended id -- `claude --resume` reuses the host id, and a hook can
+        outlive SessionEnd -- gets a successor rather than the closed
+        session back. Continuing the work is legitimate, so refusing the
+        write would lose a record; but clearing `ended_at` would contradict
+        what end_session recorded. The returned id is the substitution
+        notice.
+        """
         if session_id:
             row = self.conn.execute(
                 "SELECT id, ended_at FROM sessions WHERE id=?", (session_id,)
@@ -4934,6 +5140,11 @@ class Store:
                 )
                 if commit:
                     self.conn.commit()
+                return session_id
+            if row["ended_at"]:
+                return self._successor_session(
+                    session_id, source=source, meta=meta, commit=commit
+                )
             return session_id
         current = self.get_meta("current_session")
         if current:
@@ -4956,16 +5167,68 @@ class Store:
             )
         return sid
 
+    def _open_successor_sessions(self, session_id: str) -> list[str]:
+        return [
+            str(row["id"])
+            for row in self.conn.execute(
+                _OPEN_SUCCESSOR_SESSIONS, (session_id,)
+            ).fetchall()
+        ]
+
+    def _successor_session(
+        self,
+        ended_session_id: str,
+        *,
+        source: str,
+        meta: dict[str, Any] | None,
+        commit: bool,
+    ) -> str:
+        """Open (or reuse) the session that continues an ended one.
+
+        Reused rather than minted per write so a host replaying one ended id
+        stays in one session instead of a row per event. The successor's own
+        id is opaque: embedding the predecessor's id would survive a privacy
+        purge of it, whereas meta is already sanitized against erased values
+        (see _purge_safe_session_context).
+        """
+        open_successors = self._open_successor_sessions(ended_session_id)
+        if open_successors:
+            return open_successors[-1]
+        sid = new_id()
+        self.conn.execute(
+            "INSERT INTO sessions(id, started_at, ended_at, source, meta) VALUES (?,?,?,?,?)",
+            (
+                sid,
+                now_iso(),
+                None,
+                source,
+                dumps({**(meta or {}), SESSION_SUCCEEDS_KEY: ended_session_id}),
+            ),
+        )
+        if commit:
+            self.conn.commit()
+        return sid
+
     def end_session(self, session_id: str | None = None) -> dict[str, Any]:
-        """Close an open session. Returns ok=False if nothing was ended."""
+        """Close an open session and any successor of it. ok=False if none.
+
+        Successors exist only because this id was already ended once, so
+        leaving them open would make ending advisory again: the next replay
+        of the id would simply keep filling the one that stayed open.
+        """
         sid = session_id or self.get_meta("current_session")
         if not sid:
             return {"ok": False, "error": "no open session"}
-        cur = self.conn.execute(
-            "UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL",
-            (now_iso(), sid),
-        )
-        if cur.rowcount == 0:
+        candidates = [sid, *self._open_successor_sessions(sid)]
+        placeholders = ",".join("?" for _ in candidates)
+        ended = [
+            str(row["id"])
+            for row in self.conn.execute(
+                f"SELECT id FROM sessions WHERE ended_at IS NULL AND id IN ({placeholders})",
+                candidates,
+            ).fetchall()
+        ]
+        if not ended:
             row = self.conn.execute(
                 "SELECT ended_at FROM sessions WHERE id=?", (sid,)
             ).fetchone()
@@ -4980,10 +5243,14 @@ class Store:
                 "session_id": sid,
                 "error": f"session {sid} already ended",
             }
-        if self.get_meta("current_session") == sid:
+        self.conn.execute(
+            f"UPDATE sessions SET ended_at=? WHERE ended_at IS NULL AND id IN ({placeholders})",
+            (now_iso(), *candidates),
+        )
+        if self.get_meta("current_session") in ended:
             self.conn.execute("DELETE FROM meta WHERE key='current_session'")
         self.conn.commit()
-        return {"ok": True, "session_id": sid}
+        return {"ok": True, "session_id": sid, "sessions_ended": ended}
 
     def observe(
         self,
