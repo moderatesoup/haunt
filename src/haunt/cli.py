@@ -13,7 +13,12 @@ import typer
 from haunt import __version__
 from haunt.bootstrap import bootstrap, format_report
 from haunt.embed import state as embed_state
-from haunt.paths import NamespacePathError, haunt_home, resolve_namespace
+from haunt.paths import (
+    NamespacePathError,
+    haunt_home,
+    infer_namespace_context,
+    resolve_namespace,
+)
 from haunt.planner import planned_recall
 from haunt.recall import BACKEND_ERROR_CODE, execution_metadata, is_retrieval_backend_error
 from haunt.store import (
@@ -27,6 +32,7 @@ from haunt.store import (
     namespace_exists_readonly,
     open_existing,
     open_existing_readonly,
+    reconcile_namespaces,
     register_namespace,
     retire_namespace_alias,
     undo_namespace_migration,
@@ -113,9 +119,17 @@ def init_cmd(
     ),
 ) -> None:
     """Create a namespace (one SQLite file)."""
-    ns = name or resolve_namespace(None, cwd=repo)
+    if name:
+        # An explicit name is a deliberate override, not an inference, so
+        # (like HAUNT_NAMESPACE) it never auto-binds a repository unless
+        # --repo also says so explicitly.
+        ns = name
+        repo_path = str(repo) if repo else None
+    else:
+        ns, inferred_repo_path = infer_namespace_context(repo)
+        repo_path = str(repo) if repo else inferred_repo_path
     try:
-        db = register_namespace(ns, repo_path=str(repo) if repo else None)
+        db = register_namespace(ns, repo_path=repo_path)
         with Store(ns) as st:
             stats = st.stats()
     except (NamespaceCollisionError, NamespacePathError) as exc:
@@ -517,6 +531,45 @@ def namespace_alias_cmd(
         source_label, alias, repository=repository, action="alias", apply=apply,
         plan_digest=plan_digest,
     )
+
+
+@namespace_app.command("reconcile")
+def namespace_reconcile_cmd(
+    source: str = typer.Argument(
+        ..., help="Existing namespace to copy FROM (opened read-only, never modified)"
+    ),
+    target: str = typer.Argument(
+        ..., help="Existing namespace to copy INTO (receives SOURCE's missing rows)"
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Apply atomically (default is dry-run)"),
+    plan_digest: Optional[str] = typer.Option(
+        None, "--plan-digest", help="Digest printed by the matching dry-run"
+    ),
+) -> None:
+    """Heal a namespace that was already split (backlog C3).
+
+    Copies every row SOURCE has that TARGET does not into TARGET's database,
+    preserving ids, timestamps, and correction/provenance lineage exactly.
+    SOURCE is never written to. Both databases are backed up before TARGET is
+    touched. Refuses -- writing nothing -- if any row's id collides with
+    different content, if idempotency keys collide, or if either namespace is
+    not at the current schema version. Embeddings are dropped and re-queued
+    rather than copied; run this again to pick up rows added since. This does
+    not touch the registry: both labels remain independently resolvable.
+    """
+    try:
+        report = reconcile_namespaces(
+            source, target, apply=apply, plan_digest=plan_digest
+        )
+    except (
+        UnknownNamespaceError,
+        NamespaceCollisionError,
+        NamespaceMigrationError,
+        ValueError,
+    ) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
 
 @namespace_app.command("undo")

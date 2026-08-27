@@ -137,6 +137,10 @@ def test_persistent_process_drains_embedding_queue(trust_env, monkeypatch):
             "processed": 1,
             "failed": 0,
             "available": True,
+            # C5: process_embedding_jobs now also reports rows parked at/over
+            # the attempts cap (see tests/test_embedding_isolation.py) — none
+            # here, so exhausted stays 0.
+            "exhausted": 0,
         }
         row = store.conn.execute(
             "SELECT embedding FROM memories WHERE id=?", (result.memory_id,)
