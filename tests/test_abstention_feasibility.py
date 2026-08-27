@@ -6,6 +6,7 @@ import inspect
 import json
 import shutil
 import socket
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
@@ -141,6 +142,93 @@ def test_sealed_e0_artifacts_have_zero_diff():
     assert evidence["diff"] == ""
     assert evidence["tracked_file_count"] > 0
     assert evidence["byte_mismatches"] == []
+
+
+def test_public_runtime_guard_is_scoped_to_the_e6_change_set(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "src" / "haunt").mkdir(parents=True)
+    runtime = repo / "src" / "haunt" / "recall.py"
+    evidence = repo / "src" / "haunt" / "abstention_eval.py"
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "e6@example.invalid")
+    git("config", "user.name", "E6")
+    runtime.write_text("runtime\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "runtime before E6")
+    evidence.write_text("evidence\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "E6 evidence")
+    monkeypatch.setattr(abstention_eval, "ROOT", repo)
+    clean = abstention_eval.public_runtime_evidence()
+    assert clean["diff_empty"] is True
+    assert clean["history_attributable"] is True
+
+    runtime.write_text("concurrent work\n", encoding="utf-8")
+    git("commit", "-qam", "unrelated runtime change")
+    assert abstention_eval.public_runtime_evidence()["diff_empty"] is True
+
+    evidence.write_text("evidence and policy\n", encoding="utf-8")
+    runtime.write_text("abstention policy\n", encoding="utf-8")
+    assert abstention_eval.public_runtime_evidence()["diff_empty"] is False
+
+    git("commit", "-qam", "E6 ships an abstention policy")
+    shipped = abstention_eval.public_runtime_evidence()
+    assert shipped["diff_empty"] is False
+    assert "src/haunt/recall.py" in shipped["diff"]
+
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow)],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(abstention_eval, "ROOT", shallow)
+    degraded = abstention_eval.public_runtime_evidence()
+    assert degraded["history_attributable"] is False
+    assert degraded["diff_empty"] is True
+
+    monkeypatch.setattr(abstention_eval, "ROOT", tmp_path / "not-a-repo")
+    with pytest.raises(RuntimeError, match="requires git"):
+        abstention_eval.public_runtime_evidence()
+
+
+def test_sealed_e0_guard_separates_e0_maintenance_from_e6(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "src" / "haunt").mkdir(parents=True)
+    (repo / "tests" / "fixtures" / "retrieval_eval").mkdir(parents=True)
+    corpus = repo / "tests" / "fixtures" / "retrieval_eval" / "corpus.json"
+    evidence = repo / "src" / "haunt" / "abstention_eval.py"
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "e0@example.invalid")
+    git("config", "user.name", "E0")
+    corpus.write_text('{"records": []}\n', encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "seal E0 corpus")
+    evidence.write_text("evidence\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "E6 evidence")
+    monkeypatch.setattr(abstention_eval, "ROOT", repo)
+    assert sealed_e0_evidence()["tracked_file_count"] == 1
+
+    # E0 re-freezing its own artifacts is not an E6 change to them.
+    corpus.write_text('{"records": ["stemming case"]}\n', encoding="utf-8")
+    git("commit", "-qam", "add a non-prefix inflection case and re-freeze")
+    maintained = sealed_e0_evidence()
+    assert maintained["diff_empty"] is True
+    assert maintained["byte_mismatches"] == []
+
+    evidence.write_text("evidence reaching into E0\n", encoding="utf-8")
+    corpus.write_text('{"records": ["retuned for E6"]}\n', encoding="utf-8")
+    git("commit", "-qam", "E6 retunes the sealed corpus")
+    assert sealed_e0_evidence()["diff_empty"] is False
 
 
 def test_feature_definition_forbids_rrf_truth_and_reader_shortcuts():
