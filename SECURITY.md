@@ -57,6 +57,32 @@ digest, device, and inode ownership; replacement links fail closed.
 MCP export/import therefore require `HAUNT_MCP_ADMIN=1`; the dashboard launch
 token similarly grants administrative transfer access to every namespace.
 
+## Hard purge and byte-level erasure
+
+Hard purge does not stop at unlinking rows. It runs the erasure with
+`secure_delete` on so the pages it frees are zeroed, merges the FTS index so the
+erased terms go with the row instead of lingering as delete markers, rebuilds
+the database file so no free page keeps an older copy the row left behind, and
+truncates the WAL so the pre-purge frames go too. A canary planted before a
+purge is absent from the namespace file and its sidecars afterwards.
+
+The report's `bytes_overwritten` is the honest signal: it is false when a
+concurrent reader blocked the rebuild. What this purge freed is zeroed either
+way; the older copies stay readable until a later purge rebuilds the file.
+
+This covers Haunt's own file, and nothing else. Export bundles, backups,
+filesystem snapshots, and any copy someone already made are untouched — purge
+one namespace and its bundles remain. Nor does it reach blocks the filesystem
+has already released: truncation, copy-on-write snapshots, and SSD
+wear-levelling can leave the original blocks intact on the physical device.
+Full-disk encryption, not purge, is the answer to an attacker with the raw
+device.
+
+The rebuild is proportional to the namespace, not to the erased row, so a purge
+on a large namespace is slow. `secure_delete` is scoped to the purge
+transaction rather than left on globally, so ordinary writes do not pay its
+write amplification.
+
 ## Persistent recalled content and prompt injection
 
 Stored text is untrusted data. In particular, tool input/output can contain hostile instructions copied from files, web pages, command output, or another MCP server.

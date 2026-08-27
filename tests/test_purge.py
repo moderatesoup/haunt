@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 from haunt.recall import recall
 from haunt.store import Store, observe
+
+
+def _canary_counts(db_path: Path, needle: bytes) -> dict[str, int]:
+    """Raw occurrences of needle across the namespace file and its sidecars."""
+    paths = (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"))
+    return {p.name: p.read_bytes().count(needle) for p in paths if p.exists()}
 
 
 def test_purge_removes_memory_and_keeps_other(haunt_env):
@@ -138,3 +147,64 @@ def test_purge_not_found(haunt_env):
         result = st.purge("nonexistent-id-12345")
     assert result["ok"] is False
     assert "not found" in result["error"]
+
+
+def test_purge_overwrites_canary_bytes_on_disk(haunt_env):
+    """The purged text must not survive anywhere in the raw namespace files.
+
+    The churn between observe and purge is the point: index merges and page
+    splits leave older copies of a row behind, and a purge that only unlinks
+    rows leaves those copies legible.
+    """
+    canary = "securedeletecanaryq7x2"
+    r = observe(f"leaked credential {canary} rotate it", namespace="default")
+    for i in range(40):
+        observe(f"filler note {i} about deployments and databases", namespace="default")
+
+    needle = canary.encode()
+    with Store("default") as st:
+        db_path = st.db_path
+        before = _canary_counts(db_path, needle)
+        assert sum(before.values()) > 0, f"canary was never written: {before}"
+
+        result = st.purge(r.memory_id)
+        assert result["bytes_overwritten"] is True
+
+        after = _canary_counts(db_path, needle)
+    assert sum(after.values()) == 0, f"canary survives on disk: {after}"
+
+
+def test_purge_restores_secure_delete(haunt_env):
+    """secure_delete is scoped to the purge, not left on for ordinary writes."""
+    r = observe("SECURE-DELETE-SCOPE-CANARY unique phrase", namespace="default")
+    with Store("default") as st:
+        before = st.conn.execute("PRAGMA secure_delete").fetchone()[0]
+        st.purge(r.memory_id)
+        assert st.conn.execute("PRAGMA secure_delete").fetchone()[0] == before
+
+
+def test_purge_zeroes_its_own_bytes_when_the_rebuild_is_blocked(haunt_env):
+    """A refused VACUUM still overwrites what this purge freed, and says so."""
+    canary = "vacuumblockedcanaryk4m9"
+    r = observe(f"leaked credential {canary} rotate it", namespace="default")
+    needle = canary.encode()
+
+    with Store("default") as st:
+        db_path = st.db_path
+        real_execute = st.conn.execute
+
+        def refuse_vacuum(sql, *args):
+            if sql.lstrip().upper().startswith("VACUUM"):
+                raise sqlite3.OperationalError("database is locked")
+            return real_execute(sql, *args)
+
+        st.conn.execute = refuse_vacuum  # type: ignore[method-assign]
+        try:
+            result = st.purge(r.memory_id)
+        finally:
+            del st.conn.execute
+
+        assert result["ok"] is True
+        assert result["bytes_overwritten"] is False
+        after = _canary_counts(db_path, needle)
+    assert sum(after.values()) == 0, f"canary survives on disk: {after}"

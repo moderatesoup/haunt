@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Hard purge erases bytes, not just rows. The erasure transaction runs with `secure_delete` on, merges the FTS index so erased terms do not linger behind delete markers, then rebuilds the database file and truncates the WAL. A canary planted before a purge is absent from the namespace file and its sidecars afterwards. The report and `haunt delete` carry `bytes_overwritten`, false when a concurrent reader blocked the rebuild. Copies outside that file (exports, backups, filesystem snapshots) and blocks the filesystem already released are still out of reach; SECURITY.md states the boundary.
+
+The test fixture stopped gating its model cache on a dead `/workspace/lore` path, so a populated `$HAUNT_HOME/models` is reused instead of re-downloading the model per test, and it no longer deletes `HAUNT_FTS_ONLY` — CI's FTS-only run now really is FTS-only. CI gained a `test-hybrid` job so sqlite-vec and the embedding path still get exercised.
+
 Dashboard Host/Origin/launch-token (#66): `haunt dash` still defaults to 127.0.0.1, rejects untrusted `Host`, requires a minted launch token (`X-Haunt-Token` or `?token=`) on every `/api` route, and validates `Origin` on DELETE/contradict. `--allow-remote` without that token refuses to start (empty token → every `/api` route 401). HTML index still loads without the token. Loopback injects the token into the console HTML; `--allow-remote` / non-loopback bind does not embed it (stdout only). `--allow-remote` is unsafe without the token; namespaces are not authorization.
 
 New timestamps keep microseconds (or finer) and stay UTC. Opening a namespace runs a schema-versioned one-time rewrite of offset/naive clocks; queries do not rewrite history. Newest-procedure / latest-row picks break ties with `rowid`, not second-resolution `created_at` alone. (#67)
