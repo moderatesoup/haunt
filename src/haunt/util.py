@@ -18,20 +18,20 @@ def new_id() -> str:
 
 
 def env_int(name: str, *, default: int, lo: int, hi: int) -> int:
-    """One env var as a bounded int: parse, fall back to `default` on
-    anything unparsable, then clamp into [lo, hi].
-
-    Clamping is the point. Every caller is configuring a cap or an attempt
-    ceiling, so a typo must not be able to disable the bound it was meant
-    to set -- neither a 0/negative that no caller can work under nor an
-    absurd value that is no bound at all.
-    """
+    """One env var as an int, `default` on anything unparsable, clamped
+    into [lo, hi] so a typo can never disable the bound it was setting."""
     raw = (os.environ.get(name) or "").strip()
     try:
         value = int(raw) if raw else default
     except ValueError:
         value = default
     return max(lo, min(value, hi))
+
+
+def env_flag(name: str) -> bool:
+    """One env var as a boolean: "1"/"true"/"yes" (case-insensitive) is on,
+    anything else -- unset, empty, "false", garbage -- is off."""
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes"}
 
 
 K_MIN = 1

@@ -90,53 +90,31 @@ def _truncate_hit_content(hit: dict[str, Any], budget: int) -> dict[str, Any] | 
     `budget` serialized chars, always marked when it does.
 
     Last-resort path only: used when a single hit does not fit the recall
-    budget even alone (e.g. k=1 against one huge raw-tool-I/O hit, or the
-    budget was configured very small). Never silent -- haunt's whole
-    premise is verbatim fidelity, so a shortened value must never still
-    look like the complete record. Follows _cap_tool_io's precedent of an
-    explicit inline marker in the text itself, plus structured sibling
-    fields so a machine reader is not forced to parse marker text out of
-    content to detect truncation.
+    budget even alone. Never silent -- a shortened value must never still look
+    like the complete record, so the text carries an inline marker and the hit
+    gains structured `content_truncated`/`content_omitted_chars` siblings.
 
-    MEASUREMENT ONLY -- no estimation. Three prior rounds each patched a
-    different way `_truncate_hit_content` tried to *predict* the
-    JSON-serialized size of a hit instead of measuring it: ignoring
-    `explanation.references` overhead, overestimating a fixed RESERVE and
-    giving up on hits truncation could have saved, and (the shape that
-    finally forced this rewrite) assuming one kept content char costs one
-    serialized char -- false whenever content is escape-heavy (quotes,
-    backslashes, control chars all expand under json.dumps), which made
-    a single over-budget estimate abandon the hit entirely instead of
-    trying a smaller `keep`. Patching the arithmetic a fourth time would
-    just add a fourth escape hatch, so there is no arithmetic left here
-    to be wrong: every candidate below is checked by actually building it
-    and calling `serialize` on it, exactly like the caller's own size check.
+    MEASUREMENT ONLY -- no estimation. Every candidate is built and passed to
+    `serialize`, exactly like the caller's own size check. Predicting a hit's
+    JSON size is not possible here: one kept content char can cost up to six
+    serialized ones.
 
-    `budget` bounds the *entire* hit dict, not just content -- a hit still
-    carries memory_id/tier/timestamps and the whole explanation object
-    (rrf_contributions, references, filters, ...) alongside content, and
-    that fixed scaffolding is often itself well over a thousand chars.
+    `budget` bounds the *entire* hit dict. A hit still carries
+    memory_id/tier/timestamps and the whole explanation object alongside
+    content, often itself well over a thousand chars.
 
-    Returns None -- never a hit whose serialized size still exceeds
-    `budget` -- when truncating content cannot make this hit fit:
+    Returns None -- never a hit still over `budget` -- when truncation cannot
+    help, because the overage then lives entirely outside `content`:
 
       * content is not a string (e.g. a sqlite-blob envelope from
         json_safe_sqlite), so there is nothing to slice; or
-      * even with content emptied out completely (keep=0, i.e. only the
-        marker and its two sibling keys remain), the hit's non-content
-        scaffolding (memory_id, tier, timestamps, and the whole
-        `explanation` object -- rrf_contributions, filters, and
-        `references`, which can itself carry an unbounded
-        correction_lineage.correction_ids list or a multi-KB validated
-        provenance envelope) still measures over `budget`, by an actual
-        measurement of that exact keep=0 rendering, not an estimate of
-        it.
+      * even with content emptied out completely (keep=0, marker and siblings
+        only, measured rather than estimated), the hit's non-content
+        scaffolding still exceeds `budget`.
 
-    Either way the overage lives entirely outside `content`, so cutting
-    `content` would destroy real, verbatim data for zero size benefit --
-    exactly what haunt must never do. Callers must drop a hit this
-    returns None for rather than ship it over budget with a truncation
-    marker that didn't actually help.
+    Cutting `content` there would destroy verbatim data for zero size benefit.
+    Callers must drop such a hit rather than ship it over budget wearing a
+    truncation marker that did not help.
     """
     content = hit.get("content")
     if budget <= 0:
@@ -169,25 +147,17 @@ def _truncate_hit_content(hit: dict[str, Any], budget: int) -> dict[str, Any] | 
     # a large fitting `keep` in O(log len(content)) real measurements,
     # about 17 for a 100KB hit.
     #
-    # Size is *very nearly* monotonic non-decreasing in `keep`: each extra
-    # raw char only ever adds to the JSON-escaped output (a plain char
-    # costs 1, `"`/`\` cost 2, control chars up to 6 -- never 0 or
-    # negative). It is not strictly monotonic, though, and the earlier
-    # version of this comment claimed a proof it does not have: `omitted`
-    # appears twice in the payload, once inside the marker text and again
-    # as the content_omitted_chars integer, so crossing a power-of-ten
-    # boundary downward can shrink the total by 2 while the newly kept
-    # char adds only 1. An adversarial review reproduced those one-index
-    # "notches" directly.
+    # Size is *nearly* monotonic non-decreasing in `keep` -- each extra raw
+    # char only ever adds to the escaped output -- but not strictly:
+    # `omitted` appears both in the marker text and as
+    # content_omitted_chars, so crossing a power-of-ten boundary downward
+    # can shrink the total by 2 while the newly kept char adds 1.
     #
     # Safety does not rest on monotonicity. Every candidate is built and
-    # measured, and the value returned is always one that was itself
-    # measured to fit -- either the keep=0 floor or a passing midpoint --
-    # never a value inferred from the ordering. So a notch can at worst
-    # cost a byte or two of kept content; it cannot produce an
-    # over-budget result. Brute-force comparison across ~150 adversarial
-    # cases (escape-heavy, control chars, astral emoji, lone surrogates)
-    # found the search agreeing with the true optimum every time.
+    # measured, and the returned value is always one measured to fit --
+    # the keep=0 floor or a passing midpoint -- never inferred from the
+    # ordering. A notch can cost a byte or two of kept content; it cannot
+    # produce an over-budget result.
     lo, hi = 0, len(content)
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -204,64 +174,36 @@ def apply_recall_budget(
     """Bound the serialized size of a hits list crossing a machine surface.
 
     recall()/planned_recall() already selected and ranked these rows; this
-    function only decides how much TEXT of that fixed, ordered list is
-    allowed to cross into agent context. It never reorders hits, never
-    changes which rows were selected, and never fabricates a hit -- it can
-    only shorten what one hit emits (always marked) or drop a suffix of
-    the already-ranked list (also always marked).
+    only decides how much TEXT of that fixed, ordered list crosses into agent
+    context. It never reorders, never changes which rows were selected, and
+    never fabricates a hit.
 
     Degrade order, least to most destructive:
-      1. No-op if the untouched payload already fits. This is the common
-         case (small corpora, the hook's fixed k=8 lookups, ordinary
-         k=8 default calls) and must stay byte-for-byte unchanged.
-      2. Drop the redundant `snippet` field. It is a 200-char derivative
-         of `content`, which is always still present in full when
-         `snippet` is -- pure waste once it is `content`, not `snippet`,
-         that is crossing the boundary.
-      3. Keep hits whole, in rank order, until the next one would overflow
-         the budget; drop the remaining suffix. Chosen over truncating
-         every hit a little: this system's premise is verbatim fidelity,
-         so a caller is better served by fewer *complete*, trustworthy
-         hits than by many partially-cut ones it cannot fully rely on.
-         Every hit that IS returned here is untouched (post step 2).
-      4. Only if the very first hit alone cannot fit whole (k=1 against
-         one huge hit, or a very small configured budget): try truncating
-         that single hit's `content` (see _truncate_hit_content). This
-         step only ever shortens `content` -- a hit's non-content
-         scaffolding (memory_id, tier, timestamps, and the whole
-         `explanation` object: rrf_contributions, filters, and
-         `references`, which by itself can carry an unbounded
-         correction_lineage.correction_ids list or a multi-KB validated
-         provenance envelope) is never touched, because silently
-         shortening haunt's own retrieval/trust/correction metadata would
-         misrepresent it, which is worse than dropping the hit.
+      1. No-op if the untouched payload already fits. The common case; stays
+         byte-for-byte unchanged.
+      2. Drop the redundant `snippet` field -- a 200-char derivative of
+         `content`, which is always still present in full beside it.
+      3. Keep hits whole, in rank order, until the next would overflow; drop
+         the remaining suffix. Fewer complete, trustworthy hits beat many
+         partially-cut ones. Every hit returned here is untouched.
+      4. Only if the first hit alone cannot fit whole: try truncating that one
+         hit's `content` (see _truncate_hit_content). Non-content scaffolding
+         -- memory_id, tier, timestamps, the whole `explanation` object -- is
+         never touched, because silently shortening haunt's own
+         retrieval/trust/correction metadata misrepresents it.
 
-         If truncating content makes the hit fit, that one hit is
-         returned, marked partial via content_truncated /
-         content_omitted_chars, and every hit after it (by rank) is
-         still dropped, not also truncated -- one marked-partial hit,
-         never many.
+         If that makes the hit fit, it is returned marked partial via
+         content_truncated/content_omitted_chars, and every hit after it is
+         dropped, not also truncated -- one marked-partial hit, never many.
 
-         If truncating content CANNOT make it fit -- because the overage
-         lives entirely in that untouched fixed scaffolding, e.g. a
-         600-entry correction_lineage or a multi-KB provenance envelope,
-         so the hit is still oversized even with content emptied out --
-         the hit is dropped instead of being shipped over budget wearing
-         a truncation marker that saved nothing. This is the one place
-         this function can return fewer hits than one for a nonempty
-         input: `hits_returned` can be 0 even though `hits_available` is
-         not. That is a deliberate, narrow exception to "a nonempty
-         result never returns zero hits": between that guarantee and
-         `recall_budget` honestly describing what crossed the boundary,
-         this function always keeps the second promise. Returning an
-         oversized hit with `applied: True` and `hits_dropped: 0` would
-         be a silent lie about the one invariant this function exists to
-         uphold (the serialized result never exceeds `cap`); an honestly
-         empty `hits` with `hits_available: 1`, `hits_returned: 0`,
-         `hits_dropped: 1` tells the caller exactly what happened -- the
-         budget, not the corpus, produced zero hits -- so they can retry
-         with a larger HAUNT_RECALL_MAX_CHARS if they specifically need
-         that one hit.
+         If it cannot (the overage lives entirely in that untouched
+         scaffolding, e.g. a 600-entry correction_lineage), the hit is dropped
+         instead. This is the one place a nonempty input can return zero hits:
+         `hits_returned` 0 with `hits_available` 1. Deliberate -- an oversized
+         hit shipped with `applied: True, hits_dropped: 0` would lie about the
+         single invariant this function exists to uphold, while an honestly
+         empty `hits` tells the caller the budget, not the corpus, produced
+         it, so they can retry with a larger HAUNT_RECALL_MAX_CHARS.
     """
     cap = recall_payload_cap()
     meta: dict[str, Any] = {

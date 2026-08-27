@@ -189,6 +189,7 @@ class SQLitePrimaryGuard:
 
 
 def _descriptor_identities() -> dict[int, tuple[int, int]]:
+    """Open descriptor identities, for verifying which file SQLite opened."""
     for directory in (Path("/proc/self/fd"), Path("/dev/fd")):
         try:
             entries = list(directory.iterdir())
@@ -1445,48 +1446,15 @@ def _registered_namespace_for_repo(
 ) -> str | None:
     """Preserve an existing namespace already registered to this repository.
 
-    Deliberately does NOT match a registry row whose ``repo_path`` is blank
-    (backlog C1's stated acceptance criterion: "reuse matches repositories
-    whose registry row predates the fix"). This was investigated and found
-    unsafe to implement, not merely unimplemented -- see the reasoning
-    below, kept here because the next person to look at this will be
-    tempted by the same shortcut.
-
-    A blank-repo_path row (every hook/MCP-created namespace, before the
-    repo_path threading fix landed) stores *nothing* that ties it to a
-    repository: no remote identity, no path, and its ``db_path`` is derived
-    solely from its own name, so it carries no independent signal either.
-    The only remaining candidate is the row's human-chosen *name* against
-    the current checkout's directory basename -- e.g. matching a blank
-    ``ironscope`` row because the working directory is also named
-    "ironscope". That is a coincidence-of-labels heuristic, not an identity
-    match: two unrelated repositories routinely share a clone-directory
-    name (`notes`, `api`, `app`, `backend`, ...), and a false-positive match
-    would silently commingle two repositories' memory under one namespace
-    going forward -- an active-contamination failure with no clean undo,
-    which is strictly worse than the duplicate namespace it would be
-    "fixing" (a duplicate is inert and inspectable; a bad merge is not, and
-    it keeps absorbing new rows from both repositories until someone
-    notices).
-
-    Compare this to backlog C3 ("reconcile namespaces that are already
-    split"), which is explicitly scoped to heal exactly this situation and
-    is explicitly operator-invoked, dry-run-first, and reversible/backed-up
-    -- because merging two namespaces is recognized there as needing those
-    safety rails. An automatic, silent match at inference time cannot offer
-    any of them: no dry run, nothing to back up before the first write
-    lands in the wrong place, and no way to tell which rows came from which
-    repository afterward in order to undo it. So this function leaves a
-    blank-repo_path row alone. The caller falls through to minting a fresh,
-    uniquely-identity-derived namespace instead (see infer_namespace_context
-    below) -- a one-time, honest fork per pre-existing blank row, not a
-    guess. Once that fresh namespace exists, register_namespace() records
-    its repository_bindings row immediately, so this only ever costs one
-    fork per legacy repository, never a growing one
-    (test_blank_repo_path_row_forks_once_then_stabilizes in
-    tests/test_repo_binding.py covers that stability). Healing the
-    resulting split is C3's job, with an operator and a dry run, not this
-    function's.
+    Never matches a registry row whose ``repo_path`` is blank, even when its
+    name equals the checkout's directory basename. A blank row stores nothing
+    tying it to a repository, so that would be a coincidence-of-labels guess
+    (`notes`, `api`, `app` recur across unrelated clones) and a false positive
+    would silently commingle two repositories' memory with no clean undo.
+    The caller instead mints a fresh identity-derived namespace -- one honest
+    fork per legacy blank row, not a growing one, because register_namespace()
+    writes the repository_bindings row immediately. Healing the resulting
+    split is backlog C3's operator-invoked, dry-run-first, reversible job.
     """
     path = registry_path()
     if not path.is_file():

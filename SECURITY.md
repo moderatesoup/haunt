@@ -2,7 +2,11 @@
 
 ## Architecture
 
-haunt is **local-only**. All data (SQLite databases, embeddings, models) stays on your machine under `~/.haunt/` (or `$HAUNT_HOME`). haunt never phones home, never opens a port (except the optional local dashboard on 127.0.0.1), and never sends data to any remote service. The only network call is the one-time model download from Hugging Face during `haunt bootstrap`.
+haunt is **local-only**. All data (SQLite databases, embeddings, models) stays on your machine under `~/.haunt/` (or `$HAUNT_HOME`). haunt never phones home and never sends data to any remote service.
+
+It listens on a port only for the optional memory console: `haunt dash`, loopback by default and beyond loopback only under the explicit `--allow-remote` (see below).
+
+The one outbound call is the embedding-model download from Hugging Face. Normally that is once, during `haunt bootstrap` — but it is lazy, not bootstrap-only: any command that needs the model will fetch it, including a plain `haunt recall` on a machine where bootstrap was skipped. `HAUNT_FTS_ONLY=1` (or `HAUNT_EMBED_MODEL=off`) and `HAUNT_OFFLINE=1` prevent it entirely.
 
 ## Dashboard bind, Host, Origin, and launch token
 
@@ -110,7 +114,9 @@ is reported honestly as not run.
 
 ## Fail-open hooks
 
-Cursor hooks are **fail-open**: if a hook errors, it prints `{}` and exits 0. A hook will never block your agent or prevent a prompt from being submitted. This is a deliberate trade-off — reliability of the agent takes priority over memory completeness.
+Cursor hooks are **fail-open**: if a hook errors, it prints `{}` and exits 0, so a hook *error* never blocks your agent or prevents a prompt from being submitted. This is a deliberate trade-off — reliability of the agent takes priority over memory completeness.
+
+Fail-open covers errors, not hangs: haunt sets no timeout of its own, so a hook that blocks (a contended SQLite lock, a slow disk) holds the turn until the host's own hook timeout fires.
 
 ## File-per-namespace isolation
 

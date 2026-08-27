@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from haunt.paths import models_dir
-from haunt.util import diag, dumps, loads
+from haunt.util import diag, dumps, env_flag, env_int, loads
 
 DEFAULT_REQUESTED = "BAAI/bge-m3"
 FALLBACK_MODEL = "BAAI/bge-small-en-v1.5"
@@ -78,8 +78,7 @@ def _env_model() -> str:
 
 
 def fts_only() -> bool:
-    fts_env = (os.environ.get("HAUNT_FTS_ONLY") or "").strip()
-    if fts_env in {"1", "true", "yes"}:
+    if env_flag("HAUNT_FTS_ONLY"):
         return True
     model = _env_model().lower()
     return model in {"off", "none", "fts", "fts5", "disabled"}
@@ -87,20 +86,11 @@ def fts_only() -> bool:
 
 def offline() -> bool:
     """True when Haunt must not initialize/download a model or use sockets."""
-    return (os.environ.get("HAUNT_OFFLINE") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    return env_flag("HAUNT_OFFLINE")
 
 
 def _max_len() -> int:
-    raw = (os.environ.get("HAUNT_EMBED_MAX_LEN") or "512").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        return 512
-    return max(8, min(n, 8192))
+    return env_int("HAUNT_EMBED_MAX_LEN", default=512, lo=8, hi=8192)
 
 
 def _supported_fastembed() -> dict[str, int]:
@@ -170,11 +160,7 @@ def _local_bge_m3_ready(root: Path | None = None) -> Path | None:
 
 def _quant_fallback_enabled() -> bool:
     """Opt in to the third-party quantized repo when the official one is gone."""
-    return (os.environ.get("HAUNT_EMBED_QUANT_FALLBACK") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    return env_flag("HAUNT_EMBED_QUANT_FALLBACK")
 
 
 def _repo_unavailable_errors() -> tuple[type[BaseException], ...]:

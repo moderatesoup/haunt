@@ -40,6 +40,7 @@ from dataclasses import replace
 from typing import Sequence
 
 from haunt.recall import Hit, RecallResult
+from haunt.util import env_flag
 
 _TOKEN = re.compile(r"[\w./+-]+", re.UNICODE)
 
@@ -57,25 +58,14 @@ RERANK_POOL = 40
 
 
 def rerank_enabled() -> bool:
-    """HAUNT_RERANK_ENABLED. Off unless explicitly turned on.
-
-    Same boolean idiom as haunt.embed.offline()/fts_only(): '1'/'true'/'yes'
-    (case-insensitive) is on, everything else -- unset, empty, 'false', '0',
-    garbage -- is off.
-    """
-    raw = (os.environ.get(RERANK_ENABLED_ENV) or "").strip().lower()
-    return raw in {"1", "true", "yes"}
+    """HAUNT_RERANK_ENABLED. Off unless explicitly turned on."""
+    return env_flag(RERANK_ENABLED_ENV)
 
 
 def rerank_lambda() -> float:
     """HAUNT_RERANK_LAMBDA, clamped to [0, 1]. 1.0 = relevance only (no
-    diversity pressure); 0.0 = diversity only (ignores relevance).
-
-    Same parse -> fallback-on-garbage -> clamp idiom as HAUNT_TOOL_IO_MAX_CHARS
-    (cursor_hook.py's _tool_io_cap): parse, fall back to the default on
-    anything unparsable, then clamp so a bad env value cannot push the
-    tradeoff outside its valid range.
-    """
+    diversity pressure); 0.0 = diversity only (ignores relevance). Falls back
+    to the default on anything unparsable."""
     raw = (os.environ.get(RERANK_LAMBDA_ENV) or "").strip()
     try:
         value = float(raw) if raw else RERANK_LAMBDA_DEFAULT

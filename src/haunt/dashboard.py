@@ -83,9 +83,7 @@ def pick_default_namespace(namespaces: list[dict[str, Any]]) -> str:
     return namespaces[0]["name"]
 
 
-# ---------------------------------------------------------------------------
 # HTML: single-file memory management console
-# ---------------------------------------------------------------------------
 
 HTML = r"""<!doctype html>
 <html lang="en">
@@ -908,9 +906,7 @@ def _health_from_store(st: Store) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
 # Routes
-# ---------------------------------------------------------------------------
 
 async def index(_request: Request) -> HTMLResponse:
     token = (_dash_token or "") if embed_launch_token_in_html() else ""

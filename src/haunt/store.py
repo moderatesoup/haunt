@@ -25,6 +25,7 @@ from haunt.embed import embed_one
 from haunt.embed import embed_texts
 from haunt.embed import state as embed_state
 from haunt.paths import (
+    _descriptor_identities as _fd_snapshot,
     _forget_registered_alias,
     _git_repo_context,
     ensure_layout,
@@ -63,6 +64,7 @@ from haunt.util import (
     clamp_limit,
     clock_sql_column,
     dumps,
+    env_int,
     iso_or_now,
     loads,
     new_id,
@@ -687,27 +689,6 @@ def _connect_with_configuration_lock(
             raise
 
 
-def _fd_snapshot() -> dict[int, tuple[int, int]]:
-    """Return open descriptor identities for safe SQLite-open verification."""
-    for directory in (Path("/proc/self/fd"), Path("/dev/fd")):
-        try:
-            names = list(directory.iterdir())
-        except OSError:
-            continue
-        out: dict[int, tuple[int, int]] = {}
-        for entry in names:
-            try:
-                fd = int(entry.name)
-                info = os.fstat(fd)
-            except (OSError, ValueError):
-                continue
-            out[fd] = int(info.st_dev), int(info.st_ino)
-        return out
-    raise NamespacePathError(
-        "this platform cannot verify the physical file opened by SQLite"
-    )
-
-
 def _verify_new_sqlite_fd(
     before: dict[int, tuple[int, int]],
     expected: tuple[int, int],
@@ -933,39 +914,25 @@ def _vec_loaded(conn: sqlite3.Connection) -> bool:
 
 
 def _embed_max_attempts() -> int:
-    """HAUNT_EMBED_MAX_ATTEMPTS, clamped. Same style as HAUNT_TOOL_IO_MAX_CHARS
-    (cursor_hook._tool_io_cap) and HAUNT_EMBED_MAX_LEN (embed._max_len): parse,
-    fall back to the default on anything unparsable, then clamp so a bad env
-    value can't disable the cap (<=0, which would make every row selectable
-    forever) or set it so low a single transient failure is treated as
-    permanent.
-    """
-    raw = (os.environ.get("HAUNT_EMBED_MAX_ATTEMPTS") or "").strip()
-    try:
-        value = int(raw) if raw else EMBED_MAX_ATTEMPTS_DEFAULT
-    except ValueError:
-        value = EMBED_MAX_ATTEMPTS_DEFAULT
-    return max(1, min(value, 1000))
+    """HAUNT_EMBED_MAX_ATTEMPTS: retries before a queued row is given up on."""
+    return env_int(
+        "HAUNT_EMBED_MAX_ATTEMPTS",
+        default=EMBED_MAX_ATTEMPTS_DEFAULT,
+        lo=1,
+        hi=1000,
+    )
 
 
 def _embed_drain_limit() -> int:
-    """HAUNT_EMBED_DRAIN_LIMIT, clamped. Same parse/fallback/clamp style as
-    _embed_max_attempts / HAUNT_TOOL_IO_MAX_CHARS (cursor_hook._tool_io_cap).
-
-    C4: bounds Store.drain_embedding_queue(), the out-of-band backlog drain
-    that runs from `haunt bootstrap` (see bootstrap.py) independently of
-    read/recall traffic. It must never block indefinitely on a huge
-    backlog, so this is the max number of rows one drain call will attempt
-    per namespace before it reports back and stops -- see `stopped_early`
-    / `remaining` in that method's return value for how a caller tells
-    "fully drained" from "drained N, M still queued".
-    """
-    raw = (os.environ.get("HAUNT_EMBED_DRAIN_LIMIT") or "").strip()
-    try:
-        value = int(raw) if raw else EMBED_DRAIN_LIMIT_DEFAULT
-    except ValueError:
-        value = EMBED_DRAIN_LIMIT_DEFAULT
-    return max(1, min(value, 100_000))
+    """HAUNT_EMBED_DRAIN_LIMIT: max rows one drain_embedding_queue() call
+    attempts per namespace before reporting back (`stopped_early`/`remaining`
+    tell "fully drained" from "drained N, M still queued")."""
+    return env_int(
+        "HAUNT_EMBED_DRAIN_LIMIT",
+        default=EMBED_DRAIN_LIMIT_DEFAULT,
+        lo=1,
+        hi=100_000,
+    )
 
 
 def init_registry() -> None:
@@ -1579,18 +1546,9 @@ def _ensure_provenance_type_triggers(conn: sqlite3.Connection) -> None:
 def _content_hash(content: str) -> str:
     """SHA-256 hex digest over the exact stored ``content`` bytes (UTF-8).
 
-    Deliberately no normalization: no case-folding, no whitespace-
-    stripping, no Unicode normalization, no semantic similarity. Two
-    memory rows collide here if and only if their stored content is
-    byte-identical. Measured against the dogfooded corpus, normalizing
-    before hashing was found to buy essentially nothing beyond exact-byte
-    matching, while semantic/normalized collapse risks silently treating
-    genuinely distinct facts as duplicates -- the dangerous direction for
-    a verbatim memory store to err toward.
-
-    This is a measurement primitive only (C7 phase 1): nothing reads this
-    hash to suppress, collapse, or short-circuit a write. See
-    SCHEMA_VERSION's v10 note.
+    No normalization of any kind: two rows collide here if and only if their
+    stored content is byte-identical. Measurement primitive only -- nothing
+    reads this hash to suppress or collapse a write (see SCHEMA_VERSION v10).
     """
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
 
@@ -3972,7 +3930,6 @@ def retire_namespace_alias(label: str, *, apply: bool = False) -> dict[str, Any]
         conn.close()
 
 
-# ---------------------------------------------------------------------------
 # Backlog C3: reconcile namespaces that are already split.
 #
 # E3 (above) deliberately refuses to let a rename/alias repoint an existing,
@@ -4012,7 +3969,6 @@ def retire_namespace_alias(label: str, *, apply: bool = False) -> dict[str, Any]
 #     resolve two differently-`id`'d entities that merely share a name --
 #     that is entity resolution, a different and harder problem this does
 #     not claim to solve.
-# ---------------------------------------------------------------------------
 
 _RECONCILE_TABLES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
     ("sessions", ("id",), frozenset()),
@@ -4372,60 +4328,32 @@ def _reconcile_requeue_embedding(
 ) -> None:
     """Mirror SOURCE's embed-capture outcome onto a freshly-copied TARGET row.
 
-    reconcile() always nulls out `memories.embedding` on copy (vectors are
-    never carried across a possibly differently-configured model/dim --
-    see the module comment above `_RECONCILE_TABLES`), so a naive "always
-    enqueue" would defeat any capture policy (`skip_embedding` /
-    `HAUNT_EMBED_EXCLUDE_TOOLS`, see observe()'s C6 docstring) SOURCE
-    applied at admission: a row deliberately captured-but-never-embedded in
-    SOURCE would get queued in TARGET and silently embedded on the next
-    drain -- putting exactly the tool exhaust the policy excludes into the
-    vector index.
+    reconcile() always nulls out `memories.embedding` on copy (vectors never
+    cross a possibly differently-configured model/dim -- see the comment above
+    `_RECONCILE_TABLES`), so a naive "always enqueue" would defeat whatever
+    capture policy (`skip_embedding` / `HAUNT_EMBED_EXCLUDE_TOOLS`) SOURCE
+    applied at admission. This never re-derives that policy from today's env;
+    it preserves what SOURCE's own state already says:
 
-    This function never re-derives the policy from today's env (reconcile
-    writes raw SQL and never calls observe(), which is the only place the
-    policy is actually evaluated) -- that could disagree with the decision
-    actually made at admission, since env can change between then and now
-    and SOURCE/TARGET can even be different hosts. Instead it preserves
-    whatever SOURCE's own state already says:
+      - SOURCE had a non-NULL `embedding` -> enqueue. It was embedded and the
+        caller just dropped that vector, so TARGET must recompute it under
+        TARGET's own model.
+      - SOURCE had no embedding but an `embedding_jobs` row -> copy that row
+        verbatim, `attempts`/`last_error`/`queued_at` included, never a fresh
+        `queued_at=now` or `attempts=0`. max_attempts is evaluated from env at
+        drain time and never persisted, so a copied exhausted row stays
+        excluded from TARGET's drain instead of winning a fresh retry budget,
+        and a row under the cap keeps its real remaining budget.
+      - SOURCE had neither -> do not enqueue. Policy-excluded at admission (or
+        blank content); TARGET must preserve the exclusion, not resurrect it.
 
-      - SOURCE had a non-NULL `embedding` (`source_embedded`) -> enqueue.
-        It was embedded, and the caller just dropped that embedding, so
-        TARGET genuinely needs to (re)compute it under TARGET's own model.
-      - SOURCE had no embedding but an `embedding_jobs` row -> copy that
-        row verbatim, `attempts`/`last_error`/`queued_at` included, rather
-        than a fresh `INSERT ... queued_at=now`. Copying `attempts` as-is
-        (never resetting to 0) matters most for a row already at or past
-        HAUNT_EMBED_MAX_ATTEMPTS: max_attempts is evaluated dynamically
-        from env at drain time (_embed_max_attempts()), never persisted,
-        so a copied exhausted row is still excluded from TARGET's
-        process_embedding_jobs SELECT immediately -- it does not get a
-        fresh retry budget just for having been copied. A row still under
-        the cap keeps its real remaining budget (max_attempts - attempts)
-        instead of extra tries for free.
-      - SOURCE had neither -> do not enqueue. That is the policy-excluded
-        case (skip_embedding at admission) or blank content; TARGET must
-        preserve the exclusion, not resurrect it.
-
-    `source_has_embedding_jobs` guards a real regression the naive
-    version of this fix introduced: SOURCE is a ReadOnlyStore connection
-    (see open_existing_readonly), which deliberately never runs schema
-    migration on open -- "do not repair a corrupt/old database while
-    reading it" (ReadOnlyStore's own class docstring). A namespace old
-    enough to predate `embedding_jobs` (exactly the shape C3 exists to
-    reconcile: a long-lived legacy database like `ironscope`) can
-    genuinely lack that table on disk if it was never since opened by a
-    writer running current code. The pre-fix code never queried SOURCE at
-    all -- it only ever wrote to TARGET, which open_existing always
-    migrates -- so it had no dependency on SOURCE's embedding_jobs
-    existing. Querying it unconditionally would turn a merely-old,
-    perfectly valid SOURCE database into a hard crash (`sqlite3
-    .OperationalError: no such table: embedding_jobs`) for the whole
-    reconcile apply. The caller checks existence once via
-    `_table_columns` (PRAGMA table_info tolerates a missing table,
-    returning `[]` rather than raising) instead of a query here per row.
-    Missing table -> treated exactly like "no job row": don't enqueue,
-    consistent with "no positive signal that SOURCE wanted embedding".
+    `source_has_embedding_jobs` exists because SOURCE is a ReadOnlyStore
+    connection, which deliberately never migrates schema on open. A namespace
+    old enough to predate `embedding_jobs` can genuinely lack the table, and
+    querying it here would turn a merely-old SOURCE into a hard failure for
+    the whole reconcile. The caller probes once with `_table_columns` (PRAGMA
+    table_info returns [] rather than raising). Missing table is treated
+    exactly like "no job row": no positive signal, so no enqueue.
     """
     memory_id = values["id"]
     if source_embedded:
@@ -6249,10 +6177,6 @@ class Store:
             "relations": count("relations"),
         }
 
-    # ------------------------------------------------------------------
-    # purge: hard-delete a memory and its entire provenance chain
-    # ------------------------------------------------------------------
-
     def purge(self, memory_id: str) -> dict[str, Any]:
         """Hard-delete a memory and clean up all associated data.
 
@@ -7283,10 +7207,6 @@ class Store:
             }
         )
 
-    # ------------------------------------------------------------------
-    # worldview: compact per-namespace briefing
-    # ------------------------------------------------------------------
-
     def worldview(self, *, facts_cap: int = 12, names_cap: int = 12) -> dict[str, Any]:
         """Compile a structured namespace briefing from existing rows.
 
@@ -7364,9 +7284,7 @@ class Store:
             }
         )
 
-    # ------------------------------------------------------------------
     # procedure: named how-tos
-    # ------------------------------------------------------------------
 
     def procedure_write(
         self,
@@ -7464,9 +7382,7 @@ class Store:
             )
         return json_safe_sqlite(out)
 
-    # ------------------------------------------------------------------
     # contradict: supersede a memory
-    # ------------------------------------------------------------------
 
     def _correction_replay(self, key: str, payload: bytes) -> dict[str, Any] | None:
         row = self.conn.execute(

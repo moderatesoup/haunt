@@ -1098,26 +1098,6 @@ def test_format_recall_block_drops_tail_and_marks_it_when_over_budget(
     assert unbounded_lines[: 1 + len(hit_lines)] == block.splitlines()[: 1 + len(hit_lines)]
 
 
-@pytest.mark.parametrize("cap", [500, 501, 600, 700, 800, 1000, 1500, 2000, 4000])
-@pytest.mark.parametrize("n_hits", [5, 10, 20, 40, 80])
-def test_format_recall_block_marker_cost_never_pushes_block_over_cap(
-    monkeypatch, cap, n_hits
-):
-    """DEFECT 2 (fixed): the trailing drop-marker line used to be
-    appended unconditionally, uncounted against its own budget -- e.g.
-    cap=600 with 20 hits measured a 644-char block, 44 over. This is the
-    same shape of sweep the adversarial review used to find that (caps
-    500-4000, hit counts 5-80); it is now a permanent regression test
-    asserting the real invariant, len(block) <= cap, at every point.
-    """
-    from haunt.cursor_hook import format_recall_block
-
-    monkeypatch.setenv("HAUNT_RECALL_BLOCK_MAX_CHARS", str(cap))
-    hits = [_hit(i, content=_big_content(150, tag=f"tok{i}")) for i in range(n_hits)]
-    block = format_recall_block(hits, "myns")
-    assert len(block) <= cap
-
-
 def test_format_recall_block_never_renders_untrusted_hits_regardless_of_budget(
     recall_budget_env, monkeypatch
 ):
@@ -1205,18 +1185,12 @@ def test_format_recall_block_no_memories_path_respects_cap_even_when_header_fits
 def test_format_recall_block_marker_present_and_intact_whenever_hits_are_dropped(
     monkeypatch, cap, n_hits
 ):
-    """Distinct from test_format_recall_block_marker_cost_never_pushes_
-    block_over_cap above: that test (and this suite generally, before
-    this one) only ever checked the OUTER contract, len(block) <= cap.
-    An unconditional block[:cap] backstop independently satisfies that
-    contract even when the code that is supposed to reserve room for the
-    drop-count marker is wrong or missing entirely -- every test in this
-    file stayed green under exactly that mutation, because nothing
-    checked that the marker itself, not just the block's length, survived
-    intact. This asserts the actual claimed mechanism instead: whenever
-    format_recall_block reports an omission by dropping trailing hit
-    lines, the exact marker naming the correct dropped count must
-    actually be present, complete, and un-sliced in the returned block.
+    """Whenever trailing hit lines are dropped, the block must still fit
+    `cap` AND the exact drop-count marker must be present, complete and
+    un-sliced. Both halves matter: an unconditional block[:cap] backstop
+    satisfies the length bound on its own even with the marker's own budget
+    reservation missing entirely, so the outer bound alone cannot catch it.
+    Swept over the cap/hit-count grid that first exposed that defect.
     """
     from haunt.cursor_hook import _drop_marker, format_recall_block
 

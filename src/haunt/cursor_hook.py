@@ -85,20 +85,6 @@ def _truthy(raw: str | None) -> bool:
     return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def cursor_dir() -> Path:
-    raw = os.environ.get("CURSOR_HOME")
-    if raw:
-        return Path(raw).expanduser().resolve()
-    return Path.home() / ".cursor"
-
-
-def cursor_hooks_json() -> Path:
-    override = os.environ.get("CURSOR_HOOKS_JSON")
-    if override:
-        return Path(override).expanduser()
-    return cursor_dir() / "hooks.json"
-
-
 def detect_event(payload: dict[str, Any]) -> str:
     """Use hook_event_name, or infer from payload keys if Cursor omits it."""
     name = (
@@ -718,35 +704,6 @@ def run(raw: str) -> dict[str, Any]:
         return handle_event(payload)
     except Exception:
         return {}
-
-
-def _is_haunt_command(command: str) -> bool:
-    name = command.replace("\\", "/").rstrip("/").split("/")[-1]
-    return name in {"haunt-hook"}
-
-
-def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
-    """Merge haunt hook entries into a Cursor hooks.json. Do not clobber others.
-
-    Delegates to the Cursor host adapter.
-    """
-    from haunt.hosts.cursor import _merge_hooks_json
-
-    return _merge_hooks_json(path, command)
-
-
-def _install_rule_file() -> Path | None:
-    """Write haunt.mdc into .cursor/rules/."""
-    from haunt.hosts.cursor import _HAUNT_MDC
-
-    rules_dir = cursor_dir() / "rules"
-    rules_dir.mkdir(parents=True, exist_ok=True)
-    dest = rules_dir / "haunt.mdc"
-    dest.write_text(_HAUNT_MDC, encoding="utf-8")
-    old = rules_dir / "engram.mdc"
-    if old.exists():
-        old.unlink()
-    return dest
 
 
 def install_cursor_hooks() -> dict[str, Any]:
