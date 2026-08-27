@@ -3,7 +3,8 @@
 Never calls a remote LLM or embedding API. Never fakes vectors.
 
 Load order when HAUNT_EMBED_MODEL is BAAI/bge-m3 (the default):
-  1. Local ONNX under ~/.haunt/models (or $HAUNT_MODEL_CACHE)
+  1. Local ONNX under ~/.haunt/models (or $HAUNT_MODEL_CACHE), verified
+     against the committed artifact manifest before onnxruntime sees it
   2. Download BAAI/bge-m3 ONNX + tokenizer from Hugging Face
   3. Newer fastembed if it lists BAAI/bge-m3
   4. BAAI/bge-small-en-v1.5 via fastembed (384-d) — automatic fallback
@@ -51,6 +52,13 @@ BGE_M3_QUANT_PATTERNS = [
     "tokenizer_config.json",
 ]
 BGE_M3_SOURCE_FILE = "haunt-model-source.json"
+# Files at or below this size are hashed in full against the committed
+# manifest on every load (graph, tokenizer, configs -- about 18MB together).
+# The one file above it is model.onnx_data, 2.2GB of external tensors that
+# cost seconds to hash and that cannot change the graph onnxruntime runs; it
+# is checked by exact size instead. verify_local_hybrid_cache with no cap
+# still hashes it, which is what the E6 harness does.
+VERIFY_HASH_MAX_BYTES = 64 * 1024 * 1024
 # Rows per ONNX forward pass. Throughput peaks between 16 and 32 on the
 # corpus this was measured against and falls off above that; the smaller of
 # the two flat values also bounds peak activation memory.
@@ -208,6 +216,46 @@ def bge_m3_source(root: Path | None = None) -> dict[str, str] | None:
     return value if isinstance(value, dict) and value else None
 
 
+def _verify_bge_m3_cache(root: Path) -> None:
+    """Require the cached BGE-M3 bytes to match the committed manifest.
+
+    Raises RuntimeError on any mismatch, which drops the caller back to the
+    fastembed fallback rather than executing an unattested graph. Skipped --
+    with a diag each time, never silently -- when the operator opted into the
+    quantized variant no committed manifest covers, when the manifest is not
+    reachable (it ships with the repo, not with the wheel), or when
+    HAUNT_EMBED_SKIP_MODEL_VERIFY is set for a deliberately hand-placed model.
+    """
+    if env_flag("HAUNT_EMBED_SKIP_MODEL_VERIFY"):
+        diag("embed_m3_unverified", reason="HAUNT_EMBED_SKIP_MODEL_VERIFY")
+        return
+    onnx_path = _find_onnx(root)
+    quantized = onnx_path is not None and "quantized" in onnx_path.name
+    # Quantized files alone would be an easy way to dodge a check no committed
+    # manifest can make, so the opt-in that is the only legitimate way to obtain
+    # them has to be set too; without it the manifest rejects them by name.
+    if quantized and _quant_fallback_enabled():
+        diag("embed_m3_unverified", reason="quantized variant has no manifest")
+        return
+    # abstention_eval imports this module, so the import has to be deferred.
+    from haunt.abstention_eval import verify_local_hybrid_cache
+
+    try:
+        evidence = verify_local_hybrid_cache(
+            root.parent, hash_max_bytes=VERIFY_HASH_MAX_BYTES
+        )
+    except FileNotFoundError as exc:
+        diag("embed_m3_unverified", reason="manifest not installed", error=str(exc))
+        return
+    diag(
+        "embed_m3_verified",
+        manifest_id=evidence["matched_manifest_id"],
+        size_only=[
+            row["relative_path"] for row in evidence["files"] if row["sha256"] is None
+        ],
+    )
+
+
 def _download_bge_m3(root: Path) -> Path:
     """Download official BGE-M3 ONNX (+ tokenizer) into root. Local files only after this."""
     if offline():
@@ -290,7 +338,9 @@ class OnnxEmbedder:
 
         Inputs are regrouped by token length internally, so the order the
         model sees is not the order given here; the returned list is always
-        realigned to the caller's.
+        realigned to the caller's. Raises RuntimeError if the model answers a
+        batch with a different number of vectors than it was given, rather
+        than returning a list with holes in it.
         """
         batch = [t if (t or "").strip() else " " for t in texts]
         if not batch:
@@ -314,6 +364,15 @@ class OnnxEmbedder:
             hidden = self._forward(
                 input_ids[rows, :width], attention_mask[rows, :width]
             )
+            # out is pre-sized, so a short batch would leave [] holes that a
+            # positional zip cannot detect and that surface far from here --
+            # as a dimension-0 insert, or as a falsy query vector that skips
+            # vector search. The batch that dropped rows is known only here.
+            if len(hidden) != len(rows):
+                raise RuntimeError(
+                    f"ONNX model returned {len(hidden)} vectors for a batch "
+                    f"of {len(rows)}"
+                )
             for row, vec in zip(rows, hidden):
                 out[int(row)] = [float(x) for x in vec]
         return out
@@ -360,6 +419,9 @@ def _load_onnx_bge_m3() -> tuple[OnnxEmbedder, int]:
     ready = _local_bge_m3_ready(root)
     if ready is None:
         raise RuntimeError(f"BGE-M3 ONNX not ready at {root}")
+    # Before onnxruntime is handed the graph: the source marker is written by
+    # whoever wrote the cache, so it attests nothing on its own.
+    _verify_bge_m3_cache(ready)
     model = OnnxEmbedder(ready)
     return model, _dir_bytes(ready)
 

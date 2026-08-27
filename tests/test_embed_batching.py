@@ -10,6 +10,10 @@ the regrouping, the per-group padding trim and the realignment without
 needing a real model. The fake session derives each vector only from its
 unmasked tokens, which is the property the trim relies on, and records the
 padded width it was handed so the trim itself is observable.
+
+A model that answers a batch with the wrong number of vectors is the other
+half of that contract: the realignment list is pre-sized, so the mismatch has
+to raise here rather than leave holes for a later caller to trip over.
 """
 
 from __future__ import annotations
@@ -184,3 +188,28 @@ def test_embed_texts_and_embed_one_preserve_the_contract(monkeypatch):
         rtol=0.0,
         atol=1e-6,
     )
+
+
+def test_embed_rejects_a_batch_the_model_answered_short():
+    e = _embedder()
+    full_run = e.sess.run
+
+    def drop_last(outputs, feeds):
+        return [full_run(outputs, feeds)[0][:-1]]
+
+    e.sess.run = drop_last
+    with pytest.raises(RuntimeError, match="returned 15 vectors for a batch of 16"):
+        e.embed(_varied())
+
+
+def test_embed_rejects_a_batch_the_model_answered_long():
+    e = _embedder()
+    full_run = e.sess.run
+
+    def repeat_first(outputs, feeds):
+        rows = full_run(outputs, feeds)[0]
+        return [np.concatenate([rows, rows[:1]])]
+
+    e.sess.run = repeat_first
+    with pytest.raises(RuntimeError, match="returned 17 vectors for a batch of 16"):
+        e.embed(_varied())

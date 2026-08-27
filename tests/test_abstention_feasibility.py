@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -27,6 +28,7 @@ from haunt.abstention_eval import (
     separation_evidence,
 )
 from haunt.recall import Hit
+from haunt.rerank import RERANK_ENABLED_ENV
 from haunt.store import Store, open_existing_readonly
 
 FIXTURE = Path(__file__).parent / "fixtures" / "abstention_eval" / "v1"
@@ -194,6 +196,77 @@ def test_public_runtime_guard_is_scoped_to_the_e6_change_set(tmp_path, monkeypat
     monkeypatch.setattr(abstention_eval, "ROOT", tmp_path / "not-a-repo")
     with pytest.raises(RuntimeError, match="requires git"):
         abstention_eval.public_runtime_evidence()
+
+
+def test_public_runtime_guard_reports_what_it_could_not_attribute(
+    tmp_path, monkeypatch
+):
+    """Uncommitted runtime edits carry no commit to attribute them by.
+
+    The gate deciding whether to diff the working tree keys on E6's own
+    evidence surface, so a dirty runtime file beside clean evidence left the
+    payload unrun and diff_empty True -- certifying what was never read.
+    sealed_e0_evidence has byte_mismatches for that; this leg had nothing.
+    """
+    repo = tmp_path / "repo"
+    (repo / "src" / "haunt").mkdir(parents=True)
+    (repo / "tests" / "fixtures" / "abstention_eval").mkdir(parents=True)
+    runtime = repo / "src" / "haunt" / "recall.py"
+    evidence = repo / "src" / "haunt" / "abstention_eval.py"
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "e6@example.invalid")
+    git("config", "user.name", "E6")
+    runtime.write_text("runtime\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "runtime before E6")
+    evidence.write_text("evidence\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "E6 evidence")
+    monkeypatch.setattr(abstention_eval, "ROOT", repo)
+    clean = abstention_eval.public_runtime_evidence()
+    assert clean["diff_empty"] is True
+    assert clean["uncommitted_paths"] == []
+    assert clean["uncommitted_unattributed"] is False
+
+    # Concurrent work on a shared branch is not E6's and must not fail the
+    # gate, but it cannot pass as a diff that was read and found empty.
+    runtime.write_text("concurrent work\n", encoding="utf-8")
+    dirty = abstention_eval.public_runtime_evidence()
+    assert dirty["diff_empty"] is True
+    assert dirty["uncommitted_paths"] == ["src/haunt/recall.py"]
+    assert dirty["uncommitted_unattributed"] is True
+
+    # An untracked evidence file is an E6 edit too, and claims the diff.
+    (repo / "tests" / "fixtures" / "abstention_eval" / "extra.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    attributed = abstention_eval.public_runtime_evidence()
+    assert attributed["diff_empty"] is False
+    assert attributed["uncommitted_unattributed"] is False
+    assert "src/haunt/recall.py" in attributed["diff"]
+
+
+def test_reproduction_seals_the_rerank_flag_out_of_the_measurement(monkeypatch):
+    """recall() honours HAUNT_RERANK_ENABLED, so evidence must not inherit it."""
+    monkeypatch.setenv(RERANK_ENABLED_ENV, "1")
+    seen: list[str | None] = []
+
+    class _Reached(Exception):
+        pass
+
+    def spy(*_args, **_kwargs):
+        seen.append(os.environ.get(RERANK_ENABLED_ENV))
+        raise _Reached
+
+    monkeypatch.setattr(abstention_eval, "recall", spy)
+    with pytest.raises(_Reached):
+        evaluate_profile("fts", fixture_dir=FIXTURE)
+    assert seen == [None]
+    assert os.environ[RERANK_ENABLED_ENV] == "1"
 
 
 def test_sealed_e0_guard_separates_e0_maintenance_from_e6(tmp_path, monkeypatch):
