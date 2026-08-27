@@ -46,7 +46,13 @@ DATASET_MANIFEST_SHA256 = (
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIXTURE_DIR = ROOT / "tests" / "fixtures" / "abstention_eval" / "v1"
 DEFAULT_E0_CORPUS = ROOT / "tests" / "fixtures" / "retrieval_eval" / "corpus.json"
-E0_BASE_REVISION = "ed806b2"
+E6_EVIDENCE_PATHS = (
+    "src/haunt/abstention_eval.py",
+    "scripts/reproduce_abstention_eval.py",
+    "scripts/benchmark_abstention_evidence.py",
+    "tests/fixtures/abstention_eval",
+    "tests/test_abstention_feasibility.py",
+)
 E0_SEALED_PATHS = (
     "src/haunt/frozen_retrieval_eval.py",
     "tests/fixtures/retrieval_eval",
@@ -588,51 +594,77 @@ def separation_evidence(
     }
 
 
-def sealed_e0_evidence() -> dict[str, Any]:
-    command = ["git", "diff", "--exit-code", E0_BASE_REVISION, "--", *E0_SEALED_PATHS]
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
+def _git(*args: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"E6 isolation evidence requires git: {exc}") from exc
+    if completed.returncode != 0:
+        # A guard that cannot read history cannot certify isolation either.
+        raise RuntimeError(
+            "E6 isolation evidence requires git metadata: "
+            f"git {args[0]}: {completed.stderr.strip()}"
+        )
+    return completed.stdout
+
+
+def _e6_attributed_diff(paths: Sequence[str]) -> dict[str, Any]:
+    """Diff of ``paths`` carried by E6's own change-set.
+
+    Diffing the whole tree against a pinned revision cannot separate an E6
+    runtime-policy change from unrelated work that shares the branch, so
+    attribution is per commit: only commits carrying E6's evidence surface,
+    plus uncommitted edits to that surface, count as E6's.
+    """
+    # A shallow clone grafts the history away and its one commit adds every
+    # file, so attribute nothing to it and say so rather than overclaim.
+    attributable = _git("rev-parse", "--is-shallow-repository").strip() != "true"
+    commits = (
+        _git("rev-list", "HEAD", "--", *E6_EVIDENCE_PATHS).split()
+        if attributable
+        else []
     )
-    tracked = subprocess.run(
-        [
-            "git",
-            "ls-tree",
-            "-r",
-            "--name-only",
-            E0_BASE_REVISION,
-            "--",
-            *E0_SEALED_PATHS,
-        ],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    ).stdout.splitlines()
+    diff = "".join(
+        _git("show", "--format=", commit, "--", *paths) for commit in commits
+    )
+    if _git("diff", "--name-only", "HEAD", "--", *E6_EVIDENCE_PATHS).strip():
+        diff += _git("diff", "HEAD", "--", *paths)
+    return {
+        "history_attributable": attributable,
+        "e6_commits": commits,
+        "paths": list(paths),
+        "diff": diff,
+        "diff_empty": not diff,
+    }
+
+
+def sealed_e0_evidence() -> dict[str, Any]:
+    tracked = _git(
+        "ls-tree", "-r", "--name-only", "HEAD", "--", *E0_SEALED_PATHS
+    ).splitlines()
     byte_mismatches: list[str] = []
     byte_sha256: dict[str, str] = {}
     for relative in tracked:
-        base_bytes = subprocess.run(
-            ["git", "show", f"{E0_BASE_REVISION}:{relative}"],
+        committed_bytes = subprocess.run(
+            ["git", "show", f"HEAD:{relative}"],
             cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True,
         ).stdout
         working_bytes = (ROOT / relative).read_bytes()
-        if working_bytes != base_bytes:
+        if working_bytes != committed_bytes:
             byte_mismatches.append(relative)
         byte_sha256[relative] = hashlib.sha256(working_bytes).hexdigest()
     return {
-        "base_revision": E0_BASE_REVISION,
-        "paths": list(E0_SEALED_PATHS),
-        "diff_empty": completed.returncode == 0,
-        "diff": completed.stdout,
+        **_e6_attributed_diff(E0_SEALED_PATHS),
         "tracked_file_count": len(tracked),
         "byte_mismatches": byte_mismatches,
         "working_tree_byte_sha256": byte_sha256,
@@ -640,20 +672,7 @@ def sealed_e0_evidence() -> dict[str, Any]:
 
 
 def public_runtime_evidence() -> dict[str, Any]:
-    completed = subprocess.run(
-        ["git", "diff", "--exit-code", E0_BASE_REVISION, "--", *PUBLIC_RUNTIME_PATHS],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    return {
-        "base_revision": E0_BASE_REVISION,
-        "paths": list(PUBLIC_RUNTIME_PATHS),
-        "diff_empty": completed.returncode == 0,
-        "diff": completed.stdout,
-    }
+    return _e6_attributed_diff(PUBLIC_RUNTIME_PATHS)
 
 
 def verify_local_hybrid_cache(
