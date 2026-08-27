@@ -1000,13 +1000,18 @@ def delete_cmd(
                     f"Permanently delete {len(rows)} memories for event {event_id}?",
                     abort=True,
                 )
+            # Each purge's whole-file rebuild takes a cross-process lock and
+            # costs the size of the namespace, so one per memory would block
+            # every writer in every namespace N times over. Defer it and pay
+            # once; the erasure is only complete after the rebuild below.
             for r in rows:
-                result = st.purge(r["id"])
+                result = st.purge(r["id"], rebuild=False)
                 typer.echo(
                     f"purged  fts={result.get('fts_deleted')}  "
                     f"vec={result.get('vec_deleted')}  rels={result.get('relations_deleted')}  "
                     f"event={result.get('event_deleted')}"
                 )
+            typer.echo(f"bytes_overwritten={st.overwrite_erased_pages()}")
         return
     with _existing(ns) as st:
         if not yes:
