@@ -41,6 +41,7 @@ from haunt.store import (
     open_existing_readonly,
     reconcile_namespaces,
     register_namespace,
+    retire_namespace,
     retire_namespace_alias,
     undo_namespace_migration,
 )
@@ -683,6 +684,35 @@ def namespace_retire_alias_cmd(
     try:
         report = retire_namespace_alias(label, apply=apply)
     except (UnknownNamespaceError, AliasRetirementError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
+
+
+@namespace_app.command("retire")
+def namespace_retire_cmd(
+    label: str = typer.Argument(..., help="Drained namespace to check or retire"),
+    into: str = typer.Option(
+        ..., "--into", help="Namespace that must already hold every row of LABEL"
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Retire when checks pass"),
+) -> None:
+    """Deregister and remove a namespace reconcile has already drained.
+
+    Refuses while any row is still unique to LABEL, so run `namespace
+    reconcile LABEL INTO --apply` first. Removes every label, alias, and
+    repository binding for LABEL, then the database file itself -- left in
+    place it would be re-adopted the next time anything registers that
+    label. The database is backed up under HAUNT_HOME/backups first.
+    """
+    try:
+        report = retire_namespace(label, into=into, apply=apply)
+    except (
+        UnknownNamespaceError,
+        AliasRetirementError,
+        NamespaceCollisionError,
+        NamespaceMigrationError,
+    ) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
