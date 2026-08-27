@@ -1,0 +1,487 @@
+{
+  "schema_version": 1,
+  "dataset_id": "haunt-abstention-e6-v1",
+  "phase": "held_out",
+  "labels": [
+    {
+      "id": "fts-held-a01",
+      "label": "answerable",
+      "relevant": [
+        "cal-r11"
+      ]
+    },
+    {
+      "id": "fts-held-a02",
+      "label": "answerable",
+      "relevant": [
+        "cal-r12"
+      ]
+    },
+    {
+      "id": "fts-held-a03",
+      "label": "answerable",
+      "relevant": [
+        "cal-r13"
+      ]
+    },
+    {
+      "id": "fts-held-a04",
+      "label": "answerable",
+      "relevant": [
+        "cal-r14"
+      ]
+    },
+    {
+      "id": "fts-held-a05",
+      "label": "answerable",
+      "relevant": [
+        "cal-r15"
+      ]
+    },
+    {
+      "id": "fts-held-a06",
+      "label": "answerable",
+      "relevant": [
+        "cal-r16"
+      ]
+    },
+    {
+      "id": "fts-held-a07",
+      "label": "answerable",
+      "relevant": [
+        "cal-r17"
+      ]
+    },
+    {
+      "id": "fts-held-a08",
+      "label": "answerable",
+      "relevant": [
+        "cal-r18"
+      ]
+    },
+    {
+      "id": "fts-held-a09",
+      "label": "answerable",
+      "relevant": [
+        "cal-r19"
+      ]
+    },
+    {
+      "id": "fts-held-a10",
+      "label": "answerable",
+      "relevant": [
+        "cal-r20"
+      ]
+    },
+    {
+      "id": "fts-held-a11",
+      "label": "answerable",
+      "relevant": [
+        "cal-r31"
+      ]
+    },
+    {
+      "id": "fts-held-a12",
+      "label": "answerable",
+      "relevant": [
+        "cal-r32"
+      ]
+    },
+    {
+      "id": "fts-held-a13",
+      "label": "answerable",
+      "relevant": [
+        "cal-r33"
+      ]
+    },
+    {
+      "id": "fts-held-a14",
+      "label": "answerable",
+      "relevant": [
+        "cal-r34"
+      ]
+    },
+    {
+      "id": "fts-held-a15",
+      "label": "answerable",
+      "relevant": [
+        "cal-r35"
+      ]
+    },
+    {
+      "id": "fts-held-a16",
+      "label": "answerable",
+      "relevant": [
+        "cal-r36"
+      ]
+    },
+    {
+      "id": "fts-held-a17",
+      "label": "answerable",
+      "relevant": [
+        "cal-r37"
+      ]
+    },
+    {
+      "id": "fts-held-a18",
+      "label": "answerable",
+      "relevant": [
+        "cal-r38"
+      ]
+    },
+    {
+      "id": "fts-held-a19",
+      "label": "answerable",
+      "relevant": [
+        "cal-r39"
+      ]
+    },
+    {
+      "id": "fts-held-a20",
+      "label": "answerable",
+      "relevant": [
+        "cal-r40"
+      ]
+    },
+    {
+      "id": "fts-held-u01",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u02",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u03",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u04",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u05",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u06",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u07",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u08",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u09",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u10",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u11",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u12",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u13",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u14",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u15",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u16",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u17",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u18",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u19",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-held-u20",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-a01",
+      "label": "answerable",
+      "relevant": [
+        "cal-r11"
+      ]
+    },
+    {
+      "id": "hybrid-held-a02",
+      "label": "answerable",
+      "relevant": [
+        "cal-r12"
+      ]
+    },
+    {
+      "id": "hybrid-held-a03",
+      "label": "answerable",
+      "relevant": [
+        "cal-r13"
+      ]
+    },
+    {
+      "id": "hybrid-held-a04",
+      "label": "answerable",
+      "relevant": [
+        "cal-r14"
+      ]
+    },
+    {
+      "id": "hybrid-held-a05",
+      "label": "answerable",
+      "relevant": [
+        "cal-r15"
+      ]
+    },
+    {
+      "id": "hybrid-held-a06",
+      "label": "answerable",
+      "relevant": [
+        "cal-r16"
+      ]
+    },
+    {
+      "id": "hybrid-held-a07",
+      "label": "answerable",
+      "relevant": [
+        "cal-r17"
+      ]
+    },
+    {
+      "id": "hybrid-held-a08",
+      "label": "answerable",
+      "relevant": [
+        "cal-r18"
+      ]
+    },
+    {
+      "id": "hybrid-held-a09",
+      "label": "answerable",
+      "relevant": [
+        "cal-r19"
+      ]
+    },
+    {
+      "id": "hybrid-held-a10",
+      "label": "answerable",
+      "relevant": [
+        "cal-r20"
+      ]
+    },
+    {
+      "id": "hybrid-held-a11",
+      "label": "answerable",
+      "relevant": [
+        "cal-r31"
+      ]
+    },
+    {
+      "id": "hybrid-held-a12",
+      "label": "answerable",
+      "relevant": [
+        "cal-r32"
+      ]
+    },
+    {
+      "id": "hybrid-held-a13",
+      "label": "answerable",
+      "relevant": [
+        "cal-r33"
+      ]
+    },
+    {
+      "id": "hybrid-held-a14",
+      "label": "answerable",
+      "relevant": [
+        "cal-r34"
+      ]
+    },
+    {
+      "id": "hybrid-held-a15",
+      "label": "answerable",
+      "relevant": [
+        "cal-r35"
+      ]
+    },
+    {
+      "id": "hybrid-held-a16",
+      "label": "answerable",
+      "relevant": [
+        "cal-r36"
+      ]
+    },
+    {
+      "id": "hybrid-held-a17",
+      "label": "answerable",
+      "relevant": [
+        "cal-r37"
+      ]
+    },
+    {
+      "id": "hybrid-held-a18",
+      "label": "answerable",
+      "relevant": [
+        "cal-r38"
+      ]
+    },
+    {
+      "id": "hybrid-held-a19",
+      "label": "answerable",
+      "relevant": [
+        "cal-r39"
+      ]
+    },
+    {
+      "id": "hybrid-held-a20",
+      "label": "answerable",
+      "relevant": [
+        "cal-r40"
+      ]
+    },
+    {
+      "id": "hybrid-held-u01",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u02",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u03",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u04",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u05",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u06",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u07",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u08",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u09",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u10",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u11",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u12",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u13",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u14",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u15",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u16",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u17",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u18",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u19",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-held-u20",
+      "label": "unanswerable",
+      "relevant": []
+    }
+  ]
+}

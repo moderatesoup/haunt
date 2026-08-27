@@ -1,0 +1,487 @@
+{
+  "schema_version": 1,
+  "dataset_id": "haunt-abstention-e6-v1",
+  "phase": "fit",
+  "labels": [
+    {
+      "id": "fts-fit-a01",
+      "label": "answerable",
+      "relevant": [
+        "cal-r01"
+      ]
+    },
+    {
+      "id": "fts-fit-a02",
+      "label": "answerable",
+      "relevant": [
+        "cal-r02"
+      ]
+    },
+    {
+      "id": "fts-fit-a03",
+      "label": "answerable",
+      "relevant": [
+        "cal-r03"
+      ]
+    },
+    {
+      "id": "fts-fit-a04",
+      "label": "answerable",
+      "relevant": [
+        "cal-r04"
+      ]
+    },
+    {
+      "id": "fts-fit-a05",
+      "label": "answerable",
+      "relevant": [
+        "cal-r05"
+      ]
+    },
+    {
+      "id": "fts-fit-a06",
+      "label": "answerable",
+      "relevant": [
+        "cal-r06"
+      ]
+    },
+    {
+      "id": "fts-fit-a07",
+      "label": "answerable",
+      "relevant": [
+        "cal-r07"
+      ]
+    },
+    {
+      "id": "fts-fit-a08",
+      "label": "answerable",
+      "relevant": [
+        "cal-r08"
+      ]
+    },
+    {
+      "id": "fts-fit-a09",
+      "label": "answerable",
+      "relevant": [
+        "cal-r09"
+      ]
+    },
+    {
+      "id": "fts-fit-a10",
+      "label": "answerable",
+      "relevant": [
+        "cal-r10"
+      ]
+    },
+    {
+      "id": "fts-fit-a11",
+      "label": "answerable",
+      "relevant": [
+        "cal-r21"
+      ]
+    },
+    {
+      "id": "fts-fit-a12",
+      "label": "answerable",
+      "relevant": [
+        "cal-r22"
+      ]
+    },
+    {
+      "id": "fts-fit-a13",
+      "label": "answerable",
+      "relevant": [
+        "cal-r23"
+      ]
+    },
+    {
+      "id": "fts-fit-a14",
+      "label": "answerable",
+      "relevant": [
+        "cal-r24"
+      ]
+    },
+    {
+      "id": "fts-fit-a15",
+      "label": "answerable",
+      "relevant": [
+        "cal-r25"
+      ]
+    },
+    {
+      "id": "fts-fit-a16",
+      "label": "answerable",
+      "relevant": [
+        "cal-r26"
+      ]
+    },
+    {
+      "id": "fts-fit-a17",
+      "label": "answerable",
+      "relevant": [
+        "cal-r27"
+      ]
+    },
+    {
+      "id": "fts-fit-a18",
+      "label": "answerable",
+      "relevant": [
+        "cal-r28"
+      ]
+    },
+    {
+      "id": "fts-fit-a19",
+      "label": "answerable",
+      "relevant": [
+        "cal-r29"
+      ]
+    },
+    {
+      "id": "fts-fit-a20",
+      "label": "answerable",
+      "relevant": [
+        "cal-r30"
+      ]
+    },
+    {
+      "id": "fts-fit-u01",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u02",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u03",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u04",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u05",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u06",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u07",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u08",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u09",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u10",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u11",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u12",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u13",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u14",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u15",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u16",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u17",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u18",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u19",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "fts-fit-u20",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-a01",
+      "label": "answerable",
+      "relevant": [
+        "cal-r01"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a02",
+      "label": "answerable",
+      "relevant": [
+        "cal-r02"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a03",
+      "label": "answerable",
+      "relevant": [
+        "cal-r03"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a04",
+      "label": "answerable",
+      "relevant": [
+        "cal-r04"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a05",
+      "label": "answerable",
+      "relevant": [
+        "cal-r05"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a06",
+      "label": "answerable",
+      "relevant": [
+        "cal-r06"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a07",
+      "label": "answerable",
+      "relevant": [
+        "cal-r07"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a08",
+      "label": "answerable",
+      "relevant": [
+        "cal-r08"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a09",
+      "label": "answerable",
+      "relevant": [
+        "cal-r09"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a10",
+      "label": "answerable",
+      "relevant": [
+        "cal-r10"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a11",
+      "label": "answerable",
+      "relevant": [
+        "cal-r21"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a12",
+      "label": "answerable",
+      "relevant": [
+        "cal-r22"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a13",
+      "label": "answerable",
+      "relevant": [
+        "cal-r23"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a14",
+      "label": "answerable",
+      "relevant": [
+        "cal-r24"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a15",
+      "label": "answerable",
+      "relevant": [
+        "cal-r25"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a16",
+      "label": "answerable",
+      "relevant": [
+        "cal-r26"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a17",
+      "label": "answerable",
+      "relevant": [
+        "cal-r27"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a18",
+      "label": "answerable",
+      "relevant": [
+        "cal-r28"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a19",
+      "label": "answerable",
+      "relevant": [
+        "cal-r29"
+      ]
+    },
+    {
+      "id": "hybrid-fit-a20",
+      "label": "answerable",
+      "relevant": [
+        "cal-r30"
+      ]
+    },
+    {
+      "id": "hybrid-fit-u01",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u02",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u03",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u04",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u05",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u06",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u07",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u08",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u09",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u10",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u11",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u12",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u13",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u14",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u15",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u16",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u17",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u18",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u19",
+      "label": "unanswerable",
+      "relevant": []
+    },
+    {
+      "id": "hybrid-fit-u20",
+      "label": "unanswerable",
+      "relevant": []
+    }
+  ]
+}
