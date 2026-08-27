@@ -51,6 +51,10 @@ BGE_M3_QUANT_PATTERNS = [
     "tokenizer_config.json",
 ]
 BGE_M3_SOURCE_FILE = "haunt-model-source.json"
+# Rows per ONNX forward pass. Throughput peaks between 16 and 32 on the
+# corpus this was measured against and falls off above that; the smaller of
+# the two flat values also bounds peak activation memory.
+ONNX_SUB_BATCH = 16
 
 _lock = threading.Lock()
 _state: "EmbedState | None" = None
@@ -296,13 +300,41 @@ class OnnxEmbedder:
             raise RuntimeError("ONNX embedder produced an empty vector")
 
     def embed(self, texts: Iterable[str]) -> list[list[float]]:
+        """Embed texts, returning one vector per input in the input's order.
+
+        Inputs are regrouped by token length internally, so the order the
+        model sees is not the order given here; the returned list is always
+        realigned to the caller's.
+        """
         batch = [t if (t or "").strip() else " " for t in texts]
         if not batch:
             return []
-        encs = self.tok.encode_batch(batch)
         np = self._np
+        encs = self.tok.encode_batch(batch)
         input_ids = np.array([e.ids for e in encs], dtype=np.int64)
         attention_mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
+        lengths = attention_mask.sum(axis=1)
+        # encode_batch pads every row out to the longest row it was given, so a
+        # single truncation-length text makes the model compute those columns
+        # for all of its batch-mates. Grouping similar lengths and trimming
+        # each group to its own width removes that work. Padding is on the
+        # right, so the trim can only drop pad columns, and a masked position
+        # cannot reach the pooled vector -- the numbers are unchanged.
+        order = np.argsort(lengths, kind="stable")
+        out: list[list[float]] = [[] for _ in batch]
+        for start in range(0, len(order), ONNX_SUB_BATCH):
+            rows = order[start : start + ONNX_SUB_BATCH]
+            width = max(1, int(lengths[rows].max()))
+            hidden = self._forward(
+                input_ids[rows, :width], attention_mask[rows, :width]
+            )
+            for row, vec in zip(rows, hidden):
+                out[int(row)] = [float(x) for x in vec]
+        return out
+
+    def _forward(self, input_ids: Any, attention_mask: Any) -> Any:
+        """Run one padded batch and return its pooled hidden states."""
+        np = self._np
         feeds: dict[str, Any] = {}
         if "input_ids" in self.input_names:
             feeds["input_ids"] = input_ids
@@ -331,10 +363,7 @@ class OnnxEmbedder:
             raise RuntimeError("ONNX session returned no embedding output")
         if hidden.ndim == 3:
             hidden = hidden[:, 0, :]
-        out: list[list[float]] = []
-        for row in hidden:
-            out.append([float(x) for x in row])
-        return out
+        return hidden
 
 
 def _load_onnx_bge_m3() -> tuple[OnnxEmbedder, int]:
