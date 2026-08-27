@@ -22,13 +22,13 @@ frozen_retrieval_eval.py's own reason for excluding vectors from its golden
 lock (model/host portability), and it is bitwise reproducible on any
 machine.
 
-Off by default, gated by HAUNT_RERANK_ENABLED (see rerank_enabled()). This
-module never imports anything that touches recall.py's internals and never
-modifies recall.py, mcp_server.py, cursor_hook.py, planner.py, dashboard.py,
-or bootstrap.py -- it only consumes the public ``Hit``/``RecallResult``
-objects recall.recall() already returns. No production call path imports
-this module yet: see rerank_eval.py for the measurement this capability
-exists to support, and the C12 backlog entry for the adopt-on-evidence bar.
+Off by default, gated by HAUNT_RERANK_ENABLED (see rerank_enabled()). It
+consumes only the public ``Hit``/``RecallResult`` objects recall.recall()
+already returns. recall() is the single wiring point -- it sizes its fused
+candidate slice with candidate_pool() and trims that slice to the caller's
+``k`` with apply() -- so CLI, MCP, dashboard and hooks either all rerank or
+all do not. See rerank_eval.py for the measurement this capability exists
+to support, and the C12 backlog entry for the adopt-on-evidence bar.
 """
 
 from __future__ import annotations
@@ -36,22 +36,23 @@ from __future__ import annotations
 import os
 import re
 from copy import deepcopy
+from dataclasses import replace
 from typing import Sequence
 
-from haunt.recall import Hit, RecallResult, recall as _recall
+from haunt.recall import Hit, RecallResult
 
 _TOKEN = re.compile(r"[\w./+-]+", re.UNICODE)
 
 RERANK_ENABLED_ENV = "HAUNT_RERANK_ENABLED"
 RERANK_LAMBDA_ENV = "HAUNT_RERANK_LAMBDA"
-RERANK_LAMBDA_DEFAULT = 0.5
+RERANK_LAMBDA_DEFAULT = 0.3
 RERANK_METHOD = "lexical_mmr"
 # Mirrors recall.py's own CANDIDATES = 40: an algorithm-internal constant,
-# not an env var. How many already RRF-ranked candidates recall_with_rerank()
-# asks for before MMR trims the pool down to the caller's requested k. MMR
-# can only trade off a redundant top candidate for a more distinct one that
-# is already somewhere in this pool -- it can never promote a memory recall()
-# did not return as a candidate at all.
+# not an env var. How many already RRF-ranked candidates candidate_pool()
+# asks recall() to materialize before MMR trims them down to the caller's
+# requested k. MMR can only trade off a redundant top candidate for a more
+# distinct one that is already somewhere in this pool -- it can never
+# promote a memory recall() did not fuse as a candidate at all.
 RERANK_POOL = 40
 
 
@@ -157,28 +158,45 @@ def mmr_rerank(
     return [pool[i] for i in selected]
 
 
+def candidate_pool(k: int) -> int:
+    """How many fused candidates recall() should materialize for a caller's ``k``.
+
+    ``k`` itself while disabled, so a default recall still reads exactly the
+    rows it returns. MMR can only trade a redundant top candidate for a more
+    distinct one already in the pool, so the wider pool is worth its extra
+    row reads only when something will use it.
+    """
+    return max(int(k), RERANK_POOL) if rerank_enabled() else int(k)
+
+
 def apply(hits: Sequence[Hit], *, k: int) -> list[Hit]:
-    """The one seam a future production caller would use. Off by default.
+    """The seam recall() routes its fused candidate slice through.
 
     When rerank_enabled() is false, returns ``hits`` completely unchanged --
-    the identical object when it is already a list -- so a caller that
-    unconditionally routes recall() output through here sees byte-identical
-    behavior to calling recall.recall() directly.
+    the identical object when it is already a list -- so recall() behaves
+    exactly as it did before this stage existed.
 
-    When enabled, reorders/truncates to ``k`` via mmr_rerank() and, if the
-    input carried RecallResult.execution evidence, returns a new
-    RecallResult with that same evidence plus an additive "rerank" entry --
-    it never edits or drops existing execution/modalities evidence. Per-hit
-    fields (including final_rank and the RRF-stage explanation.ordering
-    computed by Hit.as_dict()) are left exactly as recall() produced them:
-    they describe fusion provenance, not this module's post-fusion list
-    order, and this module does not claim otherwise.
+    When enabled, reorders and truncates to ``k`` via mmr_rerank(), then
+    restamps ranking provenance so it describes the order actually returned:
+    ``final_rank`` becomes the post-rerank position and ``rerank_stage``
+    names the stage that chose it plus the RRF fusion rank the hit moved
+    from. Restamping builds copies, so the caller's own Hit objects are never
+    mutated. When the input carried RecallResult.execution evidence the
+    result carries that same evidence plus an additive "rerank" entry;
+    existing execution/modalities evidence is never edited or dropped.
     """
     if not rerank_enabled():
         return hits if isinstance(hits, list) else list(hits)
     lambda_ = rerank_lambda()
     pool_size = len(hits)
-    reranked = mmr_rerank(hits, k=k, lambda_=lambda_)
+    reranked: list[Hit] = [
+        replace(
+            hit,
+            final_rank=position,
+            rerank_stage={"method": RERANK_METHOD, "rrf_rank": hit.final_rank},
+        )
+        for position, hit in enumerate(mmr_rerank(hits, k=k, lambda_=lambda_), start=1)
+    ]
     execution = getattr(hits, "execution", None)
     if execution is not None:
         merged = deepcopy(execution)
@@ -191,21 +209,3 @@ def apply(hits: Sequence[Hit], *, k: int) -> list[Hit]:
         }
         return RecallResult(reranked, execution=merged)
     return reranked
-
-
-def recall_with_rerank(query: str, *, k: int = 8, **recall_kwargs: object) -> list[Hit]:
-    """Convenience wrapper: recall() then apply(). Never modifies recall.py.
-
-    Disabled (the default): calls ``recall.recall(query, k=k,
-    **recall_kwargs)`` directly and returns it unchanged -- byte-identical to
-    calling recall() yourself.
-
-    Enabled: requests a wider RERANK_POOL candidate pool from recall() (so
-    MMR has room to trade a redundant top candidate for a distinct one
-    further down), then trims to ``k`` via apply().
-    """
-    if not rerank_enabled():
-        return _recall(query, k=k, **recall_kwargs)
-    pool_k = max(int(k), RERANK_POOL)
-    hits = _recall(query, k=pool_k, **recall_kwargs)
-    return apply(hits, k=k)

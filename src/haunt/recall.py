@@ -1,6 +1,8 @@
 """Hybrid recall: sqlite-vec ANN + FTS5 BM25 + Reciprocal Rank Fusion.
 
-No reader-LLM. Optional cross-encoder is not wired (off).
+No reader-LLM. Optional cross-encoder is not wired (off). An optional
+lexical diversity rerank (haunt.rerank) sits between fusion and the
+returned k; it is off unless HAUNT_RERANK_ENABLED is set.
 """
 
 from __future__ import annotations
@@ -111,6 +113,10 @@ class Hit:
     final_rank: int | None = None
     vector_stage: dict[str, str] | None = None
     fts_stage: dict[str, str] | None = None
+    # Set only when a post-fusion stage reordered the fused list, so
+    # final_rank no longer equals the RRF rank the hit came from. None --
+    # the default -- means final_rank IS the fusion rank.
+    rerank_stage: dict[str, Any] | None = None
     references: dict[str, Any] | None = None
     recall_class: str | None = None
     classification_source: str = "legacy_unknown"
@@ -188,6 +194,13 @@ class Hit:
                 "rrf_rank_signal_not_confidence" if is_rrf else "not_ranked"
             ),
             "final_rank": self.final_rank,
+            # Only when a rerank stage moved this hit: without it final_rank
+            # is the fusion rank and repeating it would be noise.
+            **(
+                {"rrf_rank": self.rerank_stage["rrf_rank"]}
+                if self.rerank_stage is not None
+                else {}
+            ),
             # Keep the unrounded contributions and their sum together so a
             # consumer can reproduce this serialized score without a rounding
             # discrepancy. The legacy top-level ``score`` remains rounded.
@@ -280,7 +293,20 @@ def classify_recall_residue(
 
 
 def _ordering_explanation(hit: Hit, *, is_rrf: bool) -> dict[str, str]:
-    """Describe only ordering evidence this Hit actually carries."""
+    """Describe only ordering evidence this Hit actually carries.
+
+    A post-fusion stage owns the order it produced: reporting fusion
+    ordering for a list some later stage reordered would describe an order
+    the caller was not given.
+    """
+    if hit.rerank_stage is not None:
+        method = str(hit.rerank_stage["method"])
+        return {
+            "primary": f"{method}_desc",
+            "ties": "memory_id_asc",
+            "stage": method,
+            "reordered_from": "rrf_score_desc",
+        }
     if is_rrf:
         return {"primary": "rrf_score_desc", "ties": "memory_id_asc"}
     if (
@@ -617,7 +643,16 @@ def recall(
             rrf[mid] = rrf.get(mid, 0.0) + 1.0 / (RRF_K + rank)
             fts_rank[mid] = (rank, raw)
 
-        ranked = sorted(rrf.items(), key=lambda kv: (-kv[1], kv[0]))[: int(k)]
+        # haunt.rerank consumes this module's Hit/RecallResult, so importing
+        # it back at module scope would be a cycle. The optional stage sits
+        # between fusion and the returned k, so it sizes the slice it trims:
+        # exactly k while disabled, wide enough for MMR to have somewhere to
+        # promote from while enabled.
+        from haunt import rerank
+
+        ranked = sorted(rrf.items(), key=lambda kv: (-kv[1], kv[0]))[
+            : rerank.candidate_pool(k)
+        ]
         hits: list[Hit] = []
         recall_class_select = (
             "e.recall_class AS recall_class"
@@ -685,7 +720,7 @@ def recall(
             )
         except sqlite3.Error:
             pending_jobs = None
-        return RecallResult(
+        result = RecallResult(
             hits,
             execution={
                 "version": 1,
@@ -704,6 +739,9 @@ def recall(
                 ],
             },
         )
+        # Returns `result` itself while disabled; reorders and truncates the
+        # widened pool to k, restamping rank provenance, while enabled.
+        return rerank.apply(result, k=int(k))
     except sqlite3.Error as exc:
         raise RetrievalBackendError(str(exc)) from exc
     finally:

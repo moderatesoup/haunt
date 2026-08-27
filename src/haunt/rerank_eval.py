@@ -41,7 +41,12 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from haunt.recall import Hit, recall
-from haunt.rerank import RERANK_LAMBDA_DEFAULT, RERANK_POOL, mmr_rerank
+from haunt.rerank import (
+    RERANK_ENABLED_ENV,
+    RERANK_LAMBDA_DEFAULT,
+    RERANK_POOL,
+    mmr_rerank,
+)
 from haunt.store import Store
 
 SCHEMA_VERSION = 1
@@ -249,7 +254,12 @@ def evaluate(
 
     saved_env = {
         key: os.environ.get(key)
-        for key in ("HAUNT_HOME", "HAUNT_FTS_ONLY", "HAUNT_EMBED_MODEL")
+        for key in (
+            "HAUNT_HOME",
+            "HAUNT_FTS_ONLY",
+            "HAUNT_EMBED_MODEL",
+            RERANK_ENABLED_ENV,
+        )
     }
     with TemporaryDirectory(prefix="haunt-rerank-eval-") as tmp:
         try:
@@ -260,6 +270,10 @@ def evaluate(
                     "HAUNT_EMBED_MODEL": "off",
                 }
             )
+            # Both arms come from one recall() call, and recall() honours
+            # HAUNT_RERANK_ENABLED -- left set, the baseline arm would
+            # silently become a second reranked arm.
+            os.environ.pop(RERANK_ENABLED_ENV, None)
             embed.reset()
             return _evaluate_unsafe(corpus, k=k, lambda_=lambda_, pool=pool)
         finally:
