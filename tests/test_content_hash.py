@@ -259,6 +259,26 @@ def test_stats_preserves_all_c4_and_earlier_keys(dup_env):
     assert "duplicate_content_values" in stats
 
 
+def test_haunt_health_shows_the_duplicate_and_coverage_counts(dup_env):
+    """stats() computing a number nothing prints is a measurement the user
+    cannot act on. `haunt health` is the CLI surface for stats(), and MCP
+    memory_health and the dashboard already return the whole dict."""
+    from typer.testing import CliRunner
+
+    from haunt import cli
+    from haunt.store import Store
+
+    with Store("dup-test") as store:
+        for i in range(3):
+            store.observe("haunt session start", session_id=f"s{i}")
+
+    result = CliRunner().invoke(cli.app, ["health", "-n", "dup-test"])
+    assert result.exit_code == 0, result.output
+    assert "duplicates    memories=2 content=1" in result.output
+    assert "embedding     embedded=0 pending=" in result.output
+    assert "index=False" in result.output
+
+
 # ---------------------------------------------------------------------------
 # Schema / index
 # ---------------------------------------------------------------------------

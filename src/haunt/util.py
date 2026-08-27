@@ -1,10 +1,11 @@
-"""Shared helpers: ids, timestamps, diagnostics. No I/O beyond stderr."""
+"""Shared helpers: ids, timestamps, env bounds, diagnostics. No I/O beyond stderr."""
 
 from __future__ import annotations
 
 import base64
 import json
 import math
+import os
 import sys
 import unicodedata
 import uuid
@@ -14,6 +15,23 @@ from typing import Any
 
 def new_id() -> str:
     return str(uuid.uuid4())
+
+
+def env_int(name: str, *, default: int, lo: int, hi: int) -> int:
+    """One env var as a bounded int: parse, fall back to `default` on
+    anything unparsable, then clamp into [lo, hi].
+
+    Clamping is the point. Every caller is configuring a cap or an attempt
+    ceiling, so a typo must not be able to disable the bound it was meant
+    to set -- neither a 0/negative that no caller can work under nor an
+    absurd value that is no bound at all.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(lo, min(value, hi))
 
 
 K_MIN = 1
