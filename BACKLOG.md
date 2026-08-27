@@ -1156,7 +1156,39 @@ both the citation and the finding as unconfirmed.
 | R23 | E4's purge-lineage claim is overstated in the PR and doc wording. See the E4 gap list; the test itself is honest. | LOW code / MEDIUM honesty | `tests/test_portability.py:1305-1319` | verified |
 | R28 | Triplicated environment parse/clamp idiom. The docstrings say "same idiom as", so a shared helper was consciously skipped; C11 added the third copy. | LOW | `src/haunt/cursor_hook.py` (x2), `src/haunt/mcp_server.py` | unverified |
 
-28 open items. R6 is the only merge blocker.
+28 open items above. R6 is the only merge blocker.
+
+### LongMemEval retrieval (2026-08-27)
+
+Operator-run and judge-free, FTS-only, `k=10`, against clean `main` `ed806b2`.
+Harness `scripts/score_lme_retrieval.py`, which lands at `4973169` on
+`perf/embed-batching` and is **not** in `d1aec40`. Dataset
+`longmemeval_s_cleaned.json`, n=500, seeded stratified split of 350 working and
+150 held-out.
+
+| Split | n | R@1 | R@3 | R@5 | R@10 | MRR |
+|---|---|---|---|---|---|---|
+| working | 350 | 0.851 | 0.920 | 0.937 | 0.960 | 0.890 |
+| held-out | 150 | 0.887 | 0.927 | 0.960 | 0.973 | 0.915 |
+
+The held-out split exists to verify generalization. Do not diagnose against it,
+do not tune against it, and do not report a per-type held-out cell without the
+power check in L8.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L1 | `single-session-preference` is the weakest retrieval type, by lexical signal inversion. Working R@1 0.429 / R@10 0.714; held-out 0.444 / 0.889; every other type is 0.95 to 1.00 at R@10. The mechanism is measured, not inferred: lexical margin = (best gold-turn content-word overlap with the query) minus (best non-gold-turn overlap), and margin predicts R@1 monotonically across all six types - knowledge-update +0.334/0.945, single-session-user +0.259/0.959, single-session-assistant +0.232/0.872, multi-session +0.107/0.860, temporal-reasoning +0.098/0.817, single-session-preference -0.089/0.429. Preference is the only negative margin: the best distractor matches the query better than anything in gold, so BM25 cannot rank gold first. The cause is not benchmark-specific - a preference question names the task ("what should I serve for dinner") while the gold session holds the constraint ("my homegrown cherry tomatoes, basil, mint"); those vocabularies are disjoint by construction, and a real haystack reliably contains a session that genuinely is about the task. | MEDIUM (product) | working n=350, held-out n=150 at `ed806b2`; GitHub issue #37, which until now had no measurement behind it | operator |
+| L2 | Hybrid retrieval fixes L1 at zero code cost, so the FTS-only figure understates the shipped product. Measured on the 16 working-set preference questions with embeddings fully drained (bge-m3, coverage 1.0): preference R@10 0.688 to 1.000, R@1 0.312 to 0.438, 10 improved and 0 regressed, all five completed misses recovered. Evidence, not a task: the action is to run and report hybrid, not to change code. | n/a (evidence) | working preference subset n=16, embedding coverage 1.0 | operator |
+| L3 | The harness's `ranking_fusion` miss bucket is vacuous and should be replaced. In FTS-only mode there is one modality, and RRF `1.0/(RRF_K + rank)` is strictly decreasing in rank, so the fused order is identical to the BM25 order - there is no fusion to fail. The bucket fires whenever gold lands anywhere in the candidate pool, which is always. Note also that `_fts_hits` is called with `CANDIDATES` = 40, not `k` and not a probe constant. Working-set recall@40 = 1.000, so candidate generation never fails; ordering within 40 is the whole problem (R@10 0.960, R@15 0.971, R@20 0.977). Replace it with a `margin < 0` bucket, which labels 14/14 misses meaningfully. | LOW (harness correctness) | `src/haunt/recall.py:30`, `:31`, `:577`, `:614`, `:617`, `:620` | verified |
+| L4 | `CANDIDATES` = 40 also caps each modality independently before fusion, so hybrid mode fuses two 40-candidate pools rather than widening the pool. Untested in FTS-only. Measure it on its own before the L2 hybrid proof run, or the two effects confound. | LOW (unmeasured) | `src/haunt/recall.py:31`, `:577`, `:592` | verified |
+| L5 | `temporal-reasoning` misses are the documented implicit-time limitation, now quantified. Questions carrying a relative-time expression: n=26, R@1 0.615, R@10 0.808. Questions without: n=67, R@1 0.896, R@10 1.000. All five misses fall in the relative group. Bolting relative-time date parsing onto the query path is explicitly **not** recommended: it contradicts a stated design decision and would be dataset-tuning. | LOW (known limit, quantified) | working temporal-reasoning n=93; GitHub issues #39 and #40 | operator |
+| L6 | No fuzzy fallback exists for a query anchor that is absent from the index. `tokenize='porter unicode61'` means a query term with no index entry cannot match at all. Two working-set cases turn on this: `homegrown` (df 0/503) and `buisiness`, a misspelling in the benchmark's own question (df 0/476). Recorded as a product property worth knowing; no fix proposed. | LOW (known limit) | `src/haunt/store.py:1395` | verified |
+| L7 | Candidate fix, **not adopted**: stopword-filter the FTS query only, roughly 6 lines. Measured over all 350 working questions: overall R@1 0.851 to 0.866 and R@10 0.960 to 0.974; preference R@10 0.714 to 0.905; single-session-assistant R@1 0.872 to 1.000; 6 gained and 1 lost at R@10. It is underpowered - no cell reaches p<0.05 (McNemar: assistant R@1 5/0 p=0.063; preference R@10 4/0 p=0.125; overall R@10 6/1 p=0.125) - and single-session-user R@1 regresses 0.959 to 0.918. Sensitivity: a 33-word minimal IR stoplist recovers the assistant gain but none of the preference gain, so the effect lives in mid-frequency closed-class words and is list-dependent. Governing constraint if it is ever adopted: one published list, frozen a priori. Curating membership against working-set recall would be tuning and would manufacture a held-out failure. Removing `not` is separately risky for negation queries. | LOW (not adopted) | working n=350; McNemar exact, two-sided | operator |
+| L8 | Held-out power warning. Held-out `single-session-preference` is n=9, where a +0.19 R@10 effect moves about 1.7 questions. Judge generalization on pooled R@10 (n=150) and on single-session-assistant R@1 (n=17), never on that cell. | n/a (method) | held-out split composition, n=150 | operator |
+| L9 | Embedding ingest wastes throughput on padding: `tokenizers` pads each batch to its longest member, so a randomly ordered batch of 100 turns is almost always padded to 512, roughly 2.6x the tokens actually needed. Length-sorting before batching measured 3.34x (3.14 to 10.49 texts/s at batch=16) with vectors unchanged (min cosine 1.00000000, max absolute difference 6.6e-07). This affects every user's ingest, not only the benchmark. Fix in progress. | MEDIUM (performance, all users) | `perf/embed-batching` `6198083` | operator |
+| L10 | `answer_substring_proxy` is not a retrieval signal for `single-session-preference`. It reads 0.000 at every cutoff because the benchmark's preference answers are free-form rationales that never appear in the haystack. Scoring artifact; do not treat it as a miss. | n/a (scoring artifact) | working n=350, all cutoffs | operator |
+
+10 LongMemEval items, none of them a merge blocker. 38 open in the register.
 
 ### Closed and disproven claims
 
@@ -1219,6 +1251,18 @@ rather than line, because line numbers have drifted since the audits.
 - **D3 — C7 phase 2.** Dropped. See the C7 phase 2 decision above.
 - **D4 — E6 unblock path.** Standing recommendation is option 1 (v2 feature
   family plus v2 dataset). See the E6 blocker review above.
+- **D5 — reranker scope.** D1 stands, and the reranker is **not** the fix for
+  L1. An MMR-style diversity rerank over BM25 candidates cannot repair
+  vocabulary disjunction: it reorders a pool in which gold is already
+  out-ranked by a genuinely on-topic distractor. Hybrid retrieval (L2) is the
+  fix.
+- **D6 — CoreML execution provider.** `CoreMLExecutionProvider` is available,
+  but `embed.py` hardcodes `CPUExecutionProvider`
+  (`src/haunt/embed.py:218`). Deliberately deferred pending a vector-agreement
+  measurement, and to land as a change separate from L9.
+- **D7 — ONNX thread tuning.** Not adopted. The `intra=8` 1.32x result came
+  from a short-sequence-biased sample and would ship as a hardware-specific
+  hardcode.
 
 ### Integration state (verified)
 
@@ -1238,3 +1282,6 @@ rather than line, because line numbers have drifted since the audits.
 - E4 round trip confirmed: memory count preserved, correction lineage
   preserved, recall works after import, superseded value not resurrected. The
   only gap is R7.
+- The integrated tree reproduces the working-set LongMemEval retrieval numbers
+  exactly, so the 39,941 lines merged over `ed806b2` across 54 files are
+  retrieval-neutral. See the LongMemEval register above.
