@@ -551,3 +551,62 @@ def test_null_content_hash_rows_are_never_counted_as_duplicates(dup_env):
     assert null_rows == 3, "fixture must actually produce NULL-hash rows"
     assert stats["duplicate_memories"] == 0
     assert stats["duplicate_content_values"] == 0
+
+
+class _BatchCountingConn:
+    """sqlite3.Connection stand-in that records each UPDATE batch's size."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.batches: list[int] = []
+
+    def execute(self, sql, params=()):
+        return self._conn.execute(sql, params)
+
+    def executemany(self, sql, seq):
+        rows = list(seq)
+        self.batches.append(len(rows))
+        return self._conn.executemany(sql, rows)
+
+
+def test_backfill_pages_instead_of_loading_a_whole_namespace_at_once(
+    dup_env, monkeypatch
+):
+    """The one-shot v9 -> v10 backfill must not materialize every row's
+    full content in a single SELECT. Its semantics (content untouched,
+    hashes identical to observe()'s) stay covered by
+    test_migration_backfills_hashes_idempotently_without_touching_content.
+    """
+    from haunt import store as store_mod
+    from haunt.store import Store, _backfill_content_hashes
+
+    monkeypatch.setattr(store_mod, "CONTENT_HASH_BACKFILL_BATCH", 10)
+
+    with Store("dup-test") as store:
+        for i in range(25):
+            store.observe(f"paged backfill row {i}", session_id=f"page-{i}")
+        before = sorted(
+            (r["id"], r["content"])
+            for r in store.conn.execute("SELECT id, content FROM memories").fetchall()
+        )
+        assert len(before) == 25
+        store.conn.execute("UPDATE memories SET content_hash=NULL")
+        store.conn.commit()
+
+        counting = _BatchCountingConn(store.conn)
+        assert _backfill_content_hashes(counting) == 25
+        assert counting.batches == [10, 10, 5], counting.batches
+
+        rows = store.conn.execute(
+            "SELECT id, content, content_hash FROM memories"
+        ).fetchall()
+        assert sorted((r["id"], r["content"]) for r in rows) == before
+        for row in rows:
+            assert row["content_hash"] == hashlib.sha256(
+                row["content"].encode("utf-8")
+            ).hexdigest()
+
+        # Nothing left to fill costs one empty page and no UPDATE at all.
+        again = _BatchCountingConn(store.conn)
+        assert _backfill_content_hashes(again) == 0
+        assert again.batches == []

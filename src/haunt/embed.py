@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from haunt.paths import models_dir
-from haunt.util import diag
+from haunt.util import diag, dumps, loads
 
 DEFAULT_REQUESTED = "BAAI/bge-m3"
 FALLBACK_MODEL = "BAAI/bge-small-en-v1.5"
@@ -37,12 +37,20 @@ BGE_M3_PATTERNS = [
     "onnx/tokenizer_config.json",
     "onnx/config.json",
 ]
+# The revision whose onnx/ file sizes and SHA-256s are the ones in
+# tests/fixtures/abstention_eval/v1/hybrid-model-manifest.json, which
+# abstention_eval.verify_local_hybrid_cache enforces byte for byte.
+BGE_M3_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 BGE_M3_QUANT_REPO = "onnx-community/bge-m3-ONNX"
+# No committed manifest covers this variant -- the hybrid manifest's
+# variant_policy forbids it -- so this pin is its only identity.
+BGE_M3_QUANT_REVISION = "25b9af8e87a38eb120cfe87125383677b9cd309e"
 BGE_M3_QUANT_PATTERNS = [
     "onnx/model_quantized.onnx",
     "tokenizer.json",
     "tokenizer_config.json",
 ]
+BGE_M3_SOURCE_FILE = "haunt-model-source.json"
 
 _lock = threading.Lock()
 _state: "EmbedState | None" = None
@@ -156,6 +164,60 @@ def _local_bge_m3_ready(root: Path | None = None) -> Path | None:
     return None
 
 
+def _quant_fallback_enabled() -> bool:
+    """Opt in to the third-party quantized repo when the official one is gone."""
+    return (os.environ.get("HAUNT_EMBED_QUANT_FALLBACK") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _repo_unavailable_errors() -> tuple[type[BaseException], ...]:
+    """Hub errors meaning the pinned repo/revision itself cannot be had.
+
+    Deliberately excludes timeouts, 5xx, DNS and disk errors. Empty when
+    huggingface_hub is too old to expose any of them by name.
+    """
+    try:
+        from huggingface_hub import errors
+    except ImportError:
+        try:
+            from huggingface_hub import utils as errors  # type: ignore[no-redef]
+        except ImportError:
+            return ()
+    found = (
+        getattr(errors, name, None)
+        for name in (
+            "RepositoryNotFoundError",
+            "RevisionNotFoundError",
+            "EntryNotFoundError",
+            "GatedRepoError",
+        )
+    )
+    return tuple(cls for cls in found if isinstance(cls, type))
+
+
+def _record_bge_m3_source(root: Path, repo_id: str, revision: str) -> None:
+    """Record which repo produced these bytes. Best effort; never raises."""
+    try:
+        (root / BGE_M3_SOURCE_FILE).write_text(
+            dumps({"repo_id": repo_id, "revision": revision}), encoding="utf-8"
+        )
+    except OSError as exc:
+        diag("embed_m3_source_unrecorded", error=str(exc))
+
+
+def bge_m3_source(root: Path | None = None) -> dict[str, str] | None:
+    """Repo and revision the cached BGE-M3 came from, or None if unrecorded."""
+    marker = (root or _bge_m3_dir()) / BGE_M3_SOURCE_FILE
+    try:
+        value = loads(marker.read_text(encoding="utf-8"), default={})
+    except OSError:
+        return None
+    return value if isinstance(value, dict) and value else None
+
+
 def _download_bge_m3(root: Path) -> Path:
     """Download official BGE-M3 ONNX (+ tokenizer) into root. Local files only after this."""
     if offline():
@@ -166,24 +228,32 @@ def _download_bge_m3(root: Path) -> Path:
     try:
         snapshot_download(
             repo_id=BGE_M3_ID,
+            revision=BGE_M3_REVISION,
             local_dir=str(root),
             allow_patterns=BGE_M3_PATTERNS,
         )
+    except _repo_unavailable_errors() as exc:
+        official_exc: Exception = exc
+    else:
         if _local_bge_m3_ready(root):
+            _record_bge_m3_source(root, BGE_M3_ID, BGE_M3_REVISION)
             return root
-        raise RuntimeError("BAAI/bge-m3 ONNX files missing after download")
-    except Exception as official_exc:
-        diag("embed_m3_official_failed", error=str(official_exc))
-        snapshot_download(
-            repo_id=BGE_M3_QUANT_REPO,
-            local_dir=str(root),
-            allow_patterns=BGE_M3_QUANT_PATTERNS,
-        )
-        if _local_bge_m3_ready(root):
-            return root
-        raise RuntimeError(
-            f"BGE-M3 ONNX download failed (official: {official_exc})"
-        )
+        official_exc = RuntimeError("BAAI/bge-m3 ONNX files missing after download")
+    # onnxruntime executes whatever graph lands here, so switching publishers
+    # is a decision, not a retry.
+    if not _quant_fallback_enabled():
+        raise official_exc
+    diag("embed_m3_official_unavailable", error=str(official_exc))
+    snapshot_download(
+        repo_id=BGE_M3_QUANT_REPO,
+        revision=BGE_M3_QUANT_REVISION,
+        local_dir=str(root),
+        allow_patterns=BGE_M3_QUANT_PATTERNS,
+    )
+    if _local_bge_m3_ready(root) is None:
+        raise RuntimeError(f"BGE-M3 ONNX download failed (official: {official_exc})")
+    _record_bge_m3_source(root, BGE_M3_QUANT_REPO, BGE_M3_QUANT_REVISION)
+    return root
 
 
 class OnnxEmbedder:

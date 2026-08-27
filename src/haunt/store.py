@@ -101,6 +101,7 @@ RECALL_CLASSES = ("tool", "task")
 SCHEMA_VERSION = 11
 SCHEMA_VERSION_KEY = "schema_version"
 PRIVACY_LINEAGE_KEY = "privacy_lineage_head"
+CONTENT_HASH_BACKFILL_BATCH = 1000
 REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
 _NAMESPACE_DB_HANDLE_LOCK = SQLITE_OPEN_LOCK
@@ -1586,21 +1587,25 @@ def _content_hash(content: str) -> str:
 def _backfill_content_hashes(conn: sqlite3.Connection) -> int:
     """Populate content_hash for memory rows written before schema v10.
 
-    Uses the exact same hash function observe() uses at admission, so a
-    backfilled row and a freshly written row with identical content always
-    produce identical hashes. Only ever fills the new column -- `content`
-    itself is never read back out and rewritten. Returns the row count
-    touched.
+    Uses observe()'s hash function, so a backfilled row and a freshly
+    written row with identical content hash identically. Only ever fills
+    the new column; `content` is never rewritten. Pages the table in
+    CONTENT_HASH_BACKFILL_BATCH-sized UPDATEs so a large namespace is not
+    materialized in one go. Returns rows filled.
     """
-    rows = conn.execute(
-        "SELECT id, content FROM memories WHERE content_hash IS NULL"
-    ).fetchall()
-    for row in rows:
-        conn.execute(
+    total = 0
+    while True:
+        rows = conn.execute(
+            "SELECT id, content FROM memories WHERE content_hash IS NULL LIMIT ?",
+            (CONTENT_HASH_BACKFILL_BATCH,),
+        ).fetchall()
+        if not rows:
+            return total
+        conn.executemany(
             "UPDATE memories SET content_hash=? WHERE id=?",
-            (_content_hash(row["content"]), row["id"]),
+            [(_content_hash(row["content"]), row["id"]) for row in rows],
         )
-    return len(rows)
+        total += len(rows)
 
 
 def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
@@ -7644,11 +7649,19 @@ def iter_stores() -> Iterator[Store]:
 
 
 def reembed_all_namespaces() -> list[dict[str, Any]]:
-    """Rebuild embeddings in every registered namespace."""
+    """Rebuild embeddings in every registered namespace.
+
+    A namespace that cannot be opened or read yields {"namespace", "error"}
+    in place of a reembed report; the walk continues past it.
+    """
     out: list[dict[str, Any]] = []
     for row in list_namespace_rows():
-        with Store(row["name"], create=False) as st:
-            report = st.reembed()
-            report["namespace"] = row["name"]
-            out.append(report)
+        try:
+            with Store(row["name"], create=False) as st:
+                report = st.reembed()
+        except (sqlite3.Error, OSError, NamespacePathError) as exc:
+            out.append({"namespace": row["name"], "error": str(exc)})
+            continue
+        report["namespace"] = row["name"]
+        out.append(report)
     return out

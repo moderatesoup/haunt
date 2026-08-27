@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 import sys
 from pathlib import Path
 
-from haunt.embed import fts_only, warmup
-from haunt.paths import bin_dir, ensure_layout, haunt_home, models_dir, repair_private_modes
+from haunt.embed import bge_m3_source, fts_only, warmup
+from haunt.paths import (
+    NamespacePathError,
+    bin_dir,
+    ensure_layout,
+    haunt_home,
+    models_dir,
+    repair_private_modes,
+)
 from haunt.store import Store, init_registry, register_namespace, list_namespace_rows, reembed_all_namespaces
 from haunt.util import diag, dumps
 
@@ -97,76 +105,13 @@ class BootstrapError(SystemExit):
 
 
 def _drain_worth_reporting(drained: dict, *, deliberately_off: bool) -> bool:
-    """True when Store.drain_embedding_queue() found or touched anything
-    worth telling the operator about.
+    """True when a drain result earns a per-namespace line in the report.
 
-    Keeps reembed_report (and format_report's rendering of it) from
-    growing one no-op entry per namespace on every `haunt bootstrap` call
-    -- most namespaces most of the time have an empty embedding_jobs queue,
-    and drain_embedding_queue always makes at least one
-    process_embedding_jobs() call (so `batches` alone is not a useful
-    "was there ever a backlog" signal).
-
-    C-series follow-up: one deliberate exception. A permanently FTS-only
-    namespace -- HAUNT_FTS_ONLY=1 or HAUNT_EMBED_MODEL=off, both
-    first-class supported modes; the project's own CI runs FTS-only --
-    still queues embedding_jobs rows on every write (see observe()), but
-    process_embedding_jobs() returns `available=False` before it ever
-    touches a row's `attempts` (its `if not es.available` branch). That
-    means `remaining` never shrinks and drain_embedding_queue() reports
-    stop_reason="blocked" on *every single* `haunt bootstrap` call,
-    forever -- not a one-time event, since nothing about that namespace
-    is ever going to change on its own. Before the C4 out-of-band drain
-    existed, a namespace in this shape produced no report line at all;
-    this restores that silence for that specific shape rather than
-    printing "stopped early (blocked)" -- wording that reads as a fault --
-    for a namespace that is deliberately, permanently configured this way
-    and not actionable by the operator. The top-level report already says
-    the embedding backend is off once per run (`sqlite-vec skipped
-    (FTS-only)` / the `embed` block); repeating it per namespace on every
-    run adds no information, only alarm. Anyone who wants the raw
-    per-namespace backlog count can still get it from Store.stats()'s
-    `embedding_pending` / `embedding_exhausted` fields (also what the
-    dashboard's per-namespace JSON exposes) -- it is only this alarming,
-    repeats-forever bootstrap report line that is silenced, not the
-    underlying data.
-
-    `deliberately_off` is the caller's answer to "is `available=False`
-    actually this deliberate, permanent shape, or something else".
-    embed.py::_load() has THREE branches that all report
-    available=False: fts_only(), offline(), and a bare `except Exception`
-    catch-all for a genuine load failure (missing dependency, corrupted
-    model cache, persistent network failure). Only the first two are
-    "normal, permanent, and not actionable" -- both set
-    EmbedState.backend="off" for exactly this reason. The catch-all sets
-    EmbedState.backend="none" and is none of those things: it is an
-    operator-fixable fault that can start or stop happening between runs,
-    and silencing it here would hide a real backlog stuck for a reason
-    the operator can actually do something about. The caller
-    (bootstrap()) passes `embed_state.backend == "off"` -- reading the
-    very EmbedState that already decided `available`, rather than
-    re-deriving fts_only()/offline() a second time, which could disagree
-    with the state that actually produced this `drained` result if
-    anything about the environment changed in between. Threading this in
-    as an explicit parameter (instead of calling fts_only()/offline()
-    directly in here) also keeps this function a pure, hermetic check of
-    its inputs -- see the tests, none of which need to control process
-    env to exercise every branch.
-
-    This also checks the `available` flag itself rather than
-    `stop_reason == "blocked"`, and only silences when `processed`,
-    `failed`, and `exhausted` are *all* zero too -- so it stays narrowly
-    scoped to "nothing happened because there is no backend at all, and
-    there is no other signal (like pre-existing exhausted rows) either".
-    A block that happens while a backend IS available -- available=True --
-    never matches this branch and always falls through to the normal
-    reporting rule below; that is a real signal and must survive. Keying
-    off `available` rather than the derived stop_reason string also means
-    this stays correct even if a future change adds some other way to
-    reach stop_reason="blocked" -- the only thing silenced here is "no
-    backend, and it is deliberately, permanently configured that way,
-    with nothing else to say" -- never a block that happens with a
-    working backend, and never a genuine embedding-backend load failure.
+    Pass `deliberately_off` as `EmbedState.backend == "off"`, not as
+    `not available`: an FTS-only or offline namespace queues embedding jobs
+    that can never run, so its permanent backlog is reported as nothing,
+    while a genuine embed-backend load failure (backend="none") still is.
+    Non-zero `remaining` alone is therefore not enough to return True.
     """
     if (
         drained.get("available") is False
@@ -222,30 +167,28 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
     else:
         from haunt.store import Store as _S
         for row in list_namespace_rows():
-            with _S(row["name"], create=False) as st:
-                changed = st.ensure_current_embeddings()
-                # C4: hook writes always defer embedding (defer_embedding=True),
-                # so a hook-driven write never reaches the drain gated on
-                # `commit and not defer_embedding` inside Store.observe().
-                # Before this, the only other caller of process_embedding_jobs
-                # was recall() -- so a namespace that is written to but rarely
-                # searched grew an unbounded backlog. This out-of-band call
-                # drains it, bounded by HAUNT_EMBED_DRAIN_LIMIT per namespace
-                # per bootstrap run so a huge backlog cannot block `haunt
-                # bootstrap` indefinitely -- see Store.drain_embedding_queue.
-                drained = st.drain_embedding_queue()
-                entry = dict(changed) if changed else {}
-                # embed_state is the same EmbedState warmup() already
-                # produced above -- backend=="off" only for _load()'s
-                # fts_only()/offline() branches, never for the genuine
-                # load-failure catch-all -- see _drain_worth_reporting.
-                if changed or _drain_worth_reporting(
-                    drained, deliberately_off=(embed_state.backend == "off")
-                ):
-                    entry["drain"] = drained
-                    entry["namespace"] = row["name"]
-                    entry["auto"] = True
-                    reembed_report.append(entry)
+            try:
+                with _S(row["name"], create=False) as st:
+                    changed = st.ensure_current_embeddings()
+                    # Hook writes always defer embedding, so nothing else
+                    # drains this queue out of band. Bounded per namespace
+                    # per run by HAUNT_EMBED_DRAIN_LIMIT.
+                    drained = st.drain_embedding_queue()
+            except (sqlite3.Error, OSError, NamespacePathError) as exc:
+                # Isolated per namespace: aborting here would strand every
+                # namespace listed after this one on an undrained queue.
+                reembed_report.append(
+                    {"namespace": row["name"], "auto": True, "error": str(exc)}
+                )
+                continue
+            entry = dict(changed) if changed else {}
+            if changed or _drain_worth_reporting(
+                drained, deliberately_off=(embed_state.backend == "off")
+            ):
+                entry["drain"] = drained
+                entry["namespace"] = row["name"]
+                entry["auto"] = True
+                reembed_report.append(entry)
     from haunt.desktop import install_desktop_icon
     icon_result = install_desktop_icon()
 
@@ -270,6 +213,8 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
             "available": embed_state.available,
             "fallback": embed_state.fallback,
             "error": embed_state.error,
+            # None for a non-ONNX backend, or a cache predating the marker.
+            "source": bge_m3_source() if embed_state.backend == "onnx" else None,
         },
         "default_namespace": default_namespace,
         "default_db": str(db),
@@ -321,18 +266,27 @@ def format_report(report: dict) -> str:
     ]
     if report["embed"].get("error"):
         lines.append(f"embed error   {report['embed']['error']}")
+    source = report["embed"].get("source") or {}
+    if source:
+        lines.append(
+            f"embed source  {source.get('repo_id')}@{source.get('revision')}"
+        )
     if report.get("backend"):
         lines.append(f"embed backend {report['backend']}")
     if report.get("download_bytes"):
         lines.append(f"embed bytes   {report['download_bytes']}")
     lines.append(f"namespace     {report['default_namespace']} → {report['default_db']}")
     for row in report.get("reembed") or []:
+        line = f"reembed       ns={row.get('namespace')}"
+        if row.get("error"):
+            # The other namespaces still ran; say which one did not.
+            lines.append(line + f" FAILED {row['error']}")
+            continue
         # Full-reembed entries (auto, stale model/dim, or --reembed) carry
         # updated/total/dim/model. C4-only drain entries (nothing stale,
         # just a backlog to clear) may carry only `drain` -- render each
         # part only when present so a drain-only row doesn't print
         # "updated=None/None".
-        line = f"reembed       ns={row.get('namespace')}"
         if "updated" in row:
             line += (
                 f" updated={row.get('updated')}/{row.get('total')}"
