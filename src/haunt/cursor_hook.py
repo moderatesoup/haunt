@@ -305,7 +305,7 @@ def _truncate_header(header: str, cap: int, reason: str) -> str:
     not a body line, not a drop marker -- within `cap` chars. Truncates
     the header text itself with its own inline marker, guaranteed <= cap
     BY CONSTRUCTION: plain Python string slicing costs exactly one char
-    per char kept, unlike JSON serialization (see _truncate_hit_content
+    per char kept, unlike JSON serialization (see _truncate_row_text
     in mcp_server.py for the escape-expansion trap that bites when that
     assumption is false there), so no measure-after-the-fact check is
     needed here -- the arithmetic below is exact, not an estimate.
