@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from haunt import embed
 from haunt.recall import Hit, recall
+from haunt.rerank import RERANK_ENABLED_ENV
 from haunt.store import ReadOnlyStore, Store, open_existing_readonly
 
 SCHEMA_VERSION = 1
@@ -615,6 +616,14 @@ def _git(*args: str) -> str:
     return completed.stdout
 
 
+def _uncommitted(paths: Sequence[str]) -> list[str]:
+    """Paths under ``paths`` that differ from HEAD, untracked additions included."""
+    changed = _git("diff", "--name-only", "HEAD", "--", *paths)
+    added = _git("ls-files", "--others", "--exclude-standard", "--", *paths)
+    lines = (*changed.splitlines(), *added.splitlines())
+    return sorted({line for line in lines if line})
+
+
 def _e6_attributed_diff(paths: Sequence[str]) -> dict[str, Any]:
     """Diff of ``paths`` carried by E6's own change-set.
 
@@ -622,6 +631,10 @@ def _e6_attributed_diff(paths: Sequence[str]) -> dict[str, Any]:
     runtime-policy change from unrelated work that shares the branch, so
     attribution is per commit: only commits carrying E6's evidence surface,
     plus uncommitted edits to that surface, count as E6's.
+
+    Working-tree edits that no commit can attribute are reported separately
+    in uncommitted_paths rather than folded into diff_empty, so a caller
+    never reads an empty diff as a diff that was read and found empty.
     """
     # A shallow clone grafts the history away and its one commit adds every
     # file, so attribute nothing to it and say so rather than overclaim.
@@ -634,7 +647,15 @@ def _e6_attributed_diff(paths: Sequence[str]) -> dict[str, Any]:
     diff = "".join(
         _git("show", "--format=", commit, "--", *paths) for commit in commits
     )
-    if _git("diff", "--name-only", "HEAD", "--", *E6_EVIDENCE_PATHS).strip():
+    uncommitted = _uncommitted(paths)
+    # Uncommitted work carries no commit to attribute it by. Dirty E6 evidence
+    # claims the whole working-tree diff for E6; dirt without it is
+    # unattributable concurrent work, which must not fail this gate -- but
+    # must not read as a checked-and-empty diff either, because nothing here
+    # looked at it. sealed_e0_evidence has byte_mismatches for that; every
+    # caller of this helper now gets the same leg.
+    e6_dirty = bool(_uncommitted(E6_EVIDENCE_PATHS))
+    if e6_dirty:
         diff += _git("diff", "HEAD", "--", *paths)
     return {
         "history_attributable": attributable,
@@ -642,6 +663,8 @@ def _e6_attributed_diff(paths: Sequence[str]) -> dict[str, Any]:
         "paths": list(paths),
         "diff": diff,
         "diff_empty": not diff,
+        "uncommitted_paths": uncommitted,
+        "uncommitted_unattributed": bool(uncommitted) and not e6_dirty,
     }
 
 
@@ -680,8 +703,15 @@ def verify_local_hybrid_cache(
     *,
     fixture_dir: Path = DEFAULT_FIXTURE_DIR,
     audit_hook: AuditHook | None = None,
+    hash_max_bytes: int | None = None,
 ) -> dict[str, Any]:
-    """Require the committed BGE-M3 artifact identity before embed init."""
+    """Require the committed BGE-M3 artifact identity before embed init.
+
+    Every manifested file is checked for presence, type and exact size.
+    hash_max_bytes caps content hashing: a file whose manifest size exceeds
+    it is reported with sha256 None and stands on its size alone. The default
+    hashes every file, which is the evidence E6 records.
+    """
     manifest = _read_json_component(
         fixture_dir,
         "hybrid-model-manifest.json",
@@ -792,6 +822,15 @@ def verify_local_hybrid_cache(
 
     verified: list[dict[str, Any]] = []
     for row in actual_rows:
+        if hash_max_bytes is not None and row["size"] > hash_max_bytes:
+            verified.append(
+                {
+                    "relative_path": row["relative_path"],
+                    "size": row["size"],
+                    "sha256": None,
+                }
+            )
+            continue
         digest = _file_hash(row["path"])
         if digest != row["expected_sha256"]:
             raise RuntimeError(
@@ -1321,6 +1360,7 @@ def evaluate_profile(
             "HAUNT_OFFLINE",
             "HAUNT_EMBED_MODEL",
             "HAUNT_MODEL_CACHE",
+            RERANK_ENABLED_ENV,
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
             "HF_TOKEN",
@@ -1344,6 +1384,10 @@ def evaluate_profile(
             os.environ["HF_TOKEN"] = "e6-ambient-fake-key"
             os.environ["HUGGING_FACE_HUB_TOKEN"] = "e6-ambient-fake-key"
             os.environ["HAUNT_EMBED_MODEL"] = "BAAI/bge-m3"
+            # recall() honours HAUNT_RERANK_ENABLED. Left set, this harness
+            # would measure reranked retrieval and write reranked final_rank
+            # into committed evidence.
+            os.environ.pop(RERANK_ENABLED_ENV, None)
             if profile == "fts":
                 os.environ["HAUNT_FTS_ONLY"] = "1"
                 os.environ["HAUNT_OFFLINE"] = "1"
