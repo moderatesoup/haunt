@@ -154,6 +154,7 @@ Default recall hides superseded rows unless you pass `as_of`.
 - `memory_timeline` only with ISO `since`/`until` or `session`. No NL compile.
 - `memory_session_end` `session`. `ok: false` if nothing ended.
 - `memory_health` / `memory_namespaces` when you need counts or the bound namespace.
+- `memory_export_bundle` / `memory_import_bundle` only in explicit admin mode and only for an operator-requested transfer. Bundles contain sensitive verbatim data; a digest is not encryption or authenticity.
 - `memory_namespace_migrate` / `memory_namespace_undo` only in explicit admin mode; dry-run first and pass the returned plan digest to apply.
 
 ## Namespace

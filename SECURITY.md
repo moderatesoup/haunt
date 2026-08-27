@@ -17,6 +17,11 @@ haunt is **local-only**. All data (SQLite databases, embeddings, models) stays o
 
 Do not add Docker, Postgres, or HTTP team-tier auth. This is a local-first console.
 
+The canonical export download is covered by the same token gate. Dashboard
+import is an administrative mutation and additionally requires a trusted
+`Origin`, an accepted JSON media type, and a bounded body. The HTML console has
+no import/paste control in v1; callers use the authenticated API deliberately.
+
 ## Secret redaction
 
 Cursor hook input and output are run through a best-effort denylist that redacts common secret patterns (API keys, bearer tokens, AWS access keys, GitHub PATs, JWTs, Slack tokens, etc.).
@@ -27,7 +32,23 @@ Guidance:
 
 - Do not point `haunt observe` at `.env` files, credential stores, or token outputs.
 - Treat `~/.haunt/namespaces/*.db` files as sensitive — they contain verbatim agent conversation history.
+- Treat `haunt.namespace-export` JSON files as equally sensitive. They contain
+  verbatim surviving history and audit metadata. Mode 0600 is defense in depth;
+  it is not encryption.
 - The redaction layer is defense-in-depth, not a guarantee.
+
+Canonical export digests detect corruption and make exact import replay
+identifiable. They are unkeyed hashes, not signatures or authenticity claims.
+Export excludes local paths, embeddings, indexes, and previously purged bytes,
+but anyone who can read a bundle can read its surviving plaintext content.
+An opaque namespace history head rotates in the hard-purge transaction, so an
+older or independently diverged bundle cannot be replayed into that namespace
+to restore erased rows. The head is not a secret, signature, or defense against
+a same-user attacker who can directly rewrite Haunt's files. Interrupted fresh
+imports recover only files still matching the fsynced intent's exact token,
+digest, device, and inode ownership; replacement links fail closed.
+MCP export/import therefore require `HAUNT_MCP_ADMIN=1`; the dashboard launch
+token similarly grants administrative transfer access to every namespace.
 
 ## Persistent recalled content and prompt injection
 
