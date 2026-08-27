@@ -10,7 +10,6 @@ from pathlib import Path
 
 from haunt.embed import bge_m3_source, fts_only, warmup
 from haunt.paths import (
-    NamespacePathError,
     bin_dir,
     ensure_layout,
     haunt_home,
@@ -174,9 +173,19 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                     # drains this queue out of band. Bounded per namespace
                     # per run by HAUNT_EMBED_DRAIN_LIMIT.
                     drained = st.drain_embedding_queue()
-            except (sqlite3.Error, OSError, NamespacePathError) as exc:
+            except (sqlite3.Error, OSError, ValueError) as exc:
                 # Isolated per namespace: aborting here would strand every
-                # namespace listed after this one on an undrained queue.
+                # namespace listed after this one on an undrained queue, and
+                # skip install_desktop_icon()/install_all_hosts() below.
+                #
+                # ValueError, not the individual classes: NamespacePathError,
+                # UnknownNamespaceError, NamespaceCollisionError,
+                # NamespaceMigrationError and AliasRetirementError are all
+                # ValueError subclasses, and naming only some of them let a
+                # sibling through. `namespace retire --apply` deregistering a
+                # namespace between list_namespace_rows() and Store() raises
+                # UnknownNamespaceError here, which is exactly the abort this
+                # guard exists to prevent.
                 reembed_report.append(
                     {"namespace": row["name"], "auto": True, "error": str(exc)}
                 )

@@ -70,106 +70,158 @@ def _hits_size(hits: list[dict[str, Any]]) -> int:
     return len(serialize(hits))
 
 
-def _rendered_hit(hit: dict[str, Any], content: str, keep: int) -> dict[str, Any]:
-    """`hit` with `content` replaced by its first `keep` chars plus an
-    inline "chars omitted" marker and two structured sibling keys. Pure
-    data construction, no size reasoning -- the one place that assembles
-    what a truncated hit looks like, shared by every `keep` candidate
-    _truncate_hit_content measures.
+# Which keys hold a row's shrinkable bulk, listed most expendable first.
+#
+# A recall hit's bulk is `content`. An *event* row's is not: hooks write
+# tool rows with content="" and the payload in tool_input/tool_output, each
+# capped at HAUNT_TOOL_IO_MAX_CHARS (12,000 by default) -- so one hook-captured
+# Bash event can carry 24,000 chars while its `content` is empty. Shrinking
+# only `content` there saves nothing, leaves the row over budget, and made
+# memory_timeline return zero events for a namespace that had them.
+#
+# Order is the sacrifice order: tool_output (the bulkiest, and reconstructible
+# by re-running the tool) goes before tool_input (the command that produced
+# it), and verbatim conversational `content` is cut last.
+HIT_TEXT_FIELDS = ("content",)
+EVENT_TEXT_FIELDS = ("tool_output", "tool_input", "content")
+
+
+def _row_identity(row: dict[str, Any]) -> Any:
+    """The id a caller can use to re-fetch this row in full.
+
+    Recall hits key on `memory_id`; event rows key on `id`. Reading only
+    `memory_id` filled the budget's truncated-id list with None, so a caller
+    could see that something was cut but not which row.
     """
-    omitted = len(content) - keep
-    out = dict(hit)
-    out["content"] = f"{content[:keep]}\n… [truncated by haunt: {omitted} chars omitted]"
-    out["content_truncated"] = True
-    out["content_omitted_chars"] = omitted
+    identity = row.get("memory_id")
+    return identity if identity is not None else row.get("id")
+
+
+def _rendered_field(row: dict[str, Any], field: str, keep: int) -> dict[str, Any]:
+    """`row` with `field` replaced by its first `keep` chars plus an
+    inline "chars omitted" marker and two structured sibling keys
+    (`<field>_truncated`, `<field>_omitted_chars`). Pure data
+    construction, no size reasoning -- the one place that assembles what a
+    truncated row looks like, shared by every `keep` candidate
+    _truncate_row_text measures.
+    """
+    value = row[field]
+    omitted = len(value) - keep
+    out = dict(row)
+    out[field] = f"{value[:keep]}\n… [truncated by haunt: {omitted} chars omitted]"
+    out[f"{field}_truncated"] = True
+    out[f"{field}_omitted_chars"] = omitted
     return out
 
 
-def _truncate_hit_content(hit: dict[str, Any], budget: int) -> dict[str, Any] | None:
-    """Try to shrink one hit's content so the whole hit dict fits in
+def _truncate_row_text(
+    row: dict[str, Any], budget: int, fields: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """Try to shrink one row's text fields so the whole dict fits in
     `budget` serialized chars, always marked when it does.
 
-    Last-resort path only: used when a single hit does not fit the recall
+    Last-resort path only: used when a single row does not fit the recall
     budget even alone. Never silent -- a shortened value must never still look
-    like the complete record, so the text carries an inline marker and the hit
-    gains structured `content_truncated`/`content_omitted_chars` siblings.
+    like the complete record, so each cut field carries an inline marker and
+    gains structured `<field>_truncated`/`<field>_omitted_chars` siblings.
+
+    `fields` is in sacrifice order, most expendable first. Each field is cut
+    only as far as it has to be: the first field is kept as long as the
+    remaining fields at full length still leave the row over budget, and a
+    later field is touched only if emptying every earlier one was not enough.
+    A row whose bulk is in an earlier field therefore keeps the later ones
+    byte-for-byte.
 
     MEASUREMENT ONLY -- no estimation. Every candidate is built and passed to
-    `serialize`, exactly like the caller's own size check. Predicting a hit's
-    JSON size is not possible here: one kept content char can cost up to six
+    `serialize`, exactly like the caller's own size check. Predicting a row's
+    JSON size is not possible here: one kept char can cost up to six
     serialized ones.
 
-    `budget` bounds the *entire* hit dict. A hit still carries
+    `budget` bounds the *entire* row dict. A hit still carries
     memory_id/tier/timestamps and the whole explanation object alongside
     content, often itself well over a thousand chars.
 
-    Returns None -- never a hit still over `budget` -- when truncation cannot
-    help, because the overage then lives entirely outside `content`:
+    Returns None -- never a row still over `budget` -- when truncation cannot
+    help, because the overage then lives entirely outside `fields`:
 
-      * content is not a string (e.g. a sqlite-blob envelope from
-        json_safe_sqlite), so there is nothing to slice; or
-      * even with content emptied out completely (keep=0, marker and siblings
-        only, measured rather than estimated), the hit's non-content
-        scaffolding still exceeds `budget`.
+      * no listed field holds a non-empty string (e.g. a sqlite-blob envelope
+        from json_safe_sqlite), so there is nothing to slice; or
+      * even with every listed field emptied out completely (keep=0, markers
+        and siblings only, measured rather than estimated), the row's
+        remaining scaffolding still exceeds `budget`.
 
-    Cutting `content` there would destroy verbatim data for zero size benefit.
-    Callers must drop such a hit rather than ship it over budget wearing a
+    Cutting text there would destroy verbatim data for zero size benefit.
+    Callers must drop such a row rather than ship it over budget wearing a
     truncation marker that did not help.
     """
-    content = hit.get("content")
     if budget <= 0:
         return None
-    if not isinstance(content, str):
-        # Non-string content (e.g. a sqlite-blob envelope from
-        # json_safe_sqlite) cannot be sliced -- there is no way to shrink
-        # it, so it cannot help this hit fit. Marking it "truncated"
-        # without changing a single byte would be exactly the lie this
-        # function must not tell.
+    # A non-string field (e.g. a sqlite-blob envelope from json_safe_sqlite)
+    # cannot be sliced, so it cannot help this row fit; marking it
+    # "truncated" without changing a single byte would be exactly the lie
+    # this function must not tell. An already-empty field is skipped for the
+    # same reason -- its marker would add chars, not remove them.
+    shrinkable = [
+        field for field in fields if isinstance(row.get(field), str) and row.get(field)
+    ]
+    if not shrinkable:
         return None
-    if len(serialize(hit)) <= budget:
+    if len(serialize(row)) <= budget:
         # Defensive only: the caller only reaches this function when the
-        # hit's real measured size didn't fit, so this shouldn't occur in
+        # row's real measured size didn't fit, so this shouldn't occur in
         # practice. Measuring first costs one cheap check and makes this
         # function correct standalone, not just under its one caller's
         # current control flow.
-        return hit
+        return row
 
-    # keep=0: content entirely emptied, only the marker and its two
-    # sibling keys remain. The smallest this hit's content can ever make
-    # it. If even this measures over budget, the overage lives entirely
-    # in fixed scaffolding no amount of content truncation can touch --
-    # drop the hit rather than ship a marker that saved nothing.
-    if len(serialize(_rendered_hit(hit, content, 0))) > budget:
+    # keep=0 everywhere: every shrinkable field emptied, only markers and
+    # their sibling keys left. The smallest this row's text can ever make
+    # it. If even this measures over budget, the overage lives entirely in
+    # fixed scaffolding no amount of truncation can touch -- drop the row
+    # rather than ship markers that saved nothing.
+    floor = row
+    for field in shrinkable:
+        floor = _rendered_field(floor, field, 0)
+    if len(serialize(floor)) > budget:
         return None
 
-    # A fitting `keep` exists in [0, len(content)] -- keep=0 was just
-    # measured as fitting -- so binary search over [0, len(content)] finds
-    # a large fitting `keep` in O(log len(content)) real measurements,
-    # about 17 for a 100KB hit.
+    # A fitting assignment exists -- `floor` was just measured as fitting --
+    # so walk the fields in sacrifice order, binary-searching each one's
+    # largest fitting `keep` while every later field is still at full length.
+    # O(len(fields) * log len(value)) real measurements, about 17 per field
+    # for a 100KB value.
     #
     # Size is *nearly* monotonic non-decreasing in `keep` -- each extra raw
     # char only ever adds to the escaped output -- but not strictly:
     # `omitted` appears both in the marker text and as
-    # content_omitted_chars, so crossing a power-of-ten boundary downward
+    # <field>_omitted_chars, so crossing a power-of-ten boundary downward
     # can shrink the total by 2 while the newly kept char adds 1.
     #
     # Safety does not rest on monotonicity. Every candidate is built and
     # measured, and the returned value is always one measured to fit --
-    # the keep=0 floor or a passing midpoint -- never inferred from the
-    # ordering. A notch can cost a byte or two of kept content; it cannot
+    # the all-fields floor or a passing midpoint -- never inferred from the
+    # ordering. A notch can cost a byte or two of kept text; it cannot
     # produce an over-budget result.
-    lo, hi = 0, len(content)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if len(serialize(_rendered_hit(hit, content, mid))) <= budget:
-            lo = mid
-        else:
-            hi = mid - 1
-    return _rendered_hit(hit, content, lo)
+    out = row
+    for field in shrinkable:
+        if len(serialize(out)) <= budget:
+            break
+        lo, hi = 0, len(out[field])
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(serialize(_rendered_field(out, field, mid))) <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        out = _rendered_field(out, field, lo)
+    return out
 
 
 def apply_recall_budget(
-    hit_dicts: list[dict[str, Any]], *, k: int
+    hit_dicts: list[dict[str, Any]],
+    *,
+    k: int,
+    text_fields: tuple[str, ...] = HIT_TEXT_FIELDS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Bound the serialized size of a hits list crossing a machine surface.
 
@@ -187,14 +239,15 @@ def apply_recall_budget(
          the remaining suffix. Fewer complete, trustworthy hits beat many
          partially-cut ones. Every hit returned here is untouched.
       4. Only if the first hit alone cannot fit whole: try truncating that one
-         hit's `content` (see _truncate_hit_content). Non-content scaffolding
-         -- memory_id, tier, timestamps, the whole `explanation` object -- is
+         hit's `text_fields` (see _truncate_row_text). Everything else --
+         memory_id, tier, timestamps, the whole `explanation` object -- is
          never touched, because silently shortening haunt's own
          retrieval/trust/correction metadata misrepresents it.
 
          If that makes the hit fit, it is returned marked partial via
-         content_truncated/content_omitted_chars, and every hit after it is
-         dropped, not also truncated -- one marked-partial hit, never many.
+         <field>_truncated/<field>_omitted_chars on each cut field, and every
+         hit after it is dropped, not also truncated -- one marked-partial
+         hit, never many.
 
          If it cannot (the overage lives entirely in that untouched
          scaffolding, e.g. a 600-entry correction_lineage), the hit is dropped
@@ -204,6 +257,15 @@ def apply_recall_budget(
          single invariant this function exists to uphold, while an honestly
          empty `hits` tells the caller the budget, not the corpus, produced
          it, so they can retry with a larger HAUNT_RECALL_MAX_CHARS.
+
+    `text_fields` names the keys holding this kind of row's bulk, most
+    expendable first. It defaults to a recall hit's (`content`); event rows
+    carry theirs in tool_output/tool_input and pass EVENT_TEXT_FIELDS, without
+    which step 4 empties an already-empty `content` and drops the row.
+
+    `content_truncated_memory_ids` names every row step 4 shortened, by
+    `memory_id` for a hit and `id` for an event row, whichever the row has.
+    Which field was cut is marked on the row itself.
     """
     cap = recall_payload_cap()
     meta: dict[str, Any] = {
@@ -254,10 +316,10 @@ def apply_recall_budget(
             used += size
             continue
         if not kept:
-            truncated = _truncate_hit_content(hit, max(0, cap - used))
+            truncated = _truncate_row_text(hit, max(0, cap - used), text_fields)
             if truncated is not None:
                 kept.append(truncated)
-                meta["content_truncated_memory_ids"].append(hit.get("memory_id"))
+                meta["content_truncated_memory_ids"].append(_row_identity(hit))
         # Whether or not the first hit could be salvaged by truncation,
         # every hit from here on (by rank) is dropped, never truncated in
         # its place: only ever one marked-partial hit, and a hit is never

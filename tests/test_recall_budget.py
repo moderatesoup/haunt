@@ -1011,6 +1011,151 @@ def test_memory_timeline_is_bounded_at_the_mcp_boundary(recall_budget_env):
     assert len(json.dumps(payload["events"], ensure_ascii=False)) <= recall_budget["max_chars"]
 
 
+def _seed_oversized_tool_events(rows: int = 3) -> None:
+    """Hook-shaped Bash events at the tool-I/O cap on BOTH fields.
+
+    HAUNT_TOOL_IO_MAX_CHARS is 12,000 for tool_input and again for
+    tool_output, so one such row is over the 24,000-char default recall
+    budget on its own -- while its `content` is "", the way the hooks write
+    tool rows. _seed_big_tool_io_corpus's 3,000-char rows never reach that.
+    """
+    from haunt.cursor_hook import TOOL_IO_MAX_CHARS_DEFAULT
+    from haunt.store import Store
+
+    with Store("default") as store:
+        for i in range(rows):
+            store.observe(
+                "",
+                role="tool",
+                tier="episodic",
+                tool_name="Bash",
+                tool_input=_big_content(TOOL_IO_MAX_CHARS_DEFAULT, tag=f"in{i}"),
+                tool_output=_big_content(TOOL_IO_MAX_CHARS_DEFAULT, tag=f"out{i}"),
+                defer_embedding=True,
+            )
+
+
+def test_memory_timeline_returns_events_whose_tool_io_alone_busts_the_cap(
+    recall_budget_env,
+):
+    """An event's bulk lives in tool_input/tool_output, not `content`.
+
+    Budgeted as a recall hit, degrade step 4 emptied an already-empty
+    `content`, saved nothing, still measured over budget, and returned zero
+    events for a namespace that had them -- indistinguishable from an empty
+    namespace.
+    """
+    from haunt import mcp_server
+
+    _seed_oversized_tool_events()
+    mcp_server._MCP_AUTHORITY = None
+
+    payload = json.loads(mcp_server.memory_timeline(namespace="default", limit=50))
+    events = payload["events"]
+    recall_budget = payload["recall_budget"]
+
+    assert events, f"non-empty namespace returned no events: {recall_budget}"
+    assert len(json.dumps(events, ensure_ascii=False)) <= recall_budget["max_chars"]
+
+    # Identifiable: which row was cut (event rows key on `id`, not
+    # `memory_id`, which used to fill this list with None) and which field.
+    assert recall_budget["content_truncated_memory_ids"] == [events[0]["id"]]
+    assert events[0]["tool_output_truncated"] is True
+    assert events[0]["tool_output_omitted_chars"] > 0
+    assert "[truncated by haunt:" in events[0]["tool_output"]
+    # Sacrifice order: tool_output goes first, so the command that produced it
+    # survives byte-for-byte.
+    assert "tool_input_truncated" not in events[0]
+    assert len(events[0]["tool_input"]) == 12_000
+
+
+def test_memory_timeline_says_a_truncated_window_lost_its_oldest_events(
+    recall_budget_env,
+):
+    """events() is newest-first, so the budget's rank prefix drops the OLDEST
+    rows of the requested window. Without a signal, an audit query reads the
+    newest few as the whole window."""
+    from haunt import mcp_server
+
+    _seed_oversized_tool_events(rows=4)
+    mcp_server._MCP_AUTHORITY = None
+
+    payload = json.loads(mcp_server.memory_timeline(namespace="default", limit=50))
+    window = payload["window_truncated"]
+
+    assert window["reason"] == "recall_budget"
+    assert window["dropped_end"] == "oldest"
+    assert window["events_dropped"] == payload["recall_budget"]["hits_dropped"] > 0
+    assert window["oldest_returned"]["id"] == payload["events"][-1]["id"]
+    assert window["oldest_returned"]["event_time"]
+
+
+def _seed_ranked_namespaces(count: int = 8, rows: int = 10) -> str:
+    """One rank-ordered corpus per namespace, named so alphabetical collation
+    and rank order visibly disagree."""
+    from haunt.store import observe
+
+    token = "FANOUTBUDGETTOKEN"
+    for index in range(count):
+        name = f"fanout-{chr(ord('a') + index)}"
+        for i in range(rows):
+            observe(
+                f"{token} {_big_content(400, tag=f'{name}-{i}')}",
+                namespace=name,
+                role="user",
+                tier="episodic",
+            )
+    return token
+
+
+def test_all_namespace_recall_budget_cuts_by_rank_not_by_alphabet(
+    recall_budget_env, monkeypatch
+):
+    """The fan-out concatenated namespaces alphabetically before budgeting, so
+    apply_recall_budget's rank prefix was really a *namespace* prefix: late-
+    alphabet namespaces came back with empty hits, a successful execution and
+    no error -- indistinguishable from "nothing matched"."""
+    from tests.dashutil import make_dash_client
+
+    namespaces, rows = 8, 10
+    token = _seed_ranked_namespaces(namespaces, rows)
+    client = make_dash_client()
+    params = {"q": token, "k": rows}
+
+    # Calibrate off the real uncapped payload so the assertion does not rest
+    # on a hit's incidental serialized size.
+    monkeypatch.setenv(
+        "HAUNT_RECALL_MAX_CHARS", str(budget.RECALL_PAYLOAD_MAX_CHARS_MAX)
+    )
+    whole = client.get("/api/recall", params=params).json()
+    assert whole["recall_budget"]["hits_returned"] == namespaces * rows
+    monkeypatch.setenv(
+        "HAUNT_RECALL_MAX_CHARS",
+        str(len(json.dumps(whole["hits"], ensure_ascii=False)) // 2),
+    )
+
+    every = client.get("/api/recall", params=params).json()
+    recall_budget = every["recall_budget"]
+    groups = every["namespace_groups"]
+
+    assert recall_budget["hits_dropped"] > 0
+    # Every namespace that matched keeps at least its top-ranked hit: no
+    # namespace loses its #1 while another still ships its #7.
+    answered = [group["namespace"] for group in groups if group["hits"]]
+    assert len(answered) == namespaces, (
+        f"only {answered} survived the budget; the rest were cut for coming "
+        "later in the alphabet, not for ranking lower"
+    )
+    # A group the budget cut says so rather than reading as no matches.
+    assert all(group["hits_dropped"] >= 0 for group in groups)
+    assert any(group["hits_dropped"] for group in groups)
+    assert sum(group["hits_dropped"] for group in groups) == recall_budget["hits_dropped"]
+    for group in groups:
+        assert group["hits_available"] == len(group["hits"]) + group["hits_dropped"]
+    # `hits` still agrees with the groups it is flattened from.
+    assert [hit for group in groups for hit in group["hits"]] == every["hits"]
+
+
 # ---------------------------------------------------------------------------
 # HAUNT_RECALL_MAX_CHARS parsing (util.env_int, like HAUNT_TOOL_IO_MAX_CHARS)
 # ---------------------------------------------------------------------------

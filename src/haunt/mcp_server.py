@@ -16,7 +16,7 @@ try:
 except ImportError as exc:  # MCP 1.x has no MCPServer
     raise ImportError("haunt requires mcp>=2,<3 (MCPServer API).") from exc
 
-from haunt.budget import apply_recall_budget, serialize as _json
+from haunt.budget import EVENT_TEXT_FIELDS, apply_recall_budget, serialize as _json
 from haunt.paths import (
     NamespacePathError,
     haunt_home,
@@ -539,7 +539,7 @@ def memory_recall(
 
 
 @server.tool(
-    description="List stored events in time order. clock is event_time (default) or storage_time (ingest time, events.ts — not source time). write_time is a deprecated alias for storage_time."
+    description="List stored events in time order. clock is event_time (default) or storage_time (ingest time, events.ts — not source time). write_time is a deprecated alias for storage_time. The response is size-budgeted (HAUNT_RECALL_MAX_CHARS): recall_budget describes what the budget did, a row whose tool_output/tool_input was shortened is marked <field>_truncated/<field>_omitted_chars, and because events are newest-first a budgeted window loses its OLDEST rows — window_truncated names the oldest event actually returned, so a short list is not the whole requested window."
 )
 def memory_timeline(
     namespace: Optional[str] = None,
@@ -563,11 +563,36 @@ def memory_timeline(
     except (UnknownNamespaceError, ValueError) as exc:
         return _json({"ok": False, "error": str(exc), "namespace": ns})
     # Same boundary, same budget as memory_recall: an event row carries the
-    # same uncapped tool I/O, and limit accepts up to 100 of them.
-    bounded_rows, recall_budget = apply_recall_budget(rows, k=limit)
-    return _json(
-        {"namespace": ns, "events": bounded_rows, "recall_budget": recall_budget}
+    # same uncapped tool I/O, and limit accepts up to 100 of them. It needs
+    # EVENT_TEXT_FIELDS because an event's bulk is tool_output/tool_input, not
+    # the `content` a recall hit carries -- budgeting it as a hit shrank an
+    # already-empty field and returned no events at all.
+    bounded_rows, recall_budget = apply_recall_budget(
+        rows, k=limit, text_fields=EVENT_TEXT_FIELDS
     )
+    payload: dict[str, Any] = {
+        "namespace": ns,
+        "events": bounded_rows,
+        "recall_budget": recall_budget,
+    }
+    if recall_budget["hits_dropped"]:
+        # events() orders newest-first, so the budget's rank-prefix keep drops
+        # the OLDEST rows of the requested window. Without this an audit
+        # caller reads a short list as the whole window.
+        oldest = bounded_rows[-1] if bounded_rows else None
+        payload["window_truncated"] = {
+            "reason": "recall_budget",
+            "events_dropped": recall_budget["hits_dropped"],
+            "dropped_end": "oldest",
+            "oldest_returned": {
+                "id": oldest.get("id"),
+                "event_time": oldest.get("event_time"),
+                "ts": oldest.get("ts"),
+            }
+            if oldest
+            else None,
+        }
+    return _json(payload)
 
 
 @server.tool(description="Health and counts for a namespace.")

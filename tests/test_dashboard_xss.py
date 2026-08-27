@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.dashutil import make_dash_client
+from tests.dashutil import TEST_DASH_TOKEN, make_dash_client
 
 from haunt import dashboard
 from haunt.graph import ENTITY_TYPES
@@ -160,6 +160,32 @@ def test_api_responses_are_not_documents(haunt_env):
     response = make_dash_client().get("/api/namespaces")
     assert response.headers["content-security-policy"] == dashboard._API_CSP
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_unhandled_errors_still_carry_the_api_hardening_headers(haunt_env, monkeypatch):
+    """Starlette builds ServerErrorMiddleware outside `user_middleware`, so a
+    500 replied through the raw ASGI send and never reached the guard
+    middleware that sets these -- leaving the response easiest to induce
+    post-auth as the one with no CSP, no nosniff and a text/plain body."""
+    from starlette.testclient import TestClient
+
+    def boom():
+        raise RuntimeError("induced-failure-detail")
+
+    monkeypatch.setattr(dashboard, "list_namespaces", boom)
+    client = TestClient(
+        dashboard.app,
+        base_url="http://127.0.0.1:7340",
+        headers={"X-Haunt-Token": TEST_DASH_TOKEN},
+        raise_server_exceptions=False,
+    )
+    response = client.get("/api/namespaces")
+
+    assert response.status_code == 500
+    assert response.headers["content-security-policy"] == dashboard._API_CSP
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-type"].startswith("application/json")
+    assert "induced-failure-detail" not in response.text
 
 
 @pytest.fixture

@@ -91,6 +91,48 @@ def test_bootstrap_drains_namespaces_listed_after_a_corrupt_one(
     assert report["hosts"], "host installation was skipped"
 
 
+def test_bootstrap_survives_a_namespace_deregistered_mid_walk(fanout_env, monkeypatch):
+    """`namespace retire --apply` can deregister a namespace between
+    list_namespace_rows() and Store(), which raises UnknownNamespaceError.
+
+    That is a plain ValueError subclass, like NamespaceCollisionError,
+    NamespaceMigrationError and NamespacePathError -- naming only some of
+    them in the guard let the others abort the whole walk.
+    """
+    import haunt.store as store_module
+    from haunt.bootstrap import bootstrap
+    from haunt.store import Store, UnknownNamespaceError
+
+    victim, later = _seed()
+    real_store = Store
+
+    def retired_mid_walk(name, *args, **kwargs):
+        if name == victim:
+            raise UnknownNamespaceError(name)
+        return real_store(name, *args, **kwargs)
+
+    monkeypatch.setattr(store_module, "Store", retired_mid_walk)
+
+    visited: list[str] = []
+    real_drain = Store.drain_embedding_queue
+
+    def spy(self, *args, **kwargs):
+        visited.append(self.name)
+        return real_drain(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "drain_embedding_queue", spy)
+    report = bootstrap("default")
+
+    assert set(later) <= set(visited), (
+        f"retiring {victim} stranded the namespaces after it; "
+        f"drained only {visited}"
+    )
+    rows = {row.get("namespace"): row for row in report["reembed"]}
+    assert "unknown namespace" in rows.get(victim, {}).get("error", "")
+    # Everything downstream of the loop still runs.
+    assert report["hosts"], "host installation was skipped"
+
+
 def test_reembed_all_namespaces_reports_the_corrupt_one_and_keeps_going(fanout_env):
     from haunt.store import reembed_all_namespaces
 

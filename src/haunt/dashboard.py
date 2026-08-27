@@ -624,6 +624,11 @@ async function doPurge(){
     closeDetail();
     if(!ALL_NS)loadNs(NS);
     if($('view-browse').classList.contains('on'))doBrowse(BROWSE_PAGE);
+    // The rows are gone either way, but a concurrent reader blocks the file
+    // rebuild, leaving older copies of the erased text readable in free
+    // pages. CLI and MCP both report this; the console must not be the one
+    // surface that says "deleted" and stops there.
+    if(r.bytes_overwritten===false)alert("Memory deleted, but the database file was not rebuilt (bytes_overwritten=false) — a concurrent reader held it open. Erased text may still be readable in free pages until a later purge rebuilds the file. Close other haunt processes and purge again.");
   }else{
     alert("Delete failed: "+(r.error||"unknown error"));
   }
@@ -824,6 +829,10 @@ const ACTIONS={
 document.addEventListener("click",ev=>{
   const el=ev.target.closest("[data-act]");
   if(!el)return;
+  // Object.hasOwn, not a plain lookup: data-act="valueOf" would otherwise
+  // resolve to an inherited Object.prototype method and data-act="__proto__"
+  // to a truthy non-callable, both of which throw inside this handler.
+  if(!Object.hasOwn(ACTIONS,el.dataset.act))return;
   const run=ACTIONS[el.dataset.act];
   if(run)run(el);
 });
@@ -997,6 +1006,23 @@ def _local_recall_order(hit: Hit) -> tuple[int, int, float, str]:
     return (1, 0, -hit.score, hit.memory_id)
 
 
+def _rank_interleaved(groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Merge rank-ordered per-namespace lists into one, round-robin by rank
+    position: every namespace's #1, then every namespace's #2, and so on.
+
+    Relative order within a namespace is preserved, and no cross-namespace
+    score comparison is made or implied -- every namespace's rank N is treated
+    as equally worth keeping, which is the strongest ordering RRF values that
+    are only meaningful locally can support.
+    """
+    merged: list[dict[str, Any]] = []
+    for position in range(max((len(group) for group in groups), default=0)):
+        for group in groups:
+            if position < len(group):
+                merged.append(group[position])
+    return merged
+
+
 async def api_namespace(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
     missing = _missing_namespace(name)
@@ -1040,7 +1066,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
         return _recall_error(exc, query=q)
     ns_rows = sorted(list_namespace_rows_readonly(), key=lambda row: row["name"])
     namespace_groups: list[dict[str, Any]] = []
-    flattened: list[dict[str, Any]] = []
+    per_namespace: list[list[dict[str, Any]]] = []
     errors: list[dict[str, str]] = []
     for row in ns_rows:
         ns_name = row["name"]
@@ -1071,7 +1097,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
                 execution = execution_metadata(hits)
                 if execution is not None:
                     group["execution"] = execution
-                flattened.extend(results)
+                per_namespace.append(results)
         except Exception as exc:
             error = {
                 "namespace": ns_name,
@@ -1088,14 +1114,28 @@ async def api_recall_all(request: Request) -> JSONResponse:
 
     # One budget for the whole fan-out rather than one per namespace: this
     # endpoint answers from every registered namespace at once, so a
-    # per-namespace cap would multiply by however many exist. Groups are
-    # rebuilt from what survived so a group can never disagree with `hits`.
-    bounded_hits, recall_budget = apply_recall_budget(flattened, k=k)
+    # per-namespace cap would multiply by however many exist.
+    #
+    # apply_recall_budget keeps a strict prefix of the list it is handed, so
+    # feeding it namespace-by-namespace made alphabetical collation, not rank,
+    # decide whose hits survive: namespaces late in the alphabet came back with
+    # an empty `hits` and a successful `execution`, indistinguishable from "no
+    # matches". Interleaving by local rank makes that prefix a rank prefix
+    # instead -- round-robin rather than a global sort, because RRF scores are
+    # not comparable across namespaces (see _local_recall_order).
+    bounded_hits, recall_budget = apply_recall_budget(
+        _rank_interleaved(per_namespace), k=k
+    )
     kept: dict[str, list[dict[str, Any]]] = {}
     for hit in bounded_hits:
         kept.setdefault(str(hit.get("namespace")), []).append(hit)
     for group in namespace_groups:
+        available = len(group["hits"])
         group["hits"] = kept.get(group["namespace"], [])
+        # A group emptied by the budget must not read as a group that matched
+        # nothing.
+        group["hits_available"] = available
+        group["hits_dropped"] = available - len(group["hits"])
 
     return JSONResponse(
         {
@@ -1105,7 +1145,9 @@ async def api_recall_all(request: Request) -> JSONResponse:
             "namespace_groups": namespace_groups,
             # Kept for the existing UI/API shape. This is namespace-grouped,
             # not a global result ranking, and each final_rank remains local.
-            "hits": bounded_hits,
+            # Regrouping here (rather than returning the interleaved order the
+            # budget saw) keeps `hits` agreeing with `namespace_groups`.
+            "hits": [hit for group in namespace_groups for hit in group["hits"]],
             "recall_budget": recall_budget,
             "errors": errors,
         }
@@ -1655,10 +1697,31 @@ class DashboardGuardMiddleware:
         await self.app(scope, receive, send_hardened)
 
 
+async def unhandled_error_response(_request: Request, _exc: Exception) -> JSONResponse:
+    """500 body for an unhandled exception, carrying the hardening headers.
+
+    Starlette builds ServerErrorMiddleware outside `user_middleware`, so an
+    unhandled exception replies through the raw ASGI `send` and never reaches
+    DashboardGuardMiddleware.send_hardened -- the headers have to be set here
+    or the easiest response to induce is the one response with no CSP and no
+    nosniff. ServerErrorMiddleware still re-raises afterwards, so the server
+    logs the traceback as before; the exception stays out of the body.
+    """
+    return JSONResponse(
+        {"error": "internal error"},
+        status_code=500,
+        headers={
+            "content-security-policy": _API_CSP,
+            "x-content-type-options": "nosniff",
+        },
+    )
+
+
 app = Starlette(
     debug=False,
     routes=routes,
     middleware=[Middleware(DashboardGuardMiddleware)],
+    exception_handlers={Exception: unhandled_error_response},
 )
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
 
 from haunt.store import Store, observe
@@ -287,3 +289,94 @@ class TestContradictRoute:
         )
         assert resp.status_code == 200
         assert resp.json()["namespace"] == "default"
+
+
+# --------------------------------------------------------------------------
+# The console client script itself, run under stubbed browser globals
+# --------------------------------------------------------------------------
+
+
+def _dashboard_script() -> str:
+    import re
+
+    from haunt import dashboard
+
+    match = re.search(r"<script[^>]*>\n(.*)\n</script>", dashboard.HTML, re.S)
+    assert match, "dashboard template no longer has a single inline script"
+    return match.group(1).replace(dashboard._HTML_TOKEN_PLACEHOLDER, '""')
+
+
+def _run_console(tmp_path, *, purge=None, acts=(), purge_response=None) -> dict:
+    """Boot the shipped client script in node against real API payloads."""
+    import json
+    import subprocess
+    from pathlib import Path
+
+    from tests.dashutil import make_dash_client
+
+    client = make_dash_client()
+    responses = {
+        path: client.get(path).json()
+        for path in ("/api/namespaces", "/api/namespace/default")
+    }
+    if purge is not None:
+        responses[
+            f"/api/namespace/{purge['namespace']}/memory/{purge['memory_id']}"
+        ] = purge_response
+
+    harness = (Path(__file__).parent / "dashboard_console_harness.js").read_text()
+    prologue, epilogue = harness.split("//__DASHBOARD_SCRIPT__\n")
+    bundle = tmp_path / "console.js"
+    bundle.write_text(prologue + _dashboard_script() + epilogue)
+    case = tmp_path / "case.json"
+    case.write_text(
+        json.dumps({"responses": responses, "purge": purge, "acts": list(acts)})
+    )
+    proc = subprocess.run(
+        ["node", str(bundle), str(case)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+_PURGED = {"namespace": "default", "memory_id": "mem-console-probe"}
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None, reason="node runs the dashboard client script"
+)
+class TestConsoleClientScript:
+    def test_purge_tells_the_operator_when_free_pages_were_not_overwritten(
+        self, dash_client, tmp_path
+    ):
+        """_overwrite_erased_pages returns False whenever a concurrent reader
+        blocks the rebuild, and the API still answers 200 {ok:true}. CLI, MCP
+        and SECURITY.md all surface that; the console said only "deleted"."""
+        result = _run_console(
+            tmp_path,
+            purge=_PURGED,
+            purge_response={"ok": True, "bytes_overwritten": False},
+        )
+        assert any("bytes_overwritten" in message for message in result["alerts"]), (
+            f"purge reported nothing about unerased free pages: {result['alerts']}"
+        )
+
+    def test_a_fully_erased_purge_stays_quiet(self, dash_client, tmp_path):
+        """The warning must mean something -- it cannot fire on every purge."""
+        result = _run_console(
+            tmp_path,
+            purge=_PURGED,
+            purge_response={"ok": True, "bytes_overwritten": True},
+        )
+        assert result["alerts"] == []
+
+    def test_prototype_keys_never_dispatch_as_actions(self, dash_client, tmp_path):
+        """ACTIONS[el.dataset.act] was an unguarded lookup: "__proto__" gave a
+        truthy non-callable and "valueOf" an inherited Object.prototype
+        method, both reached from inside the one global click handler."""
+        result = _run_console(
+            tmp_path,
+            acts=["__proto__", "valueOf", "toString", "constructor", "purge-cancel"],
+        )
+        assert result["errors"] == []
+        assert result["called"] == ["purge-cancel"]
