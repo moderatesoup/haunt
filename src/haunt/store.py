@@ -4133,6 +4133,33 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     ]
 
 
+def _table_column_signatures(
+    conn: sqlite3.Connection, table: str
+) -> dict[str, tuple[str, int, Any, int]]:
+    """Map every column name to its declared (type, notnull, default, pk).
+
+    Keyed by name, so ordinal position -- the one thing PRAGMA table_info
+    reports that two namespaces at the same schema version may legitimately
+    disagree about -- is deliberately excluded. A missing table yields `{}`,
+    matching `_table_columns`.
+
+    What table_info cannot see is not compared: CHECK constraints, foreign
+    keys, and indexes (including the partial UNIQUE indexes behind
+    `_RECONCILE_SECONDARY_UNIQUE_KEYS`) are absent from its output, so two
+    tables comparing equal here are equal in column set, affinity,
+    nullability, default, and primary key -- not in every possible respect.
+    """
+    return {
+        str(row["name"]): (
+            str(row["type"]),
+            int(row["notnull"]),
+            row["dflt_value"],
+            int(row["pk"]),
+        )
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
 def _reconcile_sort_key(pk: tuple[Any, ...]) -> tuple[str, ...]:
     return tuple("" if value is None else str(value) for value in pk)
 
@@ -4224,13 +4251,27 @@ def _reconcile_content_state_digest(
     diffs: dict[str, _TableDiff] = {}
     per_table_digest: dict[str, Any] = {}
     for table, pk_columns, ignore_columns in _RECONCILE_TABLES:
-        source_columns = _table_columns(source_conn, table)
-        target_columns = _table_columns(target_conn, table)
+        # Compared by name, never by ordinal. A namespace created fresh at
+        # the current schema and one that reached it through ALTER TABLE
+        # order their columns differently for the same version -- `events`
+        # carries `idempotency_key` second when created fresh and thirteenth
+        # when migrated -- and that pair is precisely what reconcile exists
+        # to heal. Nothing downstream reads a column by position: rows are
+        # fetched into name-keyed dicts, diffed by name, and the apply's
+        # INSERT builds its own column list from TARGET's PRAGMA order while
+        # pulling each value out of the SOURCE row by name.
+        source_columns = _table_column_signatures(source_conn, table)
+        target_columns = _table_column_signatures(target_conn, table)
         if source_columns != target_columns:
+            differing = sorted(
+                name
+                for name in set(source_columns) | set(target_columns)
+                if source_columns.get(name) != target_columns.get(name)
+            )
             raise NamespaceMigrationError(
-                f"{table!r} column layout differs between the two namespaces "
-                "even though both report the current schema version; "
-                "refusing to guess a mapping"
+                f"{table!r} columns differ between the two namespaces even "
+                "though both report the current schema version "
+                f"({', '.join(differing)}); refusing to guess a mapping"
             )
         source_rows = _fetch_rows_by_pk(source_conn, table, pk_columns)
         target_rows = _fetch_rows_by_pk(target_conn, table, pk_columns)
