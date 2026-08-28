@@ -619,6 +619,30 @@ def test_registered_collision_prone_label_still_resolves(repo_env, monkeypatch):
     assert len(_namespace_rows()) == 1
 
 
+def test_registration_wins_over_a_label_the_formula_cannot_produce(
+    repo_env, monkeypatch
+):
+    """The load-bearing back-compat case: a namespace whose label no
+    derivation would ever mint for this repo.
+
+    The sibling tests register the label the formula happens to produce, so
+    they cannot tell a registry lookup apart from a re-derivation that
+    coincidentally agrees. This one can: nothing about `acme/foo-bar4`
+    yields `legacy-ns-from-before-c1`, so returning it proves resolution
+    came from the binding, not the formula."""
+    project = repo_env / "foo-bar4"
+    project.mkdir()
+    _patch_git_context(monkeypatch, "git@github.com:acme/foo-bar4.git", project)
+    register_namespace("legacy-ns-from-before-c1", str(project.resolve()))
+
+    for _ in range(3):
+        ns, repo_path = infer_namespace_context(project)
+        assert ns == "legacy-ns-from-before-c1"
+        assert repo_path == str(project.resolve())
+
+    assert len(_namespace_rows()) == 1
+
+
 def test_registered_basename_label_still_resolves(repo_env, monkeypatch):
     """The same guarantee for R8's derivation path: a remote-less checkout
     whose basename-derived namespace already exists keeps resolving to it."""
