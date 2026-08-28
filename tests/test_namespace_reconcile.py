@@ -1669,3 +1669,69 @@ def test_namespace_backup_carries_rows_that_are_still_only_in_the_wal(reconcile_
         assert found == 1, "the backup dropped a committed row that lived in the WAL"
     finally:
         backup.close()
+
+
+def test_embedding_jobs_drift_between_the_dry_run_and_the_apply_is_refused(
+    reconcile_home,
+):
+    """The apply copies embedding_jobs rows, so the digest must cover them.
+
+    `attempts`/`last_error` are mutable queue state a background drain moves.
+    They were copied verbatim into TARGET while sitting outside
+    content_state_digest, so the operator authorized one plan and the apply
+    wrote values that plan never saw.
+    """
+    register_namespace("jobs-src")
+    with Store("jobs-src") as st:
+        queued = st.observe("a source row waiting to be embedded").memory_id
+        assert st.conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (queued,)
+        ).fetchone() is not None
+    register_namespace("jobs-dst")
+    with Store("jobs-dst") as st:
+        st.observe("an unrelated dst row")
+
+    plan = reconcile_namespaces("jobs-src", "jobs-dst")
+
+    with Store("jobs-src") as st:
+        st.conn.execute(
+            "UPDATE embedding_jobs SET attempts=4, last_error='drift' WHERE memory_id=?",
+            (queued,),
+        )
+        st.conn.commit()
+
+    with pytest.raises(NamespaceMigrationError, match="digest"):
+        reconcile_namespaces(
+            "jobs-src", "jobs-dst", apply=True, plan_digest=plan["plan_digest"]
+        )
+
+    with Store("jobs-dst", create=False) as st:
+        assert st.conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (queued,)
+        ).fetchone() is None, "nothing may be written once the digest is refused"
+
+    # A fresh cycle authorizes the drifted state and then copies it.
+    replan = reconcile_namespaces("jobs-src", "jobs-dst")
+    reconcile_namespaces(
+        "jobs-src", "jobs-dst", apply=True, plan_digest=replan["plan_digest"]
+    )
+    with Store("jobs-dst", create=False) as st:
+        job = st.conn.execute(
+            "SELECT attempts, last_error FROM embedding_jobs WHERE memory_id=?",
+            (queued,),
+        ).fetchone()
+        assert (job["attempts"], job["last_error"]) == (4, "drift")
+
+
+def test_embedding_jobs_stays_out_of_the_plans_per_table_report(reconcile_home):
+    """Digest-only means digest-only: no diff, no collision semantics."""
+    register_namespace("jobs-report-src")
+    with Store("jobs-report-src") as st:
+        st.observe("source row")
+    register_namespace("jobs-report-dst")
+    with Store("jobs-report-dst") as st:
+        st.observe("dst row")
+
+    plan = reconcile_namespaces("jobs-report-src", "jobs-report-dst")
+    assert set(plan["tables"]) == {table for table, _pk, _ig in _RECONCILE_TABLES}
+    assert "embedding_jobs" not in plan["tables"]

@@ -18,6 +18,8 @@ import json
 
 import pytest
 
+from haunt.embed import EmbedState
+
 
 @pytest.fixture
 def policy_env(tmp_path, monkeypatch):
@@ -39,6 +41,30 @@ def policy_env(tmp_path, monkeypatch):
     register_namespace("policy-test")
     yield home
     embed.reset()
+
+
+_FAKE_DIM = 384
+_FAKE_STATE = EmbedState(
+    model_id="test-capture-policy-model",
+    requested="test-capture-policy-model",
+    dim=_FAKE_DIM,
+    available=True,
+    fallback=False,
+)
+
+
+def _fake_embed_texts(texts):
+    return [[0.1] * _FAKE_DIM for _ in texts]
+
+
+def _plain_vec_table(conn, dim, commit=True):
+    """Stand-in for ensure_vec_table: policy_env runs without sqlite-vec."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS vec_memories (id TEXT PRIMARY KEY, embedding BLOB)"
+    )
+    if commit:
+        conn.commit()
+    return True
 
 
 def _memory_row(store, memory_id):
@@ -469,3 +495,97 @@ def test_mcp_style_observe_call_is_not_silently_unembedded(policy_env, monkeypat
             "skip_embedding itself"
         )
         assert _queued(store, r.memory_id)
+
+
+def test_persisted_exclusion_survives_a_full_reembed(policy_env):
+    """C6's whole point: a model change must not resurrect an excluded row.
+
+    The exclusion used to live only in observe()'s parameter, so reembed()
+    -- which walks `memories` rather than the queue -- re-embedded and
+    re-queued every policy-excluded row it found.
+    """
+    from unittest.mock import patch
+
+    from haunt.store import Store
+
+    with Store("policy-test") as store:
+        excluded = store.observe(
+            "",
+            role="tool",
+            tier="episodic",
+            tool_name="Bash",
+            tool_output="REEMBED-RESURRECTION-TOKEN",
+            defer_embedding=True,
+            skip_embedding=True,
+        )
+        embedded = store.observe("an ordinary note worth embedding", role="user")
+
+        # No embed backend: reembed's fallback branch re-queues everything
+        # it means to embed later.
+        no_model = store.reembed()
+        assert not _queued(store, excluded.memory_id)
+        assert _queued(store, embedded.memory_id)
+        assert no_model["available"] is False
+
+        with (
+            patch("haunt.store.embed_state", return_value=_FAKE_STATE),
+            patch("haunt.store.embed_texts", side_effect=_fake_embed_texts),
+            patch("haunt.store.ensure_vec_table", side_effect=_plain_vec_table),
+            patch.object(store, "vec_ok", return_value=True),
+        ):
+            rebuilt = store.reembed()
+
+        assert _memory_row(store, excluded.memory_id)["embedding"] is None
+        vec_ids = {
+            row["id"]
+            for row in store.conn.execute("SELECT id FROM vec_memories").fetchall()
+        }
+        assert excluded.memory_id not in vec_ids
+        assert embedded.memory_id in vec_ids
+        assert store.conn.execute(
+            "SELECT skip_embedding FROM memories WHERE id=?", (excluded.memory_id,)
+        ).fetchone()["skip_embedding"] == 1
+        assert (no_model["skipped"], rebuilt["skipped"]) == (1, 1)
+        assert rebuilt["total"] == 1, "only the embeddable row is rebuilt"
+
+
+def test_persisted_exclusion_keeps_the_drain_from_embedding_a_stale_job(policy_env):
+    """A queue row that predates the flag must not drain into the index.
+
+    The v3 migration and a model-less reembed() both enqueue every non-blank
+    unembedded row, so an excluded memory can carry a job row it never asked
+    for. The drain honours the column, not the queue.
+    """
+    from unittest.mock import patch
+
+    from haunt.store import Store
+
+    with Store("policy-test") as store:
+        excluded = store.observe(
+            "",
+            role="tool",
+            tier="episodic",
+            tool_name="Read",
+            tool_output="STALE-QUEUE-ROW-TOKEN",
+            defer_embedding=True,
+            skip_embedding=True,
+        )
+        store.conn.execute(
+            "INSERT INTO embedding_jobs(memory_id, queued_at) "
+            "SELECT id, created_at FROM memories WHERE id=?",
+            (excluded.memory_id,),
+        )
+        store.conn.commit()
+
+        with (
+            patch("haunt.store.embed_state", return_value=_FAKE_STATE),
+            patch("haunt.store.embed_texts", side_effect=_fake_embed_texts),
+            patch("haunt.store.ensure_vec_table", side_effect=_plain_vec_table),
+            patch.object(store, "vec_ok", return_value=True),
+        ):
+            drained = store.drain_embedding_queue()
+
+        assert drained["processed"] == 0
+        assert drained["remaining"] == 0, "an undrainable job must not be counted"
+        assert drained["stop_reason"] == "drained"
+        assert _memory_row(store, excluded.memory_id)["embedding"] is None

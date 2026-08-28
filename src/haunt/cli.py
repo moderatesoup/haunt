@@ -968,6 +968,17 @@ def procedure_list_cmd(
         typer.echo(f"  provenance {human_display(p['provenance'], limit=4096)}")
 
 
+def _warn_unerased_backups(names: list[str]) -> None:
+    """Report backups the purge could not sweep. Silent when there are none."""
+    if not names:
+        return
+    typer.echo(
+        "warning: erased content remains in "
+        f"{len(names)} backup(s) under HAUNT_HOME/backups: " + ", ".join(names),
+        err=True,
+    )
+
+
 @app.command("delete")
 def delete_cmd(
     memory_id: Optional[str] = typer.Argument(
@@ -1004,14 +1015,17 @@ def delete_cmd(
             # costs the size of the namespace, so one per memory would block
             # every writer in every namespace N times over. Defer it and pay
             # once; the erasure is only complete after the rebuild below.
+            unerased: set[str] = set()
             for r in rows:
                 result = st.purge(r["id"], rebuild=False)
+                unerased.update(result.get("backups_unerased") or ())
                 typer.echo(
                     f"purged  fts={result.get('fts_deleted')}  "
                     f"vec={result.get('vec_deleted')}  rels={result.get('relations_deleted')}  "
                     f"event={result.get('event_deleted')}"
                 )
             typer.echo(f"bytes_overwritten={st.overwrite_erased_pages()}")
+            _warn_unerased_backups(sorted(unerased))
         return
     with _existing(ns) as st:
         if not yes:
@@ -1030,6 +1044,7 @@ def delete_cmd(
         f"event_deleted={result['event_deleted']}  "
         f"bytes_overwritten={result['bytes_overwritten']}"
     )
+    _warn_unerased_backups(result["backups_unerased"])
 
 
 @app.command("correct")

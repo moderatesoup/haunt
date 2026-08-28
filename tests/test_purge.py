@@ -335,3 +335,94 @@ def test_purge_keeps_the_replacement_session_in_its_succession_chain(haunt_env):
 
     assert ended["ok"] is True, "the replacement lost its place in the chain"
     assert len(ended["sessions_ended"]) == 1
+
+
+def _backup_canary_counts(home: Path, needle: bytes) -> dict[str, int]:
+    """Raw occurrences of needle across every file Haunt's backup dir holds."""
+    root = home / "backups"
+    if not root.is_dir():
+        return {}
+    return {p.name: p.read_bytes().count(needle) for p in sorted(root.iterdir())}
+
+
+def test_purge_erases_the_canary_from_the_backups_haunt_wrote(haunt_env):
+    """Both backup-creating paths must not outlive the erasure they predate.
+
+    reconcile and retire each write a full plaintext copy of a namespace
+    database under HAUNT_HOME/backups. Evidence is the raw bytes of those
+    files, not the purge report: a copy nothing scans is exactly how the
+    erasure guarantee was false while every in-database assertion passed.
+    """
+    from haunt.store import (
+        reconcile_namespaces,
+        register_namespace,
+        retire_namespace,
+    )
+
+    canary = "backupleakcanaryf3w8"
+    register_namespace("leak-src")
+    with Store("leak-src") as st:
+        memory_id = st.observe(f"leaked credential {canary} rotate it").memory_id
+        for i in range(20):
+            st.observe(f"filler note {i} about deployments and databases")
+    register_namespace("leak-dst")
+    with Store("leak-dst") as st:
+        st.observe("an unrelated destination row")
+
+    plan = reconcile_namespaces("leak-src", "leak-dst")
+    reconcile_namespaces(
+        "leak-src", "leak-dst", apply=True, plan_digest=plan["plan_digest"]
+    )
+    retired = retire_namespace("leak-src", into="leak-dst", apply=True)
+    assert retired["retired"] is True
+
+    needle = canary.encode()
+    before = _backup_canary_counts(haunt_env, needle)
+    assert sum(before.values()) > 0, f"no backup ever held the canary: {before}"
+
+    with Store("leak-dst", create=False) as st:
+        result = st.purge(memory_id)
+
+    after = _backup_canary_counts(haunt_env, needle)
+    assert sum(after.values()) == 0, f"canary survives in a backup: {after}"
+    assert result["ok"] is True
+    assert result["backups_unerased"] == []
+    assert result["backups_erased"] >= 2, (
+        "the reconcile-source and retire backups both held the row"
+    )
+
+
+def test_purge_leaves_backups_that_never_held_the_row_alone(haunt_env):
+    """Sweeping is per-row, not a retention policy on the whole directory."""
+    from haunt.store import reconcile_namespaces, register_namespace
+
+    register_namespace("keep-src")
+    with Store("keep-src") as st:
+        kept = st.observe("a source row that survives the purge").memory_id
+        doomed = st.observe("PURGED-BACKUP-SIBLING-TOKEN").memory_id
+    register_namespace("keep-dst")
+    with Store("keep-dst") as st:
+        st.observe("an unrelated destination row")
+
+    plan = reconcile_namespaces("keep-src", "keep-dst")
+    reconcile_namespaces(
+        "keep-src", "keep-dst", apply=True, plan_digest=plan["plan_digest"]
+    )
+
+    with Store("keep-dst", create=False) as st:
+        result = st.purge(doomed)
+
+    backups = sorted((haunt_env / "backups").glob("namespace-*.db"))
+    assert backups, "the reconcile must have written backups to sweep"
+    for backup in backups:
+        check = sqlite3.connect(f"{backup.as_uri()}?mode=ro", uri=True)
+        try:
+            ids = {row[0] for row in check.execute("SELECT id FROM memories")}
+        finally:
+            check.close()
+        assert doomed not in ids
+        if kept in ids:
+            break
+    else:
+        pytest.fail("the surviving row was swept out of every backup")
+    assert result["backups_unerased"] == []
