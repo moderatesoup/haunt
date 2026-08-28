@@ -47,8 +47,14 @@ DATASET_MANIFEST_SHA256 = (
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIXTURE_DIR = ROOT / "tests" / "fixtures" / "abstention_eval" / "v1"
 DEFAULT_E0_CORPUS = ROOT / "tests" / "fixtures" / "retrieval_eval" / "corpus.json"
+# The hybrid artifact manifest gates embed initialization, so it has to be
+# reachable from an installed wheel, where ROOT points outside the package and
+# tests/ was never shipped. It lives beside the code and stays E6 evidence:
+# one file, hash-pinned, read by both the runtime check and the E6 harness.
+HYBRID_MANIFEST_DIR = Path(__file__).resolve().parent / "data"
 E6_EVIDENCE_PATHS = (
     "src/haunt/abstention_eval.py",
+    "src/haunt/data/hybrid-model-manifest.json",
     "scripts/reproduce_abstention_eval.py",
     "scripts/benchmark_abstention_evidence.py",
     "tests/fixtures/abstention_eval",
@@ -701,7 +707,7 @@ def public_runtime_evidence() -> dict[str, Any]:
 def verify_local_hybrid_cache(
     cache_root: Path,
     *,
-    fixture_dir: Path = DEFAULT_FIXTURE_DIR,
+    manifest_dir: Path = HYBRID_MANIFEST_DIR,
     audit_hook: AuditHook | None = None,
     hash_max_bytes: int | None = None,
 ) -> dict[str, Any]:
@@ -711,9 +717,13 @@ def verify_local_hybrid_cache(
     hash_max_bytes caps content hashing: a file whose manifest size exceeds
     it is reported with sha256 None and stands on its size alone. The default
     hashes every file, which is the evidence E6 records.
+
+    manifest_dir defaults to the packaged manifest and exists so a caller can
+    point at a tampered copy; a relocated manifest still has to carry the
+    pinned canonical hash, so it cannot bless a different artifact identity.
     """
     manifest = _read_json_component(
-        fixture_dir,
+        manifest_dir,
         "hybrid-model-manifest.json",
         component="hybrid_model_manifest",
         audit_hook=audit_hook,
@@ -1371,9 +1381,7 @@ def evaluate_profile(
     if profile == "hybrid":
         if model_cache is None:
             raise RuntimeError("hybrid reproduction requires --model-cache")
-        cache_evidence = verify_local_hybrid_cache(
-            model_cache, fixture_dir=fixture_dir, audit_hook=audit
-        )
+        cache_evidence = verify_local_hybrid_cache(model_cache, audit_hook=audit)
 
     network_attempts: list[str] = []
     with TemporaryDirectory(prefix=f"haunt-e6-{profile}-") as home:
