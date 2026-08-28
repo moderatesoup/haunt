@@ -1147,7 +1147,12 @@ def cursor_install_cmd() -> None:
 
 @app.command("doctor")
 def doctor_cmd() -> None:
-    """Check sqlite-vec, haunt-mcp, embed, and host files. Exit 1 if any check fails."""
+    """Check sqlite-vec, haunt-mcp, embed, host files, and namespace collisions.
+
+    Exit 1 if any check fails. A namespace already shared by two repositories
+    is reported as an advisory and does not affect the exit code: healing it
+    is `haunt namespace reconcile`'s operator-invoked job.
+    """
     from haunt.bootstrap import bind_launchers
     from haunt.doctor import diagnose, format_doctor
     from haunt.hosts import install_all_hosts
