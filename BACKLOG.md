@@ -1115,14 +1115,18 @@ cross-encoder as deliberately not wired.
 Verified against `main` `ed806b2` and `integration/all-work` `d1aec40`, then
 extended by a late pass at `integration/all-work` `413f8b9` that closed 19 of
 these rows, added six new ones (L11-L16), and recorded the verification
-evidence below. This register supersedes every prior audit of this repository. **Audits written
-against `88f607f` are 15 commits stale** — that revision is 15 commits behind
+evidence below. A third pass at `integration/followups` `3c4bb1e` records the
+PR #85 review (14 findings fixed, 1 refuted), closes R8 and L12, and adds the
+real-namespace reconcile proof with its four findings (L17-L20). This register
+supersedes every prior audit of this repository. **Audits written against
+`88f607f` are 15 commits stale** — that revision is 15 commits behind
 `main`, and most of what those audits report was fixed in between. The closed
 table below is the list; do not re-open anything in it without new evidence.
 
 `Checked` reads: `verified` — citation re-checked during this reconciliation, at
-`d1aec40` for R1-R30 and M1-M3, at `413f8b9` for L11-L16; `operator` —
-re-checked directly by the operator; `unverified` — carried from the source
+`d1aec40` for R1-R30 and M1-M3, at `413f8b9` for L11-L16, at `3c4bb1e` for
+L17-L20 and for every row this pass closed; `operator` — re-checked directly
+by the operator; `unverified` — carried from the source
 ledger and **not** independently re-checked, so treat both the citation and the
 finding as unconfirmed.
 
@@ -1131,7 +1135,6 @@ finding as unconfirmed.
 | ID | Item | Severity | Evidence | Checked |
 |---|---|---|---|---|
 | R7 | `content_hash` is NULL after an E4 import into a fresh home. `portability.py` has zero `content_hash` references and the C7 backfill runs only in the `current < 10` migration step, which never fires on a fresh v11 database. C7 duplicate measurement silently reads zero in any imported namespace. Not data loss — recomputable. | MEDIUM | `src/haunt/portability.py` (0 hits); `_backfill_content_hashes` reached only at `src/haunt/store.py:1703-1717` | verified |
-| R8 | Remote-less repositories still collide on the directory leaf name: two local-only repositories named `api` share one memory database. Misses worktrees and pre-`git remote add` repositories. | MEDIUM | fallback at `src/haunt/paths.py:1707` `safe_name(repo_root.name)` | unverified |
 | R9 | Prompt injection is mitigated at the highest-volume channel only, not closed. `trusted=False` covers raw tool I/O; assistant replies and user prompts replay verbatim into the next session's `additionalContext` with no data/instruction delimiter. Laundering path: poisoned page to tool output (excluded) to assistant summary (stored trusted) to replay. | MEDIUM | `src/haunt/recall.py:138`; hook injection in `src/haunt/claude_hook.py`, `src/haunt/cursor_hook.py` | unverified |
 | R1 | Inspection surfaces (timeline, health, worldview, trace, procedure get/list, and eight dashboard GET routes) open a **read-write** connection and take the writer lifecycle lock: they need write permission and serialize concurrent inspection. Entity surrogate UUIDs are not stable across a rebuild. **Not** a per-read rebuild — `_ensure_graph_evidence` is a version-gated one-shot backfill returning immediately once `graph_evidence_version == "1"`; measured steady-state mutation is zero. **Not** an undocumented invariant violation — `README.md:130-136` and `docs/MEMORY_CONTRACT.md:211-217` scope the read-only requirement to recall, and `MEMORY_CONTRACT.md:206-208` names timeline/trace/detail as a different class. Read-only media fail at WAL configuration first. GitHub issue #84. | LOW-MEDIUM (downgraded from HIGHEST) | `src/haunt/store.py:4886-4897`, `_rebuild_graph_with_configuration_lock` at `:5911` | operator |
 | R12 | Dashboard async routes block the event loop (no `to_thread`/`run_in_threadpool` anywhere) and re-embed the same query once per namespace with no query-vector cache. Latency only, single user. | LOW-MEDIUM | `src/haunt/dashboard.py` recall routes; `src/haunt/recall.py` `embed_one` | unverified |
@@ -1139,7 +1142,7 @@ finding as unconfirmed.
 | R21 | No ruff or mypy configuration and no CI gate. Current state: ruff 13 findings (7 `F401`, 5 `F841`, 1 `E741`; only one in `src/` — `desktop.py:5` unused `os`); mypy 1.11.2 reports 57 errors across 11 files, about 17 from `MCPNamespaceAccess` attribute/assignment. | LOW code risk / MEDIUM process | `pyproject.toml` (no `[tool.ruff]`/`[tool.mypy]`); `.github/workflows/ci.yml` runs neither | unverified |
 | R23 | E4's purge-lineage claim is overstated in the PR and doc wording. See the E4 gap list; the test itself is honest. | LOW code / MEDIUM honesty | `tests/test_portability.py:1305-1319` | verified |
 
-9 open items above. Nothing here is a merge blocker: R6 was the only one and
+7 open items above. Nothing here is a merge blocker: R6 was the only one and
 it is fixed and closed below.
 
 ### LongMemEval retrieval (2026-08-27)
@@ -1182,13 +1185,50 @@ IDs continue the L-series. None is a merge blocker.
 | ID | Item | Severity | Evidence | Checked |
 |---|---|---|---|---|
 | L11 | The `test-hybrid` job was authored and exercised on macOS only and has never run on Linux. Its first CI run is a cold `actions/cache` miss that downloads bge-small (~64 MB) before the key populates. The key is a bare literal with no `restore-keys`, so if the embedding model pin ever changes that key must be bumped or the job silently reuses the wrong cached model. | LOW (operational) | `.github/workflows/ci.yml:61-86`, key at `:78` | verified |
-| L12 | Purge is now O(namespace), not O(row): `VACUUM` rebuilds the whole namespace file. Acceptable for a gated, confirmed delete, but `haunt delete --event-id` calls `purge()` once per memory on that event, so the rebuild runs once per memory — that is where it surfaces first. `bytes_overwritten` in the purge report says whether the rebuild actually completed (false when a concurrent reader blocks `VACUUM`); the purge's own bytes are zeroed either way. | LOW-MEDIUM (performance) | `src/haunt/store.py:6484-6508`; per-memory loop at `src/haunt/cli.py:1003-1009` | verified |
 | L13 | `drain_embedding_queue(batch_size=N)` silently clamps N to 100, via `clamp_limit`'s `LIMIT_MAX`. Undocumented kwarg and no production caller sets it — `bootstrap` calls with no arguments. `README.md` is **not** wrong: it documents `HAUNT_EMBED_DRAIN_LIMIT`, which controls `max_rows` and genuinely reaches 100,000. A one-line docstring note is the whole fix. | LOW | `src/haunt/store.py:5714-5715`, clamp at `:5510`; `LIMIT_MAX` at `src/haunt/util.py:154`; `README.md:312` | verified |
 | L14 | `_load_fastembed` remains unpinned: fastembed exposes no revision knob, so `TextEmbedding(model_name=...)` takes whatever the hub serves. A separate download path from the one the R2 BGE-M3 revision pin closed. | LOW (supply chain) | `src/haunt/embed.py:367-374` | verified |
 | L15 | `tests/test_correction_lineage.py::test_concurrent_corrections_do_not_fork` failed once at machine load ~97 with `NamespacePathError: SQLite zero-write read observed storage drift`. Passed 5/5 in isolation at the same load, and in the clean-load full suite. Cause not established. Not a merge blocker; re-check if it recurs. | LOW | `tests/test_correction_lineage.py:359`; one observed failure, not reproduced | operator |
 | L16 | Hooks fail **open** on exception, but there is no timeout at all, so a hang is not covered: a contended SQLite lock or a slow disk holds the turn until the host's own hook timeout fires. `SECURITY.md`/`README.md` wording was corrected to "a hook *error* never blocks", which is honest, but the underlying gap remains. Found during the cleanup pass and deliberately not fixed there — behaviour change, out of scope. | LOW-MEDIUM | `SECURITY.md:117-119`; `README.md:158`; no `timeout`/`signal` in `src/haunt/claude_hook.py` or `src/haunt/cursor_hook.py` | verified |
 
-6 late findings. 25 open in the register.
+5 late findings.
+
+### Reconcile against real namespaces (2026-08-28)
+
+D2 executed. Run against **copies** of the owner's namespaces -- `ironscope`
+into `github.com-moderatesoup-ironscope`, `memory-protocol` into
+`github.com-memory-protocol-memory-protocol` -- never against the live store.
+
+- `~/.haunt` verified untouched: identical sha256 and mtime for all 8 files. A
+  shipped property did the protecting. `registry.db` stores absolute paths plus
+  device and inode, so a copied registry still resolves to the live store and
+  the code refuses with `NamespacePathError`.
+- Five proofs passed, 33,255 rows moved.
+  - Concurrent write during apply refused at rc=2 on storage drift, detected
+    before any backup or insert. Both canary rows survived; 0 source rows
+    inserted.
+  - Rollback from backup opens, `integrity_check` ok, 0 FK violations,
+    per-table counts exact, sha256 matching the apply report's declared value.
+  - A purged canary went from 4 raw-byte occurrences in a 295MB backup to 0
+    anywhere under `backups/`.
+  - 5 exclusions survived `reembed()` with 0 vectors and 0 requeues.
+  - Row parity exact across 9 tables: 0 source ids and 0 pre-existing target
+    ids missing.
+- Timings: v9-to-v13 migration 1.0-1.3s per namespace; dry-run 6.5-6.9s; apply
+  of 33,255 rows plus 299MB of backups 11.08s; purge with 313MB of backups
+  3.15s. **The feared minutes-long purge cost did not materialize.**
+  `reembed()` of 3,128 rows took 680.8s (about 0.22s per row) -- by far the
+  slowest step, and not part of reconcile.
+
+IDs continue the L-series.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L17 | Order-sensitive column comparison. `_reconcile_content_state_digest` compares `PRAGMA table_info` as an ordered list, so a fresh namespace and an ALTER-migrated one refuse to pair even at the same schema version: `events.idempotency_key` sits at ordinal 2 fresh and 13 migrated. The column sets are identical and every row is keyed by name downstream. Reconcile therefore refuses exactly the fresh-versus-migrated pairing it exists to heal. Reproduced on both of the owner's real pairs. Fix in progress. | HIGH | `_table_columns` returns a list (`src/haunt/store.py:4130-4133`), compared with `!=` at `:4229` | verified |
+| L18 | Real session-id conflicts: ironscope 1 row, memory-protocol 4 rows. Session `b56829c0` carries `started_at` 16:47:51 and `ended_at` NULL in SOURCE against 17:55:08 and 23:18:24 in TARGET, and TARGET's `started_at` is exactly the rename timestamp -- the namespace split happened mid-session and forked the rows. Refusing is correct. The owner chooses which side wins; this is an operator decision, not a defect. | n/a (operator decision) | dry-run against copies of `ironscope` and `memory-protocol`, 2026-08-28 | operator |
+| L19 | The v13 `skip_embedding` backfill inferred 0 rows in all four real namespaces. Its signature requires no vector, no queue row and non-blank content, and every unembedded row was already in `embedding_jobs` (2970 of 2970 in the target) -- the documented miss case. So the persisted exclusion protects new writes but gives the existing corpus no retroactive protection: the next `reembed()` still pulls those rows into the vector index. Forward-only, not backward. | MEDIUM | `_backfill_skip_embedding` (`src/haunt/store.py:1610-1633`); measured on copies of all four namespaces, 2026-08-28 | operator |
+| L20 | Digest-versus-drain interaction. Every `haunt` invocation drains embedding jobs (observed 2970, then 2906, then 2874), and `embedding_jobs` is now hashed into the plan digest, so any haunt command run between a dry-run and its `--apply` invalidates the plan. Dry-run and apply must be run back to back. A direct trade for the authorization guarantee, not a defect to remove. | LOW-MEDIUM (usability) | `_RECONCILE_DIGEST_ONLY_TABLES` (`src/haunt/store.py:4108-4110`); observed on the 2026-08-28 run | operator |
+
+4 reconcile findings. 26 open in the register.
 
 ### Verification evidence (2026-08-27)
 
@@ -1237,7 +1277,11 @@ Plain facts, each re-checkable.
 Do not schedule work against any row here. Each was checked against current
 code, not against a PR title or a prior audit: the original rows at `d1aec40`,
 citing symbols rather than lines because line numbers had drifted since the
-audits; the late-pass rows at `413f8b9`, citing lines at that revision.
+audits; the late-pass rows at `413f8b9`, citing lines at that revision; the
+PR #85 review rows and the two rows this pass closed at `integration/followups`
+`3c4bb1e`, citing lines at that revision. The PR #85 review is recorded here in
+full -- 14 fixed and 1 refuted, none of it previously registered -- so the next
+audit does not re-report settled work.
 
 | Claim | Verdict | Closing evidence |
 |---|---|---|
@@ -1300,8 +1344,25 @@ audits; the late-pass rows at `413f8b9`, citing lines at that revision.
 | E0's only stemming case was a literal prefix, so the gate could not observe stemming | FIXED | `porter_stemming_nonprefix` added — query "study" against the indexed "studies", neither a prefix nor a substring of the other (`tests/fixtures/retrieval_eval/corpus.json:29`, `tests/test_frozen_retrieval_eval.py:100-103`). Mutation-confirmed load-bearing: under `trigram` it is the one case in the corpus that mismatches baseline. Baseline relocked; `config_sha256` unchanged because the retrieval contract is unchanged |
 | E0 scored reranked retrieval against a baseline frozen without reranking | FIXED | `frozen_retrieval_eval` pins `HAUNT_RERANK_ENABLED` out of the isolated environment it already owns (`src/haunt/frozen_retrieval_eval.py:263-265`). Gate produces the frozen result with the flag unset and with it set, so no relock |
 | `memory_purge` claimed erasure while plain DELETEs left the bytes readable | FIXED | a canary planted before a purge was still readable 8 times in the raw database, twice in live `memories_fts_data` rows. Purge now runs under `PRAGMA secure_delete=ON` (`src/haunt/store.py:6230`), merges the FTS index (`:6359`), then rebuilds the file and truncates the WAL (`:6502-6506`). All three mutation-verified load-bearing: removing any one puts the canary back. `bytes_overwritten` (`:6475`) reports false rather than claiming a rebuild a concurrent reader blocked. Cost is L12 |
+| PR #85 — purge `VACUUM` spilled the corpus in plaintext to `$TMPDIR` | FIXED | `temp_store` was unset and SQLite's default is FILE, so every privacy purge materialized a readable copy of the namespace outside the 0700 `HAUNT_HOME` and unlinked it without zeroing. The rebuild now runs under `PRAGMA temp_store=MEMORY` (`src/haunt/store.py:6998-7008`) and fails closed: a rebuild too large for RAM reports `bytes_overwritten` false rather than spilling |
+| PR #85 — the purged session id survived in its successor's succession link and shipped in export bundles | FIXED | purge rekeyed events, corrections and `meta.current_session` but never another session's row, and `portability` exports `sessions.meta`. Schema v12 promotes the link to a reserved `succeeds_session` column (`src/haunt/store.py:1312`), giving purge exactly one place to rekey |
+| PR #85 — `public_runtime_evidence` could certify an isolation it never checked | FIXED | `_e6_attributed_diff` gated the working-tree diff on E6's evidence paths while the payload diffed the caller's runtime paths, and the two sets do not overlap, so an uncommitted `recall.py` edit left `diff_empty` true with no byte-leg backup. Every caller now gets the same leg (`src/haunt/abstention_eval.py:633`, `:703-704`); `sealed_e0_evidence` keeps its independent `byte_mismatches` (`:681-698`) |
+| PR #85 — the bootstrap isolation guard caught one `ValueError` subclass and missed three siblings | FIXED | widened to `except (sqlite3.Error, OSError, ValueError)` rather than enumerating, so siblings added later are covered (`src/haunt/bootstrap.py:176-188`). `namespace retire --apply` racing `list_namespace_rows()` raised `UnknownNamespaceError` straight through the old guard, stranding every later namespace on an undrained queue |
+| PR #85 — `delete --event-id` ran one full `VACUUM` per memory under the cross-process lock | FIXED | `purge()` gains `rebuild=False` (`src/haunt/store.py:6601`) and the command pays for one rebuild after the set (`src/haunt/cli.py:1014-1020`). This is L12 |
+| PR #85 — successor lookup was an unindexed JSON scan on every `observe()` | FIXED | the `json_extract` predicate no index could serve is now the v12 column plus partial index `idx_sessions_succeeds` (`src/haunt/store.py:1773`), scanned on the `claude --resume` path the feature exists for |
+| PR #85 — `succeeds_session` was forgeable through caller-supplied meta | FIXED | `ensure_session` stored caller metadata verbatim, so a caller could claim a predecessor it did not own and have `end_session` act on it. It is now a reserved column, rejected from caller meta (`src/haunt/store.py:1290-1312`) |
+| PR #85 — `zip()` truncation made the per-row embedding fallback unreachable | FIXED | `OnnxEmbedder.embed` realigns into a pre-sized list, so a short sub-batch left `[]` holes a positional `zip` cannot see and `len(out) == len(batch)` was always true; the hole surfaced later as a dimension-0 insert or a falsy query vector. It now raises on the batch that dropped the rows (`src/haunt/embed.py:367-375`) |
+| PR #85 — the `secure_delete` restore could not round-trip FAST and sat after the transaction's re-raise | FIXED | SQLite parses the integer 2 as boolean ON, so on a `SQLITE_SECURE_DELETE=FAST` build the first purge promoted the long-lived writer connection permanently, and a mid-purge error stranded it. Both are one scope that emits FAST (`_secure_delete_enabled`, `src/haunt/store.py:6950-6966`), entered with the purge transaction (`:6663`, `:6988`) |
+| PR #85 — `memory_timeline` could return zero events for a populated namespace | FIXED | the budget's only shrinkable field was `content`, which a hook-captured tool row leaves empty while its bulk sits in `tool_input`/`tool_output`. The budget now cuts the fields that hold a row's bulk, in sacrifice order (`EVENT_TEXT_FIELDS`, `src/haunt/budget.py:86`), keys truncated ids on `id` where there is no `memory_id` (`:92-96`), and `window_truncated` names the oldest event actually returned (`src/haunt/mcp_server.py:583`) |
+| PR #85 — the all-namespace recall budget truncated by alphabetical namespace order rather than rank | FIXED | the strict rank prefix was really a namespace prefix, so namespaces late in the alphabet returned empty hits with a successful execution and no error. Lists are now interleaved round-robin by local rank -- not globally sorted, since RRF values are not comparable across namespaces -- and each group reports its own `hits_available`/`hits_dropped` (`src/haunt/dashboard.py:1013`, `:1127`) |
+| PR #85 — `retire_namespace` committed deregistration before the work that could fail | FIXED | the verified backup now runs inside the registry transaction (`src/haunt/store.py:5042`); the drainage re-read stays after the commit on its own snapshot, so a racing write is still caught |
+| PR #85 — the recorded model source was self-asserted and spoofable | FIXED | the BGE-M3 revision pin bound only the download path, and the `haunt-model-source.json` marker beside a hand-placed cache is written by whoever wrote the cache, so `bge_m3_source()` could report the pinned identity while onnxruntime executed another graph. The load path now verifies the cache against the committed artifact manifest before the ONNX session is built (`_verify_bge_m3_cache`, `src/haunt/embed.py:219`, called at `:424`); `model.onnx_data` is checked by exact size, the graph, tokenizer and configs are hashed, and every skip emits `embed_m3_unverified` |
+| PR #85 — 500 responses carried no CSP and no nosniff | FIXED | Starlette builds `ServerErrorMiddleware` outside `user_middleware`, so a 500 replied through the raw ASGI send and never reached the guard middleware. An installed handler sets both headers itself and `ServerErrorMiddleware` still re-raises, so logging is unchanged (`src/haunt/dashboard.py:1706-1727`) |
+| PR #85 — namespace backups do not checkpoint the WAL | REFUTED | `_backup_namespace_database` (`src/haunt/store.py:4361-4367`) reads through a zero-write snapshot that copies main **and** `-wal` into a private shadow, checkpoints the copy, and opens the materialized result immutable (`_open_zero_write_sqlite_snapshot`, `:2619-2662`), so the file `copy_primary_to_fd` reads is already materialized. Locked in by a regression test that backs up a namespace whose committed rows are still WAL-only (`tests/test_namespace_reconcile.py:1632`) |
+| R8 — remote-less and separator-collapsed labels share one database | FIXED | inference is now registration-aware: a label already registered to a **different** repository is forked by appending sha256 of this repository's own discriminator -- the remote identity where there is one, the checkout path where there is not (`disambiguate_namespace_label`, `src/haunt/paths.py:1444`, applied at `:1723-1728`). Derivation itself is unchanged, so nothing already registered moves and a blank `repo_path` row is still not evidence of another owner. Pairs that collided before the guard are not migrated; `haunt doctor` reports them as an advisory that stays out of `DoctorReport.ok` and leaves the exit code alone (`src/haunt/doctor.py:324-410`) |
+| L12 — purge is O(namespace), and `delete --event-id` paid that cost once per memory | FIXED (the amplification) | see the `delete --event-id` row above. The per-purge whole-file rebuild stands as an accepted cost of erasure and is documented as such (`src/haunt/store.py:6601-6622`); the backup sweep adds one rebuild per backup it touches, and the measured cost is in the 2026-08-28 reconcile timings above |
 
-58 closed rows.
+76 closed rows.
 
 ### Decisions (do not re-litigate)
 
