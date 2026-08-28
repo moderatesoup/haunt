@@ -8,15 +8,20 @@ instances, performs supersession through `Store.contradict` with frozen clocks,
 and calls `recall` or `planned_recall` through their namespace/open-existing
 paths as declared by each case.
 
-The corpus covers lexical ordering, Unicode FTS, a Porter stemming query whose
-surface form is absent from the indexed text, current and as-of supersession,
-a compiled temporal window, procedural-tier recall, namespace isolation, and
-an out-of-distribution negative query. It also locks one explicit raw tool-I/O
-result: its fixture ID plus `trusted=false` and
+The corpus covers lexical ordering, Unicode FTS, two Porter stemming queries
+whose surface forms are absent from the indexed text, current and as-of
+supersession, a compiled temporal window, procedural-tier recall, namespace
+isolation, and an out-of-distribution negative query. It also locks one
+explicit raw tool-I/O result: its fixture ID plus `trusted=false` and
 `trust_reason="untrusted-tool-io"`. The artifact deliberately uses fixture IDs
 rather than generated physical memory IDs, so the trust lock stays portable.
 Vector/semantic quality is intentionally not locked: locally available models
 and floating-point ANN results are not a portable deterministic CI contract.
+
+One stemming query is deliberately non-prefix: `study` against the indexed
+`studies`. A prefix pair such as `synchronize`/`synchronizes` still matches
+under a plain substring or trigram index, so on its own it cannot detect the
+loss of Porter stemming.
 
 `baseline.json` is a lock, not an automatically updated artifact. Change the
 corpus or retrieval contract first, review the per-case output and metric

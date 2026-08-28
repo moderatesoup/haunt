@@ -18,7 +18,7 @@ from typing import Any
 from haunt.paths import infer_namespace, infer_namespace_context, safe_name
 from haunt.recall import Hit, recall
 from haunt.store import Store
-from haunt.util import snippet
+from haunt.util import env_int, snippet
 
 ORIGIN = "cursor-hook"
 
@@ -83,20 +83,6 @@ def _as_text(value: Any) -> str:
 
 def _truthy(raw: str | None) -> bool:
     return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def cursor_dir() -> Path:
-    raw = os.environ.get("CURSOR_HOME")
-    if raw:
-        return Path(raw).expanduser().resolve()
-    return Path.home() / ".cursor"
-
-
-def cursor_hooks_json() -> Path:
-    override = os.environ.get("CURSOR_HOOKS_JSON")
-    if override:
-        return Path(override).expanduser()
-    return cursor_dir() / "hooks.json"
 
 
 def detect_event(payload: dict[str, Any]) -> str:
@@ -250,7 +236,7 @@ def _tool_excluded(name: str) -> bool:
 # skip_embedding=True), just never embedded or enqueued into
 # embedding_jobs. The record stays complete and keyword-searchable; only
 # vector-index capacity is saved.
-EMBED_EXCLUDE_TOOLS_DEFAULT = "Bash,Read"
+EMBED_EXCLUDE_TOOLS_DEFAULT = "Bash,Read,Shell"
 
 
 def _embed_excluded(name: str) -> bool:
@@ -259,10 +245,13 @@ def _embed_excluded(name: str) -> bool:
     Same glob syntax as _tool_excluded, but a different default: an unset
     HAUNT_EMBED_EXCLUDE_TOOLS means "use EMBED_EXCLUDE_TOOLS_DEFAULT", not
     "exclude nothing" -- a user has to set it to "" explicitly to embed
-    every tool. The default excludes Bash and Read because, measured on a
-    dogfooded corpus, tool rows are ~80% of all memory and Bash alone is
+    every tool. The default excludes Bash, Read, and Shell because, measured
+    on a dogfooded corpus, tool rows are ~80% of all memory and Bash alone is
     ~76% of those (Read ~14%) -- almost entirely raw shell/file output that
-    FTS keyword search already covers as well as a vector index would.
+    FTS keyword search already covers as well as a vector index would. Shell
+    is Cursor's name for the same shell output Claude Code reports as Bash
+    (_handle_after_shell); without it the identical bytes were embedded under
+    one host and skipped under the other.
     """
     raw = os.environ.get("HAUNT_EMBED_EXCLUDE_TOOLS")
     if raw is None:
@@ -273,12 +262,9 @@ def _embed_excluded(name: str) -> bool:
 
 
 def _tool_io_cap() -> int:
-    raw = (os.environ.get("HAUNT_TOOL_IO_MAX_CHARS") or "").strip()
-    try:
-        value = int(raw) if raw else TOOL_IO_MAX_CHARS_DEFAULT
-    except ValueError:
-        value = TOOL_IO_MAX_CHARS_DEFAULT
-    return max(256, min(value, 100_000))
+    return env_int(
+        "HAUNT_TOOL_IO_MAX_CHARS", default=TOOL_IO_MAX_CHARS_DEFAULT, lo=256, hi=100_000
+    )
 
 
 def _cap_tool_io(text: str) -> str:
@@ -297,20 +283,17 @@ def _prepare_tool_io(tool_input: str, tool_output: str) -> tuple[str, str]:
 
 
 def _recall_block_cap() -> int:
-    """HAUNT_RECALL_BLOCK_MAX_CHARS, clamped. Same parse/fallback/clamp
-    idiom as HAUNT_TOOL_IO_MAX_CHARS just above (_tool_io_cap): parse, fall
-    back to the default on anything unparsable, then clamp so a bad env
-    value can't disable the budget or set it below what one header plus
-    one hit line needs (each line is already bounded to roughly 200 chars
-    by the fixed 160-char snippet() call below, so 500 always leaves room
-    for at least one full line and the dropped-count marker).
+    """HAUNT_RECALL_BLOCK_MAX_CHARS, clamped (util.env_int). The 500 floor is
+    what one header plus one hit line needs: each line is already bounded to
+    roughly 200 chars by the fixed 160-char snippet() call below, so 500
+    always leaves room for a full line and the dropped-count marker.
     """
-    raw = (os.environ.get("HAUNT_RECALL_BLOCK_MAX_CHARS") or "").strip()
-    try:
-        value = int(raw) if raw else RECALL_BLOCK_MAX_CHARS_DEFAULT
-    except ValueError:
-        value = RECALL_BLOCK_MAX_CHARS_DEFAULT
-    return max(500, min(value, 100_000))
+    return env_int(
+        "HAUNT_RECALL_BLOCK_MAX_CHARS",
+        default=RECALL_BLOCK_MAX_CHARS_DEFAULT,
+        lo=500,
+        hi=100_000,
+    )
 
 
 def _drop_marker(dropped: int, cap: int) -> str:
@@ -322,7 +305,7 @@ def _truncate_header(header: str, cap: int, reason: str) -> str:
     not a body line, not a drop marker -- within `cap` chars. Truncates
     the header text itself with its own inline marker, guaranteed <= cap
     BY CONSTRUCTION: plain Python string slicing costs exactly one char
-    per char kept, unlike JSON serialization (see _truncate_hit_content
+    per char kept, unlike JSON serialization (see _truncate_row_text
     in mcp_server.py for the escape-expansion trap that bites when that
     assumption is false there), so no measure-after-the-fact check is
     needed here -- the arithmetic below is exact, not an estimate.
@@ -539,7 +522,17 @@ def _handle_after_thought(store: Store, payload: dict[str, Any]) -> dict[str, An
         return {}
     text = _as_text(payload.get("text"))
     if text.strip():
-        _observe(store, payload, content=text, role="system", tier="coordinate")
+        # Opt-in reasoning residue, one row per thought: captured in full and
+        # keyword-searchable like any other row, but no more worth vector
+        # capacity than the session ceremony row it mirrors.
+        _observe(
+            store,
+            payload,
+            content=text,
+            role="system",
+            tier="coordinate",
+            skip_embedding=True,
+        )
     return {}
 
 
@@ -711,35 +704,6 @@ def run(raw: str) -> dict[str, Any]:
         return handle_event(payload)
     except Exception:
         return {}
-
-
-def _is_haunt_command(command: str) -> bool:
-    name = command.replace("\\", "/").rstrip("/").split("/")[-1]
-    return name in {"haunt-hook"}
-
-
-def merge_hooks_json(path: Path, command: str) -> dict[str, Any]:
-    """Merge haunt hook entries into a Cursor hooks.json. Do not clobber others.
-
-    Delegates to the Cursor host adapter.
-    """
-    from haunt.hosts.cursor import _merge_hooks_json
-
-    return _merge_hooks_json(path, command)
-
-
-def _install_rule_file() -> Path | None:
-    """Write haunt.mdc into .cursor/rules/."""
-    from haunt.hosts.cursor import _HAUNT_MDC
-
-    rules_dir = cursor_dir() / "rules"
-    rules_dir.mkdir(parents=True, exist_ok=True)
-    dest = rules_dir / "haunt.mdc"
-    dest.write_text(_HAUNT_MDC, encoding="utf-8")
-    old = rules_dir / "engram.mdc"
-    if old.exists():
-        old.unlink()
-    return dest
 
 
 def install_cursor_hooks() -> dict[str, Any]:

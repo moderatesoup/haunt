@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from pathlib import Path
 from typing import NoReturn, Optional
@@ -12,6 +11,7 @@ import typer
 
 from haunt import __version__
 from haunt.bootstrap import bootstrap, format_report
+from haunt.budget import apply_recall_budget
 from haunt.embed import state as embed_state
 from haunt.paths import (
     NamespacePathError,
@@ -41,11 +41,19 @@ from haunt.store import (
     open_existing_readonly,
     reconcile_namespaces,
     register_namespace,
+    retire_namespace,
     retire_namespace_alias,
     undo_namespace_migration,
 )
 from haunt.temporal import TemporalParseError
-from haunt.util import clamp_limit, dumps, format_iso, human_display, snippet
+from haunt.util import (
+    clamp_limit,
+    dumps,
+    env_flag,
+    format_iso,
+    human_display,
+    snippet,
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -57,13 +65,18 @@ def _ns(name: Optional[str]) -> str:
     return resolve_namespace(name)
 
 
+def _die(exc: BaseException, *, code: int = 2) -> NoReturn:
+    """`error: <exc>` on stderr, then exit. 2 = bad request, 1 = failed action."""
+    typer.echo(f"error: {exc}", err=True)
+    raise typer.Exit(code) from exc
+
+
 def _existing(ns: str) -> Store:
     """Open an existing namespace or exit 2. Never creates a DB."""
     try:
         return open_existing(ns)
     except UnknownNamespaceError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
 
 
 def _existing_readonly(ns: str):
@@ -71,8 +84,7 @@ def _existing_readonly(ns: str):
     try:
         return open_existing_readonly(ns)
     except UnknownNamespaceError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
 
 
 def _recall_json_error(
@@ -117,8 +129,7 @@ def export_cmd(
     try:
         report = export_namespace_path(ns, output, cut=cut)
     except (ExportError, NamespacePathError, OSError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     if json_out:
         typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return
@@ -156,8 +167,7 @@ def import_cmd(
             bundle, limits=limits, timeout_seconds=timeout
         )
     except (ImportBundleError, NamespacePathError, OSError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     if json_out:
         typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return
@@ -216,8 +226,7 @@ def init_cmd(
         with Store(ns) as st:
             stats = st.stats()
     except (NamespaceCollisionError, NamespacePathError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     typer.echo(f"namespace  {ns}")
     typer.echo(f"db         {db}")
     typer.echo(f"events     {stats['events']}")
@@ -279,8 +288,7 @@ def observe_cmd(
         typer.echo(f"error: invalid provenance JSON: {exc}", err=True)
         raise typer.Exit(2) from exc
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     ents = ",".join(result.entities[:8]) if result.entities else "-"
     typer.echo(
         f"ok  event={result.event_id}  memory={result.memory_id}  "
@@ -328,8 +336,7 @@ def recall_cmd(
     except ValueError as exc:
         if json_out:
             _recall_json_error(exc, namespace=namespace, query=query)
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
 
     try:
         # _existing retains the established human diagnostic. JSON callers
@@ -351,18 +358,21 @@ def recall_cmd(
     except (TemporalParseError, UnknownNamespaceError, ValueError, sqlite3.Error) as exc:
         if json_out:
             _recall_json_error(exc, namespace=ns, query=query)
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     except Exception as exc:
         if json_out and is_retrieval_backend_error(exc):
             _recall_json_error(exc, namespace=ns, query=query)
         else:
             raise
     if json_out:
+        bounded_hits, recall_budget = apply_recall_budget(
+            [hit.as_dict() for hit in hits], k=k
+        )
         payload = {
             "namespace": ns,
             "query": query,
-            "hits": [hit.as_dict() for hit in hits],
+            "hits": bounded_hits,
+            "recall_budget": recall_budget,
         }
         execution = execution_metadata(hits)
         if execution is not None:
@@ -411,8 +421,7 @@ def maintenance_cmd(
         ns = _ns(namespace)
         limit = clamp_limit(limit, default=64)
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     try:
         # This is the explicit mutating surface, but still must not create a
         # typo namespace.  Do the rejection through E3's no-write registry
@@ -426,14 +435,12 @@ def maintenance_cmd(
         payload = {
             "namespace": ns,
             "maintenance_performed": True,
-            "offline": (os.environ.get("HAUNT_OFFLINE") or "").strip().lower()
-            in {"1", "true", "yes"},
+            "offline": env_flag("HAUNT_OFFLINE"),
             "embedding_upgrade": upgraded,
             "embedding_jobs": drained,
         }
     except (UnknownNamespaceError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     if json_out:
         typer.echo(json.dumps(payload, ensure_ascii=False, allow_nan=False))
     else:
@@ -470,9 +477,8 @@ def timeline_cmd(
                 dumps({"ok": False, "error": str(exc), "namespace": ns}),
                 err=True,
             )
-        else:
-            typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+            raise typer.Exit(2) from exc
+        _die(exc)
     if json_out:
         typer.echo(dumps({"namespace": ns, "events": rows}))
         return
@@ -517,8 +523,7 @@ def namespaces_cmd() -> None:
     try:
         rows = list_namespaces()
     except NamespacePathError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     if not rows:
         typer.echo("no namespaces (run: haunt bootstrap)")
         return
@@ -573,8 +578,7 @@ def _namespace_change(
             plan_digest=plan_digest,
         )
     except (UnknownNamespaceError, NamespaceCollisionError, NamespaceMigrationError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
 
@@ -650,8 +654,7 @@ def namespace_reconcile_cmd(
         NamespaceMigrationError,
         ValueError,
     ) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
 
@@ -669,8 +672,7 @@ def namespace_undo_cmd(
             migration_id, apply=apply, plan_digest=plan_digest
         )
     except (NamespaceMigrationError, UnknownNamespaceError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
 
@@ -683,8 +685,35 @@ def namespace_retire_alias_cmd(
     try:
         report = retire_namespace_alias(label, apply=apply)
     except (UnknownNamespaceError, AliasRetirementError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
+
+
+@namespace_app.command("retire")
+def namespace_retire_cmd(
+    label: str = typer.Argument(..., help="Drained namespace to check or retire"),
+    into: str = typer.Option(
+        ..., "--into", help="Namespace that must already hold every row of LABEL"
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Retire when checks pass"),
+) -> None:
+    """Deregister and remove a namespace reconcile has already drained.
+
+    Refuses while any row is still unique to LABEL, so run `namespace
+    reconcile LABEL INTO --apply` first. Removes every label, alias, and
+    repository binding for LABEL, then the database file itself -- left in
+    place it would be re-adopted the next time anything registers that
+    label. The database is backed up under HAUNT_HOME/backups first.
+    """
+    try:
+        report = retire_namespace(label, into=into, apply=apply)
+    except (
+        UnknownNamespaceError,
+        AliasRetirementError,
+        NamespaceCollisionError,
+        NamespaceMigrationError,
+    ) as exc:
+        _die(exc)
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
 
@@ -722,6 +751,15 @@ def health_cmd(
             f"sessions={s['sessions']} entities={s['entities']} relations={s['relations']}"
         )
         typer.echo(f"tiers         {s['tiers']}")
+        typer.echo(
+            f"embedding     embedded={s['memories_embedded']} "
+            f"pending={s['embedding_pending']} exhausted={s['embedding_exhausted']} "
+            f"index={s['vector_index']}"
+        )
+        typer.echo(
+            f"duplicates    memories={s['duplicate_memories']} "
+            f"content={s['duplicate_content_values']}"
+        )
         typer.echo(f"last write    {s['last_write']}")
 
 
@@ -962,13 +1000,18 @@ def delete_cmd(
                     f"Permanently delete {len(rows)} memories for event {event_id}?",
                     abort=True,
                 )
+            # Each purge's whole-file rebuild takes a cross-process lock and
+            # costs the size of the namespace, so one per memory would block
+            # every writer in every namespace N times over. Defer it and pay
+            # once; the erasure is only complete after the rebuild below.
             for r in rows:
-                result = st.purge(r["id"])
+                result = st.purge(r["id"], rebuild=False)
                 typer.echo(
                     f"purged  fts={result.get('fts_deleted')}  "
                     f"vec={result.get('vec_deleted')}  rels={result.get('relations_deleted')}  "
                     f"event={result.get('event_deleted')}"
                 )
+            typer.echo(f"bytes_overwritten={st.overwrite_erased_pages()}")
         return
     with _existing(ns) as st:
         if not yes:
@@ -984,7 +1027,8 @@ def delete_cmd(
     typer.echo(
         f"ok  purged  fts={result['fts_deleted']}  vec={result['vec_deleted']}  "
         f"rels={result['relations_deleted']}  ents={result['entities_deleted']}  "
-        f"event_deleted={result['event_deleted']}"
+        f"event_deleted={result['event_deleted']}  "
+        f"bytes_overwritten={result['bytes_overwritten']}"
     )
 
 
@@ -1020,8 +1064,7 @@ def correct_cmd(
                 channel="cli",
             )
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+        _die(exc)
     typer.echo(dumps({"namespace": ns, **result}))
     if not result.get("ok"):
         raise typer.Exit(1)
@@ -1051,8 +1094,7 @@ def install_cmd() -> None:
     try:
         reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
     except HostConfigError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        _die(exc, code=1)
     for r in reports:
         status = "seeded" if r.seeded else "merged"
         typer.echo(f"[{r.host}]  {status}")
@@ -1075,8 +1117,7 @@ def cursor_install_cmd() -> None:
     try:
         report = install_cursor_hooks()
     except HostConfigError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        _die(exc, code=1)
     typer.echo(f"hooks     {report['hooks_json']}")
     typer.echo(f"mcp       {report.get('mcp_json', '-')}")
     typer.echo(f"launcher  {report['launcher']}")
@@ -1111,8 +1152,7 @@ def doctor_cmd() -> None:
         try:
             install_all_hosts(str(home), hook_cmd, mcp_cmd)
         except HostConfigError as exc:
-            typer.echo(f"error: {exc}", err=True)
-            raise typer.Exit(1) from exc
+            _die(exc, code=1)
         report = diagnose(str(home), hook_cmd, mcp_cmd)
         typer.echo(format_doctor(report))
         if report.ok:

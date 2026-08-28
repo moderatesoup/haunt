@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "manifest_id": "haunt-abstention-e6-composite-v1",
+  "verification_phase": "after_held_out_scoring",
+  "components": {
+    "records": {
+      "path": "records.json",
+      "canonical_sha256": "68f715125649a3d9a20c1b0d1d1e1f26df5bd0dea8151eeee9bdfd0e889e2054"
+    },
+    "queries": {
+      "path": "queries.json",
+      "canonical_sha256": "66dabb8586186c3dbae54e2433ed6ba302efb4ccd058d98064c1b1e314da23a4"
+    },
+    "split": {
+      "path": "split.json",
+      "canonical_sha256": "d57b1a02e30d48087065528bfc01575d67735295003de26b1087bb348d05414d"
+    },
+    "fit_labels": {
+      "path": "fit-labels.json",
+      "canonical_sha256": "2b22611b22b48a4e99b2f58f1dc6b0325d20869f7583e048c1fc610d2d6b7422"
+    },
+    "held_labels": {
+      "path": "held-labels.json",
+      "canonical_sha256": "f33049ced043fe25bac44f2f636a5e5cadcfa70dfafd740ee6a05d5a01ba4ca2"
+    }
+  },
+  "composite_dataset": {
+    "assembly": "records_plus_queries_joined_with_fit_and_held_labels_in_query_order",
+    "canonical_sha256": "8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c"
+  }
+}

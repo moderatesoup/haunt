@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "split_id": "haunt-abstention-e6-split-v1",
+  "fit": {
+    "fts": ["fts-fit-a01","fts-fit-a02","fts-fit-a03","fts-fit-a04","fts-fit-a05","fts-fit-a06","fts-fit-a07","fts-fit-a08","fts-fit-a09","fts-fit-a10","fts-fit-a11","fts-fit-a12","fts-fit-a13","fts-fit-a14","fts-fit-a15","fts-fit-a16","fts-fit-a17","fts-fit-a18","fts-fit-a19","fts-fit-a20","fts-fit-u01","fts-fit-u02","fts-fit-u03","fts-fit-u04","fts-fit-u05","fts-fit-u06","fts-fit-u07","fts-fit-u08","fts-fit-u09","fts-fit-u10","fts-fit-u11","fts-fit-u12","fts-fit-u13","fts-fit-u14","fts-fit-u15","fts-fit-u16","fts-fit-u17","fts-fit-u18","fts-fit-u19","fts-fit-u20"],
+    "hybrid": ["hybrid-fit-a01","hybrid-fit-a02","hybrid-fit-a03","hybrid-fit-a04","hybrid-fit-a05","hybrid-fit-a06","hybrid-fit-a07","hybrid-fit-a08","hybrid-fit-a09","hybrid-fit-a10","hybrid-fit-a11","hybrid-fit-a12","hybrid-fit-a13","hybrid-fit-a14","hybrid-fit-a15","hybrid-fit-a16","hybrid-fit-a17","hybrid-fit-a18","hybrid-fit-a19","hybrid-fit-a20","hybrid-fit-u01","hybrid-fit-u02","hybrid-fit-u03","hybrid-fit-u04","hybrid-fit-u05","hybrid-fit-u06","hybrid-fit-u07","hybrid-fit-u08","hybrid-fit-u09","hybrid-fit-u10","hybrid-fit-u11","hybrid-fit-u12","hybrid-fit-u13","hybrid-fit-u14","hybrid-fit-u15","hybrid-fit-u16","hybrid-fit-u17","hybrid-fit-u18","hybrid-fit-u19","hybrid-fit-u20"]
+  },
+  "held_out": {
+    "fts": ["fts-held-a01","fts-held-a02","fts-held-a03","fts-held-a04","fts-held-a05","fts-held-a06","fts-held-a07","fts-held-a08","fts-held-a09","fts-held-a10","fts-held-a11","fts-held-a12","fts-held-a13","fts-held-a14","fts-held-a15","fts-held-a16","fts-held-a17","fts-held-a18","fts-held-a19","fts-held-a20","fts-held-u01","fts-held-u02","fts-held-u03","fts-held-u04","fts-held-u05","fts-held-u06","fts-held-u07","fts-held-u08","fts-held-u09","fts-held-u10","fts-held-u11","fts-held-u12","fts-held-u13","fts-held-u14","fts-held-u15","fts-held-u16","fts-held-u17","fts-held-u18","fts-held-u19","fts-held-u20"],
+    "hybrid": ["hybrid-held-a01","hybrid-held-a02","hybrid-held-a03","hybrid-held-a04","hybrid-held-a05","hybrid-held-a06","hybrid-held-a07","hybrid-held-a08","hybrid-held-a09","hybrid-held-a10","hybrid-held-a11","hybrid-held-a12","hybrid-held-a13","hybrid-held-a14","hybrid-held-a15","hybrid-held-a16","hybrid-held-a17","hybrid-held-a18","hybrid-held-a19","hybrid-held-a20","hybrid-held-u01","hybrid-held-u02","hybrid-held-u03","hybrid-held-u04","hybrid-held-u05","hybrid-held-u06","hybrid-held-u07","hybrid-held-u08","hybrid-held-u09","hybrid-held-u10","hybrid-held-u11","hybrid-held-u12","hybrid-held-u13","hybrid-held-u14","hybrid-held-u15","hybrid-held-u16","hybrid-held-u17","hybrid-held-u18","hybrid-held-u19","hybrid-held-u20"]
+  },
+  "immutability": "Any case, label, or membership change requires a new dataset/split version and reviewed hashes.",
+  "manual_semantic_audit": {
+    "reviewed_on": "2026-08-26",
+    "method": "Human comparison of all E6 queries/records against every frozen E0 query and record.",
+    "finding": "No E6 logical ID, query, record text, canary, temporal scenario, or expected result is copied from E0. Broad product nouns alone are not shared evaluation cases.",
+    "hybrid_paraphrase_rule": "Every fit and held-out hybrid answerable case is marked semantic_paraphrase=true and required_lexical_overlap=false; reproduction proves its relevant row is absent from the complete FTS candidate set."
+  }
+}

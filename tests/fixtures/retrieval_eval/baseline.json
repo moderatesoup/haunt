@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "dataset_sha256": "838e0efbb4bb63e6dc9b064b71a63307d1a942e14782c1d38f60ac4cc451ea09",
+  "dataset_sha256": "6a73167821408dfdb40293e5f11fb72d39052de10bb62b9e2fe7314f8676c607",
   "config_sha256": "26eb082f224aa63b358e9ca5f29d75d88ce90d89fbf7b3ae8f37f22058f7f5b9",
   "cases": {
     "lexical_ranking": {
@@ -30,6 +30,16 @@
       ],
       "relevant": [
         "porter_stemming"
+      ],
+      "first_relevant_rank": 1,
+      "empty": false
+    },
+    "porter_stemming_nonprefix": {
+      "returned": [
+        "porter_stemming_nonprefix"
+      ],
+      "relevant": [
+        "porter_stemming_nonprefix"
       ],
       "first_relevant_rank": 1,
       "empty": false
@@ -109,12 +119,12 @@
     }
   },
   "metrics": {
-    "cases": 10,
-    "positive_cases": 9,
+    "cases": 11,
+    "positive_cases": 10,
     "negative_cases": 1,
     "recall_at_3": 1.0,
     "mrr": 1.0,
-    "empty_result_rate": 0.1,
+    "empty_result_rate": 0.090909,
     "false_negative_rate": 0.0,
     "false_positive_rate": 0.0
   }

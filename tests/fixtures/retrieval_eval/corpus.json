@@ -26,6 +26,12 @@
       "event_time": "2024-01-13T09:00:00+00:00"
     },
     {
+      "id": "porter_stemming_nonprefix",
+      "namespace": "frozen-main",
+      "content": "The lapidary studies the obsidian tessera.",
+      "event_time": "2024-01-13T12:00:00+00:00"
+    },
+    {
       "id": "tool_io_capture",
       "namespace": "frozen-main",
       "role": "tool",
@@ -101,6 +107,12 @@
       "namespace": "frozen-main",
       "query": "synchronize",
       "relevant": ["porter_stemming"]
+    },
+    {
+      "id": "porter_stemming_nonprefix",
+      "namespace": "frozen-main",
+      "query": "study",
+      "relevant": ["porter_stemming_nonprefix"]
     },
     {
       "id": "tool_io_trust_metadata",

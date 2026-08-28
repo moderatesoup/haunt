@@ -518,6 +518,34 @@ and retain the canonical memory semantics and audit information.
   not counted green; the exact 83- and 237-test Python 3.12 matrices are the
   cross-version evidence pending fresh independent security/correctness review.
 
+**Verification and open gaps (2026-08-27, `integration/all-work` `d1aec40`)**
+
+The implementation is real, not scaffolded: export, import, limits, budgets,
+rollback, and receipts execute against a live store. Determinism and the fresh-
+home round trip were re-confirmed (see the reconciliation register's integration
+state). Four gaps stand between here and merge.
+
+- The purge-lineage claim above is overstated. It prevents resurrection only
+  within the same namespace lineage. The implementation's own test is honest
+  about this: `tests/test_portability.py:1305-1319` imports a pre-purge bundle
+  into a fresh `HAUNT_HOME` and asserts the purged canary **is** restored
+  (`assert event["tool_output"] == blob_canary`). Correct the PR and doc
+  wording, not the test. (R23)
+- The default limits are not co-feasible. `_StrictJSONParser`
+  (`src/haunt/portability.py:679`) scans byte-at-a-time in pure Python at
+  roughly 5 MB/s, so the default 64 MiB `input_bytes`
+  (`src/haunt/portability.py:86`) consumes about 13 s of the default 30 s
+  `timeout_seconds` (`:92`). Raising `input_bytes` toward the 256 MiB clamp
+  (`:95`) without raising `timeout_seconds` yields an opaque timeout. (R24)
+- `FORMAT_MINOR = 0` (`src/haunt/portability.py:61`) leaves "Accept known older
+  minor versions through explicit migrations" with no exercised path. Recorded
+  as an accepted caveat on that criterion, not as scheduled work. (R25)
+- Import validates `recall_class` against `RECALL_CLASSES`
+  (`src/haunt/portability.py:38`, `:1344`) but never validates `tier`, which it
+  carries as a plain field (`:146`, `:154`) into columns with no CHECK
+  constraint. With the dashboard's unescaped sinks this is stored XSS from a
+  crafted bundle — see M1 in the reconciliation register. (M1)
+
 **Non-goals**
 
 - Byte-copying SQLite databases, syncing live stores, exporting caches, remote
@@ -649,6 +677,118 @@ does not support the query.
 - A leakage test proves held-out labels are not read while fitting, and a
   separation test proves E0 cases/results are not calibration inputs. A mutation
   that uses `rrf_score` as the threshold must fail.
+
+**Blocker evidence (2026-08-26)**
+
+- E6 v1 is frozen separately from E0 at dataset hash
+  `8119f4508d3582bc665a5a0117940c6eeca593de56f33999563ddf188846264c`
+  and split hash
+  `d57b1a02e30d48087065528bfc01575d67735295003de26b1087bb348d05414d`.
+  Its 40 records and 160 cases have no logical-ID, canonical record, or query
+  hash overlap with E0; the sealed E0 paths have a byte-for-byte empty diff.
+  Records, unlabeled queries, split membership, fit labels, and held labels are
+  physically separate. The held-label file is first opened only after the
+  fit-only boundary exists; the composite manifest is first opened and verified
+  after held-out scoring, where it reconstructs the same frozen dataset hash.
+- The FTS-only fit cohort is separable at `0.875`; held-out Recall@5,
+  conditional retention, and negative abstention are all `1.0`. This proves the
+  harness but does not close E6 because a separate pinned hybrid profile is
+  required.
+- Under hashed local `BAAI/bge-m3` ONNX inputs (dimension 1024) and actual
+  sqlite-vec native cosine execution, the fit-only boundary needed for 100%
+  negative abstention retains only `6/20` conditional positives (`0.30`, below
+  the required `0.95`). Held-out pre-abstention Recall@5 is `15/20` (`0.75`);
+  at that unchanged fit-only boundary, all 20 negatives abstain but only `6/15`
+  conditional positives remain (`0.40`). Close absent-attribute negatives
+  dominate real semantic positives on both strength and the diagnostic top-two
+  distance margin, so no approved raw-evidence threshold can meet both gates.
+- Reproduction runs with ambient fake API/Hugging Face keys. FTS uses strict
+  `HAUNT_OFFLINE=1`; hybrid leaves it unset, requires an explicit verified local
+  cache, denies socket/DNS/HTTP access, proves zero attempts, and fails on any
+  non-native vector arm. Coverage evidence is case-folded/deduplicated and uses
+  one batched SQL statement for the fixed top five; 1k/10k/100k timing evidence
+  is recorded separately as a non-cross-machine gate.
+- Hybrid preflight accepts only committed artifact manifest
+  `haunt-bge-m3-onnx-split-f8425123-v1`: exact relative paths, sizes, and hashes
+  for config, nonquantized ONNX, required external-data sidecar, tokenizer, and
+  tokenizer config. Missing/extra/zero-byte/size/hash/sidecar/variant mismatches
+  fail before embedding initialization; quantized and root-level variants are
+  explicitly forbidden.
+- Evidence and reproduction live in `src/haunt/abstention_eval.py`,
+  `scripts/reproduce_abstention_eval.py`,
+  `scripts/benchmark_abstention_evidence.py`, and
+  `tests/fixtures/abstention_eval/v1/`. No public runtime policy, threshold
+  artifact, CLI/MCP/dashboard behavior, or fallback compatibility behavior is
+  shipped while the hybrid gate is unsatisfied.
+- Honest unblock choices are: predeclare and review a new raw retrieval feature
+  in a new E6 evidence version; explicitly amend the contract to permit a
+  reader/cross-encoder; or leave hybrid abstention unshipped. Removing or
+  relabeling hard negatives, padding with lexical positives, thresholding RRF,
+  fitting held-out labels, or silently falling back to FTS are not valid fixes.
+
+**Blocker review (2026-08-27)**
+
+The harness is sound and should merge. Its integrity controls were re-verified and
+real: held labels are physically separate and first opened only after the fit
+boundary exists (`src/haunt/abstention_eval.py:1398-1411`), the composite
+manifest is verified only at `verification_phase == "after_held_out_scoring"`
+(`:508-513`), and the BGE-M3 artifact identity is enforced before embed
+initialization by `verify_local_hybrid_cache` (`:659`). No label leakage was
+found; model pinning is genuine.
+
+The **conclusion** above does not follow. The dataset forces the result.
+
+- All 40 hybrid answerable queries carry `required_lexical_overlap: false`
+  (`tests/fixtures/abstention_eval/v1/queries.json`, 40 occurrences, 0 set
+  `true`), and the rule is applied to **both** splits
+  (`tests/fixtures/abstention_eval/v1/split.json:17`). The fixture additionally
+  requires the gold row to be absent from the complete FTS candidate set
+  (`tests/fixtures/abstention_eval/v1/README.md:18-21`).
+- The negatives are under no such constraint and keep on-topic wording. Mean
+  max-Jaccard of negatives against positive queries is 0.160-0.164 with 19-20 of
+  40 at or above 0.20, while positives against *other positives* is 0.079 with 0
+  of 40 at or above 0.20. The positives are more dissimilar from each other than
+  the negatives are from them.
+- Blocker mass is concentrated in two cases: dropping `hybrid-fit-u04` moves fit
+  retention from 6/20 to 12/20; dropping `u04` and `u10` moves it to 17/20. The
+  dominating pairs are `u04` against `a16`/`a18`. The 40 negatives were checked
+  individually and contain zero mislabels — the problem is the positives.
+- The contract was misread. The acceptance criterion at `BACKLOG.md:647-649`
+  requires held-out answerables that are paraphrases with **no required**
+  lexical overlap; the implementation applied **zero** overlap to every hybrid
+  answerable in both splits.
+
+**A named acceptance criterion is directly unmet.** Held-out conditional
+positives number 15, so a 95% gate means 15/15, and held-out pre-abstention
+Recall@5 is only 0.75
+(`tests/fixtures/abstention_eval/v1/reports/hybrid-blocked.json`,
+`held_out.metrics_at_fit_only_diagnostic_boundary`). The threshold criterion
+at `BACKLOG.md:653-657` states that "If the calibration dataset is too small to
+support those gates, version and review an expanded E6 dataset/split before
+fitting" (`:656-657`). That escape hatch was triggered and ignored; fitting
+proceeded anyway.
+
+**The accurate statement of the result** is: *raw BGE-M3 cosine cannot separate
+absent-attribute negatives from deliberately zero-overlap paraphrase positives
+at n=15.* It is **not** "abstention is infeasible", and it must not be recorded
+as a scientific finding of infeasibility.
+
+The three honest unblock options above stand, restated against this review:
+
+1. Predeclare a v2 feature family **and** a v2 dataset whose paraphrases span
+   zero-to-moderate overlap, with enough held-out positives that 95% is not a
+   single-case coin flip.
+2. Explicitly amend the contract to admit a reader/cross-encoder.
+3. Leave hybrid abstention unshipped and amend E7.
+
+**Standing recommendation: option 1.** Option 2 must not be taken on the
+strength of an experiment that never fairly tested the light signals. Option 3
+is a defensible schedule call. This survives the strongest counter-argument —
+that zero-overlap paraphrase is E6's legitimate hard case — because the
+contract's own escape hatch was triggered and ignored.
+
+E6 therefore remains **Blocked**, on the dataset and the unmet dataset-size
+criterion rather than on a proven infeasibility. E7 remains blocked on E6.
 
 **Non-goals**
 
@@ -871,6 +1011,33 @@ not tool I/O at all.
   payload, preserving that the event genuinely recurred.
 - Re-measure the duplicate fraction after C6 lands to size what remains.
 
+*Superseded as of 2026-08-27: phase 1 shipped. Schema v10 adds
+`memories.content_hash` and `idx_memories_content_hash`
+(`src/haunt/store.py:1703-1711`), so "No `content_hash` exists" above no longer
+holds. The measurement it enables is not reachable from the CLI (R19), and it is
+never populated by an E4 import (R7).*
+
+**C7 phase 2 (reference-not-copy) — dropped (2026-08-27)**
+
+Re-measured across all seven namespace databases: 11,017 rows, 394 extra copies
+(3.58%), wasting 713.2 KB of 38.3 MB of content (**1.86% of bytes**). Of the 394,
+229 are tool exhaust (Bash 142, Read 74, and 13 in `ToolSearch`/`mcp`/`Write`/
+`ScheduleWakeup` that the default exclusion does not cover), 161 are
+`haunt session start` ceremony, and **4 are genuine**.
+
+The decision stands on those two numbers — 1.86% of bytes and 4 genuine
+duplicates in 11,017 rows — and not on the earlier rate comparison. Both
+duplication measurements were correct; the corpus grew about 5x during
+development (2,200 to 11,017 rows), so the rate fell by dilution while the
+absolute count rose. Two parts of the original justification do not hold:
+
+- "Already neutralized by C6" does not address phase 2. C6 sets
+  `skip_embedding`, which keeps a row out of the vector index but still
+  **stores** it (`src/haunt/store.py:5119-5123`). Phase 2 was a storage
+  proposal.
+- Of the 161 ceremony duplicates, only 85 sit in the junk `aronriley` namespace
+  that C2 prevents; 76 are in legitimate namespaces where C2 does nothing.
+
 ### Retrieval quality and cost
 
 **C8 — Reproducible abstention failure (evidence for E6)**
@@ -942,3 +1109,249 @@ cross-encoder as deliberately not wired.
 - Dropping capture as a corpus-size remedy. Size is managed at the embedder and
   in the view, not by discarding the log.
 - Redefining `trusted`, which is an authority label, as a visibility switch.
+
+## Reconciliation register (2026-08-27)
+
+Verified against `main` `ed806b2` and `integration/all-work` `d1aec40`, then
+extended by a late pass at `integration/all-work` `413f8b9` that closed 19 of
+these rows, added six new ones (L11-L16), and recorded the verification
+evidence below. This register supersedes every prior audit of this repository. **Audits written
+against `88f607f` are 15 commits stale** — that revision is 15 commits behind
+`main`, and most of what those audits report was fixed in between. The closed
+table below is the list; do not re-open anything in it without new evidence.
+
+`Checked` reads: `verified` — citation re-checked during this reconciliation, at
+`d1aec40` for R1-R30 and M1-M3, at `413f8b9` for L11-L16; `operator` —
+re-checked directly by the operator; `unverified` — carried from the source
+ledger and **not** independently re-checked, so treat both the citation and the
+finding as unconfirmed.
+
+### Open items
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| R7 | `content_hash` is NULL after an E4 import into a fresh home. `portability.py` has zero `content_hash` references and the C7 backfill runs only in the `current < 10` migration step, which never fires on a fresh v11 database. C7 duplicate measurement silently reads zero in any imported namespace. Not data loss — recomputable. | MEDIUM | `src/haunt/portability.py` (0 hits); `_backfill_content_hashes` reached only at `src/haunt/store.py:1703-1717` | verified |
+| R8 | Remote-less repositories still collide on the directory leaf name: two local-only repositories named `api` share one memory database. Misses worktrees and pre-`git remote add` repositories. | MEDIUM | fallback at `src/haunt/paths.py:1707` `safe_name(repo_root.name)` | unverified |
+| R9 | Prompt injection is mitigated at the highest-volume channel only, not closed. `trusted=False` covers raw tool I/O; assistant replies and user prompts replay verbatim into the next session's `additionalContext` with no data/instruction delimiter. Laundering path: poisoned page to tool output (excluded) to assistant summary (stored trusted) to replay. | MEDIUM | `src/haunt/recall.py:138`; hook injection in `src/haunt/claude_hook.py`, `src/haunt/cursor_hook.py` | unverified |
+| R1 | Inspection surfaces (timeline, health, worldview, trace, procedure get/list, and eight dashboard GET routes) open a **read-write** connection and take the writer lifecycle lock: they need write permission and serialize concurrent inspection. Entity surrogate UUIDs are not stable across a rebuild. **Not** a per-read rebuild — `_ensure_graph_evidence` is a version-gated one-shot backfill returning immediately once `graph_evidence_version == "1"`; measured steady-state mutation is zero. **Not** an undocumented invariant violation — `README.md:130-136` and `docs/MEMORY_CONTRACT.md:211-217` scope the read-only requirement to recall, and `MEMORY_CONTRACT.md:206-208` names timeline/trace/detail as a different class. Read-only media fail at WAL configuration first. GitHub issue #84. | LOW-MEDIUM (downgraded from HIGHEST) | `src/haunt/store.py:4886-4897`, `_rebuild_graph_with_configuration_lock` at `:5911` | operator |
+| R12 | Dashboard async routes block the event loop (no `to_thread`/`run_in_threadpool` anywhere) and re-embed the same query once per namespace with no query-vector cache. Latency only, single user. | LOW-MEDIUM | `src/haunt/dashboard.py` recall routes; `src/haunt/recall.py` `embed_one` | unverified |
+| R24 | E4 default limits are not co-feasible: `_StrictJSONParser` runs at ~5 MB/s, so the default 64 MiB input cap consumes ~13 s of the default 30 s timeout. See the E4 gap list. | LOW-MEDIUM | `src/haunt/portability.py:679`, `:86`, `:92`, `:95` | verified |
+| R21 | No ruff or mypy configuration and no CI gate. Current state: ruff 13 findings (7 `F401`, 5 `F841`, 1 `E741`; only one in `src/` — `desktop.py:5` unused `os`); mypy 1.11.2 reports 57 errors across 11 files, about 17 from `MCPNamespaceAccess` attribute/assignment. | LOW code risk / MEDIUM process | `pyproject.toml` (no `[tool.ruff]`/`[tool.mypy]`); `.github/workflows/ci.yml` runs neither | unverified |
+| R23 | E4's purge-lineage claim is overstated in the PR and doc wording. See the E4 gap list; the test itself is honest. | LOW code / MEDIUM honesty | `tests/test_portability.py:1305-1319` | verified |
+
+9 open items above. Nothing here is a merge blocker: R6 was the only one and
+it is fixed and closed below.
+
+### LongMemEval retrieval (2026-08-27)
+
+Operator-run and judge-free, FTS-only, `k=10`, against clean `main` `ed806b2`.
+Harness `scripts/score_lme_retrieval.py`, which lands at `4973169` on
+`perf/embed-batching` and is **not** in `d1aec40`. Dataset
+`longmemeval_s_cleaned.json`, n=500, seeded stratified split of 350 working and
+150 held-out.
+
+| Split | n | R@1 | R@3 | R@5 | R@10 | MRR |
+|---|---|---|---|---|---|---|
+| working | 350 | 0.851 | 0.920 | 0.937 | 0.960 | 0.890 |
+| held-out | 150 | 0.887 | 0.927 | 0.960 | 0.973 | 0.915 |
+
+The held-out split exists to verify generalization. Do not diagnose against it,
+do not tune against it, and do not report a per-type held-out cell without the
+power check in L8.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L1 | `single-session-preference` is the weakest retrieval type, by lexical signal inversion. Working R@1 0.429 / R@10 0.714; held-out 0.444 / 0.889; every other type is 0.95 to 1.00 at R@10. The mechanism is measured, not inferred: lexical margin = (best gold-turn content-word overlap with the query) minus (best non-gold-turn overlap), and margin predicts R@1 monotonically across all six types - knowledge-update +0.334/0.945, single-session-user +0.259/0.959, single-session-assistant +0.232/0.872, multi-session +0.107/0.860, temporal-reasoning +0.098/0.817, single-session-preference -0.089/0.429. Preference is the only negative margin: the best distractor matches the query better than anything in gold, so BM25 cannot rank gold first. The cause is not benchmark-specific - a preference question names the task ("what should I serve for dinner") while the gold session holds the constraint ("my homegrown cherry tomatoes, basil, mint"); those vocabularies are disjoint by construction, and a real haystack reliably contains a session that genuinely is about the task. | MEDIUM (product) | working n=350, held-out n=150 at `ed806b2`; GitHub issue #37, which until now had no measurement behind it | operator |
+| L2 | Hybrid retrieval fixes L1 at zero code cost, so the FTS-only figure understates the shipped product. Measured on the 16 working-set preference questions with embeddings fully drained (bge-m3, coverage 1.0): preference R@10 0.688 to 1.000, R@1 0.312 to 0.438, 10 improved and 0 regressed, all five completed misses recovered. Evidence, not a task: the action is to run and report hybrid, not to change code. | n/a (evidence) | working preference subset n=16, embedding coverage 1.0 | operator |
+| L3 | The harness's `ranking_fusion` miss bucket is vacuous and should be replaced. In FTS-only mode there is one modality, and RRF `1.0/(RRF_K + rank)` is strictly decreasing in rank, so the fused order is identical to the BM25 order - there is no fusion to fail. The bucket fires whenever gold lands anywhere in the candidate pool, which is always. Note also that `_fts_hits` is called with `CANDIDATES` = 40, not `k` and not a probe constant. Working-set recall@40 = 1.000, so candidate generation never fails; ordering within 40 is the whole problem (R@10 0.960, R@15 0.971, R@20 0.977). Replace it with a `margin < 0` bucket, which labels 14/14 misses meaningfully. | LOW (harness correctness) | `src/haunt/recall.py:30`, `:31`, `:577`, `:614`, `:617`, `:620` | verified |
+| L4 | `CANDIDATES` = 40 also caps each modality independently before fusion, so hybrid mode fuses two 40-candidate pools rather than widening the pool. Untested in FTS-only. Measure it on its own before the L2 hybrid proof run, or the two effects confound. | LOW (unmeasured) | `src/haunt/recall.py:31`, `:577`, `:592` | verified |
+| L5 | `temporal-reasoning` misses are the documented implicit-time limitation, now quantified. Questions carrying a relative-time expression: n=26, R@1 0.615, R@10 0.808. Questions without: n=67, R@1 0.896, R@10 1.000. All five misses fall in the relative group. Bolting relative-time date parsing onto the query path is explicitly **not** recommended: it contradicts a stated design decision and would be dataset-tuning. | LOW (known limit, quantified) | working temporal-reasoning n=93; GitHub issues #39 and #40 | operator |
+| L6 | No fuzzy fallback exists for a query anchor that is absent from the index. `tokenize='porter unicode61'` means a query term with no index entry cannot match at all. Two working-set cases turn on this: `homegrown` (df 0/503) and `buisiness`, a misspelling in the benchmark's own question (df 0/476). Recorded as a product property worth knowing; no fix proposed. | LOW (known limit) | `src/haunt/store.py:1395` | verified |
+| L7 | Candidate fix, **not adopted**: stopword-filter the FTS query only, roughly 6 lines. Measured over all 350 working questions: overall R@1 0.851 to 0.866 and R@10 0.960 to 0.974; preference R@10 0.714 to 0.905; single-session-assistant R@1 0.872 to 1.000; 6 gained and 1 lost at R@10. It is underpowered - no cell reaches p<0.05 (McNemar: assistant R@1 5/0 p=0.063; preference R@10 4/0 p=0.125; overall R@10 6/1 p=0.125) - and single-session-user R@1 regresses 0.959 to 0.918. Sensitivity: a 33-word minimal IR stoplist recovers the assistant gain but none of the preference gain, so the effect lives in mid-frequency closed-class words and is list-dependent. Governing constraint if it is ever adopted: one published list, frozen a priori. Curating membership against working-set recall would be tuning and would manufacture a held-out failure. Removing `not` is separately risky for negation queries. | LOW (not adopted) | working n=350; McNemar exact, two-sided | operator |
+| L8 | Held-out power warning. Held-out `single-session-preference` is n=9, where a +0.19 R@10 effect moves about 1.7 questions. Judge generalization on pooled R@10 (n=150) and on single-session-assistant R@1 (n=17), never on that cell. | n/a (method) | held-out split composition, n=150 | operator |
+| L9 | Embedding ingest wastes throughput on padding: `tokenizers` pads each batch to its longest member, so a randomly ordered batch of 100 turns is almost always padded to 512, roughly 2.6x the tokens actually needed. Length-sorting before batching measured 3.34x (3.14 to 10.49 texts/s at batch=16) with vectors unchanged (min cosine 1.00000000, max absolute difference 6.6e-07). This affects every user's ingest, not only the benchmark. Fix in progress. | MEDIUM (performance, all users) | `perf/embed-batching` `6198083` | operator |
+| L10 | `answer_substring_proxy` is not a retrieval signal for `single-session-preference`. It reads 0.000 at every cutoff because the benchmark's preference answers are free-form rationales that never appear in the haystack. Scoring artifact; do not treat it as a miss. | n/a (scoring artifact) | working n=350, all cutoffs | operator |
+
+10 LongMemEval items, none of them a merge blocker.
+
+### Late findings (2026-08-27)
+
+Found after the reconciliation above, during integration and the cleanup pass.
+IDs continue the L-series. None is a merge blocker.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L11 | The `test-hybrid` job was authored and exercised on macOS only and has never run on Linux. Its first CI run is a cold `actions/cache` miss that downloads bge-small (~64 MB) before the key populates. The key is a bare literal with no `restore-keys`, so if the embedding model pin ever changes that key must be bumped or the job silently reuses the wrong cached model. | LOW (operational) | `.github/workflows/ci.yml:61-86`, key at `:78` | verified |
+| L12 | Purge is now O(namespace), not O(row): `VACUUM` rebuilds the whole namespace file. Acceptable for a gated, confirmed delete, but `haunt delete --event-id` calls `purge()` once per memory on that event, so the rebuild runs once per memory — that is where it surfaces first. `bytes_overwritten` in the purge report says whether the rebuild actually completed (false when a concurrent reader blocks `VACUUM`); the purge's own bytes are zeroed either way. | LOW-MEDIUM (performance) | `src/haunt/store.py:6484-6508`; per-memory loop at `src/haunt/cli.py:1003-1009` | verified |
+| L13 | `drain_embedding_queue(batch_size=N)` silently clamps N to 100, via `clamp_limit`'s `LIMIT_MAX`. Undocumented kwarg and no production caller sets it — `bootstrap` calls with no arguments. `README.md` is **not** wrong: it documents `HAUNT_EMBED_DRAIN_LIMIT`, which controls `max_rows` and genuinely reaches 100,000. A one-line docstring note is the whole fix. | LOW | `src/haunt/store.py:5714-5715`, clamp at `:5510`; `LIMIT_MAX` at `src/haunt/util.py:154`; `README.md:312` | verified |
+| L14 | `_load_fastembed` remains unpinned: fastembed exposes no revision knob, so `TextEmbedding(model_name=...)` takes whatever the hub serves. A separate download path from the one the R2 BGE-M3 revision pin closed. | LOW (supply chain) | `src/haunt/embed.py:367-374` | verified |
+| L15 | `tests/test_correction_lineage.py::test_concurrent_corrections_do_not_fork` failed once at machine load ~97 with `NamespacePathError: SQLite zero-write read observed storage drift`. Passed 5/5 in isolation at the same load, and in the clean-load full suite. Cause not established. Not a merge blocker; re-check if it recurs. | LOW | `tests/test_correction_lineage.py:359`; one observed failure, not reproduced | operator |
+| L16 | Hooks fail **open** on exception, but there is no timeout at all, so a hang is not covered: a contended SQLite lock or a slow disk holds the turn until the host's own hook timeout fires. `SECURITY.md`/`README.md` wording was corrected to "a hook *error* never blocks", which is honest, but the underlying gap remains. Found during the cleanup pass and deliberately not fixed there — behaviour change, out of scope. | LOW-MEDIUM | `SECURITY.md:117-119`; `README.md:158`; no `timeout`/`signal` in `src/haunt/claude_hook.py` or `src/haunt/cursor_hook.py` | verified |
+
+6 late findings. 25 open in the register.
+
+### Verification evidence (2026-08-27)
+
+Plain facts, each re-checkable.
+
+- Full suite on the integrated tree: 1157 passed, 1 skipped, 7 xfailed, 0
+  failed, of 1165 collected.
+- Retrieval regression against clean `main` `ed806b2`, judge-free LongMemEval
+  FTS-only `k=10`, n=500 on the seeded 350 working / 150 held-out split: **0 of
+  180 numeric fields differ**. Confirmed independently three times — at 7
+  branches, at 8 branches with the reranker wired into `recall()`, and on the
+  final tree after the cleanup pass.
+- Cleanup pass: 493 lines removed, 223 added, across 13 files (270 net).
+- Embedding ingest: 1.98x faster through the shipped `embed_texts()` path,
+  vectors identical at min cosine 1.0000000000, max absolute difference
+  3.257e-07.
+- Test suite wall clock: 377-590s down to 102-165s.
+- Hybrid n=500 LongMemEval, judge-free, k=10, BAAI/bge-m3, embedding coverage
+  246738/246750 (1.0000) with an empty queue, so this is a real hybrid run and
+  not an FTS-only run under a hybrid label. 7.07h wall clock, 98.8% of it
+  embedding.
+
+  | set | n | @1 | @3 | @5 | @10 | MRR | misses |
+  |---|---|---|---|---|---|---|---|
+  | working | 350 | 0.900 | 0.951 | 0.974 | 0.989 | 0.930 | 4 |
+  | held-out | 150 | 0.940 | 0.980 | 0.987 | 0.993 | 0.961 | 1 |
+
+  Against the FTS-only baseline on clean `main` (working 0.851/0.960,
+  held-out 0.887/0.973) both sets improve on both metrics. Held-out scoring
+  above working is the generalization evidence: no change was tuned toward
+  the diagnostic set.
+
+  Held-out reaches @10 1.000 on knowledge-update, multi-session,
+  single-session-assistant and single-session-preference.
+  `single-session-preference`, the weakest FTS type and the measurement
+  behind issue #37, moves from 0.444/0.889 to 0.778/1.000.
+
+  All 5 remaining misses across both sets are `ranking_fusion` -- gold in the
+  candidate pool, ranked below k. Three of them (`gpt4_59149c78`, `eac54add`,
+  `gpt4_8279ba03`) are already in the eight known-temporal-miss IDs hardcoded
+  in `scripts/score_lme_temporal.py`, i.e. the documented implicit-English-time
+  limitation. The other two share no mechanism. **No new trend to file.**
+
+### Closed and disproven claims
+
+Do not schedule work against any row here. Each was checked against current
+code, not against a PR title or a prior audit: the original rows at `d1aec40`,
+citing symbols rather than lines because line numbers had drifted since the
+audits; the late-pass rows at `413f8b9`, citing lines at that revision.
+
+| Claim | Verdict | Closing evidence |
+|---|---|---|
+| R15 | `execution` computed from `hits` rather than `bounded_hits` | NOT A DEFECT | `execution_metadata` reads `getattr(hits, "execution")` on the planner's result object, not per-hit data; a plain list carries none, so passing `bounded_hits` would return `None` and drop the block entirely. Rationale now inline at `src/haunt/mcp_server.py:533-534`. | operator |
+| `HAUNT_HOME` shell injection in the generated wrapper | FIXED | `_sh_single_quote` (`src/haunt/bootstrap.py:16`); 5 payloads executed, 0 markers created |
+| Planner temporal `k` under-fill | FIXED | `src/haunt/planner.py` paginates until `len(merged) >= limit`; the audit's exact repro now returns 2 hits, not 0 |
+| Contradict is non-atomic | FIXED | `Store.contradict` (`src/haunt/store.py:7164`) runs under `BEGIN IMMEDIATE`; re-contradict returns `conflict: already_superseded`, guarded twice |
+| Contradict "rewrites `valid_to`" | MISREAD | It still writes `valid_to`; that is the designed supersede (E1 keeps it as a current/as-of projection). What was fixed is atomicity and the re-contradict guard |
+| Observe commits before graph extraction | FIXED | `extract_and_store(commit=False)`, single commit, rollback on exception |
+| Purge erases older relation evidence | FIXED | `remove_event_evidence` scoped to that event, then `_refresh_relation` re-aggregates |
+| Purge deletes unrelated singleton entities | FIXED | scoped to entities mentioned by that event only |
+| Malformed editor JSON is overwritten | FIXED | `read_json_object` raises `HostConfigError`; the CLI exits 1 without writing |
+| FTS-only bootstrap still requires sqlite-vec | FIXED | `if not vec.get("ok") and not fts_only():` (`src/haunt/bootstrap.py:192`); verified on an interpreter lacking `enable_load_extension` |
+| MCP/CLI create typo namespaces | FIXED | `_open_mcp_store(ns, create=False)`; probe returns 404, zero database files created |
+| Existing timestamps not migrated to UTC | FIXED | `_normalize_stored_clocks` (`src/haunt/store.py:1414`) runs when `schema_version < 1`; covers sessions, events, memories, entities, relations |
+| Second-resolution timestamp ties | FIXED | `timespec="microseconds"` (`src/haunt/util.py:39`); `ORDER BY created_at DESC, rowid DESC` |
+| `timeline --limit -1` is unbounded | FIXED | `clamp_limit` (`src/haunt/util.py:139`) floors at `LIMIT_MIN` |
+| Negative or uncapped worldview caps | FIXED | `clamp_limit` in CLI and MCP; -1 to 1, 1e9 to 100 |
+| `HAUNT_STORE_THOUGHTS` unwired | FIXED | handler registered and env-gated in `src/haunt/cursor_hook.py` |
+| Invalid global params mislabeled per-namespace | FIXED | `_validate_recall_request` (`src/haunt/dashboard.py:926`) runs once before the namespace loop |
+| Hooks reload the heavyweight model | FIXED | `defer_embedding=True` plus hook recall `use_vectors=False`; no fastembed import on the hook path |
+| Inverted entity time bounds (`first_seen > last_seen`) | FIXED | `MIN`/`MAX` in `src/haunt/graph.py` |
+| `lore` to `haunt` data/wiring migration missing | VACUOUS | zero `lore` references in `src/` or `docs/`; aliases removed in `8e35095`, never PyPI-released. Only residue is the `MODEL_CACHE` path in `tests/conftest.py:10`, which is R13 |
+| Graph dedup race | NOT REACHABLE | `INSERT INTO events` takes the SQLite write lock before the `SELECT`/`INSERT` on the only path that reaches it |
+| "10 unmerged codex branches, biggest integration risk" | FALSE | Squash-merge ghosts. `codex/recall-release-gate` is PR #82, merged, `src/` and `tests/` byte-identical to `main`. Same for `namespace-aliases` (#80), `structured-provenance` (#78), `correction-lineage` (#77), `frozen-retrieval-eval` (#74), `eval-trust-controls` (#76), `memory-roadmap` (#75) |
+| Dashboard `GET /` leaks the admin token | NOT A DEFECT | `embed_launch_token_in_html()` (`src/haunt/dashboard.py:875`) gates to loopback and non-remote, is explicitly withheld under `--allow-remote`, and is documented. Residual risk only on a shared multi-user host |
+| Blob content is marked truncated rather than shrunk (C11) | ALREADY HANDLED | the budget returns `None` (drops the hit); regression test in `tests/test_recall_budget.py`. Also unreachable: `content` is `TEXT NOT NULL` |
+| Tiny budget is not hard-asserted (C11) | MISDESCRIBED | hard assertions exist in `tests/test_recall_budget.py` at `cap=2000`; overflow is impossible by construction because the budget measures rather than estimates |
+| Drain runs only via `haunt bootstrap` | MISDESCRIBED | three drain sites: `haunt maintenance`, an inline `Store` drain, and bootstrap. The true half is that there is no timer or daemon |
+| No index on `embedding_jobs.attempts` | NOT A DEFECT | the hot query is already ordered by `idx_embedding_jobs_queued`; a composite would force a sort, and rows are deleted on success |
+| Entity resolution not attempted (C3) | NOT A DEFECT | deliberate scope decision, documented in `src/haunt/store.py` |
+| Trigram tokenizer rejected (C9) | WELL-FOUNDED | FTS5 trigram cannot be wrapped by porter; losing stemming on a prose corpus is a net loss |
+| C7 phase 2 (reference-not-copy) dropped | WELL-FOUNDED, restated | see the C7 phase 2 decision above — the grounds changed, the decision did not |
+| R25 — `FORMAT_MINOR = 0` leaves the older-minor path unexercised | NOT SCHEDULED | true but not work; recorded as an accepted E4 caveat (`src/haunt/portability.py:61`) |
+| R26 — `_backfill_content_hashes` runs on every store open, inside R5's unprotected loop | REFUTED | it is called once inside `if current < 10:` (`src/haunt/store.py:1703-1717`) and `_ensure_namespace_schema` early-returns when `current >= SCHEMA_VERSION` (`:1610-1615`). One-shot migration. It is unbounded within that single pass; cheap batching is welcome, heavy machinery is not |
+| R27 — `idx_memories_content_hash` costs a write per INSERT to serve one diagnostic | REFUTED twice | `EXPLAIN QUERY PLAN` shows `SEARCH memories USING COVERING INDEX idx_memories_content_hash`, so the index is used. The residual worry that a fresh v11 database never gets the C7/C10 indexes is false: a fresh database stamps at `SCHEMA_VERSION` 11 and receives both `idx_memories_content_hash` (`src/haunt/store.py:1709-1711`) and `idx_memories_current` (`:1723-1726`), 20 `idx_` indexes total |
+| R29 — missing `UNIQUE(norm_name, type)` on the entities index | DROPPED | latent invariant gap; the race is unreachable today via `observe` |
+| R30 — camelCase identifiers unsearchable by parts | DROPPED | deliberate, tested (`tests/test_identifier_tokenization.py`), and documented. Keep as a known limit |
+| Stored XSS via `session_id` in the dashboard | **FIXED, but the class is not closed** | that specific sink is escaped and ~30 `innerHTML` sinks were swept. Other stored values are still raw — see M1 |
+| E4 import sets `graph_evidence_version='1'` | CORRECT BY DESIGN | `src/haunt/portability.py:1453-1455`. A restored bundle is correctly not re-derived by R1's backfill. Do not "fix" this |
+| R6 — E6 integrity guard diffs the whole tree against a pinned revision (the merge blocker) | FIXED | attribution is now per commit over E6's own evidence paths, plus uncommitted edits to them (`_e6_attributed_diff`, `src/haunt/abstention_eval.py:618-645`). `E0_BASE_REVISION` is gone, so a later merge cannot break it; a shallow clone reports `history_attributable: false` instead of claiming every file; `_git` raises rather than returning a false clean when git is unrunnable (`:597-615`) |
+| R2 — embedding model download unpinned, bare `except` redirects to a different repo | FIXED | `BGE_M3_REVISION` pinned (`src/haunt/embed.py:43`); the fallback catches only repo/revision-unavailable hub errors, not timeouts or 5xx (`:166-188`, `:225`), and is opt-in behind `HAUNT_EMBED_QUANT_FALLBACK`, otherwise re-raising (`:234-235`); the cache records which repo produced its bytes (`:191`) |
+| R3 — closed sessions accept new events on the explicit-`session_id` path | FIXED | an ended id now routes to `_successor_session` rather than being ignored (`src/haunt/store.py:5077-5080`, `:5111`); `end_session` closes successors alongside the id it was given (`:5145-5180`) |
+| R4 — reconcile takes its verified backups before acquiring the write lock | FIXED | the TARGET backup runs inside the merge's own `BEGIN IMMEDIATE` (`src/haunt/store.py:4492-4499`); SOURCE reads one frozen read-only snapshot for both its backup and the copy (`:4489`) |
+| R5 — namespace fan-out has no per-namespace isolation | FIXED | `bootstrap` catches `sqlite3.Error`/`OSError`/`NamespacePathError` per namespace and continues (`src/haunt/bootstrap.py:177-183`), so `install_desktop_icon()` and `install_all_hosts()` at `:192-199` are always reached; `reembed_all_namespaces` matches (`src/haunt/store.py:7897-7900`) |
+| R10 — the recall budget bounds the sum of the parts, not the serialized list | FIXED | `apply_recall_budget` measures `len(serialize(hits))` and charges the `", "` separator per kept hit (`src/haunt/budget.py:66`, `:70`, `:251`) |
+| R11 — `haunt recall --json`, dashboard `/api/recall`, and MCP `memory_timeline` are uncapped | FIXED | one budget on every retrieval surface: `src/haunt/cli.py:368`, `src/haunt/dashboard.py:1093` (fan-out budgeted once, not per namespace), `:1159`, `src/haunt/mcp_server.py:525`, `:567` |
+| R13 — the CI fixture defeats `HAUNT_FTS_ONLY` and guards on a dead `MODEL_CACHE` path | FIXED | ambient `HAUNT_FTS_ONLY`/`HAUNT_EMBED_MODEL` now win (`tests/conftest.py:54-73`) and the cache is resolved from `models_dir()` before `HAUNT_HOME` moves (`:12-29`), so no second absolute path can rot. That leaves sqlite-vec and embeddings without coverage, so a `test-hybrid` job runs the suite against them (`.github/workflows/ci.yml:61-86`) — see L11 |
+| R14 — C3 source-side digest TOCTOU | FIXED | `_execute_reconciliation_writes` compares the digest of its own in-transaction read against the plan's and refuses a mismatch (`src/haunt/store.py:4406-4415`) |
+| R16 — no reconcile concurrency test | FIXED | racing writer added, asserting every TARGET row the merge reads is covered by that merge's backup (`tests/test_namespace_reconcile.py:647-695`); verified failing against the pre-fix functions and passing after |
+| R17 — Cursor `Shell` output embeds while Claude Code `Bash` output does not | FIXED | `EMBED_EXCLUDE_TOOLS_DEFAULT = "Bash,Read,Shell"` (`src/haunt/cursor_hook.py:239`) |
+| R18 — `HAUNT_STORE_THOUGHTS` rows omit `skip_embedding` | FIXED | `src/haunt/cursor_hook.py:534` |
+| R19 — C7/C4 metrics are invisible from the CLI | FIXED | `health_cmd` prints `memories_embedded`, `vector_index`, `duplicate_memories`, and `duplicate_content_values` (`src/haunt/cli.py:755-761`) |
+| R20 — no CLI affordance to remove the drained namespace after reconcile | FIXED | `haunt namespace retire LABEL --into TARGET` (`src/haunt/cli.py:692-709`, `retire_namespace` at `src/haunt/store.py:4591`): dry-run by default, refuses while any row is still unique to LABEL, verifies a backup, then drops identity/aliases/bindings and unlinks the database |
+| R22 — `rerank.py` ships with zero production callers | D1 EXECUTED | wired into `recall()` between fusion and the returned `k`, still off by default (`src/haunt/recall.py:646-655`, `:744`); default `HAUNT_RERANK_LAMBDA` corrected to `0.3`, and both variables documented (`README.md:322-323`) |
+| R28 — triplicated environment parse/clamp idiom | FIXED | `util.env_int`/`util.env_flag` (`src/haunt/util.py:20`, `:31`), used from `budget.py:53`, `cursor_hook.py:265`, `:291`, `embed.py`, and `store.py:918` |
+| M1 — E4 import never validates `tier`; the dashboard interpolates it raw | FIXED | `_validate_enumerated_columns` rejects unknown `events.tier`, `memories.tier`, and `entities.type` (`src/haunt/portability.py:1350-1368`); `tierCls` returns `""` off-vocabulary instead of `"t-"+t` (`src/haunt/dashboard.py:384`), and its remaining attribute uses are escaped |
+| M2 — no `Content-Security-Policy` header anywhere in the dashboard | FIXED | `default-src 'none'; script-src 'nonce-...'` with a fresh per-response nonce (`src/haunt/dashboard.py:52-56`, `:919-924`). `style-src` stays `'unsafe-inline'`, documented at `:52` |
+| M3 — `esc()` is the wrong escaper for inline handler attributes | FIXED | every `onclick="..."` attribute replaced by `data-act` plus one delegated `click` listener (`src/haunt/dashboard.py:806-829`), which is also what lets M2's nonce work; the three surviving `onclick` hits are JS property assignments, not attributes |
+| E0's only stemming case was a literal prefix, so the gate could not observe stemming | FIXED | `porter_stemming_nonprefix` added — query "study" against the indexed "studies", neither a prefix nor a substring of the other (`tests/fixtures/retrieval_eval/corpus.json:29`, `tests/test_frozen_retrieval_eval.py:100-103`). Mutation-confirmed load-bearing: under `trigram` it is the one case in the corpus that mismatches baseline. Baseline relocked; `config_sha256` unchanged because the retrieval contract is unchanged |
+| E0 scored reranked retrieval against a baseline frozen without reranking | FIXED | `frozen_retrieval_eval` pins `HAUNT_RERANK_ENABLED` out of the isolated environment it already owns (`src/haunt/frozen_retrieval_eval.py:263-265`). Gate produces the frozen result with the flag unset and with it set, so no relock |
+| `memory_purge` claimed erasure while plain DELETEs left the bytes readable | FIXED | a canary planted before a purge was still readable 8 times in the raw database, twice in live `memories_fts_data` rows. Purge now runs under `PRAGMA secure_delete=ON` (`src/haunt/store.py:6230`), merges the FTS index (`:6359`), then rebuilds the file and truncates the WAL (`:6502-6506`). All three mutation-verified load-bearing: removing any one puts the canary back. `bytes_overwritten` (`:6475`) reports false rather than claiming a rebuild a concurrent reader blocked. Cost is L12 |
+
+58 closed rows.
+
+### Decisions (do not re-litigate)
+
+- **D1 — reranker.** Wire `haunt.rerank` in behind `HAUNT_RERANK_ENABLED`
+  (default off) **and** correct the default `HAUNT_RERANK_LAMBDA` from `0.5` to
+  `0.3`. The correction is on measured evidence, confirmed by an independent
+  sweep: `lambda` 0.2/0.3 give recall@k `0.9375`, MRR `0.8542`, redundancy
+  `0.0417`, against the shipped `0.5` at `0.875`/`0.8542`/`0.0833`; `lambda` 0.1
+  also dominates. Caveat: 8 cases over 20 records on a purpose-built fixture.
+  Update `README.md:319-320` with the wiring. See R22.
+- **D2 — real-namespace reconcile.** Approved to run against the real corpus
+  **after** the R4 backup-ordering fix lands, not before.
+- **D3 — C7 phase 2.** Dropped. See the C7 phase 2 decision above.
+- **D4 — E6 unblock path.** Standing recommendation is option 1 (v2 feature
+  family plus v2 dataset). See the E6 blocker review above.
+- **D5 — reranker scope.** D1 stands, and the reranker is **not** the fix for
+  L1. An MMR-style diversity rerank over BM25 candidates cannot repair
+  vocabulary disjunction: it reorders a pool in which gold is already
+  out-ranked by a genuinely on-topic distractor. Hybrid retrieval (L2) is the
+  fix.
+- **D6 — CoreML execution provider.** `CoreMLExecutionProvider` is available,
+  but `embed.py` hardcodes `CPUExecutionProvider`
+  (`src/haunt/embed.py:218`). Deliberately deferred pending a vector-agreement
+  measurement, and to land as a change separate from L9.
+- **D7 — ONNX thread tuning.** Not adopted. The `intra=8` 1.32x result came
+  from a short-sequence-biased sample and would ship as a hardware-specific
+  hardcode.
+
+### Integration state (verified)
+
+- `integration/all-work` `d1aec40` = `main` `ed806b2` + #79 + #81 + #83 +
+  `codex/calibrated-abstention`. All four merged with **zero conflicts**;
+  confirmed from the merge parents.
+- The schema ladder merged sequentially and correctly: v9 `recall_class` (main)
+  to v10 `content_hash` plus index plus backfill (C7) to v11
+  `idx_memories_current` partial index (C10). No duplicate version numbers;
+  `SCHEMA_VERSION = 11` (`src/haunt/store.py:101`).
+- `portability`, `rerank`, and `abstention_eval` all co-import.
+- `integration/all-work` `413f8b9` adds the E6 guard, store-correctness,
+  dashboard-XSS, surface-polish, resilience, embed-batching, E0-gate,
+  rerank-wiring, test-environment, and cleanup branches on top of `d1aec40`.
+- The full suite on the integrated tree passes: 1157 passed, 1 skipped, 7
+  xfailed, 0 failed. The four `tests/test_abstention_feasibility.py` failures
+  are gone with R6.
+- E4 determinism confirmed: two exports differ only in
+  `creation.exported_at` (the contract's permitted volatile field); with a
+  pinned `exported_at` they are byte-identical.
+- E4 round trip confirmed: memory count preserved, correction lineage
+  preserved, recall works after import, superseded value not resurrected. The
+  only gap is R7.
+- The integrated tree reproduces the working-set LongMemEval retrieval numbers
+  exactly, so the 39,941 lines merged over `ed806b2` across 54 files are
+  retrieval-neutral. See the LongMemEval register above.

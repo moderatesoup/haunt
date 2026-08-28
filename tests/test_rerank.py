@@ -1,13 +1,15 @@
-"""C12: off-by-default lexical MMR rerank over haunt.recall.recall() output.
+"""C12: off-by-default lexical MMR rerank, wired into haunt.recall.recall().
 
 Covers the acceptance bar from BACKLOG.md C12 and the task that implemented
-it: feature-off is byte-identical to current recall() behavior;
-HAUNT_RERANK_ENABLED / HAUNT_RERANK_LAMBDA parse and clamp like their
-siblings (HAUNT_TOOL_IO_MAX_CHARS's _tool_io_cap idiom in cursor_hook.py);
-the reranker changes hit ordering only when explicitly enabled; and
-trusted/trust_reason survive reordering unchanged, because mmr_rerank never
-rebuilds a Hit -- it only reorders and truncates the objects recall() (or a
-caller here) already produced.
+it: feature-off leaves recall() output, its ranking provenance and its row
+reads exactly as they were before this stage existed; HAUNT_RERANK_ENABLED /
+HAUNT_RERANK_LAMBDA parse and clamp like their siblings
+(HAUNT_TOOL_IO_MAX_CHARS's _tool_io_cap idiom in cursor_hook.py); the
+reranker changes hit ordering only when explicitly enabled; the order it
+reports is the order it returned; the response budget truncates what the
+reranker chose rather than the other way round; and trusted/trust_reason
+survive reordering unchanged, because mmr_rerank never rebuilds a Hit -- it
+only reorders and truncates the objects recall() already produced.
 """
 
 from __future__ import annotations
@@ -19,9 +21,10 @@ from haunt.rerank import (
     RERANK_ENABLED_ENV,
     RERANK_LAMBDA_DEFAULT,
     RERANK_LAMBDA_ENV,
+    RERANK_METHOD,
     apply,
+    candidate_pool,
     mmr_rerank,
-    recall_with_rerank,
     rerank_enabled,
     rerank_lambda,
 )
@@ -76,6 +79,23 @@ def rerank_store_env(tmp_path, monkeypatch):
     embed.reset()
     yield tmp_path / "haunt"
     embed.reset()
+
+
+@pytest.fixture
+def rerank_mcp_env(rerank_store_env, monkeypatch):
+    """rerank_store_env plus the registry/authority mcp_server needs."""
+    from haunt import mcp_server
+    from haunt.paths import ensure_layout
+    from haunt.store import init_registry, register_namespace
+
+    monkeypatch.setenv("HAUNT_NAMESPACE", "default")
+    monkeypatch.delenv("HAUNT_RECALL_MAX_CHARS", raising=False)
+    mcp_server._MCP_AUTHORITY = None
+    ensure_layout()
+    init_registry()
+    register_namespace("default")
+    yield rerank_store_env
+    mcp_server._MCP_AUTHORITY = None
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +182,7 @@ def test_apply_changes_ordering_only_when_enabled(monkeypatch):
     # Disabled: apply() is a pure passthrough, unaware of k, exactly like a
     # caller who never routed through it -- so it returns all 4, not a
     # truncated 3. Truncating to k is recall()'s own job when this feature
-    # is off (see recall_with_rerank(), which only ever asks apply() to
-    # truncate when the feature is on).
+    # is off (recall() slices candidate_pool(k) == k before calling here).
     disabled = apply(hits, k=3)
     assert disabled is hits
     assert [h.memory_id for h in disabled] == ["dup-1", "dup-2", "dup-3", "distinct"]
@@ -310,59 +329,200 @@ def test_mmr_rerank_preserves_trust_labelling():
 
 
 # ---------------------------------------------------------------------------
-# recall_with_rerank(): the recall.recall() wrapper
+# recall(): the wired stage
 # ---------------------------------------------------------------------------
 
+CROWDED_QUERY = "alpha bravo charlie delta echo"
+RRF_ORDERING = {"primary": "rrf_score_desc", "ties": "memory_id_asc"}
 
-def test_recall_with_rerank_byte_identical_to_recall_when_disabled(rerank_store_env):
-    from haunt.recall import recall
+
+def _seed_crowded_corpus(filler: str = "") -> None:
+    """Four near-duplicates plus one distinct row sharing a single query token.
+
+    MMR can only trade one fused candidate for another, so the distinct row
+    has to be a real (if weak) FTS candidate rather than an unrelated one.
+    """
     from haunt.store import Store
 
-    with Store("default") as store:
-        store.observe("alpha bravo charlie note one", defer_embedding=True)
-        store.observe("alpha bravo charlie note two", defer_embedding=True)
-        store.observe("delta echo foxtrot distinct note", defer_embedding=True)
-
-    assert rerank_enabled() is False
-    direct = recall("alpha bravo charlie", namespace="default", k=3, use_vectors=False)
-    wrapped = recall_with_rerank(
-        "alpha bravo charlie", namespace="default", k=3, use_vectors=False
-    )
-
-    assert [h.as_dict() for h in wrapped] == [h.as_dict() for h in direct]
-
-
-def test_recall_with_rerank_widens_pool_when_enabled(rerank_store_env, monkeypatch):
-    from haunt.recall import recall
-    from haunt.store import Store
-
-    dup = "alpha bravo charlie delta echo"
     with Store("default") as store:
         for i in range(4):
-            store.observe(f"{dup} restatement {i}", defer_embedding=True)
-        # Shares exactly one query token ("alpha") with the dup cluster, so
-        # it is a real (if weaker) FTS candidate -- MMR can only ever
-        # promote a hit recall() actually returned as a candidate, never one
-        # that shares nothing with the query at all.
+            store.observe(
+                f"{CROWDED_QUERY} restatement {i} {filler}", defer_embedding=True
+            )
         store.observe(
-            "alpha is also mentioned in a wholly distinct golf hotel fact",
+            f"alpha is also mentioned in a wholly distinct golf hotel fact {filler}",
             defer_embedding=True,
         )
 
-    baseline = recall("alpha bravo charlie delta echo", namespace="default", k=3, use_vectors=False)
-    baseline_ids = {h.memory_id for h in baseline}
+
+def test_disabled_recall_is_unchanged_and_reports_fusion_ordering(rerank_store_env):
+    """Default-off is inert: same order, same provenance, no rerank evidence."""
+    from haunt.recall import recall
+
+    _seed_crowded_corpus()
+    assert rerank_enabled() is False
+
+    hits = recall(CROWDED_QUERY, namespace="default", k=3, use_vectors=False)
+
+    assert list(hits) == sorted(hits, key=lambda h: (-h.score, h.memory_id))
+    assert all(hit.rerank_stage is None for hit in hits)
+    assert "rerank" not in hits.execution
+    for position, hit in enumerate(hits, start=1):
+        explanation = hit.as_dict()["explanation"]
+        assert explanation["final_rank"] == position
+        assert explanation["ordering"] == RRF_ORDERING
+        # The fusion rank IS final_rank here, so repeating it would be noise.
+        assert "rrf_rank" not in explanation
+
+
+def test_disabled_recall_reads_no_more_rows_than_it_returns(
+    rerank_store_env, monkeypatch
+):
+    """Off must cost nothing: no MMR call, and no widened pool materialized."""
+    from haunt import rerank as rerank_module
+    from haunt.recall import recall
+    from haunt.store import Store
+
+    _seed_crowded_corpus()
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("mmr_rerank ran with HAUNT_RERANK_ENABLED unset")
+
+    monkeypatch.setattr(rerank_module, "mmr_rerank", _explode)
+
+    statements: list[str] = []
+    with Store("default") as store:
+        store.conn.set_trace_callback(statements.append)
+        hits = recall(
+            CROWDED_QUERY, namespace="default", k=3, use_vectors=False, store=store
+        )
+        store.conn.set_trace_callback(None)
+
+    assert candidate_pool(3) == 3
+    assert len(hits) == 3
+    # One per-hit row read per returned hit. Enabled, the same k=3 answer
+    # would cost RERANK_POOL of these reads instead.
+    row_read = "SELECT m.id, m.event_id, m.tier, m.content"
+    assert sum(row_read in sql for sql in statements) == 3
+
+
+def test_enabled_recall_widens_the_pool_and_promotes_a_distinct_hit(
+    rerank_store_env, monkeypatch
+):
+    from haunt.recall import recall
+
+    _seed_crowded_corpus()
+    baseline = recall(CROWDED_QUERY, namespace="default", k=3, use_vectors=False)
+    baseline_ids = {hit.memory_id for hit in baseline}
 
     monkeypatch.setenv(RERANK_ENABLED_ENV, "1")
-    monkeypatch.setenv(RERANK_LAMBDA_ENV, "0.5")
-    reranked = recall_with_rerank(
-        "alpha bravo charlie delta echo", namespace="default", k=3, use_vectors=False
-    )
+    reranked = recall(CROWDED_QUERY, namespace="default", k=3, use_vectors=False)
 
     assert len(reranked) == 3
-    # Widening the pool before applying MMR is the whole point: enabling the
+    # Widening the fused slice before MMR is the whole point: enabling the
     # feature must be able to surface a candidate outside the un-widened
-    # top-k, not just reorder exactly the same three hits.
-    assert {h.memory_id for h in reranked} != baseline_ids
+    # top-k, not merely reorder the same three hits.
+    assert {hit.memory_id for hit in reranked} != baseline_ids
+
+
+def test_enabled_recall_reports_the_order_it_actually_returned(
+    rerank_store_env, monkeypatch
+):
+    """E5: the reported ordering must be the stage that produced it.
+
+    Before this stage was wired, final_rank and explanation.ordering kept
+    describing RRF fusion for a list MMR had already reordered.
+    """
+    from haunt.recall import recall
+
+    _seed_crowded_corpus()
+    monkeypatch.setenv(RERANK_ENABLED_ENV, "1")
+
+    hits = recall(CROWDED_QUERY, namespace="default", k=3, use_vectors=False)
+    explanations = [hit.as_dict()["explanation"] for hit in hits]
+
+    assert [item["final_rank"] for item in explanations] == [1, 2, 3]
+    assert all(
+        item["ordering"]
+        == {
+            "primary": f"{RERANK_METHOD}_desc",
+            "ties": "memory_id_asc",
+            "stage": RERANK_METHOD,
+            "reordered_from": "rrf_score_desc",
+        }
+        for item in explanations
+    )
+    # RRF evidence is kept, not overwritten -- and at least one hit really
+    # moved, so rrf_rank is load-bearing rather than a copy of final_rank.
+    assert all(item["rrf_score"] is not None for item in explanations)
+    assert any(
+        item["rrf_rank"] != item["final_rank"] for item in explanations
+    )
+    assert hits.execution["rerank"] == {
+        "enabled": True,
+        "method": RERANK_METHOD,
+        "lambda": RERANK_LAMBDA_DEFAULT,
+        "pool": 5,
+        "selected": 3,
+    }
+
+
+def test_enabled_planned_recall_does_not_resort_away_the_rerank(
+    rerank_store_env, monkeypatch
+):
+    """planner.run_recall re-sorts merged hits; that must not undo MMR."""
+    from haunt.planner import planned_recall
+    from haunt.recall import recall
+
+    _seed_crowded_corpus()
+    monkeypatch.setenv(RERANK_ENABLED_ENV, "1")
+
+    direct = recall(CROWDED_QUERY, namespace="default", k=3, use_vectors=False)
+    planned = planned_recall(CROWDED_QUERY, namespace="default", k=3)
+
+    assert [hit.memory_id for hit in planned] == [hit.memory_id for hit in direct]
+
+
+def test_response_budget_truncates_what_the_reranker_chose(
+    rerank_mcp_env, monkeypatch
+):
+    """Ordering constraint: rerank reorders, the budget truncates -- in that
+    order. Budget-first would drop the hits MMR promoted before it ever ran.
+    """
+    import json
+
+    from haunt import budget as budget_module
+    from haunt import mcp_server
+
+    _seed_crowded_corpus(filler="padding " * 120)
+    fused_ids = [
+        hit["memory_id"]
+        for hit in json.loads(
+            mcp_server.memory_recall(query=CROWDED_QUERY, k=3)
+        )["hits"]
+    ]
+
+    monkeypatch.setenv(RERANK_ENABLED_ENV, "1")
+    unbudgeted = json.loads(mcp_server.memory_recall(query=CROWDED_QUERY, k=3))
+    reranked = unbudgeted["hits"]
+    reranked_ids = [hit["memory_id"] for hit in reranked]
+    assert unbudgeted["recall_budget"]["applied"] is False
+    assert reranked_ids[:2] != fused_ids[:2]
+
+    # Size the budget to admit exactly the first two hits, so it is forced
+    # to drop a suffix of whatever list reached it.
+    slim = [
+        {key: value for key, value in hit.items() if key != "snippet"}
+        for hit in reranked
+    ]
+    monkeypatch.setenv(
+        "HAUNT_RECALL_MAX_CHARS", str(len(budget_module.serialize(slim[:2])))
+    )
+
+    payload = json.loads(mcp_server.memory_recall(query=CROWDED_QUERY, k=3))
+
+    assert payload["recall_budget"]["hits_dropped"] == 1
+    assert [hit["memory_id"] for hit in payload["hits"]] == reranked_ids[:2]
 
 
 def test_mmr_diversity_penalty_is_scaled_by_one_minus_lambda():
@@ -395,19 +555,36 @@ def test_mmr_diversity_penalty_is_scaled_by_one_minus_lambda():
     )
 
 
+# ---------------------------------------------------------------------------
+# rerank_eval: the flag must not leak into its baseline arm
+# ---------------------------------------------------------------------------
+
+
+def test_rerank_eval_baseline_arm_survives_the_flag_being_set(monkeypatch):
+    """Both arms come from one recall() call, and recall() honours the flag,
+    so a set flag would quietly turn the baseline arm into a second reranked
+    arm -- and the comparison this harness exists for into a no-op.
+    """
+    from haunt import rerank_eval
+
+    clean = rerank_eval.evaluate().as_dict()
+    monkeypatch.setenv(RERANK_ENABLED_ENV, "1")
+
+    assert rerank_eval.evaluate().as_dict() == clean
+
+
 def test_readme_documents_rerank_env_vars():
     """C-series adversarial review defect (LOW): HAUNT_RERANK_ENABLED and
     HAUNT_RERANK_LAMBDA appeared nowhere in README.md, unlike every other
-    env var this branch adds. Guards against that regressing, and against
-    the table saying so without also being clear the reranker is off by
-    default and wired into no call site today (this module's own
-    docstring: "No production call path imports this module yet") -- a
-    reader who only sees the var names could reasonably assume setting
-    them does something today.
+    env var this branch adds. Guards against that regressing, and -- now
+    that recall() is the wiring point -- against the table still telling a
+    reader these vars change nothing, which was true only while the
+    reranker had no caller.
     """
     from pathlib import Path
 
     readme = Path("README.md").read_text(encoding="utf-8")
     assert RERANK_ENABLED_ENV in readme
     assert RERANK_LAMBDA_ENV in readme
-    assert "no call site" in readme.lower()
+    assert "no call site" not in readme.lower()
+    assert "currently changes nothing" not in readme.lower()

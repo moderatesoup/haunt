@@ -21,6 +21,7 @@ from typing import Any
 from unittest.mock import patch
 
 from haunt.planner import planned_recall
+from haunt.rerank import RERANK_ENABLED_ENV
 from haunt.recall import recall
 from haunt.store import Store
 
@@ -243,7 +244,12 @@ def evaluate(corpus_path: Path = DEFAULT_CORPUS) -> Evaluation:
 
     saved_env = {
         key: os.environ.get(key)
-        for key in ("HAUNT_HOME", "HAUNT_FTS_ONLY", "HAUNT_EMBED_MODEL")
+        for key in (
+            "HAUNT_HOME",
+            "HAUNT_FTS_ONLY",
+            "HAUNT_EMBED_MODEL",
+            RERANK_ENABLED_ENV,
+        )
     }
     with TemporaryDirectory(prefix="haunt-frozen-retrieval-") as tmp:
         try:
@@ -254,6 +260,9 @@ def evaluate(corpus_path: Path = DEFAULT_CORPUS) -> Evaluation:
                     "HAUNT_EMBED_MODEL": "off",
                 }
             )
+            # recall() honours HAUNT_RERANK_ENABLED. Left set, this gate would
+            # score reranked retrieval against a baseline frozen without it.
+            os.environ.pop(RERANK_ENABLED_ENV, None)
             # A prior caller may have cached an embedding backend. Resetting
             # makes planned_recall's normal vector check resolve to off.
             embed.reset()

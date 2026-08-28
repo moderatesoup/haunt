@@ -207,3 +207,162 @@ def test_memory_session_end_open_session_succeeds(fts_env):
             "SELECT ended_at FROM sessions WHERE id=?", (sid,)
         ).fetchone()
     assert row is not None and row["ended_at"]
+
+
+def test_ended_session_never_takes_another_event(fts_env):
+    """A caller replaying an ended id (claude --resume, a late hook, an
+    explicit --session) must not have its write attributed to the closed
+    session, and must not silently clear what end_session recorded."""
+    from haunt.store import Store
+
+    with Store("default") as st:
+        sid = st.ensure_session("resumed-sess")
+        first = st.observe("before the end", session_id=sid)
+        ended_at = st.end_session(sid)["ok"] and st.conn.execute(
+            "SELECT ended_at FROM sessions WHERE id=?", (sid,)
+        ).fetchone()["ended_at"]
+
+        after = st.observe("after the end", session_id=sid)
+        row = st.conn.execute(
+            "SELECT ended_at FROM sessions WHERE id=?", (sid,)
+        ).fetchone()
+        attributed = st.conn.execute(
+            "SELECT session_id FROM events WHERE id=?", (after.event_id,)
+        ).fetchone()["session_id"]
+        successor = st.conn.execute(
+            "SELECT ended_at, meta, succeeds_session FROM sessions WHERE id=?",
+            (after.session_id,),
+        ).fetchone()
+
+    assert first.session_id == sid
+    assert after.session_id != sid, "an ended session must not take another event"
+    assert attributed == after.session_id
+    assert row["ended_at"] == ended_at, "end_session's record must stand"
+    assert successor["ended_at"] is None
+    assert successor["succeeds_session"] == sid
+    assert "succeeds_session" not in json.loads(successor["meta"])
+
+
+def test_replayed_ended_session_reuses_one_successor(fts_env):
+    """Every write after the end shares one successor, not a row per event."""
+    from haunt.store import Store
+
+    with Store("default") as st:
+        sid = st.ensure_session("replayed-sess")
+        st.observe("before", session_id=sid)
+        st.end_session(sid)
+        successors = {
+            st.observe(f"after {i}", session_id=sid).session_id for i in range(3)
+        }
+        total = st.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+    assert len(successors) == 1
+    assert total == 2
+
+
+def test_end_session_closes_the_successor_too(fts_env):
+    """Otherwise ending stays advisory: the next replay refills the successor."""
+    from haunt.store import Store
+
+    with Store("default") as st:
+        sid = st.ensure_session("advisory-sess")
+        st.end_session(sid)
+        successor = st.observe("after the end", session_id=sid).session_id
+
+        result = st.end_session(sid)
+        open_rows = st.conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL"
+        ).fetchone()[0]
+        again = st.observe("after the second end", session_id=sid).session_id
+
+    assert result["ok"] is True
+    assert result["sessions_ended"] == [successor]
+    assert open_rows == 0
+    assert again not in (sid, successor)
+
+
+def test_caller_meta_cannot_forge_a_succession(fts_env):
+    """succeeds_session is the store's own bookkeeping, not caller metadata.
+
+    end_session acts on the claim and _open_successor_sessions treats it as
+    legitimate, so a caller able to write the key could attach itself to --
+    and close -- a session it never opened.
+    """
+    from haunt.store import Store
+
+    with Store("default") as st:
+        victim = st.ensure_session("victim-sess")
+        st.observe("victim work", session_id=victim)
+        assert st.end_session(victim)["ok"] is True
+
+        forged = st.ensure_session(
+            "forger-sess", meta={"succeeds_session": victim, "note": "kept"}
+        )
+        assert _claimed_ok(st.end_session(victim)) is False, (
+            "a forged succession let a caller re-end someone else's session"
+        )
+        row = st.conn.execute(
+            "SELECT meta, succeeds_session FROM sessions WHERE id=?", (forged,)
+        ).fetchone()
+        assert row["succeeds_session"] is None
+        assert json.loads(row["meta"]) == {"note": "kept"}, (
+            "only the reserved key is dropped"
+        )
+
+
+def test_successor_lookup_is_indexed_not_a_scan(fts_env):
+    """Every write reaches this lookup once the host session id is ended."""
+    from haunt.store import _OPEN_SUCCESSOR_SESSIONS, Store
+
+    with Store("default") as st:
+        plan = " ".join(
+            str(value)
+            for row in st.conn.execute(
+                f"EXPLAIN QUERY PLAN {_OPEN_SUCCESSOR_SESSIONS}", ("any-session",)
+            ).fetchall()
+            for value in row
+        )
+    assert "idx_sessions_succeeds" in plan, plan
+    assert "SCAN sessions" not in plan, plan
+
+
+def test_migration_moves_an_existing_succession_out_of_meta(fts_env):
+    """A pre-v12 successor keeps working, and its predecessor leaves meta."""
+    import sqlite3
+
+    from haunt.paths import namespace_db_path
+    from haunt.store import SCHEMA_VERSION, Store
+
+    with Store("default") as st:
+        sid = st.ensure_session("legacy-sess")
+        st.observe("before the end", session_id=sid)
+        st.end_session(sid)
+        successor = st.observe("after the resume", session_id=sid).session_id
+        assert successor != sid
+
+    # Force the on-disk state back to a genuinely pre-v12 database: the link
+    # only in meta, the column and its index physically gone.
+    conn = sqlite3.connect(namespace_db_path("default"))
+    conn.execute(
+        "UPDATE sessions SET meta=json_set(meta, '$.succeeds_session', "
+        "succeeds_session) WHERE succeeds_session IS NOT NULL"
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_sessions_succeeds")
+    conn.execute("ALTER TABLE sessions DROP COLUMN succeeds_session")
+    conn.execute("UPDATE meta SET value='11' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+
+    with Store("default", create=False) as migrated:
+        assert migrated.get_meta("schema_version") == str(SCHEMA_VERSION)
+        row = migrated.conn.execute(
+            "SELECT meta, succeeds_session FROM sessions WHERE id=?", (successor,)
+        ).fetchone()
+        assert row["succeeds_session"] == sid, "the link must survive the migration"
+        assert "succeeds_session" not in json.loads(row["meta"])
+        ended = migrated.end_session(sid)
+
+    assert ended["ok"] is True
+    assert successor in ended["sessions_ended"], (
+        "a migrated successor must still be closed with its predecessor"
+    )

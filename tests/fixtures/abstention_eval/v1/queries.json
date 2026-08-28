@@ -1,0 +1,886 @@
+{
+  "schema_version": 1,
+  "dataset_id": "haunt-abstention-e6-v1",
+  "cases": [
+    {
+      "id": "fts-fit-a01",
+      "profile": "fts",
+      "query": "deployment pipeline canary cohort"
+    },
+    {
+      "id": "fts-fit-a02",
+      "profile": "fts",
+      "query": "encrypted snapshots thirty days"
+    },
+    {
+      "id": "fts-fit-a03",
+      "profile": "fts",
+      "query": "customer invoices business day"
+    },
+    {
+      "id": "fts-fit-a04",
+      "profile": "fts",
+      "query": "veterinarian tablets breakfast dog"
+    },
+    {
+      "id": "fts-fit-a05",
+      "profile": "fts",
+      "query": "greenhouse irrigation soil moisture"
+    },
+    {
+      "id": "fts-fit-a06",
+      "profile": "fts",
+      "query": "cobalt blue primary buttons"
+    },
+    {
+      "id": "fts-fit-a07",
+      "profile": "fts",
+      "query": "train platform Harbor City"
+    },
+    {
+      "id": "fts-fit-a08",
+      "profile": "fts",
+      "query": "database connection pool sessions"
+    },
+    {
+      "id": "fts-fit-a09",
+      "profile": "fts",
+      "query": "signing keys ninety days"
+    },
+    {
+      "id": "fts-fit-a10",
+      "profile": "fts",
+      "query": "wedding venue guest count"
+    },
+    {
+      "id": "fts-fit-a11",
+      "profile": "fts",
+      "query": "public API requests minute 429"
+    },
+    {
+      "id": "fts-fit-a12",
+      "profile": "fts",
+      "query": "museum Tuesdays free admission"
+    },
+    {
+      "id": "fts-fit-a13",
+      "profile": "fts",
+      "query": "survey drones battery charge"
+    },
+    {
+      "id": "fts-fit-a14",
+      "profile": "fts",
+      "query": "application logs forty-five days"
+    },
+    {
+      "id": "fts-fit-a15",
+      "profile": "fts",
+      "query": "garden compost vegetable scraps"
+    },
+    {
+      "id": "fts-fit-a16",
+      "profile": "fts",
+      "query": "eastern sales Ohio Michigan"
+    },
+    {
+      "id": "fts-fit-a17",
+      "profile": "fts",
+      "query": "library study rooms two hours"
+    },
+    {
+      "id": "fts-fit-a18",
+      "profile": "fts",
+      "query": "solar controller battery reserve"
+    },
+    {
+      "id": "fts-fit-a19",
+      "profile": "fts",
+      "query": "purple cutting board allergen-free"
+    },
+    {
+      "id": "fts-fit-a20",
+      "profile": "fts",
+      "query": "technical interview take-home exercise"
+    },
+    {
+      "id": "fts-fit-u01",
+      "profile": "fts",
+      "query": "backups nightly encrypted compression"
+    },
+    {
+      "id": "fts-fit-u02",
+      "profile": "fts",
+      "query": "deployment pipeline rollback procedure"
+    },
+    {
+      "id": "fts-fit-u03",
+      "profile": "fts",
+      "query": "customer invoices payment currency"
+    },
+    {
+      "id": "fts-fit-u04",
+      "profile": "fts",
+      "query": "veterinarian tablets treatment duration"
+    },
+    {
+      "id": "fts-fit-u05",
+      "profile": "fts",
+      "query": "greenhouse irrigation fertilizer schedule"
+    },
+    {
+      "id": "fts-fit-u06",
+      "profile": "fts",
+      "query": "cobalt primary buttons contrast ratio"
+    },
+    {
+      "id": "fts-fit-u07",
+      "profile": "fts",
+      "query": "train platform ticket price"
+    },
+    {
+      "id": "fts-fit-u08",
+      "profile": "fts",
+      "query": "database connection pool encryption protocol"
+    },
+    {
+      "id": "fts-fit-u09",
+      "profile": "fts",
+      "query": "signing keys hardware vendor"
+    },
+    {
+      "id": "fts-fit-u10",
+      "profile": "fts",
+      "query": "wedding venue parking capacity"
+    },
+    {
+      "id": "fts-fit-u11",
+      "profile": "fts",
+      "query": "deployment backups encrypted cohort"
+    },
+    {
+      "id": "fts-fit-u12",
+      "profile": "fts",
+      "query": "invoices tablets breakfast monthly"
+    },
+    {
+      "id": "fts-fit-u13",
+      "profile": "fts",
+      "query": "irrigation cobalt buttons moisture"
+    },
+    {
+      "id": "fts-fit-u14",
+      "profile": "fts",
+      "query": "train database sessions platform"
+    },
+    {
+      "id": "fts-fit-u15",
+      "profile": "fts",
+      "query": "signing wedding keys venue"
+    },
+    {
+      "id": "fts-fit-u16",
+      "profile": "fts",
+      "query": "sales asteroid marzipan piccolo"
+    },
+    {
+      "id": "fts-fit-u17",
+      "profile": "fts",
+      "query": "library lagoon trombone galaxy"
+    },
+    {
+      "id": "fts-fit-u18",
+      "profile": "fts",
+      "query": "solar kumquat opera zeppelin"
+    },
+    {
+      "id": "fts-fit-u19",
+      "profile": "fts",
+      "query": "allergen mandolin comet radish"
+    },
+    {
+      "id": "fts-fit-u20",
+      "profile": "fts",
+      "query": "recruiting walrus cocoa oboe"
+    },
+    {
+      "id": "fts-held-a01",
+      "profile": "fts",
+      "query": "support escalation priority tickets"
+    },
+    {
+      "id": "fts-held-a02",
+      "profile": "fts",
+      "query": "warehouse fragile glassware cartons"
+    },
+    {
+      "id": "fts-held-a03",
+      "profile": "fts",
+      "query": "analytics batch previous events"
+    },
+    {
+      "id": "fts-held-a04",
+      "profile": "fts",
+      "query": "mobile app maps seven days"
+    },
+    {
+      "id": "fts-held-a05",
+      "profile": "fts",
+      "query": "bakery sourdough Celsius hours"
+    },
+    {
+      "id": "fts-held-a06",
+      "profile": "fts",
+      "query": "projector HDMI wireless Miracast"
+    },
+    {
+      "id": "fts-held-a07",
+      "profile": "fts",
+      "query": "payroll corrections finance director"
+    },
+    {
+      "id": "fts-held-a08",
+      "profile": "fts",
+      "query": "incident commander status updates"
+    },
+    {
+      "id": "fts-held-a09",
+      "profile": "fts",
+      "query": "research samples minus eighty"
+    },
+    {
+      "id": "fts-held-a10",
+      "profile": "fts",
+      "query": "subscription cancellation billing period"
+    },
+    {
+      "id": "fts-held-a11",
+      "profile": "fts",
+      "query": "island ferry bicycles stern"
+    },
+    {
+      "id": "fts-held-a12",
+      "profile": "fts",
+      "query": "photo archive TIFF JPEG"
+    },
+    {
+      "id": "fts-held-a13",
+      "profile": "fts",
+      "query": "north field drip irrigation"
+    },
+    {
+      "id": "fts-held-a14",
+      "profile": "fts",
+      "query": "travel insurance claims receipts"
+    },
+    {
+      "id": "fts-held-a15",
+      "profile": "fts",
+      "query": "laboratory centrifuge blood samples"
+    },
+    {
+      "id": "fts-held-a16",
+      "profile": "fts",
+      "query": "password recovery links fifteen minutes"
+    },
+    {
+      "id": "fts-held-a17",
+      "profile": "fts",
+      "query": "third-floor printer recycled A4"
+    },
+    {
+      "id": "fts-held-a18",
+      "profile": "fts",
+      "query": "API maintenance Wednesday UTC"
+    },
+    {
+      "id": "fts-held-a19",
+      "profile": "fts",
+      "query": "emergency contact cards red binder"
+    },
+    {
+      "id": "fts-held-a20",
+      "profile": "fts",
+      "query": "coffee machine cleaning cycle"
+    },
+    {
+      "id": "fts-held-u01",
+      "profile": "fts",
+      "query": "support escalation response minutes"
+    },
+    {
+      "id": "fts-held-u02",
+      "profile": "fts",
+      "query": "warehouse fragile glassware insurance value"
+    },
+    {
+      "id": "fts-held-u03",
+      "profile": "fts",
+      "query": "analytics batch output format"
+    },
+    {
+      "id": "fts-held-u04",
+      "profile": "fts",
+      "query": "mobile maps download size"
+    },
+    {
+      "id": "fts-held-u05",
+      "profile": "fts",
+      "query": "bakery sourdough flour supplier"
+    },
+    {
+      "id": "fts-held-u06",
+      "profile": "fts",
+      "query": "projector HDMI maximum resolution"
+    },
+    {
+      "id": "fts-held-u07",
+      "profile": "fts",
+      "query": "payroll corrections employee portal"
+    },
+    {
+      "id": "fts-held-u08",
+      "profile": "fts",
+      "query": "incident status updates audience channel"
+    },
+    {
+      "id": "fts-held-u09",
+      "profile": "fts",
+      "query": "research samples freezer manufacturer"
+    },
+    {
+      "id": "fts-held-u10",
+      "profile": "fts",
+      "query": "subscription cancellation refund amount"
+    },
+    {
+      "id": "fts-held-u11",
+      "profile": "fts",
+      "query": "support warehouse escalation glassware"
+    },
+    {
+      "id": "fts-held-u12",
+      "profile": "fts",
+      "query": "analytics mobile batch maps"
+    },
+    {
+      "id": "fts-held-u13",
+      "profile": "fts",
+      "query": "bakery projector sourdough HDMI"
+    },
+    {
+      "id": "fts-held-u14",
+      "profile": "fts",
+      "query": "payroll incident corrections updates"
+    },
+    {
+      "id": "fts-held-u15",
+      "profile": "fts",
+      "query": "research subscription samples cancellation"
+    },
+    {
+      "id": "fts-held-u16",
+      "profile": "fts",
+      "query": "password comet paprika bassoon"
+    },
+    {
+      "id": "fts-held-u17",
+      "profile": "fts",
+      "query": "printer kumquat meteor opera"
+    },
+    {
+      "id": "fts-held-u18",
+      "profile": "fts",
+      "query": "maintenance narwhal radish galaxy"
+    },
+    {
+      "id": "fts-held-u19",
+      "profile": "fts",
+      "query": "classroom trombone apricot sonata"
+    },
+    {
+      "id": "fts-held-u20",
+      "profile": "fts",
+      "query": "coffee quartz oboe mango"
+    },
+    {
+      "id": "hybrid-fit-a01",
+      "profile": "hybrid",
+      "query": "gradual production launch method",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a02",
+      "profile": "hybrid",
+      "query": "recovery copies kept roughly one month",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a03",
+      "profile": "hybrid",
+      "query": "billing documents delivery schedule",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a04",
+      "profile": "hybrid",
+      "query": "senior canine morning medication dosage",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a05",
+      "profile": "hybrid",
+      "query": "automatic horticulture watering threshold from ground wetness",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a06",
+      "profile": "hybrid",
+      "query": "main interface control color selection",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a07",
+      "profile": "hybrid",
+      "query": "rail journey origin track departure hour",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a08",
+      "profile": "hybrid",
+      "query": "maximum simultaneous storage clients",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a09",
+      "profile": "hybrid",
+      "query": "cryptographic credential renewal cadence",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a10",
+      "profile": "hybrid",
+      "query": "attendance total submission deadline pre-nuptials",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a11",
+      "profile": "hybrid",
+      "query": "service throttle ceiling each sixty seconds",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a12",
+      "profile": "hybrid",
+      "query": "gallery weekly closure plus complimentary entry date",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a13",
+      "profile": "hybrid",
+      "query": "unmanned aircraft low-power homecoming threshold",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a14",
+      "profile": "hybrid",
+      "query": "diagnostic history online retention interval",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a15",
+      "profile": "hybrid",
+      "query": "allowed versus forbidden food waste within shared soil pile",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a16",
+      "profile": "hybrid",
+      "query": "regional commercial geography assignment",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a17",
+      "profile": "hybrid",
+      "query": "maximum workspace booking duration plus extension rule",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a18",
+      "profile": "hybrid",
+      "query": "nighttime stored-energy switchover minimum remainder",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a19",
+      "profile": "hybrid",
+      "query": "special preparation surface color serving allergy-safe dishes",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-a20",
+      "profile": "hybrid",
+      "query": "job applicant conversation prerequisite following homework assessment",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-fit-u01",
+      "profile": "hybrid",
+      "query": "which compression codec protects monthly recovery copies"
+    },
+    {
+      "id": "hybrid-fit-u02",
+      "profile": "hybrid",
+      "query": "what exact percentage joins the first gradual production launch"
+    },
+    {
+      "id": "hybrid-fit-u03",
+      "profile": "hybrid",
+      "query": "which currency and tax rate appear on billing documents"
+    },
+    {
+      "id": "hybrid-fit-u04",
+      "profile": "hybrid",
+      "query": "how many weeks should the senior canine continue morning medicine"
+    },
+    {
+      "id": "hybrid-fit-u05",
+      "profile": "hybrid",
+      "query": "which fertilizer accompanies early watering after a dry sensor"
+    },
+    {
+      "id": "hybrid-fit-u06",
+      "profile": "hybrid",
+      "query": "what accessibility contrast score applies to main interface controls"
+    },
+    {
+      "id": "hybrid-fit-u07",
+      "profile": "hybrid",
+      "query": "how much does the rail journey cost"
+    },
+    {
+      "id": "hybrid-fit-u08",
+      "profile": "hybrid",
+      "query": "which encryption protocol protects simultaneous storage clients"
+    },
+    {
+      "id": "hybrid-fit-u09",
+      "profile": "hybrid",
+      "query": "which hardware manufacturer supplies cryptographic credentials"
+    },
+    {
+      "id": "hybrid-fit-u10",
+      "profile": "hybrid",
+      "query": "how many parking spaces are available beside the nuptial location"
+    },
+    {
+      "id": "hybrid-fit-u11",
+      "profile": "hybrid",
+      "query": "which shared vendor handles recovery copies and cryptographic credentials"
+    },
+    {
+      "id": "hybrid-fit-u12",
+      "profile": "hybrid",
+      "query": "what common regulator governs billing documents and senior canine medication"
+    },
+    {
+      "id": "hybrid-fit-u13",
+      "profile": "hybrid",
+      "query": "which supplier serves both crop watering and interface color materials"
+    },
+    {
+      "id": "hybrid-fit-u14",
+      "profile": "hybrid",
+      "query": "what shared subscription covers rail travel and simultaneous storage"
+    },
+    {
+      "id": "hybrid-fit-u15",
+      "profile": "hybrid",
+      "query": "which contractor manages credential renewal and nuptial attendance"
+    },
+    {
+      "id": "hybrid-fit-u16",
+      "profile": "hybrid",
+      "query": "handwoven carpet knot taxonomy"
+    },
+    {
+      "id": "hybrid-fit-u17",
+      "profile": "hybrid",
+      "query": "saturn ring particle resonance"
+    },
+    {
+      "id": "hybrid-fit-u18",
+      "profile": "hybrid",
+      "query": "prehistoric cave pigment binders"
+    },
+    {
+      "id": "hybrid-fit-u19",
+      "profile": "hybrid",
+      "query": "mangrove crab feeding behavior"
+    },
+    {
+      "id": "hybrid-fit-u20",
+      "profile": "hybrid",
+      "query": "glassblowing furnace oxygen ratios"
+    },
+    {
+      "id": "hybrid-held-a01",
+      "profile": "hybrid",
+      "query": "point when neglected help request alerts duty staff",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a02",
+      "profile": "hybrid",
+      "query": "protective shipping method for breakable items",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a03",
+      "profile": "hybrid",
+      "query": "nightly reporting job input window",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a04",
+      "profile": "hybrid",
+      "query": "how long downloaded navigation data remains usable",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a05",
+      "profile": "hybrid",
+      "query": "bread fermentation temperature and duration",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a06",
+      "profile": "hybrid",
+      "query": "display equipment input choices",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a07",
+      "profile": "hybrid",
+      "query": "person authorizing salary adjustment ahead of payout",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a08",
+      "profile": "hybrid",
+      "query": "service disruption communication frequency",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a09",
+      "profile": "hybrid",
+      "query": "specimen freezer setting plus warning threshold",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a10",
+      "profile": "hybrid",
+      "query": "service access termination timing after opting out",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a11",
+      "profile": "hybrid",
+      "query": "cyclist loading location aboard boat trip plus required lead time",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a12",
+      "profile": "hybrid",
+      "query": "master image encoding versus web thumbnail encoding",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a13",
+      "profile": "hybrid",
+      "query": "watering duration plus alternating dawn schedule serving northern crops",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a14",
+      "profile": "hybrid",
+      "query": "deadline plus evidence needed following trip reimbursement request",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a15",
+      "profile": "hybrid",
+      "query": "spin force plus time applied to clinical specimens",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a16",
+      "profile": "hybrid",
+      "query": "single-use account reset token lifetime",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a17",
+      "profile": "hybrid",
+      "query": "location and sheet format for upper-level copier supplies",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a18",
+      "profile": "hybrid",
+      "query": "weekly service downtime start plus expected length",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a19",
+      "profile": "hybrid",
+      "query": "where pupils find urgent family phone details",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-a20",
+      "profile": "hybrid",
+      "query": "beverage count between automatic sanitation events",
+      "semantic_paraphrase": true,
+      "required_lexical_overlap": false
+    },
+    {
+      "id": "hybrid-held-u01",
+      "profile": "hybrid",
+      "query": "how many minutes pass before duty staff acknowledge an alert"
+    },
+    {
+      "id": "hybrid-held-u02",
+      "profile": "hybrid",
+      "query": "what insurance value covers breakable shipping contents"
+    },
+    {
+      "id": "hybrid-held-u03",
+      "profile": "hybrid",
+      "query": "which file encoding contains nightly reporting output"
+    },
+    {
+      "id": "hybrid-held-u04",
+      "profile": "hybrid",
+      "query": "how large is a downloaded navigation region"
+    },
+    {
+      "id": "hybrid-held-u05",
+      "profile": "hybrid",
+      "query": "which flour supplier supports bread fermentation"
+    },
+    {
+      "id": "hybrid-held-u06",
+      "profile": "hybrid",
+      "query": "what maximum resolution does the display equipment support"
+    },
+    {
+      "id": "hybrid-held-u07",
+      "profile": "hybrid",
+      "query": "which employee portal accepts salary adjustments"
+    },
+    {
+      "id": "hybrid-held-u08",
+      "profile": "hybrid",
+      "query": "which audience channel receives disruption communications"
+    },
+    {
+      "id": "hybrid-held-u09",
+      "profile": "hybrid",
+      "query": "which manufacturer built the specimen freezer"
+    },
+    {
+      "id": "hybrid-held-u10",
+      "profile": "hybrid",
+      "query": "what refund amount follows service termination"
+    },
+    {
+      "id": "hybrid-held-u11",
+      "profile": "hybrid",
+      "query": "which carrier insures both breakable parcels and duty alerts"
+    },
+    {
+      "id": "hybrid-held-u12",
+      "profile": "hybrid",
+      "query": "which shared file format links reporting output and navigation regions"
+    },
+    {
+      "id": "hybrid-held-u13",
+      "profile": "hybrid",
+      "query": "which vendor provides both fermentation flour and display equipment"
+    },
+    {
+      "id": "hybrid-held-u14",
+      "profile": "hybrid",
+      "query": "which portal combines salary adjustments with disruption messages"
+    },
+    {
+      "id": "hybrid-held-u15",
+      "profile": "hybrid",
+      "query": "which manufacturer handles specimen freezing and service termination"
+    },
+    {
+      "id": "hybrid-held-u16",
+      "profile": "hybrid",
+      "query": "silk loom heddle patterns"
+    },
+    {
+      "id": "hybrid-held-u17",
+      "profile": "hybrid",
+      "query": "comet tail plasma turbulence"
+    },
+    {
+      "id": "hybrid-held-u18",
+      "profile": "hybrid",
+      "query": "ice age bone flute acoustics"
+    },
+    {
+      "id": "hybrid-held-u19",
+      "profile": "hybrid",
+      "query": "rainforest frog egg camouflage"
+    },
+    {
+      "id": "hybrid-held-u20",
+      "profile": "hybrid",
+      "query": "obsidian blade pressure flaking"
+    }
+  ]
+}

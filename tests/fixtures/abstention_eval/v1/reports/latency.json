@@ -1,0 +1,94 @@
+{
+  "deterministic_gate": {
+    "corpus_sizes": [
+      1000,
+      10000,
+      100000
+    ],
+    "coverage_sql_statements_per_top_five": 1
+  },
+  "environment": {
+    "platform": "macOS-15.7.7-arm64-arm-64bit",
+    "processor": "arm",
+    "python": "3.10.19",
+    "sqlite": "3.53.0"
+  },
+  "measurements": [
+    {
+      "corpus_rows": 1000,
+      "coverage_sql_statement_counts": [
+        1
+      ],
+      "diagnostic_p95_overhead_ms": 0.038708000000000006,
+      "e5_fts_candidate_query_ms": {
+        "median": 0.017083,
+        "p95": 0.01775
+      },
+      "fts_plus_e6_diagnostic_ms": {
+        "median": 0.051291,
+        "p95": 0.056458
+      },
+      "non_gating_observation_below_10ms_p95_overhead": true,
+      "repeats": 31,
+      "top_five": [
+        "target-0",
+        "target-1",
+        "target-2",
+        "target-3",
+        "target-4"
+      ]
+    },
+    {
+      "corpus_rows": 10000,
+      "coverage_sql_statement_counts": [
+        1
+      ],
+      "diagnostic_p95_overhead_ms": 0.09433300000000001,
+      "e5_fts_candidate_query_ms": {
+        "median": 0.023167,
+        "p95": 0.120292
+      },
+      "fts_plus_e6_diagnostic_ms": {
+        "median": 0.071833,
+        "p95": 0.214625
+      },
+      "non_gating_observation_below_10ms_p95_overhead": true,
+      "repeats": 31,
+      "top_five": [
+        "target-0",
+        "target-1",
+        "target-2",
+        "target-3",
+        "target-4"
+      ]
+    },
+    {
+      "corpus_rows": 100000,
+      "coverage_sql_statement_counts": [
+        1
+      ],
+      "diagnostic_p95_overhead_ms": 0.044917,
+      "e5_fts_candidate_query_ms": {
+        "median": 0.028542,
+        "p95": 0.033
+      },
+      "fts_plus_e6_diagnostic_ms": {
+        "median": 0.070208,
+        "p95": 0.077917
+      },
+      "non_gating_observation_below_10ms_p95_overhead": true,
+      "repeats": 31,
+      "top_five": [
+        "target-0",
+        "target-1",
+        "target-2",
+        "target-3",
+        "target-4"
+      ]
+    }
+  ],
+  "method": "in-memory sqlite FTS5; existing top-five candidate query compared with that query plus one batched diagnostic coverage statement",
+  "report_id": "haunt-e6-evidence-latency-v1",
+  "schema_version": 1,
+  "timing_is_observational_not_a_cross_machine_gate": true
+}

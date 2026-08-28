@@ -11,8 +11,8 @@ multiple implementations, the implementation must still satisfy this contract.
 
 The governing posture is simple: Haunt remains a local-first store of verbatim
 events and memories, with one SQLite file per namespace, deterministic local
-retrieval, and no cloud, distillation, or reader LLM (`README.md:3`,
-`README.md:239-243`). “MP adoption” here means selected auditability,
+retrieval, and no cloud, distillation, or reader LLM (`README.md`, intro and
+“What v1 does / does not”). “MP adoption” here means selected auditability,
 portability, identity, explanation, and abstention semantics. It does not mean
 feature parity or protocol conformance.
 
@@ -32,27 +32,26 @@ Haunt-specific decisions below.
 ## Existing seams this contract extends
 
 - Events and memories are already distinct rows with session, time, role, tool,
-  origin, validity, and content fields (`src/haunt/store.py:131-164`). Observe
-  writes the event, memory, FTS row, vector/cache state, and graph evidence in
-  one transaction (`src/haunt/store.py:569-714`).
+  origin, validity, and content fields (`src/haunt/store.py`). Observe writes
+  the event, memory, FTS row, vector/cache state, and graph evidence in one
+  transaction (`src/haunt/store.py`).
 - Current recall excludes rows whose `valid_to` is set, while explicit `as_of`
-  recall uses the validity interval (`src/haunt/recall.py:93-123`).
+  recall uses the validity interval (`src/haunt/recall.py`).
 - Correction currently mutates `valid_to` and may write a separate replacement,
-  but stores no durable link between them (`src/haunt/store.py:1502-1565`).
+  but stores no durable link between them (`src/haunt/store.py`).
 - Memory detail already exposes useful provenance fields, though `origin` and
-  `meta` are not a structured import contract (`src/haunt/store.py:1246-1296`).
+  `meta` are not a structured import contract (`src/haunt/store.py`).
 - Repository identity already prefers normalized remote identity and preserves
-  a matching legacy registration (`src/haunt/paths.py:56-117`,
-  `src/haunt/paths.py:148-178`). The registry still identifies a namespace by a
-  single name and database path (`src/haunt/store.py:99-116`,
-  `src/haunt/store.py:352-384`).
+  a matching legacy registration (`src/haunt/paths.py`). The registry still
+  identifies a namespace by a single name and database path
+  (`src/haunt/store.py`).
 - Recall already uses reciprocal-rank fusion and retains vector/FTS component
-  ranks (`src/haunt/recall.py:31-78`, `src/haunt/recall.py:243-288`). The MCP
-  description correctly says those scores are rank-normalized, not relevance
-  probabilities (`src/haunt/mcp_server.py:197-235`).
+  ranks (`src/haunt/recall.py`). The MCP description correctly says those
+  scores are rank-normalized, not relevance probabilities
+  (`src/haunt/mcp_server.py`).
 - Purge is an intentional physical delete across canonical and derived rows
-  (`src/haunt/store.py:1169-1244`). It is destructive, separately gated, and
-  disabled over MCP by default (`src/haunt/mcp_server.py:417-461`).
+  (`src/haunt/store.py`). It is destructive, separately gated, and disabled
+  over MCP by default (`src/haunt/mcp_server.py`).
 
 These are migrations from working behavior, not permission to silently rewrite
 old stores. Schema changes MUST remain additive and old rows MUST stay readable
@@ -109,7 +108,8 @@ as erased context as well as values. A coincidentally identical session key may
 therefore be removed even if its value differs; unrelated session fields remain.
 
 This reconciles the user-visible distinction already documented between
-supersede and delete (`README.md:95-96`) with a durable correction audit trail.
+supersede and delete (`README.md`, “Memory console”: Supersede vs Delete) with
+a durable correction audit trail.
 
 ## 2. Provenance is structured attribution, not fact confidence
 
@@ -180,13 +180,15 @@ Haunt stores verbatim memories rather than MP-style distilled facts. This
 program therefore adds no `Fact`, extractor confidence, source reputation, or
 LLM self-assessment. Existing `trusted`/`trust_reason` labels continue to mean
 that raw tool I/O is untrusted data and no recalled row authorizes a mutation
-(`README.md:203`; `src/haunt/recall.py:50-78`). “Trusted” is not “true.”
+(`README.md`, “MCP”; `haunt.recall` trust labelling). “Trusted” is not
+“true.”
 
 ## 2a. Recall selection and access are explicit, read-only semantics
 
 Schema v9 records nullable `events.recall_class`, constrained to `tool` or
 `task`. A null class means legacy/unknown; migrations **MUST NOT** backfill or
-guess it from text. The `tool` role or raw tool structure **MUST** be stamped `tool` before the
+guess it from text. The `tool` role or raw tool structure **MUST** be stamped
+`tool` before the
 event write, and contradictory explicit classification **MUST** fail before any
 event/session/job write. An actual host session-start coordinate entry point
 MAY stamp its own event `task`; no ordinary prompt, procedure, correction,
@@ -227,7 +229,7 @@ vector result.
 ## 3. RRF score is ranking evidence, never confidence
 
 The value computed from `1 / (RRF_K + rank)` contributions is an RRF ordering
-score (`src/haunt/recall.py:27-28`, `src/haunt/recall.py:243-253`). It says how a
+score (`src/haunt/recall.py`). It says how a
 candidate ranked relative to other candidates in the active retrieval lists.
 It is not:
 
@@ -288,8 +290,8 @@ Embeddings **MUST NOT** appear in canonical export. Neither may vector tables,
 FTS tables, embedding jobs, absolute machine-local paths, WAL/SHM state, or
 other rebuildable indexes/caches. Embeddings depend on local model identity and
 dimension; Haunt already treats model/dimension changes as a full re-embed
-concern (`README.md:114-128`, `src/haunt/store.py:324-340`). Import rebuilds FTS
-and graph projections and queues or rebuilds embeddings using the destination's
+concern (`README.md`, “Embeddings”). Import rebuilds FTS and graph
+projections and queues or rebuilds embeddings using the destination's
 configured model.
 
 Export **MUST** include superseded surviving history and **MUST NOT** include
@@ -314,9 +316,10 @@ rule. Knowing or presenting an alias **MUST NOT** broaden authority.
 The ordinary MCP process remains immutably bound to one canonical namespace
 identity. Requests may use a proven alias for that same identity, but an alias
 resolving to any other identity is denied. Admin mode and purge enablement stay
-explicit and independent (`src/haunt/mcp_server.py:70-113`; `README.md:199-201`).
+explicit and independent (`haunt.mcp_server.MCPAuthority`; `README.md`, “MCP”).
 The README's existing warning remains governing: namespaces are storage
-isolation, not authorization (`README.md:85`; `SECURITY.md:49-51`).
+isolation, not authorization (`README.md`, “Memory console”; `SECURITY.md`,
+“File-per-namespace isolation”).
 
 Alias migration **MUST** be dry-run-first. Dry-run is zero-write and returns a
 deterministic plan digest bound to the exact registry state and requested
@@ -374,7 +377,7 @@ this contract before implementation.
 ## 7. Compatibility and evidence rules
 
 - Schema changes **MUST** use Haunt's versioned migration path and remain
-  idempotent (`src/haunt/store.py:278-321`). Read/query paths **MUST NOT** create
+  idempotent (`src/haunt/store.py`). Read/query paths **MUST NOT** create
   unknown namespaces.
 - Old data **MUST** remain byte-preserved unless the user invokes explicit
   privacy purge. Missing new metadata is represented as legacy/unknown, not

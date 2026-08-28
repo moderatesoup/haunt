@@ -11,11 +11,13 @@ from typing import Any
 from urllib.parse import urlencode, urlparse
 
 from starlette.applications import Starlette
+from starlette.datastructures import MutableHeaders
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from haunt.budget import apply_recall_budget
 from haunt.embed import state as embed_state
 from haunt.paths import haunt_home, resolve_namespace
 from haunt.planner import planned_recall
@@ -46,6 +48,16 @@ from haunt.util import clamp_limit, iso_or_now, normalize_clock
 TOKEN_HEADER = "X-Haunt-Token"
 TOKEN_QUERY = "token"
 _HTML_TOKEN_PLACEHOLDER = "__HAUNT_LAUNCH_TOKEN_JSON__"
+_HTML_NONCE_PLACEHOLDER = "__HAUNT_CSP_NONCE__"
+# style-src stays 'unsafe-inline': a nonce cannot cover the template's style=
+# attributes, and script-src is where injected markup is actually stopped.
+_HTML_CSP = (
+    "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self'; base-uri 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+# Nothing outside GET / is a document, so no source list needs to be relaxed.
+_API_CSP = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 
 _dash_token: str | None = None
@@ -71,9 +83,7 @@ def pick_default_namespace(namespaces: list[dict[str, Any]]) -> str:
     return namespaces[0]["name"]
 
 
-# ---------------------------------------------------------------------------
 # HTML: single-file memory management console
-# ---------------------------------------------------------------------------
 
 HTML = r"""<!doctype html>
 <html lang="en">
@@ -200,13 +210,13 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
     <div class="nav-section">namespaces</div>
     <div class="ns-list" id="nsList"></div>
     <div class="nav-section" style="margin-top:16px">views</div>
-    <button class="nav-btn on" data-view="overview" onclick="switchView('overview')">overview</button>
-    <button class="nav-btn" data-view="timeline" onclick="switchView('timeline')">timeline</button>
-    <button class="nav-btn" data-view="browse" onclick="switchView('browse')">browse memories</button>
-    <button class="nav-btn" data-view="search" onclick="switchView('search')">search / recall</button>
-    <button class="nav-btn" data-view="procedures" onclick="switchView('procedures')">procedures</button>
-    <button class="nav-btn" data-view="worldview" onclick="switchView('worldview')">worldview</button>
-    <button class="nav-btn" data-view="health" onclick="switchView('health')">health</button>
+    <button class="nav-btn on" data-view="overview" data-act="view">overview</button>
+    <button class="nav-btn" data-view="timeline" data-act="view">timeline</button>
+    <button class="nav-btn" data-view="browse" data-act="view">browse memories</button>
+    <button class="nav-btn" data-view="search" data-act="view">search / recall</button>
+    <button class="nav-btn" data-view="procedures" data-act="view">procedures</button>
+    <button class="nav-btn" data-view="worldview" data-act="view">worldview</button>
+    <button class="nav-btn" data-view="health" data-act="view">health</button>
   </aside>
   <main>
     <div class="persistent-health" id="persistentHealth">
@@ -242,7 +252,7 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
           <label>since</label><input id="tlSince" type="date"/>
           <label>until</label><input id="tlUntil" type="date"/>
           <label>limit</label><input id="tlLimit" type="number" value="200" style="width:70px"/>
-          <button class="primary" onclick="loadTimeline()">filter</button>
+          <button class="primary" data-act="timeline-filter">filter</button>
         </div>
         <div id="timelineResults"><div class="empty">pick a namespace and click filter</div></div>
       </div>
@@ -258,7 +268,7 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
           <label>session</label><input id="bSession" placeholder="session id" style="width:180px"/>
           <label>since</label><input id="bSince" type="date"/>
           <label>until</label><input id="bUntil" type="date"/>
-          <button class="primary" onclick="doBrowse(0)">filter</button>
+          <button class="primary" data-act="browse-filter">filter</button>
         </div>
         <div id="browseResults"><div class="empty">apply filters or click filter to load</div></div>
         <div class="page-nav" id="browseNav"></div>
@@ -321,9 +331,9 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;">
         <h2 class="section">memory detail</h2>
         <div style="display:flex;gap:8px;">
-          <button style="color:var(--amber);border-color:#5c3e00;" onclick="confirmContradict()">supersede</button>
-          <button class="danger" onclick="confirmPurge()">permanently delete</button>
-          <button onclick="closeDetail()">close</button>
+          <button style="color:var(--amber);border-color:#5c3e00;" data-act="contradict-open">supersede</button>
+          <button class="danger" data-act="purge-open">permanently delete</button>
+          <button data-act="detail-close">close</button>
         </div>
       </div>
       <div id="detailBody"></div>
@@ -337,8 +347,8 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
     <h3>permanently delete memory</h3>
     <p id="confirmText">This will permanently delete the memory, its FTS index, vector embedding, and associated graph data. This cannot be undone. To keep the data but mark it outdated, use <b>supersede</b> instead.</p>
     <div class="actions">
-      <button onclick="closeModal()">cancel</button>
-      <button class="danger" id="confirmBtn" onclick="doPurge()">delete permanently</button>
+      <button data-act="purge-cancel">cancel</button>
+      <button class="danger" id="confirmBtn" data-act="purge-confirm">delete permanently</button>
     </div>
   </div>
 </div>
@@ -350,25 +360,28 @@ tr.clickable{cursor:pointer;} tr.clickable:hover{background:var(--panel2);}
     <p>This marks the memory as superseded (sets valid_to = now). The original data is <b>kept</b> but excluded from current recall. This is NOT a delete.</p>
     <div style="margin-bottom:12px;">
       <label style="font-size:11px;color:var(--mut);font-family:var(--mono);display:block;margin-bottom:4px;">
-        <input id="contradictHasReplacement" type="checkbox" onchange="toggleContradictReplacement()"/> attach a verbatim replacement
+        <input id="contradictHasReplacement" type="checkbox"/> attach a verbatim replacement
       </label>
       <textarea id="contradictReplacement" style="width:100%;" disabled placeholder="empty and whitespace-only text are intentional"></textarea>
     </div>
     <div class="actions">
-      <button onclick="closeContradictModal()">cancel</button>
-      <button style="background:#3a2800;color:var(--amber);border-color:#5c3e00;" onclick="doContradict()">supersede</button>
+      <button data-act="contradict-cancel">cancel</button>
+      <button style="background:#3a2800;color:var(--amber);border-color:#5c3e00;" data-act="contradict-confirm">supersede</button>
     </div>
   </div>
 </div>
 
-<script>
+<script nonce="__HAUNT_CSP_NONCE__">
 const $=id=>document.getElementById(id);
 const HAUNT_TOKEN=__HAUNT_LAUNCH_TOKEN_JSON__;
 let NS=null, DETAIL_MID=null, DETAIL_NS=null, BROWSE_PAGE=0, ALL_NS=false;
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const TIERS=["episodic","semantic","procedural","coordinate"];
 function fmtBytes(n){if(n<1024)return n+" B";if(n<1048576)return(n/1024).toFixed(1)+" KB";return(n/1048576).toFixed(2)+" MB";}
-function tierCls(t){return "t-"+(t||"");}
+// Stored tier reaches a class attribute; only the four styled tiers may
+// produce one, so an unknown value styles nothing instead of escaping it.
+function tierCls(t){return TIERS.includes(t)?"t-"+t:"";}
 function fmtTime(s){return(s||"—").replace("T"," ").replace(/\+00:00$/,"Z").slice(0,19);}
 function snip(s,n){s=(s||"").replace(/\s+/g," ");return s.length<=n?s:s.slice(0,n-1)+"…";}
 async function j(url,opts){
@@ -425,8 +438,8 @@ function setPills(h){
   const e=h.embed||{},v=h.sqlite_vec||{};
   $("pills").innerHTML=[
     `<span class="pill ok">local · 127.0.0.1</span>`,
-    `<span class="pill ${v.ok?'ok':'fail'}">vec ${v.version||'off'}</span>`,
-    `<span class="pill ${e.available?'ok':'warn'}">${e.loaded||'fts'} · ${e.dim||0}d</span>`,
+    `<span class="pill ${v.ok?'ok':'fail'}">vec ${esc(v.version||'off')}</span>`,
+    `<span class="pill ${e.available?'ok':'warn'}">${esc(e.loaded||'fts')} · ${esc(e.dim||0)}d</span>`,
     `<span class="pill">verbatim</span>`,
   ].join("");
 }
@@ -434,7 +447,7 @@ function setPills(h){
 function renderNs(list,current){
   const allOn=ALL_NS;
   let html=`<div class="ns all-ns ${allOn?'on':''}" data-ns="__all__"><b>all namespaces</b><i>${list.reduce((s,n)=>s+(n.events||0),0)}</i></div>`;
-  html+=list.map(n=>`<div class="ns ${!allOn&&n.name===current?'on':''}" data-ns="${esc(n.name)}"><b>${esc(n.name)}</b><i>${n.error?'error':n.events}</i></div>`).join("");
+  html+=list.map(n=>`<div class="ns ${!allOn&&n.name===current?'on':''}" data-ns="${esc(n.name)}"><b>${esc(n.name)}</b><i>${n.error?'error':esc(n.events)}</i></div>`).join("");
   $("nsList").innerHTML=html||`<div class="empty">none</div>`;
   $("nsList").querySelectorAll(".ns").forEach(el=>{
     el.onclick=()=>{
@@ -458,19 +471,19 @@ function renderHealthGlobal(h,stats){
   let items;
   if(ALL_NS){
     items=[
-      `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?v.version:'off'}</div>`,
-      `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${e.loaded||'none'} ${e.dim||0}d</div>`,
-      `<div class="health-item"><span class="pulse ok"></span>${stats.namespace_count||0} namespaces</div>`,
+      `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?esc(v.version):'off'}</div>`,
+      `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${esc(e.loaded||'none')} ${esc(e.dim||0)}d</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>${esc(stats.namespace_count||0)} namespaces</div>`,
       `<div class="health-item"><span class="pulse ok"></span>${esc(stats.haunt_home||'')}</div>`,
     ];
   }else{
     items=[
-      `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?v.version:'off'}</div>`,
-      `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${e.loaded||'none'} ${e.dim||0}d</div>`,
+      `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?esc(v.version):'off'}</div>`,
+      `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${esc(e.loaded||'none')} ${esc(e.dim||0)}d</div>`,
       `<div class="health-item"><span class="pulse ok"></span>ns: ${esc(stats.namespace||NS)}</div>`,
-      `<div class="health-item"><span class="pulse ok"></span>${fmtBytes(stats.db_size_bytes||0)}</div>`,
-      `<div class="health-item"><span class="pulse ${lastWrite?'ok':'warn'}"></span>write ${age}</div>`,
-      `<div class="health-item"><span class="pulse ok"></span>${stats.events||0} events</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>${esc(fmtBytes(stats.db_size_bytes||0))}</div>`,
+      `<div class="health-item"><span class="pulse ${lastWrite?'ok':'warn'}"></span>write ${esc(age)}</div>`,
+      `<div class="health-item"><span class="pulse ok"></span>${esc(stats.events||0)} events</div>`,
     ];
   }
   $("healthStripGlobal").innerHTML=items.join("");
@@ -480,10 +493,10 @@ function statCards(s){
   const items=[
     ["events",s.events,""],["memories",s.memories,""],["sessions",s.sessions,""],
     ["entities",s.entities,s.relations+" rels"],
-    ["db",fmtBytes(s.db_size_bytes||0),s.db_path?esc(s.db_path.split("/").slice(-2).join("/")):""],
+    ["db",fmtBytes(s.db_size_bytes||0),s.db_path?s.db_path.split("/").slice(-2).join("/"):""],
     ["last write",fmtTime(s.last_write),""],
   ];
-  $("stats").innerHTML=items.map(([k,v,sub])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`).join("");
+  $("stats").innerHTML=items.map(([k,v,sub])=>`<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div></div>`).join("");
 }
 
 function renderHealthStrip(h,stats){
@@ -499,12 +512,12 @@ function renderHealthStrip(h,stats){
   }
   $("healthAge").textContent=age;
   $("healthStrip").innerHTML=[
-    `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?v.version:'off'}</div>`,
-    `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${e.loaded||'none'} ${e.dim||0}d</div>`,
+    `<div class="health-item"><span class="pulse ${v.ok?'ok':'fail'}"></span>sqlite-vec ${v.ok?esc(v.version):'off'}</div>`,
+    `<div class="health-item"><span class="pulse ${e.available?'ok':'warn'}"></span>embed ${esc(e.loaded||'none')} ${esc(e.dim||0)}d</div>`,
     `<div class="health-item"><span class="pulse ok"></span>namespace ${esc(stats.namespace||NS)}</div>`,
-    `<div class="health-item"><span class="pulse ok"></span>${fmtBytes(stats.db_size_bytes||0)}</div>`,
-    `<div class="health-item"><span class="pulse ${lastWrite?'ok':'warn'}"></span>last write ${age}</div>`,
-    `<div class="health-item"><span class="pulse ok"></span>${stats.events||0} events</div>`,
+    `<div class="health-item"><span class="pulse ok"></span>${esc(fmtBytes(stats.db_size_bytes||0))}</div>`,
+    `<div class="health-item"><span class="pulse ${lastWrite?'ok':'warn'}"></span>last write ${esc(age)}</div>`,
+    `<div class="health-item"><span class="pulse ok"></span>${esc(stats.events||0)} events</div>`,
     `<div class="health-item"><span class="pulse ok"></span>${esc(stats.db_path||'')}</div>`,
   ].join("");
   renderHealthGlobal(h,stats);
@@ -513,8 +526,8 @@ function renderHealthStrip(h,stats){
 function eventsTable(rows){
   if(!rows.length){$("events").innerHTML='<div class="empty">none</div>';return;}
   $("events").innerHTML=`<table><thead><tr><th>event_time</th><th>role</th><th>tier</th><th>origin</th><th>snippet</th></tr></thead><tbody>`+
-    rows.map(r=>`<tr class="clickable" onclick="openEventMemory('${esc(r.id||"")}')">
-      <td>${fmtTime(r.event_time)}</td><td>${esc(r.role||"")}</td>
+    rows.map(r=>`<tr class="clickable" data-act="event" data-eid="${esc(r.id||"")}">
+      <td>${esc(fmtTime(r.event_time))}</td><td>${esc(r.role||"")}</td>
       <td class="${tierCls(r.tier)}">${esc(r.tier||"")}</td><td>${esc(r.origin||"")}</td>
       <td class="snip">${esc(snip(r.content||(r.tool_name?"tool:"+r.tool_name:""),180))}</td>
     </tr>`).join("")+"</tbody></table>";
@@ -523,14 +536,14 @@ function eventsTable(rows){
 function hitsTable(hits){
   if(!hits.length){$("hits").innerHTML='<div class="empty">no hits</div>';return;}
   $("hits").innerHTML=`<table><thead><tr><th>rank</th><th title="RRF rank signal for ranked hits; timeline hits are time-ordered">signal</th><th>tier</th><th>origin</th>${ALL_NS?'<th>namespace</th>':''}<th>memory_id</th><th>snippet</th><th></th></tr></thead><tbody>`+
-    hits.map((h,i)=>`<tr class="clickable" onclick="openDetail('${esc(h.memory_id)}','${esc(h.namespace||NS)}')">
-      <td>${h.explanation?.final_rank??i+1}</td><td>${h.explanation?.score_semantics==='rrf_rank_signal_not_confidence'?'rrf='+(h.score||0).toFixed(4):'time-order'}</td>
-      <td class="${tierCls(h.tier)}">${h.tier}</td>
+    hits.map((h,i)=>`<tr class="clickable" data-act="detail" data-mid="${esc(h.memory_id)}" data-ns="${esc(h.namespace||NS)}">
+      <td>${esc(h.explanation?.final_rank??i+1)}</td><td>${h.explanation?.score_semantics==='rrf_rank_signal_not_confidence'?'rrf='+esc((h.score||0).toFixed(4)):'time-order'}</td>
+      <td class="${tierCls(h.tier)}">${esc(h.tier||"")}</td>
       <td style="font-size:11px;color:var(--mut)">${esc(h.origin||'')}</td>
       ${ALL_NS?`<td><span class="ns-badge">${esc(h.namespace||'')}</span></td>`:''}
-      <td style="font-size:11px;color:var(--mut)">${(h.memory_id||"").slice(0,12)}</td>
+      <td style="font-size:11px;color:var(--mut)">${esc((h.memory_id||"").slice(0,12))}</td>
       <td class="snip">${esc(snip(h.content||h.snippet||"",200))}</td>
-      <td><button style="font-size:11px;padding:2px 8px" onclick="event.stopPropagation();openDetail('${esc(h.memory_id)}','${esc(h.namespace||NS)}')">detail</button></td>
+      <td><button style="font-size:11px;padding:2px 8px" data-act="detail" data-mid="${esc(h.memory_id)}" data-ns="${esc(h.namespace||NS)}">detail</button></td>
     </tr>`).join("")+"</tbody></table>";
 }
 
@@ -577,7 +590,7 @@ async function openDetail(memId,ns){
   if(d.related_memories&&d.related_memories.length){
     html+=`<h2 class="section" style="margin-top:12px;">related memories (same session)</h2>`;
     html+=`<table><thead><tr><th>id</th><th>tier</th><th>snippet</th></tr></thead><tbody>`;
-    html+=d.related_memories.map(r=>`<tr class="clickable" onclick="openDetail('${esc(r.memory_id)}','${esc(ns)}')">
+    html+=d.related_memories.map(r=>`<tr class="clickable" data-act="detail" data-mid="${esc(r.memory_id)}" data-ns="${esc(ns)}">
       <td style="font-size:11px">${esc((r.memory_id||"").slice(0,12))}</td>
       <td class="${esc(tierCls(r.tier))}">${esc(r.tier||"")}</td>
       <td class="snip">${esc(snip(r.content||"",160))}</td>
@@ -611,6 +624,11 @@ async function doPurge(){
     closeDetail();
     if(!ALL_NS)loadNs(NS);
     if($('view-browse').classList.contains('on'))doBrowse(BROWSE_PAGE);
+    // The rows are gone either way, but a concurrent reader blocks the file
+    // rebuild, leaving older copies of the erased text readable in free
+    // pages. CLI and MCP both report this; the console must not be the one
+    // surface that says "deleted" and stops there.
+    if(r.bytes_overwritten===false)alert("Memory deleted, but the database file was not rebuilt (bytes_overwritten=false) — a concurrent reader held it open. Erased text may still be readable in free pages until a later purge rebuilds the file. Close other haunt processes and purge again.");
   }else{
     alert("Delete failed: "+(r.error||"unknown error"));
   }
@@ -630,20 +648,20 @@ async function doBrowse(page){
   const mems=data.memories||[];
   if(!mems.length){$("browseResults").innerHTML='<div class="empty">no memories match</div>';$("browseNav").innerHTML="";return;}
   $("browseResults").innerHTML=`<table><thead><tr><th>created</th><th>tier</th><th>role</th><th>origin</th><th>source</th><th>session</th><th>snippet</th><th></th></tr></thead><tbody>`+
-    mems.map(m=>`<tr class="clickable" onclick="openDetail('${esc(m.memory_id)}','${esc(NS)}')">
-      <td>${fmtTime(m.created_at)}</td>
-      <td class="${tierCls(m.tier)}">${m.tier}</td>
+    mems.map(m=>`<tr class="clickable" data-act="detail" data-mid="${esc(m.memory_id)}" data-ns="${esc(NS)}">
+      <td>${esc(fmtTime(m.created_at))}</td>
+      <td class="${tierCls(m.tier)}">${esc(m.tier||"")}</td>
       <td>${esc(m.role||"")}</td><td>${esc(m.origin||"")}</td>
       <td>${esc((m.provenance||{}).kind||"unknown")}</td>
       <td style="font-size:11px;color:var(--mut)">${esc((m.session_id||"").slice(0,8))}</td>
       <td class="snip">${esc(snip(m.content||"",160))}</td>
-      <td><button style="font-size:11px;padding:2px 8px" onclick="event.stopPropagation();openDetail('${esc(m.memory_id)}','${esc(NS)}')">detail</button></td>
+      <td><button style="font-size:11px;padding:2px 8px" data-act="detail" data-mid="${esc(m.memory_id)}" data-ns="${esc(NS)}">detail</button></td>
     </tr>`).join("")+"</tbody></table>";
   const total=data.total||0;
   const pages=Math.ceil(total/limit);
-  let nav=`<span>${total} memories · page ${page+1}/${pages}</span>`;
-  if(page>0)nav+=` <button onclick="doBrowse(${page-1})">← prev</button>`;
-  if(page<pages-1)nav+=` <button onclick="doBrowse(${page+1})">next →</button>`;
+  let nav=`<span>${esc(total)} memories · page ${page+1}/${pages}</span>`;
+  if(page>0)nav+=` <button data-act="page" data-page="${page-1}">← prev</button>`;
+  if(page<pages-1)nav+=` <button data-act="page" data-page="${page+1}">next →</button>`;
   $("browseNav").innerHTML=nav;
 }
 
@@ -653,9 +671,9 @@ async function loadProcedures(){
   const procs=data.procedures||[];
   if(!procs.length){$("procList").innerHTML='<div class="empty">no procedures</div>';return;}
   $("procList").innerHTML=`<table><thead><tr><th>name</th><th>trigger</th><th>id</th><th>body</th></tr></thead><tbody>`+
-    procs.map(p=>`<tr class="clickable" onclick="openDetail('${esc(p.id)}','${esc(NS)}')">
+    procs.map(p=>`<tr class="clickable" data-act="detail" data-mid="${esc(p.id)}" data-ns="${esc(NS)}">
       <td>${esc(p.name)}</td><td>${esc(p.trigger||"")}</td>
-      <td style="font-size:11px;color:var(--mut)">${(p.id||"").slice(0,12)}</td>
+      <td style="font-size:11px;color:var(--mut)">${esc((p.id||"").slice(0,12))}</td>
       <td class="snip">${esc(snip(p.body||"",200))}</td>
     </tr>`).join("")+"</tbody></table>";
 }
@@ -664,9 +682,9 @@ async function loadWorldview(){
   if(!NS||ALL_NS)return;
   const data=await j(`/api/namespace/${encodeURIComponent(NS)}/worldview`);
   const facts=data.facts||[];
-  $("wvFacts").innerHTML=facts.length?facts.map(f=>`<div class="ent"><span>${esc(snip(f.content,200))}</span><span class="ty">${(f.id||"").slice(0,8)}</span></div>`).join(""):'<div class="empty">no semantic facts</div>';
+  $("wvFacts").innerHTML=facts.length?facts.map(f=>`<div class="ent"><span>${esc(snip(f.content,200))}</span><span class="ty">${esc((f.id||"").slice(0,8))}</span></div>`).join(""):'<div class="empty">no semantic facts</div>';
   const names=data.names||[];
-  $("wvNames").innerHTML=names.length?names.map(n=>`<div class="ent"><span>${esc(n.name)}</span><span class="ty">${n.type} · ${n.mentions} mentions</span></div>`).join(""):'<div class="empty">no entities</div>';
+  $("wvNames").innerHTML=names.length?names.map(n=>`<div class="ent"><span>${esc(n.name)}</span><span class="ty">${esc(n.type)} · ${esc(n.mentions)} mentions</span></div>`).join(""):'<div class="empty">no entities</div>';
   const procs=data.procedures||[];
   $("wvProcs").innerHTML=procs.length?procs.map(p=>`<div class="ent"><span>${esc(p.name)}</span><span class="ty">${esc(p.trigger||"")}</span></div>`).join(""):'<div class="empty">no procedures</div>';
 }
@@ -706,10 +724,10 @@ async function loadTimeline(){
   const rows=data.events||[];
   if(!rows.length){$("timelineResults").innerHTML='<div class="empty">no events match</div>';return;}
   $("timelineResults").innerHTML=`<table><thead><tr><th>event_time</th><th>origin</th><th>role</th><th>tier</th><th>snippet</th></tr></thead><tbody>`+
-    rows.map(r=>`<tr class="clickable" onclick="openEventMemory('${esc(r.id||"")}')">
-      <td>${fmtTime(r.event_time)}</td><td>${esc(r.origin||"")}</td>
+    rows.map(r=>`<tr class="clickable" data-act="event" data-eid="${esc(r.id||"")}">
+      <td>${esc(fmtTime(r.event_time))}</td><td>${esc(r.origin||"")}</td>
       <td>${esc(r.role||"")}</td>
-      <td class="${tierCls(r.tier)}">${r.tier}</td>
+      <td class="${tierCls(r.tier)}">${esc(r.tier||"")}</td>
       <td class="snip">${esc(snip(r.content||(r.tool_name?"tool:"+r.tool_name:""),180))}</td>
     </tr>`).join("")+"</tbody></table>";
 }
@@ -788,6 +806,36 @@ async function doRecall(){
 
 $("go").onclick=doRecall;
 $("q").addEventListener("keydown",e=>{if(e.key==="Enter")doRecall();});
+$("contradictHasReplacement").addEventListener("change",toggleContradictReplacement);
+
+// Delegated dispatch, not onclick="…": an inline handler would need
+// script-src 'unsafe-inline', and esc()'s &#39; is decoded by the HTML parser
+// before the JS parser sees it, so it never protected a handler argument.
+const ACTIONS={
+  view:el=>switchView(el.dataset.view),
+  detail:el=>openDetail(el.dataset.mid,el.dataset.ns),
+  event:el=>openEventMemory(el.dataset.eid),
+  page:el=>doBrowse(Number(el.dataset.page)),
+  "timeline-filter":()=>loadTimeline(),
+  "browse-filter":()=>doBrowse(0),
+  "detail-close":()=>closeDetail(),
+  "purge-open":()=>confirmPurge(),
+  "purge-cancel":()=>closeModal(),
+  "purge-confirm":()=>doPurge(),
+  "contradict-open":()=>confirmContradict(),
+  "contradict-cancel":()=>closeContradictModal(),
+  "contradict-confirm":()=>doContradict(),
+};
+document.addEventListener("click",ev=>{
+  const el=ev.target.closest("[data-act]");
+  if(!el)return;
+  // Object.hasOwn, not a plain lookup: data-act="valueOf" would otherwise
+  // resolve to an inherited Object.prototype method and data-act="__proto__"
+  // to a truthy non-callable, both of which throw inside this handler.
+  if(!Object.hasOwn(ACTIONS,el.dataset.act))return;
+  const run=ACTIONS[el.dataset.act];
+  if(run)run(el);
+});
 
 async function selectAllNs(){
   ALL_NS=true;
@@ -867,9 +915,7 @@ def _health_from_store(st: Store) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
 # Routes
-# ---------------------------------------------------------------------------
 
 async def index(_request: Request) -> HTMLResponse:
     token = (_dash_token or "") if embed_launch_token_in_html() else ""
@@ -879,7 +925,13 @@ async def index(_request: Request) -> HTMLResponse:
         .replace(">", "\\u003e")
         .replace("&", "\\u0026")
     )
-    return HTMLResponse(HTML.replace(_HTML_TOKEN_PLACEHOLDER, token_json))
+    nonce = secrets.token_urlsafe(16)
+    body = HTML.replace(_HTML_TOKEN_PLACEHOLDER, token_json).replace(
+        _HTML_NONCE_PLACEHOLDER, nonce
+    )
+    return HTMLResponse(
+        body, headers={"Content-Security-Policy": _HTML_CSP.format(nonce=nonce)}
+    )
 
 
 async def api_namespaces(_request: Request) -> JSONResponse:
@@ -954,6 +1006,23 @@ def _local_recall_order(hit: Hit) -> tuple[int, int, float, str]:
     return (1, 0, -hit.score, hit.memory_id)
 
 
+def _rank_interleaved(groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Merge rank-ordered per-namespace lists into one, round-robin by rank
+    position: every namespace's #1, then every namespace's #2, and so on.
+
+    Relative order within a namespace is preserved, and no cross-namespace
+    score comparison is made or implied -- every namespace's rank N is treated
+    as equally worth keeping, which is the strongest ordering RRF values that
+    are only meaningful locally can support.
+    """
+    merged: list[dict[str, Any]] = []
+    for position in range(max((len(group) for group in groups), default=0)):
+        for group in groups:
+            if position < len(group):
+                merged.append(group[position])
+    return merged
+
+
 async def api_namespace(request: Request) -> JSONResponse:
     name = resolve_namespace(request.path_params["name"])
     missing = _missing_namespace(name)
@@ -997,7 +1066,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
         return _recall_error(exc, query=q)
     ns_rows = sorted(list_namespace_rows_readonly(), key=lambda row: row["name"])
     namespace_groups: list[dict[str, Any]] = []
-    flattened: list[dict[str, Any]] = []
+    per_namespace: list[list[dict[str, Any]]] = []
     errors: list[dict[str, str]] = []
     for row in ns_rows:
         ns_name = row["name"]
@@ -1028,7 +1097,7 @@ async def api_recall_all(request: Request) -> JSONResponse:
                 execution = execution_metadata(hits)
                 if execution is not None:
                     group["execution"] = execution
-                flattened.extend(results)
+                per_namespace.append(results)
         except Exception as exc:
             error = {
                 "namespace": ns_name,
@@ -1043,6 +1112,31 @@ async def api_recall_all(request: Request) -> JSONResponse:
             group["error"] = error
         namespace_groups.append(group)
 
+    # One budget for the whole fan-out rather than one per namespace: this
+    # endpoint answers from every registered namespace at once, so a
+    # per-namespace cap would multiply by however many exist.
+    #
+    # apply_recall_budget keeps a strict prefix of the list it is handed, so
+    # feeding it namespace-by-namespace made alphabetical collation, not rank,
+    # decide whose hits survive: namespaces late in the alphabet came back with
+    # an empty `hits` and a successful `execution`, indistinguishable from "no
+    # matches". Interleaving by local rank makes that prefix a rank prefix
+    # instead -- round-robin rather than a global sort, because RRF scores are
+    # not comparable across namespaces (see _local_recall_order).
+    bounded_hits, recall_budget = apply_recall_budget(
+        _rank_interleaved(per_namespace), k=k
+    )
+    kept: dict[str, list[dict[str, Any]]] = {}
+    for hit in bounded_hits:
+        kept.setdefault(str(hit.get("namespace")), []).append(hit)
+    for group in namespace_groups:
+        available = len(group["hits"])
+        group["hits"] = kept.get(group["namespace"], [])
+        # A group emptied by the budget must not read as a group that matched
+        # nothing.
+        group["hits_available"] = available
+        group["hits_dropped"] = available - len(group["hits"])
+
     return JSONResponse(
         {
             "query": q,
@@ -1051,7 +1145,10 @@ async def api_recall_all(request: Request) -> JSONResponse:
             "namespace_groups": namespace_groups,
             # Kept for the existing UI/API shape. This is namespace-grouped,
             # not a global result ranking, and each final_rank remains local.
-            "hits": flattened,
+            # Regrouping here (rather than returning the interleaved order the
+            # budget saw) keeps `hits` agreeing with `namespace_groups`.
+            "hits": [hit for group in namespace_groups for hit in group["hits"]],
+            "recall_budget": recall_budget,
             "errors": errors,
         }
     )
@@ -1101,11 +1198,13 @@ async def api_recall(request: Request) -> JSONResponse:
         d = h.as_dict()
         d["namespace"] = name
         results.append(d)
+    bounded_hits, recall_budget = apply_recall_budget(results, k=k)
     payload: dict[str, Any] = {
         "query": q,
         "namespace": name,
         "ranking_scope": "namespace",
-        "hits": results,
+        "hits": bounded_hits,
+        "recall_budget": recall_budget,
     }
     execution = execution_metadata(hits)
     if execution is not None:
@@ -1583,17 +1682,46 @@ class DashboardGuardMiddleware:
             await self.app(scope, receive, send)
             return
         request = Request(scope, receive)
+
+        async def send_hardened(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.setdefault("content-security-policy", _API_CSP)
+                headers.setdefault("x-content-type-options", "nosniff")
+            await send(message)
+
         denied = guard_dashboard_request(request)
         if denied is not None:
-            await denied(scope, receive, send)
+            await denied(scope, receive, send_hardened)
             return
-        await self.app(scope, receive, send)
+        await self.app(scope, receive, send_hardened)
+
+
+async def unhandled_error_response(_request: Request, _exc: Exception) -> JSONResponse:
+    """500 body for an unhandled exception, carrying the hardening headers.
+
+    Starlette builds ServerErrorMiddleware outside `user_middleware`, so an
+    unhandled exception replies through the raw ASGI `send` and never reaches
+    DashboardGuardMiddleware.send_hardened -- the headers have to be set here
+    or the easiest response to induce is the one response with no CSP and no
+    nosniff. ServerErrorMiddleware still re-raises afterwards, so the server
+    logs the traceback as before; the exception stays out of the body.
+    """
+    return JSONResponse(
+        {"error": "internal error"},
+        status_code=500,
+        headers={
+            "content-security-policy": _API_CSP,
+            "x-content-type-options": "nosniff",
+        },
+    )
 
 
 app = Starlette(
     debug=False,
     routes=routes,
     middleware=[Middleware(DashboardGuardMiddleware)],
+    exception_handlers={Exception: unhandled_error_response},
 )
 
 

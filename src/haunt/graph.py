@@ -8,6 +8,13 @@ from dataclasses import dataclass
 
 from haunt.util import new_id
 
+# Every type this module can emit. Import validation checks entities.type
+# against it because the column has no CHECK constraint.
+ENTITY_TYPES = (
+    "env", "file", "function", "identifier",
+    "proper", "repo", "symbol", "tool", "url",
+)
+
 FILE_RE = re.compile(
     r"(?<![\w/])("
     r"(?:[A-Za-z]:)?(?:\.{1,2}/|/)?"

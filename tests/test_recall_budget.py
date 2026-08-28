@@ -7,22 +7,23 @@ per-hit `explanation` object -- so a k=100 payload could be hundreds of KB
 to over a megabyte, injected straight into agent context with no way to
 page it.
 
-recall.py (Hit.as_dict()) is owned by a concurrent change and stays a
-library call returning complete data. The budget instead lives at the two
-places that actually inject recall output into agent context:
+recall.py (Hit.as_dict()) stays a library call returning complete data.
+The budget instead lives at the places that actually inject recall output
+into agent context:
 
-  * haunt.mcp_server.memory_recall -- the JSON payload an agent receives
-    (_apply_recall_budget, _recall_payload_cap, _truncate_hit_content).
+  * haunt.budget -- the serialized-size budget every machine surface shares
+    (apply_recall_budget, recall_payload_cap, _truncate_hit_content), wired
+    into MCP memory_recall/memory_timeline, `haunt recall --json`, and the
+    dashboard recall endpoints.
   * haunt.cursor_hook.format_recall_block -- the `[haunt ns=...]` text
     block both Cursor and Claude Code hooks inject as additional_context
     on every prompt (claude_hook.py imports the same function, so one fix
     covers both hosts) (_recall_block_cap).
 
-Both follow the existing HAUNT_TOOL_IO_MAX_CHARS / _tool_io_cap parse
--> fallback-on-garbage -> clamp idiom, and both mark truncation/dropping
-explicitly rather than silently shortening a field that claims to be the
-complete verbatim record -- see _cap_tool_io's inline marker, which this
-mirrors.
+Both parse their env var through util.env_int (parse -> fallback on
+garbage -> clamp), and both mark truncation/dropping explicitly rather
+than silently shortening a field that claims to be the complete verbatim
+record -- see _cap_tool_io's inline marker, which this mirrors.
 
 This file is the pass/fail gate for that budget: a large k=100 corpus
 stays under the configured budget, truncation is always visibly marked,
@@ -38,6 +39,7 @@ from typing import Any
 
 import pytest
 
+from haunt import budget
 from haunt.recall import Hit
 
 
@@ -73,10 +75,10 @@ def _small_hits(count: int) -> list[Hit]:
 
 
 def _render_truncated(hit: dict[str, Any], content: str, keep: int) -> dict[str, Any]:
-    """Test-local mirror of mcp_server._rendered_hit's marker format --
+    """Test-local mirror of budget._rendered_hit's marker format --
     kept independent of that internal helper on purpose, so a test using
     this to probe "what would keep=N measure?" exercises the module's
-    observable behavior (what actually round-trips through `_json`), not
+    observable behavior (what actually round-trips through `serialize`), not
     the presence of one particular private function name. Any correct
     implementation of the truncation marker, estimate-based or
     measurement-based, produces this exact shape.
@@ -222,18 +224,16 @@ def recall_budget_env(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# mcp_server._apply_recall_budget: unit-level coverage
+# budget.apply_recall_budget: unit-level coverage
 # ---------------------------------------------------------------------------
 
 
 def test_default_budget_is_a_no_op_for_a_small_ordinary_response(recall_budget_env):
     """No behavior change for the common case: identical hits, nothing
     dropped, snippet still present, budget metadata says so plainly."""
-    from haunt import mcp_server
-
     hits = _small_hits(5)
     hit_dicts = [h.as_dict() for h in hits]
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=8)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=8)
 
     assert bounded == hit_dicts
     assert all("snippet" in h for h in bounded)
@@ -243,22 +243,20 @@ def test_default_budget_is_a_no_op_for_a_small_ordinary_response(recall_budget_e
     assert meta["hits_available"] == 5
     assert meta["snippet_dropped"] is False
     assert meta["content_truncated_memory_ids"] == []
-    assert meta["max_chars"] == mcp_server.RECALL_PAYLOAD_MAX_CHARS_DEFAULT
+    assert meta["max_chars"] == budget.RECALL_PAYLOAD_MAX_CHARS_DEFAULT
 
 
 def test_large_corpus_at_k100_stays_under_the_configured_budget(recall_budget_env):
     """The literal C11 failure mode: k=100 against a realistic, mostly raw
     tool-I/O corpus (~1.1MB unbounded) is bounded to the configured cap."""
-    from haunt import mcp_server
-
     hits = _mixed_realistic_hits(100, big_fraction=0.8)
     hit_dicts = [h.as_dict() for h in hits]
-    unbounded_total = sum(len(mcp_server._json(h)) for h in hit_dicts)
+    unbounded_total = len(budget.serialize(hit_dicts))
     assert unbounded_total > 500_000  # sanity: this really is the C11 failure case
 
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=100)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=100)
 
-    bounded_total = sum(len(mcp_server._json(h)) for h in bounded)
+    bounded_total = len(budget.serialize(bounded))
     assert bounded_total <= meta["max_chars"]
     assert meta["applied"] is True
     assert meta["hits_available"] == 100
@@ -267,16 +265,39 @@ def test_large_corpus_at_k100_stays_under_the_configured_budget(recall_budget_en
     assert meta["hits_dropped"] == 100 - len(bounded)
 
 
+def test_cap_bounds_the_serialized_list_not_the_sum_of_its_hits(
+    recall_budget_env, monkeypatch
+):
+    """Hits cross the boundary as a JSON list, and json.dumps spends two
+    chars per hit on that list's own brackets and separators. Summing
+    per-hit sizes ignored them, so a response could pack exactly to the cap
+    and still serialize 2n chars past it -- ~200 at k=100, and ~15% over at
+    the 2,000 clamp floor. The cap here is tuned to the exact fill the old
+    accounting called full, so the old metric cannot pass this.
+    """
+    hit_dicts = [h.as_dict() for h in _small_hits(40)]
+    slim = [{k: v for k, v in h.items() if k != "snippet"} for h in hit_dicts]
+    packed = 15
+    cap = sum(len(budget.serialize(hit)) for hit in slim[:packed])
+    monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", str(cap))
+
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=40)
+
+    assert meta["max_chars"] == cap
+    assert len(budget.serialize(bounded)) <= cap
+    # Summing per hit reported exactly `packed` hits as fitting. They do
+    # not, once the list they are emitted in is counted.
+    assert meta["hits_returned"] < packed
+
+
 @pytest.mark.parametrize("big_fraction", [0.0, 0.5, 1.0])
 def test_large_corpus_stays_under_budget_across_content_mixes(recall_budget_env, big_fraction):
     """Same bound holds whether the bloat comes from many small hits'
     fixed explanation overhead, a realistic mix, or all-huge tool I/O."""
-    from haunt import mcp_server
-
     hits = _mixed_realistic_hits(100, big_fraction=big_fraction)
     hit_dicts = [h.as_dict() for h in hits]
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=100)
-    bounded_total = sum(len(mcp_server._json(h)) for h in bounded)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=100)
+    bounded_total = len(budget.serialize(bounded))
     assert bounded_total <= meta["max_chars"]
     assert len(bounded) >= 1  # never silently empty when hits exist
 
@@ -284,11 +305,9 @@ def test_large_corpus_stays_under_budget_across_content_mixes(recall_budget_env,
 def test_caller_can_tell_hits_were_dropped_for_budget_not_corpus_size(recall_budget_env):
     """hits_available vs hits_returned/hits_dropped disambiguates 'the
     corpus only had N matches' from 'the budget cut off the rest'."""
-    from haunt import mcp_server
-
     hits = _mixed_realistic_hits(30, big_fraction=1.0)
     hit_dicts = [h.as_dict() for h in hits]
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=30)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=30)
 
     assert meta["hits_available"] == 30
     assert meta["hits_returned"] < meta["hits_available"]
@@ -301,13 +320,11 @@ def test_truncation_is_explicit_and_never_silent(recall_budget_env):
     """A single hit whose content alone exceeds the whole budget is
     truncated, not dropped -- and the truncation can never be mistaken
     for a complete verbatim record."""
-    from haunt import mcp_server
-
     huge = _hit(0, content="MEGA-" + ("z" * 60_000))
     hit_dicts = [huge.as_dict()]
     original_content = hit_dicts[0]["content"]
 
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=1)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=1)
 
     assert len(bounded) == 1  # never silently empty for a nonempty result
     hit = bounded[0]
@@ -319,9 +336,10 @@ def test_truncation_is_explicit_and_never_silent(recall_budget_env):
     assert str(hit["content_omitted_chars"]) in hit["content"]
     assert meta["content_truncated_memory_ids"] == ["mem-0000"]
     assert meta["hits_dropped"] == 0
-    # The whole hit, not just its content slice, must respect the budget --
-    # fixed overhead (explanation, memory_id, etc.) also counts.
-    assert len(mcp_server._json(hit)) <= meta["max_chars"]
+    # The whole serialized list, not just the content slice, must respect
+    # the budget -- fixed per-hit overhead (explanation, memory_id, ...) and
+    # the list's own brackets and separators all count.
+    assert len(budget.serialize(bounded)) <= meta["max_chars"]
 
 
 def test_truncation_is_never_faked_when_it_cannot_help_the_hit_fit(recall_budget_env):
@@ -333,31 +351,28 @@ def test_truncation_is_never_faked_when_it_cannot_help_the_hit_fit(recall_budget
     repro: 25,458 serialized chars against the 24,000 default cap) --
     where truncating content CANNOT succeed, because the overage isn't in
     content at all. The same invariant from the test above
-    (len(_json(hit)) <= meta["max_chars"] for every returned hit) must
-    still hold, but only because the hit is dropped, not because it was
-    fake-truncated while the response stayed over budget and
-    recall_budget claimed success anyway -- which is what this function
-    actually did before the fix (applied=True, hits_dropped=0, and 51
-    real chars of content destroyed for zero size benefit).
+    (len(serialize(hits)) <= meta["max_chars"]) must still hold, but only
+    because the hit is dropped, not because it was fake-truncated while
+    the response stayed over budget and recall_budget claimed success
+    anyway -- which is what this function actually did before the fix
+    (applied=True, hits_dropped=0, and 51 real chars of content destroyed
+    for zero size benefit).
     """
-    from haunt import mcp_server
-
     huge_lineage = _hit_with_references(
         0,
         content="normal-length memory content, nothing unusual here.",
         correction_count=600,
     )
     hit_dicts = [huge_lineage.as_dict()]
-    unbounded_size = len(mcp_server._json(hit_dicts[0]))
+    unbounded_size = len(budget.serialize(hit_dicts))
     # Sanity: this really does reproduce the defect's premise (fixed
     # overhead alone, not content, blows the default budget).
-    assert unbounded_size > mcp_server.RECALL_PAYLOAD_MAX_CHARS_DEFAULT
+    assert unbounded_size > budget.RECALL_PAYLOAD_MAX_CHARS_DEFAULT
     assert len(hit_dicts[0]["content"]) < 100
 
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=1)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=1)
 
-    for hit in bounded:
-        assert len(mcp_server._json(hit)) <= meta["max_chars"]
+    assert len(budget.serialize(bounded)) <= meta["max_chars"]
     assert bounded == []
     assert meta["hits_available"] == 1
     assert meta["hits_returned"] == 0
@@ -376,7 +391,7 @@ def _realistic_full_explanation_hit(n: int, *, content: str) -> Hit:
     memory_id/event_id actually look like (_hit()'s short "mem-0000"
     ids underestimate this). This alone, with no lineage or provenance
     at all, already costs ~1,815 chars of fixed overhead once `snippet`
-    is stripped (the shape _apply_recall_budget's truncation step
+    is stripped (the shape apply_recall_budget's truncation step
     actually sees) -- small next to the 24,000 default, but enough to
     push the *estimated* room for content negative at the 2,000 clamp
     floor (2000 - 1815 - the 200-char marker reserve < 0), even though
@@ -448,15 +463,13 @@ def test_truncation_finds_the_largest_fitting_keep_near_the_clamp_floor(
     happens to be -- not dropped, and not needlessly reduced to keep=0
     when the margin is tight but nonzero.
     """
-    from haunt import mcp_server
-
     monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", "2000")
     content = "C" * 5000
     hit = _realistic_full_explanation_hit(0, content=content)
     hit_dicts = [hit.as_dict()]
-    unbounded_size = len(mcp_server._json(hit_dicts[0]))
+    unbounded_size = len(budget.serialize(hit_dicts))
     assert unbounded_size > 2000  # sanity: this hit really doesn't fit as-is
-    # _apply_recall_budget always strips the redundant `snippet` field
+    # apply_recall_budget always strips the redundant `snippet` field
     # (step 2) before content truncation is even considered (step 3/4) --
     # so this is the exact shape _truncate_hit_content actually measures
     # against, and what the "one more char" boundary probe below must
@@ -464,7 +477,7 @@ def test_truncation_finds_the_largest_fitting_keep_near_the_clamp_floor(
     # one the algorithm under test really operates on.
     slim_hit_dict = {k: v for k, v in hit_dicts[0].items() if k != "snippet"}
 
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=1)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=1)
 
     assert len(bounded) == 1  # truncation succeeded -- the hit was not dropped
     assert bounded[0]["content_truncated"] is True
@@ -473,7 +486,7 @@ def test_truncation_finds_the_largest_fitting_keep_near_the_clamp_floor(
     assert meta["content_truncated_memory_ids"] == [
         "cccccccc-cccc-4ccc-8ccc-000000000000"
     ]
-    assert len(mcp_server._json(bounded[0])) <= meta["max_chars"] == 2000
+    assert len(budget.serialize(bounded)) <= meta["max_chars"] == 2000
     # It's the LARGEST fitting keep, not merely *a* fitting one (which a
     # weaker "stop at the first candidate that fits" search could also
     # satisfy, or which an estimate could land on by coincidence): keeping
@@ -482,7 +495,7 @@ def test_truncation_finds_the_largest_fitting_keep_near_the_clamp_floor(
     kept_chars = 5000 - bounded[0]["content_omitted_chars"]
     assert kept_chars >= 0
     one_more = _render_truncated(dict(slim_hit_dict), content, kept_chars + 1)
-    assert len(mcp_server._json(one_more)) > 2000
+    assert len(budget.serialize([one_more])) > 2000
 
 
 def test_truncation_keeps_escape_heavy_content_instead_of_dropping_it(
@@ -502,15 +515,13 @@ def test_truncation_keeps_escape_heavy_content_instead_of_dropping_it(
     it always converges on the true largest fitting `keep` regardless of
     how much any given slice happens to expand under escaping.
     """
-    from haunt import mcp_server
-
     monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", "2000")
     content = '"\\' * 4200  # 8,400 raw chars; every one doubles once escaped
     hit = _hit(0, content=content)
     hit_dicts = [hit.as_dict()]
-    unbounded_size = len(mcp_server._json(hit_dicts[0]))
+    unbounded_size = len(budget.serialize(hit_dicts))
     assert unbounded_size > 2000  # sanity: doesn't fit whole
-    # _apply_recall_budget always strips the redundant `snippet` field
+    # apply_recall_budget always strips the redundant `snippet` field
     # (step 2) before content truncation is even considered (step 3/4) --
     # this is the exact shape _truncate_hit_content actually measures
     # against, and what both probes below must match.
@@ -520,33 +531,33 @@ def test_truncation_keeps_escape_heavy_content_instead_of_dropping_it(
     # exact "over-correction" premise: an estimate that fails once and
     # gives up would drop this hit even though the most conservative
     # truncation comfortably succeeds.
-    floor_size = len(mcp_server._json(_render_truncated(dict(slim_hit_dict), content, 0)))
+    floor_size = len(
+        budget.serialize([_render_truncated(dict(slim_hit_dict), content, 0)])
+    )
     assert floor_size < 2000 - 100, "test premise: keep=0 must fit with real slack"
 
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=1)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=1)
 
     assert len(bounded) == 1  # KEPT, not dropped -- the whole point of this test
     assert bounded[0]["content_truncated"] is True
     assert meta["hits_dropped"] == 0
     assert meta["hits_returned"] == 1
     assert meta["content_truncated_memory_ids"] == ["mem-0000"]
-    assert len(mcp_server._json(bounded[0])) <= meta["max_chars"] == 2000
+    assert len(budget.serialize(bounded)) <= meta["max_chars"] == 2000
     # And it's the largest fitting keep, strictly better than the keep=0
     # an estimate stuck permanently at "the conservative floor" would
     # have produced: one more content char must no longer fit.
     kept_chars = len(content) - bounded[0]["content_omitted_chars"]
     assert kept_chars > 0
     one_more = _render_truncated(dict(slim_hit_dict), content, kept_chars + 1)
-    assert len(mcp_server._json(one_more)) > 2000
+    assert len(budget.serialize([one_more])) > 2000
 
 
 def test_truncated_hit_never_returns_fewer_than_one_hit_for_nonempty_result(recall_budget_env):
     """Even at the minimum clamp, a nonempty result never comes back
     empty -- the caller always gets something, visibly marked partial."""
-    from haunt import mcp_server
-
     huge = _hit(0, content="Z" * 60_000)
-    bounded, meta = mcp_server._apply_recall_budget(
+    bounded, meta = budget.apply_recall_budget(
         [huge.as_dict()], k=1
     )
     assert len(bounded) == 1
@@ -562,16 +573,14 @@ def test_non_string_content_is_dropped_when_it_cannot_be_shrunk(recall_budget_en
     name only, with zero actual size benefit. Now it is dropped instead
     of shipped over budget wearing a fabricated marker.
     """
-    from haunt import mcp_server
-
     hit_dict = _hit(0, content="placeholder").as_dict()
     # Simulate what json_safe_sqlite produces for BLOB content -- a dict,
     # not a str -- without needing a real BLOB row end-to-end.
     hit_dict["content"] = {"encoding": "base64", "data": "eeee" * 20_000}
-    unbounded_size = len(mcp_server._json(hit_dict))
-    assert unbounded_size > mcp_server.RECALL_PAYLOAD_MAX_CHARS_DEFAULT  # sanity
+    unbounded_size = len(budget.serialize(hit_dict))
+    assert unbounded_size > budget.RECALL_PAYLOAD_MAX_CHARS_DEFAULT  # sanity
 
-    bounded, meta = mcp_server._apply_recall_budget([hit_dict], k=1)
+    bounded, meta = budget.apply_recall_budget([hit_dict], k=1)
 
     assert bounded == []
     assert meta["hits_available"] == 1
@@ -584,15 +593,13 @@ def test_non_string_content_is_dropped_when_it_cannot_be_shrunk(recall_budget_en
 def test_redundant_snippet_is_dropped_before_any_hit_is_dropped_or_mangled(recall_budget_env):
     """Step 2 of the degrade ladder: removing the pure-duplicate snippet
     field is preferred over losing or truncating an actual hit."""
-    from haunt import mcp_server
-
     # 16 hits of this shape serialize to ~24,818 chars with snippet (just
     # over the 24,000 default) and ~22,542 without it (comfortably under)
     # -- sized so removing the redundant snippets is enough on its own to
     # fit the default budget, without dropping or truncating a hit.
     hits = [_hit(i, content=f"conversational row {i} " * 6) for i in range(16)]
     hit_dicts = [h.as_dict() for h in hits]
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=16)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=16)
 
     assert meta["snippet_dropped"] is True
     assert meta["hits_dropped"] == 0
@@ -609,11 +616,9 @@ def test_ranking_and_order_are_never_changed_by_the_budget(recall_budget_env):
     """The kept hits are an exact, byte-identical prefix of the already-
     ranked input -- the budget can drop a suffix, never reorder or
     cherry-pick by size."""
-    from haunt import mcp_server
-
     hits = _mixed_realistic_hits(50, big_fraction=1.0)
     hit_dicts = [h.as_dict() for h in hits]
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=50)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=50)
 
     assert meta["hits_dropped"] > 0  # otherwise this test proves nothing
     without_snippets = [
@@ -629,16 +634,14 @@ def test_trust_labelling_survives_budgeting_including_on_a_truncated_hit(recall_
     """Requirement: never weaken trusted/trust_reason. Check it holds
     through every degrade path, including the truncated-content one --
     and check the budget actually ran (meta["applied"]), not just that
-    trust survived whatever _apply_recall_budget happened to do. Without
+    trust survived whatever apply_recall_budget happened to do. Without
     the applied checks below, this test previously passed vacuously even
     under a mutation that replaced the whole budget with a no-op
     passthrough (applied always False): trust labels trivially "survive"
     a function that does nothing to the hits at all.
     """
-    from haunt import mcp_server
-
     untrusted_huge = _hit(0, content="U" * 60_000, trusted=False)
-    bounded, meta = mcp_server._apply_recall_budget([untrusted_huge.as_dict()], k=1)
+    bounded, meta = budget.apply_recall_budget([untrusted_huge.as_dict()], k=1)
     assert meta["applied"] is True
     assert bounded[0]["trusted"] is False
     assert bounded[0]["trust_reason"] == "untrusted-tool-io"
@@ -647,7 +650,7 @@ def test_trust_labelling_survives_budgeting_including_on_a_truncated_hit(recall_
         _hit(i, content=_big_content(11_800), trusted=False) for i in range(1, 40)
     ]
     hit_dicts = [h.as_dict() for h in mixed]
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=40)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=40)
     assert meta["applied"] is True
     by_id = {h["memory_id"]: h for h in bounded}
     assert by_id["mem-0000"]["trusted"] is True
@@ -676,8 +679,6 @@ def test_unfittable_provenance_and_lineage_overhead_across_cap_tiers(
     applied=False (no budgeting needed at all). Sweeps all three
     documented clamp tiers in one parametrization.
     """
-    from haunt import mcp_server
-
     if cap_env is not None:
         monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", cap_env)
     else:
@@ -692,9 +693,9 @@ def test_unfittable_provenance_and_lineage_overhead_across_cap_tiers(
     )
     hit_dicts = [hit.as_dict()]
 
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=1)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=1)
 
-    bounded_total = sum(len(mcp_server._json(h)) for h in bounded)
+    bounded_total = len(budget.serialize(bounded))
     assert bounded_total <= meta["max_chars"]
     if expect_kept:
         assert meta["hits_returned"] == 1
@@ -714,7 +715,7 @@ def test_unfittable_top_ranked_hit_drops_lower_ranked_hits_too_not_promoted(
     """Resolves the tension the review called out explicitly: this
     function's existing invariant is that a hit later in rank order is
     never substituted in over an earlier one just because it is smaller
-    (see _apply_recall_budget's docstring step 3). If the top-ranked hit
+    (see apply_recall_budget's docstring step 3). If the top-ranked hit
     cannot be made to fit even truncated, the correct behavior is NOT to
     fall through and let a smaller, lower-ranked hit take its place --
     that would let hit size dictate selection, exactly what this function
@@ -725,8 +726,6 @@ def test_unfittable_top_ranked_hit_drops_lower_ranked_hits_too_not_promoted(
     (skipping ahead to smaller hits) would silently change what recall
     selected, which is worse.
     """
-    from haunt import mcp_server
-
     unfittable_top = _hit_with_references(
         0, content="top ranked but unfittable", correction_count=600
     )
@@ -734,7 +733,7 @@ def test_unfittable_top_ranked_hit_drops_lower_ranked_hits_too_not_promoted(
     small_b = _hit(2, content="small note B")
     hit_dicts = [h.as_dict() for h in (unfittable_top, small_a, small_b)]
 
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=3)
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=3)
 
     assert bounded == []
     assert meta["hits_available"] == 3
@@ -743,8 +742,8 @@ def test_unfittable_top_ranked_hit_drops_lower_ranked_hits_too_not_promoted(
     # Sanity: small_a/small_b would trivially fit on their own -- this
     # proves the result is "rank order is never bent", not "nothing
     # could possibly have fit".
-    small_only_total = sum(
-        len(mcp_server._json(h.as_dict())) for h in (small_a, small_b)
+    small_only_total = len(
+        budget.serialize([h.as_dict() for h in (small_a, small_b)])
     )
     assert small_only_total < meta["max_chars"]
 
@@ -757,11 +756,9 @@ def test_reference_overhead_sweep_stays_under_cap_at_every_clamp_tier(
     intermediate values, against hits whose bulk is in explanation
     overhead rather than content -- lineage-heavy, provenance-heavy, and
     both combined, plus one ordinary small hit. Whatever the mix, the
-    returned hits' summed serialized size never exceeds the configured
-    cap, and dropped/returned always accounts for every available hit.
+    returned hits list never serializes to more than the configured cap,
+    and dropped/returned always accounts for every available hit.
     """
-    from haunt import mcp_server
-
     monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", str(cap))
 
     hits = [
@@ -781,10 +778,10 @@ def test_reference_overhead_sweep_stays_under_cap_at_every_clamp_tier(
     ]
     hit_dicts = [h.as_dict() for h in hits]
 
-    bounded, meta = mcp_server._apply_recall_budget(hit_dicts, k=len(hits))
+    bounded, meta = budget.apply_recall_budget(hit_dicts, k=len(hits))
 
     assert meta["max_chars"] == cap
-    bounded_total = sum(len(mcp_server._json(h)) for h in bounded)
+    bounded_total = len(budget.serialize(bounded))
     # The real invariant this whole function exists to uphold: never over
     # budget, regardless of cap tier or where the bloat comes from -- even
     # (especially) when applied is False or hits_dropped is 0, the exact
@@ -797,7 +794,7 @@ def test_reference_overhead_sweep_stays_under_cap_at_every_clamp_tier(
 def test_empty_hits_list_is_a_no_op(recall_budget_env):
     from haunt import mcp_server
 
-    bounded, meta = mcp_server._apply_recall_budget([], k=8)
+    bounded, meta = budget.apply_recall_budget([], k=8)
     assert bounded == []
     assert meta["applied"] is False
     assert meta["hits_available"] == 0
@@ -824,12 +821,12 @@ def test_memory_recall_tool_bounds_k100_via_monkeypatched_planned_recall(
     payload = json.loads(raw)
 
     assert "recall_budget" in payload
-    budget = payload["recall_budget"]
-    assert budget["applied"] is True
-    assert budget["hits_dropped"] > 0
-    assert len(payload["hits"]) == budget["hits_returned"]
-    hits_total = sum(len(json.dumps(h, ensure_ascii=False)) for h in payload["hits"])
-    assert hits_total <= budget["max_chars"]
+    recall_budget = payload["recall_budget"]
+    assert recall_budget["applied"] is True
+    assert recall_budget["hits_dropped"] > 0
+    assert len(payload["hits"]) == recall_budget["hits_returned"]
+    hits_total = len(json.dumps(payload["hits"], ensure_ascii=False))
+    assert hits_total <= recall_budget["max_chars"]
     # Ordering untouched: an exact-prefix, in-order subset of the 100 ranked ids.
     expected_prefix = [f"mem-{i:04d}" for i in range(len(payload["hits"]))]
     assert [h["memory_id"] for h in payload["hits"]] == expected_prefix
@@ -882,13 +879,13 @@ def test_memory_recall_end_to_end_real_store_bounds_large_fts_corpus(
         query="BUDGETCORPUSTOKEN", namespace="default", k=100, include_residue=True
     )
     payload = json.loads(raw)
-    budget = payload["recall_budget"]
+    recall_budget = payload["recall_budget"]
 
-    assert budget["hits_available"] > 0
-    assert budget["applied"] is True
-    assert budget["hits_dropped"] > 0
-    hits_total = sum(len(json.dumps(h, ensure_ascii=False)) for h in payload["hits"])
-    assert hits_total <= budget["max_chars"]
+    assert recall_budget["hits_available"] > 0
+    assert recall_budget["applied"] is True
+    assert recall_budget["hits_dropped"] > 0
+    hits_total = len(json.dumps(payload["hits"], ensure_ascii=False))
+    assert hits_total <= recall_budget["max_chars"]
 
 
 def test_memory_recall_tool_drops_hit_whose_reference_overhead_alone_exceeds_budget(
@@ -917,47 +914,278 @@ def test_memory_recall_tool_drops_hit_whose_reference_overhead_alone_exceeds_bud
     raw = mcp_server.memory_recall(query="anything", namespace="default", k=1)
     payload = json.loads(raw)
 
-    budget = payload["recall_budget"]
-    hits_total = sum(len(json.dumps(h, ensure_ascii=False)) for h in payload["hits"])
-    assert hits_total <= budget["max_chars"]
+    recall_budget = payload["recall_budget"]
+    hits_total = len(json.dumps(payload["hits"], ensure_ascii=False))
+    assert hits_total <= recall_budget["max_chars"]
     assert payload["hits"] == []
-    assert budget["hits_available"] == 1
-    assert budget["hits_returned"] == 0
-    assert budget["hits_dropped"] == 1
-    assert budget["applied"] is True
-    assert budget["content_truncated_memory_ids"] == []
+    assert recall_budget["hits_available"] == 1
+    assert recall_budget["hits_returned"] == 0
+    assert recall_budget["hits_dropped"] == 1
+    assert recall_budget["applied"] is True
+    assert recall_budget["content_truncated_memory_ids"] == []
 
 
 # ---------------------------------------------------------------------------
-# HAUNT_RECALL_MAX_CHARS parsing (mirrors HAUNT_TOOL_IO_MAX_CHARS)
+# The other machine surfaces: one budget, not one per surface
+# ---------------------------------------------------------------------------
+
+
+def _seed_big_tool_io_corpus(rows: int = 45) -> str:
+    """Real Store.observe() tool-I/O rows, the shape hooks actually write."""
+    from haunt.store import Store
+
+    filler = _big_content(3_000, tag="SURFACEBUDGETTOKEN")
+    with Store("default") as store:
+        for i in range(rows):
+            store.observe(
+                "",
+                role="tool",
+                tier="episodic",
+                tool_name="Bash",
+                tool_input="run",
+                tool_output=f"{filler} row-{i}",
+                defer_embedding=True,
+            )
+    return "SURFACEBUDGETTOKEN"
+
+
+def test_cli_recall_json_is_bounded_like_the_mcp_tool(recall_budget_env):
+    """`haunt recall --json` feeds an agent the same way memory_recall does,
+    so it gets the same cap and the same honest recall_budget."""
+    from typer.testing import CliRunner
+
+    from haunt import cli
+
+    query = _seed_big_tool_io_corpus()
+    result = CliRunner().invoke(
+        cli.app,
+        ["recall", query, "-n", "default", "--json", "--k", "100", "--include-residue"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    recall_budget = payload["recall_budget"]
+
+    assert recall_budget["applied"] is True
+    assert recall_budget["hits_dropped"] > 0
+    assert len(json.dumps(payload["hits"], ensure_ascii=False)) <= recall_budget["max_chars"]
+
+
+def test_dashboard_recall_endpoints_are_bounded_including_the_fan_out(
+    recall_budget_env,
+):
+    """The all-namespace endpoint answers from every registered namespace at
+    once, so it needs the cap more than the single-namespace one does. Its
+    groups must agree with the bounded `hits` rather than keep the dropped
+    rows."""
+    from tests.dashutil import make_dash_client
+
+    query = _seed_big_tool_io_corpus()
+    client = make_dash_client()
+    params = {"q": query, "k": 100, "include_residue": "1"}
+
+    one = client.get("/api/namespace/default/recall", params=params).json()
+    assert one["recall_budget"]["applied"] is True
+    assert one["recall_budget"]["hits_dropped"] > 0
+    assert len(json.dumps(one["hits"], ensure_ascii=False)) <= one["recall_budget"]["max_chars"]
+
+    every = client.get("/api/recall", params=params).json()
+    assert every["recall_budget"]["applied"] is True
+    assert len(json.dumps(every["hits"], ensure_ascii=False)) <= every["recall_budget"]["max_chars"]
+    grouped = [hit for group in every["namespace_groups"] for hit in group["hits"]]
+    assert grouped == every["hits"]
+
+
+def test_memory_timeline_is_bounded_at_the_mcp_boundary(recall_budget_env):
+    """An event row carries the same uncapped tool I/O a hit does, and
+    limit accepts up to 100 of them."""
+    from haunt import mcp_server
+
+    _seed_big_tool_io_corpus()
+    mcp_server._MCP_AUTHORITY = None
+
+    payload = json.loads(mcp_server.memory_timeline(namespace="default", limit=100))
+    recall_budget = payload["recall_budget"]
+
+    assert recall_budget["applied"] is True
+    assert recall_budget["hits_dropped"] > 0
+    assert len(json.dumps(payload["events"], ensure_ascii=False)) <= recall_budget["max_chars"]
+
+
+def _seed_oversized_tool_events(rows: int = 3) -> None:
+    """Hook-shaped Bash events at the tool-I/O cap on BOTH fields.
+
+    HAUNT_TOOL_IO_MAX_CHARS is 12,000 for tool_input and again for
+    tool_output, so one such row is over the 24,000-char default recall
+    budget on its own -- while its `content` is "", the way the hooks write
+    tool rows. _seed_big_tool_io_corpus's 3,000-char rows never reach that.
+    """
+    from haunt.cursor_hook import TOOL_IO_MAX_CHARS_DEFAULT
+    from haunt.store import Store
+
+    with Store("default") as store:
+        for i in range(rows):
+            store.observe(
+                "",
+                role="tool",
+                tier="episodic",
+                tool_name="Bash",
+                tool_input=_big_content(TOOL_IO_MAX_CHARS_DEFAULT, tag=f"in{i}"),
+                tool_output=_big_content(TOOL_IO_MAX_CHARS_DEFAULT, tag=f"out{i}"),
+                defer_embedding=True,
+            )
+
+
+def test_memory_timeline_returns_events_whose_tool_io_alone_busts_the_cap(
+    recall_budget_env,
+):
+    """An event's bulk lives in tool_input/tool_output, not `content`.
+
+    Budgeted as a recall hit, degrade step 4 emptied an already-empty
+    `content`, saved nothing, still measured over budget, and returned zero
+    events for a namespace that had them -- indistinguishable from an empty
+    namespace.
+    """
+    from haunt import mcp_server
+
+    _seed_oversized_tool_events()
+    mcp_server._MCP_AUTHORITY = None
+
+    payload = json.loads(mcp_server.memory_timeline(namespace="default", limit=50))
+    events = payload["events"]
+    recall_budget = payload["recall_budget"]
+
+    assert events, f"non-empty namespace returned no events: {recall_budget}"
+    assert len(json.dumps(events, ensure_ascii=False)) <= recall_budget["max_chars"]
+
+    # Identifiable: which row was cut (event rows key on `id`, not
+    # `memory_id`, which used to fill this list with None) and which field.
+    assert recall_budget["content_truncated_memory_ids"] == [events[0]["id"]]
+    assert events[0]["tool_output_truncated"] is True
+    assert events[0]["tool_output_omitted_chars"] > 0
+    assert "[truncated by haunt:" in events[0]["tool_output"]
+    # Sacrifice order: tool_output goes first, so the command that produced it
+    # survives byte-for-byte.
+    assert "tool_input_truncated" not in events[0]
+    assert len(events[0]["tool_input"]) == 12_000
+
+
+def test_memory_timeline_says_a_truncated_window_lost_its_oldest_events(
+    recall_budget_env,
+):
+    """events() is newest-first, so the budget's rank prefix drops the OLDEST
+    rows of the requested window. Without a signal, an audit query reads the
+    newest few as the whole window."""
+    from haunt import mcp_server
+
+    _seed_oversized_tool_events(rows=4)
+    mcp_server._MCP_AUTHORITY = None
+
+    payload = json.loads(mcp_server.memory_timeline(namespace="default", limit=50))
+    window = payload["window_truncated"]
+
+    assert window["reason"] == "recall_budget"
+    assert window["dropped_end"] == "oldest"
+    assert window["events_dropped"] == payload["recall_budget"]["hits_dropped"] > 0
+    assert window["oldest_returned"]["id"] == payload["events"][-1]["id"]
+    assert window["oldest_returned"]["event_time"]
+
+
+def _seed_ranked_namespaces(count: int = 8, rows: int = 10) -> str:
+    """One rank-ordered corpus per namespace, named so alphabetical collation
+    and rank order visibly disagree."""
+    from haunt.store import observe
+
+    token = "FANOUTBUDGETTOKEN"
+    for index in range(count):
+        name = f"fanout-{chr(ord('a') + index)}"
+        for i in range(rows):
+            observe(
+                f"{token} {_big_content(400, tag=f'{name}-{i}')}",
+                namespace=name,
+                role="user",
+                tier="episodic",
+            )
+    return token
+
+
+def test_all_namespace_recall_budget_cuts_by_rank_not_by_alphabet(
+    recall_budget_env, monkeypatch
+):
+    """The fan-out concatenated namespaces alphabetically before budgeting, so
+    apply_recall_budget's rank prefix was really a *namespace* prefix: late-
+    alphabet namespaces came back with empty hits, a successful execution and
+    no error -- indistinguishable from "nothing matched"."""
+    from tests.dashutil import make_dash_client
+
+    namespaces, rows = 8, 10
+    token = _seed_ranked_namespaces(namespaces, rows)
+    client = make_dash_client()
+    params = {"q": token, "k": rows}
+
+    # Calibrate off the real uncapped payload so the assertion does not rest
+    # on a hit's incidental serialized size.
+    monkeypatch.setenv(
+        "HAUNT_RECALL_MAX_CHARS", str(budget.RECALL_PAYLOAD_MAX_CHARS_MAX)
+    )
+    whole = client.get("/api/recall", params=params).json()
+    assert whole["recall_budget"]["hits_returned"] == namespaces * rows
+    monkeypatch.setenv(
+        "HAUNT_RECALL_MAX_CHARS",
+        str(len(json.dumps(whole["hits"], ensure_ascii=False)) // 2),
+    )
+
+    every = client.get("/api/recall", params=params).json()
+    recall_budget = every["recall_budget"]
+    groups = every["namespace_groups"]
+
+    assert recall_budget["hits_dropped"] > 0
+    # Every namespace that matched keeps at least its top-ranked hit: no
+    # namespace loses its #1 while another still ships its #7.
+    answered = [group["namespace"] for group in groups if group["hits"]]
+    assert len(answered) == namespaces, (
+        f"only {answered} survived the budget; the rest were cut for coming "
+        "later in the alphabet, not for ranking lower"
+    )
+    # A group the budget cut says so rather than reading as no matches.
+    assert all(group["hits_dropped"] >= 0 for group in groups)
+    assert any(group["hits_dropped"] for group in groups)
+    assert sum(group["hits_dropped"] for group in groups) == recall_budget["hits_dropped"]
+    for group in groups:
+        assert group["hits_available"] == len(group["hits"]) + group["hits_dropped"]
+    # `hits` still agrees with the groups it is flattened from.
+    assert [hit for group in groups for hit in group["hits"]] == every["hits"]
+
+
+# ---------------------------------------------------------------------------
+# HAUNT_RECALL_MAX_CHARS parsing (util.env_int, like HAUNT_TOOL_IO_MAX_CHARS)
 # ---------------------------------------------------------------------------
 
 
 def test_recall_payload_cap_env_var_parses_and_clamps(recall_budget_env, monkeypatch):
-    from haunt.mcp_server import (
+    from haunt.budget import (
         RECALL_PAYLOAD_MAX_CHARS_DEFAULT,
         RECALL_PAYLOAD_MAX_CHARS_MAX,
         RECALL_PAYLOAD_MAX_CHARS_MIN,
-        _recall_payload_cap,
+        recall_payload_cap,
     )
 
     monkeypatch.delenv("HAUNT_RECALL_MAX_CHARS", raising=False)
-    assert _recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_DEFAULT
+    assert recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_DEFAULT
 
     monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", "not-a-number")
-    assert _recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_DEFAULT
+    assert recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_DEFAULT
 
     monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", "0")
-    assert _recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_MIN
+    assert recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_MIN
 
     monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", "-5")
-    assert _recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_MIN
+    assert recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_MIN
 
     monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", "5000")
-    assert _recall_payload_cap() == 5000
+    assert recall_payload_cap() == 5000
 
     monkeypatch.setenv("HAUNT_RECALL_MAX_CHARS", "99999999")
-    assert _recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_MAX
+    assert recall_payload_cap() == RECALL_PAYLOAD_MAX_CHARS_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -1013,26 +1241,6 @@ def test_format_recall_block_drops_tail_and_marks_it_when_over_budget(
     unbounded = format_recall_block(hits, "myns")
     unbounded_lines = unbounded.splitlines()
     assert unbounded_lines[: 1 + len(hit_lines)] == block.splitlines()[: 1 + len(hit_lines)]
-
-
-@pytest.mark.parametrize("cap", [500, 501, 600, 700, 800, 1000, 1500, 2000, 4000])
-@pytest.mark.parametrize("n_hits", [5, 10, 20, 40, 80])
-def test_format_recall_block_marker_cost_never_pushes_block_over_cap(
-    monkeypatch, cap, n_hits
-):
-    """DEFECT 2 (fixed): the trailing drop-marker line used to be
-    appended unconditionally, uncounted against its own budget -- e.g.
-    cap=600 with 20 hits measured a 644-char block, 44 over. This is the
-    same shape of sweep the adversarial review used to find that (caps
-    500-4000, hit counts 5-80); it is now a permanent regression test
-    asserting the real invariant, len(block) <= cap, at every point.
-    """
-    from haunt.cursor_hook import format_recall_block
-
-    monkeypatch.setenv("HAUNT_RECALL_BLOCK_MAX_CHARS", str(cap))
-    hits = [_hit(i, content=_big_content(150, tag=f"tok{i}")) for i in range(n_hits)]
-    block = format_recall_block(hits, "myns")
-    assert len(block) <= cap
 
 
 def test_format_recall_block_never_renders_untrusted_hits_regardless_of_budget(
@@ -1122,18 +1330,12 @@ def test_format_recall_block_no_memories_path_respects_cap_even_when_header_fits
 def test_format_recall_block_marker_present_and_intact_whenever_hits_are_dropped(
     monkeypatch, cap, n_hits
 ):
-    """Distinct from test_format_recall_block_marker_cost_never_pushes_
-    block_over_cap above: that test (and this suite generally, before
-    this one) only ever checked the OUTER contract, len(block) <= cap.
-    An unconditional block[:cap] backstop independently satisfies that
-    contract even when the code that is supposed to reserve room for the
-    drop-count marker is wrong or missing entirely -- every test in this
-    file stayed green under exactly that mutation, because nothing
-    checked that the marker itself, not just the block's length, survived
-    intact. This asserts the actual claimed mechanism instead: whenever
-    format_recall_block reports an omission by dropping trailing hit
-    lines, the exact marker naming the correct dropped count must
-    actually be present, complete, and un-sliced in the returned block.
+    """Whenever trailing hit lines are dropped, the block must still fit
+    `cap` AND the exact drop-count marker must be present, complete and
+    un-sliced. Both halves matter: an unconditional block[:cap] backstop
+    satisfies the length bound on its own even with the marker's own budget
+    reservation missing entirely, so the outer bound alone cannot catch it.
+    Swept over the cap/hit-count grid that first exposed that defect.
     """
     from haunt.cursor_hook import _drop_marker, format_recall_block
 

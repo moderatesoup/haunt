@@ -52,7 +52,7 @@ Return the ordered correction chain from any surviving member, including source 
 
 ### `memory_purge`
 `memory_id`
-Hard-delete the memory and its provenance. Data is gone. MCP purge is disabled by default; use the confirmed CLI flow unless the operator explicitly enabled `HAUNT_MCP_ALLOW_PURGE=1`. Use contradict to supersede.
+Hard-delete the memory and its provenance. The freed pages are zeroed and the database file is rebuilt without them, so the text is no longer readable in it; copies outside it (exports, backups, filesystem snapshots) are untouched. MCP purge is disabled by default; use the confirmed CLI flow unless the operator explicitly enabled `HAUNT_MCP_ALLOW_PURGE=1`. Use contradict to supersede.
 
 ### `memory_timeline`
 optional `session`, `since`, `until`, `clock`, `limit`

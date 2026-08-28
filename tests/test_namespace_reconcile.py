@@ -35,6 +35,7 @@ import hashlib
 import shutil
 import sqlite3
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,7 @@ import haunt.store as store
 from haunt.cli import app
 from haunt.paths import registry_path
 from haunt.store import (
+    AliasRetirementError,
     NamespaceCollisionError,
     NamespaceMigrationError,
     SCHEMA_VERSION,
@@ -621,6 +623,98 @@ def test_target_backup_restores_pre_merge_state_after_live_mutation(reconcile_ho
     assert len(restored_ids) == len(original_ids)
 
 
+def test_target_backup_covers_every_row_the_merge_writes_onto(
+    reconcile_home, monkeypatch
+):
+    """A write racing the backup must not be merged-over but unbacked-up.
+
+    The lock reconcile takes only serializes migrations, not observe(), so a
+    live host keeps writing to TARGET throughout an apply. If the backup is
+    taken before the write transaction, a row landing in that window is in
+    the merged database and absent from the backup -- and the documented
+    recovery (restore from HAUNT_HOME/backups) silently discards it. The
+    invariant that closes the window: every TARGET row the merge reads is
+    covered by the backup taken for that merge.
+    """
+    register_namespace("race-src")
+    with Store("race-src") as st:
+        st.observe("source row to merge in")
+    register_namespace("race-dst")
+    with Store("race-dst") as st:
+        st.observe("dst row present before apply")
+
+    plan = reconcile_namespaces("race-src", "race-dst")
+    backed_up = threading.Event()
+    raced = threading.Event()
+    racing_id: list[str] = []
+    racing_error: list[BaseException] = []
+    # Opened up front so the thread contends only on the write itself, not
+    # on writer-open configuration.
+    racer_store = Store("race-dst", create=False)
+
+    def race_the_backup() -> None:
+        try:
+            assert backed_up.wait(timeout=30)
+            racing_id.append(racer_store.observe("write racing the merge").memory_id)
+        except BaseException as exc:  # reported by the assertions below
+            racing_error.append(exc)
+        finally:
+            raced.set()
+
+    real_backup = store._backup_namespace_database
+
+    def backup_then_yield(store_obj, *, purpose):
+        backup = real_backup(store_obj, purpose=purpose)
+        if purpose == "reconcile-target":
+            backed_up.set()
+            # Returns immediately when the racing write can proceed; times
+            # out when the transaction correctly holds it off until commit.
+            raced.wait(timeout=2.0)
+        return backup
+
+    real_execute = store._execute_reconciliation_writes
+    merged_over: set[str] = set()
+
+    def capture_target_rows(source_conn, target_conn, **kwargs):
+        merged_over.update(
+            str(row[0])
+            for row in target_conn.execute("SELECT id FROM memories").fetchall()
+        )
+        return real_execute(source_conn, target_conn, **kwargs)
+
+    monkeypatch.setattr(store, "_backup_namespace_database", backup_then_yield)
+    monkeypatch.setattr(store, "_execute_reconciliation_writes", capture_target_rows)
+    thread = threading.Thread(target=race_the_backup)
+    thread.start()
+    try:
+        applied = reconcile_namespaces(
+            "race-src", "race-dst", apply=True, plan_digest=plan["plan_digest"]
+        )
+    finally:
+        backed_up.set()
+        thread.join(timeout=30)
+        racer_store.close()
+
+    assert not racing_error, f"racing write failed outright: {racing_error!r}"
+    assert racing_id, "fixture assumption: the racing write must actually land"
+
+    backup_conn = sqlite3.connect(
+        f"{Path(applied['target_backup']['path']).as_uri()}?mode=ro&immutable=1", uri=True
+    )
+    backed_up_ids = {
+        str(row[0]) for row in backup_conn.execute("SELECT id FROM memories").fetchall()
+    }
+    backup_conn.close()
+
+    assert merged_over, "fixture assumption: the merge must read TARGET's own rows"
+    assert merged_over <= backed_up_ids, (
+        "the merge wrote on top of rows the target backup does not contain; "
+        "restoring that backup would discard them"
+    )
+    with Store("race-dst", create=False) as st:
+        assert st.get_memory(racing_id[0]) is not None, "the racing write must survive"
+
+
 def test_backup_failure_leaves_target_completely_unchanged(reconcile_home, monkeypatch):
     register_namespace("bfail-src")
     with Store("bfail-src") as st:
@@ -663,10 +757,10 @@ def test_write_failure_mid_transaction_rolls_back_target_completely(
 
     real_execute = store._execute_reconciliation_writes
 
-    def flaky_execute(source_conn, target_conn):
+    def flaky_execute(source_conn, target_conn, **kwargs):
         # Let the fresh in-transaction diff run, then blow up before it
         # returns so the caller's rollback path is exercised for real.
-        real_execute(source_conn, target_conn)
+        real_execute(source_conn, target_conn, **kwargs)
         raise RuntimeError("simulated mid-write failure")
 
     monkeypatch.setattr(store, "_execute_reconciliation_writes", flaky_execute)
@@ -1394,3 +1488,184 @@ def test_relations_rows_actually_round_trip(reconcile_home):
 
     assert src_rows <= dst_rows, "every source relation must survive the merge"
     assert dst_after == dst_before + len(src_rows)
+
+
+# ---------------------------------------------------------------------------
+# Retiring the drained namespace: the operator step reconcile leaves undone.
+# ---------------------------------------------------------------------------
+
+
+def test_retire_refuses_a_namespace_that_is_not_drained(reconcile_home):
+    register_namespace("keep-src")
+    with Store("keep-src") as st:
+        st.observe("row that only the source has")
+    register_namespace("keep-dst")
+    with Store("keep-dst") as st:
+        st.observe("unrelated dst row")
+
+    report = store.retire_namespace("keep-src", into="keep-dst")
+    assert report["safe"] is False
+    assert [b["kind"] for b in report["blockers"]] == ["undrained-rows"]
+    assert report["undrained_rows"]["memories"] == 1
+
+    with pytest.raises(AliasRetirementError, match="undrained-rows"):
+        store.retire_namespace("keep-src", into="keep-dst", apply=True)
+
+    assert store.namespace_exists("keep-src")
+    assert _db_path(reconcile_home, "keep-src").exists()
+
+
+def test_retire_after_reconcile_deregisters_and_removes_the_database(reconcile_home):
+    """The commit message's own final operator step, with a command behind it."""
+    register_namespace("drain-src")
+    with Store("drain-src") as st:
+        source_ids = [st.observe(f"drained row {i}").memory_id for i in range(3)]
+    register_namespace("drain-dst")
+    with Store("drain-dst") as st:
+        st.observe("dst row")
+
+    _plan_and_apply("drain-src", "drain-dst")
+    dry = store.retire_namespace("drain-src", into="drain-dst")
+    assert dry["safe"] is True
+    assert dry["undrained_rows"] == {}
+    assert dry["labels"] == ["drain-src"]
+    assert store.namespace_exists("drain-src"), "dry-run must not deregister"
+
+    applied = store.retire_namespace("drain-src", into="drain-dst", apply=True)
+    assert applied["retired"] is True
+    assert applied["stranded_rows"] == {}
+    assert applied["database_removed"] is True
+
+    assert not store.namespace_exists("drain-src")
+    assert not _db_path(reconcile_home, "drain-src").exists()
+    with pytest.raises(UnknownNamespaceError):
+        store.open_existing_readonly("drain-src")
+
+    backup = Path(applied["backup"]["path"])
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == applied["backup"]["sha256"]
+    check = sqlite3.connect(f"{backup.as_uri()}?mode=ro&immutable=1", uri=True)
+    backup_ids = {row[0] for row in check.execute("SELECT id FROM memories").fetchall()}
+    check.close()
+    assert backup_ids == set(source_ids), "the removed database must be recoverable"
+
+    # The reconciled content is untouched, and the drained label is free again.
+    with Store("drain-dst", create=False) as st:
+        assert st.stats()["memories"] == len(source_ids) + 1
+    register_namespace("drain-src")
+    with Store("drain-src", create=False) as st:
+        assert st.stats()["memories"] == 0, "a retired label must not re-adopt a file"
+
+
+def test_cli_retire_defaults_to_dry_run(reconcile_home):
+    register_namespace("clir-src")
+    with Store("clir-src") as st:
+        st.observe("clir src content")
+    register_namespace("clir-dst")
+    with Store("clir-dst") as st:
+        st.observe("clir dst content")
+    _plan_and_apply("clir-src", "clir-dst")
+
+    runner = CliRunner()
+    dry = runner.invoke(app, ["namespace", "retire", "clir-src", "--into", "clir-dst"])
+    assert dry.exit_code == 0, dry.output
+    assert '"mode": "dry-run"' in dry.output
+    assert store.namespace_exists("clir-src")
+
+    applied = runner.invoke(
+        app, ["namespace", "retire", "clir-src", "--into", "clir-dst", "--apply"]
+    )
+    assert applied.exit_code == 0, applied.output
+    assert '"retired": true' in applied.output
+    assert not store.namespace_exists("clir-src")
+
+    blocked = runner.invoke(
+        app, ["namespace", "retire", "clir-dst", "--into", "clir-src"]
+    )
+    assert blocked.exit_code == 2
+    assert "error:" in blocked.output
+
+
+def test_retire_backup_failure_leaves_the_namespace_registered(
+    reconcile_home, monkeypatch
+):
+    """A failed backup must not leave the label gone and the file orphaned.
+
+    Deregistration used to commit first, so a backup failure retired the
+    label, discarded the report, and left the operator with no output naming
+    the database that survived at its own path.
+    """
+    register_namespace("bufail-src")
+    with Store("bufail-src") as st:
+        st.observe("drained row")
+    register_namespace("bufail-dst")
+    with Store("bufail-dst") as st:
+        st.observe("dst row")
+    _plan_and_apply("bufail-src", "bufail-dst")
+
+    real_backup = store._backup_namespace_database
+
+    def fail_backup(store_obj, *, purpose):
+        raise NamespaceMigrationError(f"forced {purpose} backup failure")
+
+    monkeypatch.setattr(store, "_backup_namespace_database", fail_backup)
+    with pytest.raises(NamespaceMigrationError, match="forced retire"):
+        store.retire_namespace("bufail-src", into="bufail-dst", apply=True)
+
+    assert store.namespace_exists("bufail-src"), (
+        "a failed backup must not deregister the namespace"
+    )
+    assert _db_path(reconcile_home, "bufail-src").exists()
+    ro = store.open_existing_readonly("bufail-src")
+    try:
+        assert ro.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    finally:
+        ro.close()
+
+    # And the operation still completes once the backup can be taken.
+    monkeypatch.setattr(store, "_backup_namespace_database", real_backup)
+    applied = store.retire_namespace("bufail-src", into="bufail-dst", apply=True)
+    assert applied["retired"] is True
+    assert applied["database_removed"] is True
+
+
+def test_namespace_backup_carries_rows_that_are_still_only_in_the_wal(reconcile_home):
+    """A backup taken while a writer holds uncheckpointed frames is complete.
+
+    Databases run journal_mode=WAL and the backup is a byte copy of a main
+    file, so this is the case where committed rows could silently go missing.
+    They do not: open_existing_readonly copies main and -wal into a private
+    shadow and checkpoints *that* before opening it, so the file the backup
+    copies is already materialized.
+    """
+    register_namespace("walbackup")
+    canary = b"walonlycanaryf3k8"
+    with Store("walbackup") as st:
+        st.observe(f"committed row {canary.decode()}")
+        db_path = _db_path(reconcile_home, "walbackup")
+        assert canary not in db_path.read_bytes(), (
+            "fixture assumption: the row must still be WAL-only"
+        )
+        assert canary in Path(f"{db_path}-wal").read_bytes()
+
+        ro = store.open_existing_readonly("walbackup")
+        try:
+            backup = store._backup_namespace_database(ro, purpose="waltest")
+        finally:
+            ro.close()
+
+    try:
+        assert backup["integrity"] == "ok"
+        copied = sqlite3.connect(
+            f"{Path(backup['path']).as_uri()}?mode=ro&immutable=1", uri=True
+        )
+        try:
+            found = copied.execute(
+                "SELECT COUNT(*) FROM memories WHERE content LIKE ?",
+                (f"%{canary.decode()}%",),
+            ).fetchone()[0]
+        finally:
+            copied.close()
+        assert found == 1, "the backup dropped a committed row that lived in the WAL"
+    finally:
+        backup.close()

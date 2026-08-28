@@ -2,7 +2,11 @@
 
 ## Architecture
 
-haunt is **local-only**. All data (SQLite databases, embeddings, models) stays on your machine under `~/.haunt/` (or `$HAUNT_HOME`). haunt never phones home, never opens a port (except the optional local dashboard on 127.0.0.1), and never sends data to any remote service. The only network call is the one-time model download from Hugging Face during `haunt bootstrap`.
+haunt is **local-only**. All data (SQLite databases, embeddings, models) stays on your machine under `~/.haunt/` (or `$HAUNT_HOME`). haunt never phones home and never sends data to any remote service.
+
+It listens on a port only for the optional memory console: `haunt dash`, loopback by default and beyond loopback only under the explicit `--allow-remote` (see below).
+
+The one outbound call is the embedding-model download from Hugging Face. Normally that is once, during `haunt bootstrap` — but it is lazy, not bootstrap-only: any command that needs the model will fetch it, including a plain `haunt recall` on a machine where bootstrap was skipped. `HAUNT_FTS_ONLY=1` (or `HAUNT_EMBED_MODEL=off`) and `HAUNT_OFFLINE=1` prevent it entirely.
 
 ## Dashboard bind, Host, Origin, and launch token
 
@@ -13,6 +17,8 @@ haunt is **local-only**. All data (SQLite databases, embeddings, models) stays o
 - Loopback bind (default 127.0.0.1) injects the token into the console HTML so the local UI works. **`--allow-remote` / a non-loopback bind does not embed the token in HTML.** GET `/` with a trusted Host is not enough to obtain `X-Haunt-Token`. The token is printed only on `haunt dash` stdout for the operator who launched it.
 - Cookie-less mutation routes (`DELETE` memory, `POST` contradict) also validate `Origin` when present. Same-origin and missing-Origin local TestClient requests still work. Cross-origin form posts are rejected.
 - `haunt dash` mints a random launch token at start and prints it. `--allow-remote` without that token configured refuses to start (or every `/api` route returns 401).
+- `GET /` carries a per-response `Content-Security-Policy` whose `script-src` is a nonce on the single inline `<script>`. The console has no inline event handlers (clicks are delegated off `data-act`), so `script-src` never needs `'unsafe-inline'`. `style-src` does allow inline styles: a nonce cannot cover `style=` attributes, and styles are not an execution vector under `default-src 'none'`. Every other response carries `default-src 'none'` and `nosniff`.
+- Stored values are escaped at every point the console writes them into `innerHTML`. That is defence in depth, not the only gate — see import validation below.
 - **`--allow-remote` is unsafe without the token.** It exposes the local memory admin API on the network. Anyone who has the token can read and mutate every namespace. **Namespaces are still not authorization** — see below.
 
 Do not add Docker, Postgres, or HTTP team-tier auth. This is a local-first console.
@@ -21,6 +27,11 @@ The canonical export download is covered by the same token gate. Dashboard
 import is an administrative mutation and additionally requires a trusted
 `Origin`, an accepted JSON media type, and a bounded body. The HTML console has
 no import/paste control in v1; callers use the authenticated API deliberately.
+
+Import also validates the enumerated columns the destination schema cannot police —
+`events.tier`, `memories.tier`, `entities.type` are plain TEXT with no CHECK
+constraint. A bundle carrying a value outside those vocabularies is rejected before
+any destination database is touched.
 
 ## Secret redaction
 
@@ -50,6 +61,32 @@ digest, device, and inode ownership; replacement links fail closed.
 MCP export/import therefore require `HAUNT_MCP_ADMIN=1`; the dashboard launch
 token similarly grants administrative transfer access to every namespace.
 
+## Hard purge and byte-level erasure
+
+Hard purge does not stop at unlinking rows. It runs the erasure with
+`secure_delete` on so the pages it frees are zeroed, merges the FTS index so the
+erased terms go with the row instead of lingering as delete markers, rebuilds
+the database file so no free page keeps an older copy the row left behind, and
+truncates the WAL so the pre-purge frames go too. A canary planted before a
+purge is absent from the namespace file and its sidecars afterwards.
+
+The report's `bytes_overwritten` is the honest signal: it is false when a
+concurrent reader blocked the rebuild. What this purge freed is zeroed either
+way; the older copies stay readable until a later purge rebuilds the file.
+
+This covers Haunt's own file, and nothing else. Export bundles, backups,
+filesystem snapshots, and any copy someone already made are untouched — purge
+one namespace and its bundles remain. Nor does it reach blocks the filesystem
+has already released: truncation, copy-on-write snapshots, and SSD
+wear-levelling can leave the original blocks intact on the physical device.
+Full-disk encryption, not purge, is the answer to an attacker with the raw
+device.
+
+The rebuild is proportional to the namespace, not to the erased row, so a purge
+on a large namespace is slow. `secure_delete` is scoped to the purge
+transaction rather than left on globally, so ordinary writes do not pay its
+write amplification.
+
 ## Persistent recalled content and prompt injection
 
 Stored text is untrusted data. In particular, tool input/output can contain hostile instructions copied from files, web pages, command output, or another MCP server.
@@ -77,7 +114,9 @@ is reported honestly as not run.
 
 ## Fail-open hooks
 
-Cursor hooks are **fail-open**: if a hook errors, it prints `{}` and exits 0. A hook will never block your agent or prevent a prompt from being submitted. This is a deliberate trade-off — reliability of the agent takes priority over memory completeness.
+Cursor hooks are **fail-open**: if a hook errors, it prints `{}` and exits 0, so a hook *error* never blocks your agent or prevents a prompt from being submitted. This is a deliberate trade-off — reliability of the agent takes priority over memory completeness.
+
+Fail-open covers errors, not hangs: haunt sets no timeout of its own, so a hook that blocks (a contended SQLite lock, a slow disk) holds the turn until the host's own hook timeout fires.
 
 ## File-per-namespace isolation
 

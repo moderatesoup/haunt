@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
 
 from tests.dashutil import TEST_DASH_TOKEN
 
-MODEL_CACHE = Path("/workspace/lore/.model-cache")
+
+@lru_cache(maxsize=1)
+def _host_model_cache() -> Path | None:
+    """The model cache this host already has, resolved from the real environment.
+
+    Must be read before `haunt_env` repoints HAUNT_HOME, because `models_dir()`
+    follows HAUNT_HOME: unpinned, every test that embeds re-downloads the model
+    into a tmp directory pytest then deletes. An explicit HAUNT_MODEL_CACHE is
+    taken as given; the derived default (`~/.haunt/models` unless the host set
+    HAUNT_HOME) only counts when it already holds something.
+    """
+    from haunt.paths import models_dir
+
+    cache = models_dir()
+    if os.environ.get("HAUNT_MODEL_CACHE"):
+        return cache
+    if cache.is_dir() and any(cache.iterdir()):
+        return cache
+    return None
 
 
 @pytest.fixture(autouse=True)
@@ -35,13 +54,23 @@ def isolate_host_homes(tmp_path, monkeypatch):
 
 @pytest.fixture
 def haunt_env(tmp_path, monkeypatch):
+    """Isolated HAUNT_HOME reusing the host model cache.
+
+    HAUNT_FTS_ONLY and HAUNT_EMBED_MODEL are left alone when the caller set
+    them: CI runs the suite with HAUNT_FTS_ONLY=1, and clearing it here would
+    make that run exercise the embedding path it claims to skip. With neither
+    set the run is still correct, only slower.
+    """
+    model_cache = _host_model_cache()
     home = tmp_path / "haunthome"
     monkeypatch.setenv("HAUNT_HOME", str(home))
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
-    monkeypatch.delenv("HAUNT_FTS_ONLY", raising=False)
-    if MODEL_CACHE.exists():
-        monkeypatch.setenv("HAUNT_MODEL_CACHE", str(MODEL_CACHE))
-    monkeypatch.setenv("HAUNT_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+    if model_cache is not None:
+        monkeypatch.setenv("HAUNT_MODEL_CACHE", str(model_cache))
+    if not os.environ.get("HAUNT_EMBED_MODEL"):
+        # Smallest model that still exercises the vector path. The bge-m3
+        # default is 2.1 GB.
+        monkeypatch.setenv("HAUNT_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
     from haunt import embed
     from haunt.bootstrap import bootstrap
     from haunt.paths import ensure_layout

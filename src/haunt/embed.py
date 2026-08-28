@@ -3,7 +3,8 @@
 Never calls a remote LLM or embedding API. Never fakes vectors.
 
 Load order when HAUNT_EMBED_MODEL is BAAI/bge-m3 (the default):
-  1. Local ONNX under ~/.haunt/models (or $HAUNT_MODEL_CACHE)
+  1. Local ONNX under ~/.haunt/models (or $HAUNT_MODEL_CACHE), verified
+     against the committed artifact manifest before onnxruntime sees it
   2. Download BAAI/bge-m3 ONNX + tokenizer from Hugging Face
   3. Newer fastembed if it lists BAAI/bge-m3
   4. BAAI/bge-small-en-v1.5 via fastembed (384-d) — automatic fallback
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from haunt.paths import models_dir
-from haunt.util import diag
+from haunt.util import diag, dumps, env_flag, env_int, loads
 
 DEFAULT_REQUESTED = "BAAI/bge-m3"
 FALLBACK_MODEL = "BAAI/bge-small-en-v1.5"
@@ -37,12 +38,31 @@ BGE_M3_PATTERNS = [
     "onnx/tokenizer_config.json",
     "onnx/config.json",
 ]
+# The revision whose onnx/ file sizes and SHA-256s are the ones in
+# tests/fixtures/abstention_eval/v1/hybrid-model-manifest.json, which
+# abstention_eval.verify_local_hybrid_cache enforces byte for byte.
+BGE_M3_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 BGE_M3_QUANT_REPO = "onnx-community/bge-m3-ONNX"
+# No committed manifest covers this variant -- the hybrid manifest's
+# variant_policy forbids it -- so this pin is its only identity.
+BGE_M3_QUANT_REVISION = "25b9af8e87a38eb120cfe87125383677b9cd309e"
 BGE_M3_QUANT_PATTERNS = [
     "onnx/model_quantized.onnx",
     "tokenizer.json",
     "tokenizer_config.json",
 ]
+BGE_M3_SOURCE_FILE = "haunt-model-source.json"
+# Files at or below this size are hashed in full against the committed
+# manifest on every load (graph, tokenizer, configs -- about 18MB together).
+# The one file above it is model.onnx_data, 2.2GB of external tensors that
+# cost seconds to hash and that cannot change the graph onnxruntime runs; it
+# is checked by exact size instead. verify_local_hybrid_cache with no cap
+# still hashes it, which is what the E6 harness does.
+VERIFY_HASH_MAX_BYTES = 64 * 1024 * 1024
+# Rows per ONNX forward pass. Throughput peaks between 16 and 32 on the
+# corpus this was measured against and falls off above that; the smaller of
+# the two flat values also bounds peak activation memory.
+ONNX_SUB_BATCH = 16
 
 _lock = threading.Lock()
 _state: "EmbedState | None" = None
@@ -66,8 +86,7 @@ def _env_model() -> str:
 
 
 def fts_only() -> bool:
-    fts_env = (os.environ.get("HAUNT_FTS_ONLY") or "").strip()
-    if fts_env in {"1", "true", "yes"}:
+    if env_flag("HAUNT_FTS_ONLY"):
         return True
     model = _env_model().lower()
     return model in {"off", "none", "fts", "fts5", "disabled"}
@@ -75,20 +94,11 @@ def fts_only() -> bool:
 
 def offline() -> bool:
     """True when Haunt must not initialize/download a model or use sockets."""
-    return (os.environ.get("HAUNT_OFFLINE") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    return env_flag("HAUNT_OFFLINE")
 
 
 def _max_len() -> int:
-    raw = (os.environ.get("HAUNT_EMBED_MAX_LEN") or "512").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        return 512
-    return max(8, min(n, 8192))
+    return env_int("HAUNT_EMBED_MAX_LEN", default=512, lo=8, hi=8192)
 
 
 def _supported_fastembed() -> dict[str, int]:
@@ -156,6 +166,96 @@ def _local_bge_m3_ready(root: Path | None = None) -> Path | None:
     return None
 
 
+def _quant_fallback_enabled() -> bool:
+    """Opt in to the third-party quantized repo when the official one is gone."""
+    return env_flag("HAUNT_EMBED_QUANT_FALLBACK")
+
+
+def _repo_unavailable_errors() -> tuple[type[BaseException], ...]:
+    """Hub errors meaning the pinned repo/revision itself cannot be had.
+
+    Deliberately excludes timeouts, 5xx, DNS and disk errors. Empty when
+    huggingface_hub is too old to expose any of them by name.
+    """
+    try:
+        from huggingface_hub import errors
+    except ImportError:
+        try:
+            from huggingface_hub import utils as errors  # type: ignore[no-redef]
+        except ImportError:
+            return ()
+    found = (
+        getattr(errors, name, None)
+        for name in (
+            "RepositoryNotFoundError",
+            "RevisionNotFoundError",
+            "EntryNotFoundError",
+            "GatedRepoError",
+        )
+    )
+    return tuple(cls for cls in found if isinstance(cls, type))
+
+
+def _record_bge_m3_source(root: Path, repo_id: str, revision: str) -> None:
+    """Record which repo produced these bytes. Best effort; never raises."""
+    try:
+        (root / BGE_M3_SOURCE_FILE).write_text(
+            dumps({"repo_id": repo_id, "revision": revision}), encoding="utf-8"
+        )
+    except OSError as exc:
+        diag("embed_m3_source_unrecorded", error=str(exc))
+
+
+def bge_m3_source(root: Path | None = None) -> dict[str, str] | None:
+    """Repo and revision the cached BGE-M3 came from, or None if unrecorded."""
+    marker = (root or _bge_m3_dir()) / BGE_M3_SOURCE_FILE
+    try:
+        value = loads(marker.read_text(encoding="utf-8"), default={})
+    except OSError:
+        return None
+    return value if isinstance(value, dict) and value else None
+
+
+def _verify_bge_m3_cache(root: Path) -> None:
+    """Require the cached BGE-M3 bytes to match the committed manifest.
+
+    Raises RuntimeError on any mismatch, which drops the caller back to the
+    fastembed fallback rather than executing an unattested graph. Skipped --
+    with a diag each time, never silently -- when the operator opted into the
+    quantized variant no committed manifest covers, when the manifest is not
+    reachable (it ships with the repo, not with the wheel), or when
+    HAUNT_EMBED_SKIP_MODEL_VERIFY is set for a deliberately hand-placed model.
+    """
+    if env_flag("HAUNT_EMBED_SKIP_MODEL_VERIFY"):
+        diag("embed_m3_unverified", reason="HAUNT_EMBED_SKIP_MODEL_VERIFY")
+        return
+    onnx_path = _find_onnx(root)
+    quantized = onnx_path is not None and "quantized" in onnx_path.name
+    # Quantized files alone would be an easy way to dodge a check no committed
+    # manifest can make, so the opt-in that is the only legitimate way to obtain
+    # them has to be set too; without it the manifest rejects them by name.
+    if quantized and _quant_fallback_enabled():
+        diag("embed_m3_unverified", reason="quantized variant has no manifest")
+        return
+    # abstention_eval imports this module, so the import has to be deferred.
+    from haunt.abstention_eval import verify_local_hybrid_cache
+
+    try:
+        evidence = verify_local_hybrid_cache(
+            root.parent, hash_max_bytes=VERIFY_HASH_MAX_BYTES
+        )
+    except FileNotFoundError as exc:
+        diag("embed_m3_unverified", reason="manifest not installed", error=str(exc))
+        return
+    diag(
+        "embed_m3_verified",
+        manifest_id=evidence["matched_manifest_id"],
+        size_only=[
+            row["relative_path"] for row in evidence["files"] if row["sha256"] is None
+        ],
+    )
+
+
 def _download_bge_m3(root: Path) -> Path:
     """Download official BGE-M3 ONNX (+ tokenizer) into root. Local files only after this."""
     if offline():
@@ -166,24 +266,32 @@ def _download_bge_m3(root: Path) -> Path:
     try:
         snapshot_download(
             repo_id=BGE_M3_ID,
+            revision=BGE_M3_REVISION,
             local_dir=str(root),
             allow_patterns=BGE_M3_PATTERNS,
         )
+    except _repo_unavailable_errors() as exc:
+        official_exc: Exception = exc
+    else:
         if _local_bge_m3_ready(root):
+            _record_bge_m3_source(root, BGE_M3_ID, BGE_M3_REVISION)
             return root
-        raise RuntimeError("BAAI/bge-m3 ONNX files missing after download")
-    except Exception as official_exc:
-        diag("embed_m3_official_failed", error=str(official_exc))
-        snapshot_download(
-            repo_id=BGE_M3_QUANT_REPO,
-            local_dir=str(root),
-            allow_patterns=BGE_M3_QUANT_PATTERNS,
-        )
-        if _local_bge_m3_ready(root):
-            return root
-        raise RuntimeError(
-            f"BGE-M3 ONNX download failed (official: {official_exc})"
-        )
+        official_exc = RuntimeError("BAAI/bge-m3 ONNX files missing after download")
+    # onnxruntime executes whatever graph lands here, so switching publishers
+    # is a decision, not a retry.
+    if not _quant_fallback_enabled():
+        raise official_exc
+    diag("embed_m3_official_unavailable", error=str(official_exc))
+    snapshot_download(
+        repo_id=BGE_M3_QUANT_REPO,
+        revision=BGE_M3_QUANT_REVISION,
+        local_dir=str(root),
+        allow_patterns=BGE_M3_QUANT_PATTERNS,
+    )
+    if _local_bge_m3_ready(root) is None:
+        raise RuntimeError(f"BGE-M3 ONNX download failed (official: {official_exc})")
+    _record_bge_m3_source(root, BGE_M3_QUANT_REPO, BGE_M3_QUANT_REVISION)
+    return root
 
 
 class OnnxEmbedder:
@@ -226,13 +334,52 @@ class OnnxEmbedder:
             raise RuntimeError("ONNX embedder produced an empty vector")
 
     def embed(self, texts: Iterable[str]) -> list[list[float]]:
+        """Embed texts, returning one vector per input in the input's order.
+
+        Inputs are regrouped by token length internally, so the order the
+        model sees is not the order given here; the returned list is always
+        realigned to the caller's. Raises RuntimeError if the model answers a
+        batch with a different number of vectors than it was given, rather
+        than returning a list with holes in it.
+        """
         batch = [t if (t or "").strip() else " " for t in texts]
         if not batch:
             return []
-        encs = self.tok.encode_batch(batch)
         np = self._np
+        encs = self.tok.encode_batch(batch)
         input_ids = np.array([e.ids for e in encs], dtype=np.int64)
         attention_mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
+        lengths = attention_mask.sum(axis=1)
+        # encode_batch pads every row out to the longest row it was given, so a
+        # single truncation-length text makes the model compute those columns
+        # for all of its batch-mates. Grouping similar lengths and trimming
+        # each group to its own width removes that work. Padding is on the
+        # right, so the trim can only drop pad columns, and a masked position
+        # cannot reach the pooled vector -- the numbers are unchanged.
+        order = np.argsort(lengths, kind="stable")
+        out: list[list[float]] = [[] for _ in batch]
+        for start in range(0, len(order), ONNX_SUB_BATCH):
+            rows = order[start : start + ONNX_SUB_BATCH]
+            width = max(1, int(lengths[rows].max()))
+            hidden = self._forward(
+                input_ids[rows, :width], attention_mask[rows, :width]
+            )
+            # out is pre-sized, so a short batch would leave [] holes that a
+            # positional zip cannot detect and that surface far from here --
+            # as a dimension-0 insert, or as a falsy query vector that skips
+            # vector search. The batch that dropped rows is known only here.
+            if len(hidden) != len(rows):
+                raise RuntimeError(
+                    f"ONNX model returned {len(hidden)} vectors for a batch "
+                    f"of {len(rows)}"
+                )
+            for row, vec in zip(rows, hidden):
+                out[int(row)] = [float(x) for x in vec]
+        return out
+
+    def _forward(self, input_ids: Any, attention_mask: Any) -> Any:
+        """Run one padded batch and return its pooled hidden states."""
+        np = self._np
         feeds: dict[str, Any] = {}
         if "input_ids" in self.input_names:
             feeds["input_ids"] = input_ids
@@ -261,10 +408,7 @@ class OnnxEmbedder:
             raise RuntimeError("ONNX session returned no embedding output")
         if hidden.ndim == 3:
             hidden = hidden[:, 0, :]
-        out: list[list[float]] = []
-        for row in hidden:
-            out.append([float(x) for x in row])
-        return out
+        return hidden
 
 
 def _load_onnx_bge_m3() -> tuple[OnnxEmbedder, int]:
@@ -275,6 +419,9 @@ def _load_onnx_bge_m3() -> tuple[OnnxEmbedder, int]:
     ready = _local_bge_m3_ready(root)
     if ready is None:
         raise RuntimeError(f"BGE-M3 ONNX not ready at {root}")
+    # Before onnxruntime is handed the graph: the source marker is written by
+    # whoever wrote the cache, so it attests nothing on its own.
+    _verify_bge_m3_cache(ready)
     model = OnnxEmbedder(ready)
     return model, _dir_bytes(ready)
 

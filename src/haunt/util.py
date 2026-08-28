@@ -1,10 +1,11 @@
-"""Shared helpers: ids, timestamps, diagnostics. No I/O beyond stderr."""
+"""Shared helpers: ids, timestamps, env bounds, diagnostics. No I/O beyond stderr."""
 
 from __future__ import annotations
 
 import base64
 import json
 import math
+import os
 import sys
 import unicodedata
 import uuid
@@ -14,6 +15,23 @@ from typing import Any
 
 def new_id() -> str:
     return str(uuid.uuid4())
+
+
+def env_int(name: str, *, default: int, lo: int, hi: int) -> int:
+    """One env var as an int, `default` on anything unparsable, clamped
+    into [lo, hi] so a typo can never disable the bound it was setting."""
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(lo, min(value, hi))
+
+
+def env_flag(name: str) -> bool:
+    """One env var as a boolean: "1"/"true"/"yes" (case-insensitive) is on,
+    anything else -- unset, empty, "false", garbage -- is off."""
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes"}
 
 
 K_MIN = 1
