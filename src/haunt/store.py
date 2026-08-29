@@ -28,6 +28,7 @@ from haunt.paths import (
     _descriptor_identities as _fd_snapshot,
     _forget_registered_alias,
     _git_repo_context,
+    disambiguate_namespace_label,
     ensure_layout,
     haunt_home,
     materialize_sqlite_shadow,
@@ -355,6 +356,22 @@ class UnknownNamespaceError(ValueError):
 
 class NamespaceCollisionError(ValueError):
     """Raised when a label, repository, or target file belongs elsewhere."""
+
+
+class _NamespaceOwnedElsewhere(Exception):
+    """Internal signal: the label being published belongs to another repository.
+
+    Raised inside the publishing transaction so its rollback path runs, and
+    always handled by _register_namespace_once_with_configuration_lock(). It
+    never reaches a caller.
+    """
+
+    def __init__(self, label: str, owner: str) -> None:
+        self.label = label
+        self.owner = owner
+        super().__init__(
+            f"namespace {label!r} is already bound to repository {owner!r}"
+        )
 
 
 class AliasRetirementError(ValueError):
@@ -2190,6 +2207,67 @@ def resolve_namespace_id(namespace_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _foreign_repository_owner(
+    conn: sqlite3.Connection,
+    *,
+    namespace_id: str,
+    db_path: str,
+    repo_identity: str | None,
+    repo_path: str | None,
+) -> str | None:
+    """Name the repository already owning this namespace, if it is not the caller.
+
+    Returns ``None`` when the namespace is unowned, when the caller owns it,
+    or when the caller names no repository at all -- an explicitly selected
+    label (``HAUNT_NAMESPACE``, ``haunt init NAME``) asserts no ownership and
+    so is never refused here.
+
+    A blank ``repo_path`` names no repository, so it is never evidence of
+    another owner: that is the rule _registered_namespace_for_repo() applies
+    in paths.py, for the same reason. Must be called inside the publishing
+    transaction -- read outside it, the answer is a snapshot another writer
+    can invalidate before the binding lands.
+    """
+    if not repo_identity and not repo_path:
+        return None
+    bindings = conn.execute(
+        "SELECT repository_identity,repo_path FROM repository_bindings WHERE namespace_id=?",
+        (namespace_id,),
+    ).fetchall()
+    bound: list[str] = []
+    for binding in bindings:
+        bound_identity = str(binding["repository_identity"] or "").strip() or None
+        bound_path = str(binding["repo_path"] or "").strip() or None
+        if repo_identity and bound_identity == repo_identity:
+            return None
+        if repo_path and bound_path == repo_path:
+            return None
+        if bound_identity or bound_path:
+            bound.append(str(bound_identity or bound_path))
+    if bound:
+        return bound[0]
+    # Registrations that predate repository_bindings recorded the repository
+    # only on `namespaces`, and those rows are still an ownership claim.
+    owner: str | None = None
+    for row in conn.execute(
+        "SELECT repo_path FROM namespaces WHERE db_path=?", (db_path,)
+    ).fetchall():
+        stored = str(row["repo_path"] or "").strip()
+        if not stored:
+            continue
+        stored_identity = repository_identity(stored)
+        if repo_identity and stored_identity == repo_identity:
+            return None
+        if repo_path and stored_identity is None:
+            try:
+                if str(Path(stored).expanduser().resolve()) == repo_path:
+                    return None
+            except OSError:
+                pass
+        owner = owner or stored
+    return owner
+
+
 def _bind_repository(
     conn: sqlite3.Connection,
     *,
@@ -2243,19 +2321,56 @@ def _bind_repository(
     )
 
 
-def _register_namespace_once(name: str, repo_path: str | None = None) -> Path:
+def _register_namespace_once(
+    name: str, repo_path: str | None = None
+) -> tuple[str, Path]:
     """Run one complete registry/namespace publication under one writer lock."""
     with _sqlite_configuration_lock():
         return _register_namespace_once_with_configuration_lock(name, repo_path)
 
 
+def _registration_candidates(label: str, discriminator: str | None) -> list[str]:
+    """The labels to publish under, in order: the requested one, then its fork."""
+    if not discriminator:
+        return [label]
+    forked = disambiguate_namespace_label(label, discriminator)
+    return [label] if forked == label else [label, forked]
+
+
 def _register_namespace_once_with_configuration_lock(
     name: str, repo_path: str | None = None
-) -> Path:
+) -> tuple[str, Path]:
+    """Publish *name*, forking when another repository already owns it.
+
+    Returns the label actually published with its database path. That label
+    differs from *name* only on a fork, so a caller that resolves *name*
+    afterwards instead of the returned label opens the other repository's
+    namespace -- the outcome this exists to prevent.
+    """
     label = safe_name(name)
+    repo_identity, repo = _repository_context(repo_path)
+    # The fork digest depends on nothing but this repository's own strongest
+    # identifier, so whichever registration loses a race lands on exactly the
+    # label paths.py would have inferred for it had it simply run second.
+    failure: _NamespaceOwnedElsewhere | None = None
+    for candidate in _registration_candidates(label, repo_identity or repo):
+        try:
+            return _publish_namespace_with_configuration_lock(
+                candidate, repo_identity, repo
+            )
+        except _NamespaceOwnedElsewhere as owned:
+            failure = owned
+    if failure is None:
+        raise AssertionError("unreachable namespace registration candidate exhaustion")
+    raise NamespaceCollisionError(str(failure)) from failure
+
+
+def _publish_namespace_with_configuration_lock(
+    label: str, repo_identity: str | None, repo: str | None
+) -> tuple[str, Path]:
+    """Publish and bind *label* in one transaction, or raise if it is owned."""
     norm = normalize_namespace_label(label)
     now = now_iso()
-    repo_identity, repo = _repository_context(repo_path)
     conn = _registry()
     claim: _FreshNamespaceClaim | None = None
     row: sqlite3.Row | None = None
@@ -2293,6 +2408,20 @@ def _register_namespace_once_with_configuration_lock(
             namespace_id = str(row["namespace_id"])
             canonical = str(row["canonical_label"])
             if repo_identity or repo:
+                # Inference's mint-time guard read the registry before any of
+                # today's racers had published, so every one of them saw this
+                # label free. This transaction is the first point that can see
+                # the winner's binding, and so the only place the decision can
+                # be made without a window between checking and binding.
+                owner = _foreign_repository_owner(
+                    conn,
+                    namespace_id=namespace_id,
+                    db_path=str(db),
+                    repo_identity=repo_identity,
+                    repo_path=repo,
+                )
+                if owner is not None:
+                    raise _NamespaceOwnedElsewhere(canonical, owner)
                 conn.execute(
                     "UPDATE namespace_identities SET updated_at=? WHERE namespace_id=?",
                     (now, namespace_id),
@@ -2383,11 +2512,20 @@ def _register_namespace_once_with_configuration_lock(
             claim.close(remove_target=False)
         else:
             ns.close()
-    return db
+    return label, db
 
 
-def register_namespace(name: str, repo_path: str | None = None) -> Path:
+def register_namespace_context(
+    name: str, repo_path: str | None = None
+) -> tuple[str, Path]:
     """Register a namespace, retrying only recognized registry handoffs.
+
+    Returns the label actually published with its database path. When
+    *repo_path* names a repository and *name* is already owned by a different
+    one, registration forks to a disambiguated label rather than binding a
+    second repository to one namespace, so the returned label is what the
+    caller must resolve afterwards -- resolving *name* would open the other
+    repository's namespace.
 
     A failed attempt may have committed the identity before a subsequent
     mapped-DB validation sees a changing WAL sidecar.  Re-entering the
@@ -2403,6 +2541,16 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
                 raise
             threading.Event().wait(0.002 * (attempt + 1))
     raise AssertionError("unreachable namespace registration retry exhaustion")
+
+
+def register_namespace(name: str, repo_path: str | None = None) -> Path:
+    """Register a namespace and return its database path.
+
+    Callers that resolve the namespace by label afterwards want
+    register_namespace_context() instead: this signature cannot report the
+    disambiguated label a fork publishes.
+    """
+    return register_namespace_context(name, repo_path)[1]
 
 
 def namespace_exists(name: str) -> bool:
@@ -5307,7 +5455,11 @@ class Store:
         requested = safe_name(name)
         registered = False
         if create:
-            register_namespace(requested, repo_path)
+            # Registration forks this label when another repository already
+            # owns it, so resolve what was published rather than what was
+            # asked for -- otherwise this opens that other repository's
+            # database, which is exactly what the fork exists to avoid.
+            requested, _ = register_namespace_context(requested, repo_path)
             registered = True
         attempts = 8 if registered else 1
         last_error: BaseException | None = None

@@ -40,7 +40,7 @@ from haunt.store import (
     open_existing,
     open_existing_readonly,
     reconcile_namespaces,
-    register_namespace,
+    register_namespace_context,
     retire_namespace,
     retire_namespace_alias,
     undo_namespace_migration,
@@ -222,7 +222,9 @@ def init_cmd(
         ns, inferred_repo_path = infer_namespace_context(repo)
         repo_path = str(repo) if repo else inferred_repo_path
     try:
-        db = register_namespace(ns, repo_path=repo_path)
+        # Registration reports the label it published: an inferred name can
+        # fork when another repository already owns it.
+        ns, db = register_namespace_context(ns, repo_path=repo_path)
         with Store(ns) as st:
             stats = st.stats()
     except (NamespaceCollisionError, NamespacePathError) as exc:

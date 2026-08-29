@@ -1369,7 +1369,7 @@ def test_store_create_retries_post_registration_transient_absence(
     """A fresh creator waits out only a stale read after its own commit."""
     import haunt.store as store_mod
 
-    real_register = store_mod.register_namespace
+    real_register = store_mod.register_namespace_context
     real_resolve = store_mod.resolve_namespace_identity
     registration_returned = False
     resolution_calls = 0
@@ -1389,7 +1389,7 @@ def test_store_create_retries_post_registration_transient_absence(
                 return None
         return real_resolve(name)
 
-    monkeypatch.setattr(store_mod, "register_namespace", registered)
+    monkeypatch.setattr(store_mod, "register_namespace_context", registered)
     monkeypatch.setattr(store_mod, "resolve_namespace_identity", stale_once)
     with Store("post-register-stale") as store:
         assert store.name == "post-register-stale"

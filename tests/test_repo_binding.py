@@ -54,6 +54,7 @@ see the same git context -- exactly like a real, unmocked git repo would.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -62,8 +63,18 @@ from typer.testing import CliRunner
 import haunt.paths as paths
 import haunt.store as store
 from haunt.cli import app
-from haunt.paths import infer_namespace_context, registry_path
-from haunt.store import Store, init_registry, namespace_exists, register_namespace
+from haunt.paths import (
+    disambiguate_namespace_label,
+    infer_namespace_context,
+    registry_path,
+)
+from haunt.store import (
+    Store,
+    init_registry,
+    namespace_exists,
+    register_namespace,
+    register_namespace_context,
+)
 
 
 @pytest.fixture
@@ -679,3 +690,230 @@ def test_blank_repo_path_row_does_not_count_as_a_collision(repo_env, monkeypatch
     with Store(ns, repo_path):
         pass
     assert len(_namespace_rows()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Concurrent registration. The mint-time guard above reads the registry during
+# inference, so two repositories that infer before either registers both see
+# the shared label free -- the first publishes it, and the second used to be
+# handed the same namespace and simply have a second repository binding added
+# to it. Ownership is therefore settled inside register_namespace()'s
+# BEGIN IMMEDIATE transaction, the first point that can see the winner.
+# ---------------------------------------------------------------------------
+
+
+def _patch_git_contexts(
+    monkeypatch, contexts: dict[Path, tuple[str | None, Path]]
+) -> None:
+    """Serve each checkout its own git context, keyed by resolved path.
+
+    _patch_git_context() above fakes one context for the whole process, which
+    cannot express two repositories running at once. Unknown paths report no
+    repository, as a non-git directory does.
+    """
+    resolved = {path.resolve(): value for path, value in contexts.items()}
+
+    def fake(root):
+        return resolved.get(Path(root).resolve(), (None, None))
+
+    monkeypatch.setattr(paths, "_git_repo_context", fake)
+    monkeypatch.setattr(store, "_git_repo_context", fake)
+
+
+def _namespaces_with_two_repository_owners() -> dict[str, list[str]]:
+    """Namespace ids bound to more than one repository: the defect, measured."""
+    conn = sqlite3.connect(registry_path())
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT namespace_id, repository_identity, repo_path FROM repository_bindings"
+        ).fetchall()
+    finally:
+        conn.close()
+    owners: dict[str, set[str]] = {}
+    for row in rows:
+        owner = str(row["repository_identity"] or row["repo_path"] or "")
+        if owner:
+            owners.setdefault(str(row["namespace_id"]), set()).add(owner)
+    return {ns: sorted(found) for ns, found in owners.items() if len(found) > 1}
+
+
+def _race_infer_then_register(projects: list[Path]) -> list[tuple[str, str]]:
+    """Infer for every project, then register them all at once.
+
+    The barrier is the point of the exercise: it holds every thread until all
+    of them have finished inference, which is the only interleaving that
+    reproduces the defect. Letting a thread register while another is still
+    inferring lets the second inference see the first registration, which is
+    the already-working serial case.
+
+    Returns each project's ``(canonical label, database path)`` as the Store
+    that opened it reports them -- the namespace the repository actually
+    landed in, not the one it asked for.
+    """
+    barrier = threading.Barrier(len(projects))
+    landed: list[tuple[str, str] | None] = [None] * len(projects)
+    failures: list[BaseException | None] = [None] * len(projects)
+
+    def worker(index: int, project: Path) -> None:
+        try:
+            ns, repo_path = infer_namespace_context(project)
+            barrier.wait(timeout=60)
+            with Store(ns, repo_path) as st:
+                landed[index] = (st.name, str(st.db_path))
+        except BaseException as exc:  # re-raised on the calling thread below
+            failures[index] = exc
+            barrier.abort()
+
+    threads = [
+        threading.Thread(target=worker, args=(index, project), daemon=True)
+        for index, project in enumerate(projects)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    for failure in failures:
+        if failure is not None:
+            raise failure
+    assert all(entry is not None for entry in landed), landed
+    return [entry for entry in landed if entry is not None]
+
+
+def test_concurrent_registration_of_a_separator_collision_forks(
+    repo_env, monkeypatch
+):
+    """`github.com/acme/foo-bar6` and `github.com/acme-foo/bar6` both sanitize
+    to `github.com-acme-foo-bar6`, and both inferences complete before either
+    registers, so neither sees the other's claim."""
+    first = repo_env / "foo-bar6"
+    second = repo_env / "bar6"
+    first.mkdir()
+    second.mkdir()
+    identities = ("github.com/acme/foo-bar6", "github.com/acme-foo/bar6")
+    _patch_git_contexts(
+        monkeypatch,
+        {
+            first: ("git@github.com:acme/foo-bar6.git", first),
+            second: ("git@github.com:acme-foo/bar6.git", second),
+        },
+    )
+
+    landed = _race_infer_then_register([first, second])
+
+    assert _namespaces_with_two_repository_owners() == {}
+    bare = "github.com-acme-foo-bar6"
+    forks = [disambiguate_namespace_label(bare, ident) for ident in identities]
+    names = [name for name, _ in landed]
+    assert len({path for _, path in landed}) == 2
+    assert set(names) in ({bare, forks[0]}, {bare, forks[1]})
+    # Whichever lost, it landed on the digest of its own remote identity --
+    # the label it would have inferred had it simply run second, never a
+    # third label and never the other repository's fork.
+    for index, name in enumerate(names):
+        assert name in (bare, forks[index])
+    for project, name in zip((first, second), names):
+        again, again_repo = infer_namespace_context(project)
+        assert again == name
+        assert again_repo == str(project.resolve())
+
+
+def test_concurrent_registration_of_a_basename_collision_forks(
+    repo_env, monkeypatch
+):
+    """The remote-less shape: `/a/app` and `/b/app` both derive `app`, and the
+    discriminator is each checkout's own path."""
+    first = repo_env / "a" / "app"
+    second = repo_env / "b" / "app"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _patch_git_contexts(monkeypatch, {first: (None, first), second: (None, second)})
+
+    landed = _race_infer_then_register([first, second])
+
+    assert _namespaces_with_two_repository_owners() == {}
+    forks = [
+        disambiguate_namespace_label("app", str(project.resolve()))
+        for project in (first, second)
+    ]
+    names = [name for name, _ in landed]
+    assert len({path for _, path in landed}) == 2
+    assert set(names) in ({"app", forks[0]}, {"app", forks[1]})
+    for index, name in enumerate(names):
+        assert name in ("app", forks[index])
+    for project, name in zip((first, second), names):
+        again, again_repo = infer_namespace_context(project)
+        assert again == name
+        assert again_repo == str(project.resolve())
+
+
+def test_concurrent_registration_from_one_repository_does_not_fork(
+    repo_env, monkeypatch
+):
+    """The negative case the guard must not break: one repository registering
+    twice at once is not a collision, so it keeps one namespace and one
+    binding rather than forking away from itself."""
+    project = repo_env / "solo6"
+    project.mkdir()
+    _patch_git_contexts(
+        monkeypatch, {project: ("git@github.com:acme/solo6.git", project)}
+    )
+
+    landed = _race_infer_then_register([project, project])
+
+    assert {name for name, _ in landed} == {"github.com-acme-solo6"}
+    assert len({path for _, path in landed}) == 1
+    assert [r["name"] for r in _namespace_rows()] == ["github.com-acme-solo6"]
+    assert _binding_count(repository_identity="github.com/acme/solo6") == 1
+    assert _namespaces_with_two_repository_owners() == {}
+
+
+def test_concurrent_registration_from_one_remoteless_repository_does_not_fork(
+    repo_env, monkeypatch
+):
+    """The same negative case for the path-discriminated shape, where the only
+    thing telling two callers apart is a checkout path they share."""
+    project = repo_env / "clientC" / "api6"
+    project.mkdir(parents=True)
+    _patch_git_contexts(monkeypatch, {project: (None, project)})
+
+    landed = _race_infer_then_register([project, project])
+
+    assert {name for name, _ in landed} == {"api6"}
+    assert len({path for _, path in landed}) == 1
+    assert [r["name"] for r in _namespace_rows()] == ["api6"]
+    assert _binding_count(repo_path=str(project.resolve())) == 1
+    assert _namespaces_with_two_repository_owners() == {}
+
+
+def _drop_repository_bindings() -> None:
+    """Reduce the registry to its pre-bindings shape: `namespaces` rows only."""
+    conn = sqlite3.connect(registry_path())
+    try:
+        conn.execute("DELETE FROM repository_bindings")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_legacy_repo_path_row_without_a_binding_still_owns_its_label(
+    repo_env, monkeypatch
+):
+    """A registry written before repository_bindings records the repository
+    only on `namespaces`, and that row is still an ownership claim -- unlike
+    a blank one, which names nobody. A second repository must fork off it,
+    and the repository it names must still be handed its own namespace."""
+    first = repo_env / "clientD" / "api7"
+    second = repo_env / "clientE" / "api7"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _patch_git_contexts(monkeypatch, {first: (None, first), second: (None, second)})
+    register_namespace("api7", str(first.resolve()))
+    _drop_repository_bindings()
+
+    intruder, _ = register_namespace_context("api7", str(second.resolve()))
+    assert intruder == disambiguate_namespace_label("api7", str(second.resolve()))
+
+    owner, _ = register_namespace_context("api7", str(first.resolve()))
+    assert owner == "api7"
+    assert _namespaces_with_two_repository_owners() == {}
