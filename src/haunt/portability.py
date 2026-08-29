@@ -202,6 +202,19 @@ _TABLE_FIELDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Durable columns deliberately absent from the wire. Every other column of
+# every exported table must appear in _TABLE_FIELDS, and the test that walks
+# `PRAGMA table_info` pins this set exactly: a new column has to be exported
+# or argued into this list, never silently dropped. Both omissions here are
+# recomputed at the destination, so neither loses namespace semantics.
+#   memories.embedding    -- a source model's vectors, rebuilt from content
+#                            against the destination's own configured model.
+#   memories.content_hash -- a pure function of the stored content the bundle
+#                            already carries; see _apply_records.
+_UNEXPORTED_COLUMNS: frozenset[tuple[str, str]] = frozenset(
+    {("memories", "embedding"), ("memories", "content_hash")}
+)
+
 _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "sessions": ("id",),
     "events": ("id",),
@@ -1294,6 +1307,41 @@ def _identity_token(value: Any) -> bytes:
         raise ImportBundleError("invalid durable record identity") from exc
 
 
+def _require_acyclic_succession(
+    succeeds: Mapping[bytes, bytes],
+    check_deadline: Callable[[], None],
+) -> None:
+    """Reject a succession loop the live store cannot mint.
+
+    ``_successor_session`` only ever points a freshly minted id at an
+    existing one, so succession is acyclic by construction in the store and
+    a bundle is the only way a loop could arrive. Self-succession is already
+    refused above; a two-session ``A -> B -> A`` is the same impossible
+    state one link further out, so the closure check draws the line at
+    "acyclic" rather than at "not length one".
+
+    Each session succeeds at most one predecessor, so this is a functional
+    graph: one memoized walk settles every node exactly once and the whole
+    pass is linear. Measured at 33 ms on a 20,000-link chain, against 56 ms
+    for the reference closure pass it rides along with.
+    """
+    settled: set[bytes] = set()
+    for start in succeeds:
+        if start in settled:
+            continue
+        walked: list[bytes] = []
+        on_path: set[bytes] = set()
+        node = start
+        while node in succeeds and node not in settled:
+            check_deadline()
+            if node in on_path:
+                raise ImportBundleError("session succession contains a cycle")
+            on_path.add(node)
+            walked.append(node)
+            node = succeeds[node]
+        settled.update(walked)
+
+
 def _validate_record_references(
     records: dict[str, list[dict[str, Any]]],
     check_deadline: Callable[[], None],
@@ -1324,6 +1372,7 @@ def _validate_record_references(
 
     # sessions.succeeds_session carries no SQLite foreign key, so the scratch
     # insert cannot catch a dangling successor link; this is the only gate.
+    succeeds: dict[bytes, bytes] = {}
     for session in records["sessions"]:
         check_deadline()
         predecessor = session["succeeds_session"]
@@ -1332,6 +1381,8 @@ def _validate_record_references(
         require(predecessor, sessions, "session references missing predecessor")
         if _identity_token(predecessor) == _identity_token(session["id"]):
             raise ImportBundleError("session cannot succeed itself")
+        succeeds[_identity_token(session["id"])] = _identity_token(predecessor)
+    _require_acyclic_succession(succeeds, check_deadline)
     for event in records["events"]:
         check_deadline()
         require(event["session_id"], sessions, "event references missing session")

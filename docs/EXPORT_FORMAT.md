@@ -51,12 +51,34 @@ a destination. Importing a 1.0 bundle onto rows that already carry the added
 fields is therefore an ordinary record conflict, refused before any write, not
 a silent un-exclusion or a dropped successor link.
 
+Both mixed-minor orders are refused, for the same reason and with the same
+`ImportConflictError`: the two bundles disagree about a durable field of a row
+whose identity they share, and the importer never resolves such a disagreement
+by preferring one side. Importing 1.1 then 1.0 is refused, and so is importing
+1.0 then 1.1. That is correct and fail-closed, but it has a consequence worth
+stating plainly: **a destination already imported from a 1.0 bundle cannot be
+repaired in place by re-importing the same namespace at 1.1.** The re-import is
+refused on the first conflicting record and the destination keeps its 1.0
+defaults. The refusal only fires where the bundles actually disagree: a 1.1
+bundle whose added fields all hold their 1.0 defaults is accepted and inserts
+nothing, because every record matches. It is a bundle carrying real exclusions
+or real successor links — precisely the one worth re-importing — that is turned
+away.
+
+Remediation for a destination in that state is to import the 1.1 bundle into a
+home that does not already carry the namespace and use that copy going forward;
+there is no in-place upgrade path through the importer. Restoring the flags by
+hand is not sufficient on its own either, because the 1.0 import already queued
+the re-admitted rows and any drain since then has put them in the vector index;
+a destination repaired that way needs `reembed()` afterwards, which drops and
+rebuilds `vec_memories` from the `skip_embedding=0` rows only.
+
 1.1 adds exactly two fields, both durable store columns that 1.0 dropped:
 
 | Field | Added | 1.0 default | Why that default is safe |
 |---|---|---|---|
 | `sessions.succeeds_session` | schema v12 | `NULL` | A 1.0 bundle records no succession anywhere, so `NULL` — the column's own value for a session that continues nothing — is the only non-fabricating choice, and it is what a 1.0 bundle already imported as. A 1.0 bundle exported from a pre-v12 namespace may carry a stale `succeeds_session` key inside `sessions.meta`; it is imported verbatim as opaque caller metadata and deliberately not promoted to the column, because rewriting `meta` would make the stored row differ from the bundle record and break receipt replay, and leaving both would give privacy purge a second carrier to rekey. |
-| `memories.skip_embedding` | schema v13 | `0` | The capture-policy decision is genuinely absent from a 1.0 bundle, not merely unread: the store infers it from "no vector, no queue row, non-blank content", and a bundle carries neither vectors nor queue rows by construction. `0` is what a 1.0 bundle already imported as, so old bundles keep meaning exactly what they meant. The harm is asymmetric — defaulting to `1` would silently drop every memory in every legacy bundle out of the vector index and out of `reembed()`, with no error and no way to tell which rows were genuinely excluded, while `0` at worst re-admits rows a source had excluded, which is visible in the index, costs only embedding work, and is corrected by re-exporting from the source at 1.1. Absence of a recorded exclusion is not evidence of one. |
+| `memories.skip_embedding` | schema v13 | `0` | The capture-policy decision is genuinely absent from a 1.0 bundle, not merely unread: the store infers it from "no vector, no queue row, non-blank content", and a bundle carries neither vectors nor queue rows by construction. `0` is what a 1.0 bundle already imported as, so old bundles keep meaning exactly what they meant. The harm is asymmetric — defaulting to `1` would silently drop every memory in every legacy bundle out of the vector index and out of `reembed()`, with no error and no way to tell which rows were genuinely excluded, while `0` re-admits rows the source had excluded. That cost is not just embedding work: an excluded row's content is exactly what the capture policy withheld from the vector index, and a 1.0 import queues it and lets a later `reembed()` index it, so the withheld content becomes semantically recallable at the destination — see [What a 1.0 bundle costs](#what-a-10-bundle-costs). `0` is still the right choice, because the two errors are not equally detectable: a wrongly re-admitted row announces itself in the index and in `skip_embedding`, while a wrongly excluded one is indistinguishable from a correctly excluded one and would be found only by missing it. Absence of a recorded exclusion is not evidence of one. |
 
 ## Envelope
 
@@ -130,10 +152,14 @@ Structured event provenance remains the canonical stored v1 JSON TEXT defined
 in [PROVENANCE.md](PROVENANCE.md). Referential closure is mandatory: every
 event/session, memory/event, correction endpoint, entity mention, and relation
 evidence reference must resolve inside the bundle. A non-null
-`sessions.succeeds_session` must name another session in the same bundle and
-may not name its own row; the column carries no SQLite foreign key, so import
-is the only gate on a dangling successor link. `memories.skip_embedding` must
-be exactly the integer `0` or `1` — the column has no CHECK constraint, and
+`sessions.succeeds_session` must name another session in the same bundle, and
+succession must be acyclic: a row may not succeed itself, and no chain of
+successor links may return to a session it already passed through. The column
+carries no SQLite foreign key, so import is the only gate on a dangling or
+looping successor link, and the store itself cannot mint a loop — it only ever
+points a freshly minted session at an existing one.
+`memories.skip_embedding` must be exactly the integer `0` or `1` — the column
+has no CHECK constraint, and
 every reader treats it as a two-valued flag, so any other value would read as
 excluded.
 
@@ -197,6 +223,42 @@ A memory with `skip_embedding=1` is still indexed for FTS and is not queued,
 exactly as the store admits one: the persisted exclusion withholds the vector
 index only, and it survives a later full `reembed()` at the destination rather
 than being re-derived from the destination's own environment.
+
+### What a 1.0 bundle costs
+
+A 1.0 bundle has no `skip_embedding` field, so every memory it carries imports
+at `0` — including the rows whose capture policy excluded them at the source.
+The cost of that is larger than "embedding work", and it is worth naming
+exactly, because the rows in question are the ones the policy singled out. A
+tool result withheld from the vector index because it contained a secret
+imports as an ordinary memory, is queued like any other, and after the next
+drain or `reembed()` is in the destination's vector index and reachable by
+semantic recall. The exclusion is not merely unrecorded at the destination; it
+is undone there. Nothing about this is silent in the sense of being invisible
+after the fact — the row's `skip_embedding=0` and its presence in the index
+both say so — but nothing warns at import time either.
+
+This is pre-existing behavior, not a regression introduced by 1.1. The
+pre-1.1 importer lands the same bundle the same way — the same row at
+`skip_embedding=0` and queued — because the field it would have needed was
+never on the wire to read. 1.1 does not repair an old bundle; it makes the flag
+transferable from here on, so a *new* export carries the exclusion and a 1.0
+bundle is the only kind still carrying this loss.
+
+It was also not fixable at import time. The store derives the flag for existing
+rows from "no vector, no queue row, non-blank content" — an inference over
+exactly the two things a bundle excludes by construction. A bundle carries
+neither vectors nor queue rows, so the signal the store backfills from is not
+merely missing from the wire, it is unavailable in principle to any reader of
+this format. Guessing `1` instead would be worse in the other direction (see
+the table above), and there is no third value meaning "unknown" to fall back
+to: every reader of the column tests it as a two-valued flag, so any other
+value would read as excluded.
+
+The remedy is to re-export the source at 1.1 and import that into a destination
+that has not already taken the 1.0 bundle. A destination that has taken one
+cannot be repaired by re-import, as described under
+[the 1.0 compatibility rule](#versioning-and-the-10-compatibility-rule).
 
 `memories.content_hash` is likewise rebuilt rather than transferred. It is a
 pure function of the stored `content` the bundle already carries, so import

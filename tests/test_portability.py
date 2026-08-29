@@ -31,8 +31,13 @@ from haunt.portability import (
     ImportLimitError,
     ImportLimits,
     _MINOR_ADDED_FIELDS,
+    _MINOR_FIELD_DEFAULTS,
+    _PRIMARY_KEYS,
+    _TABLE_FIELDS,
+    _UNEXPORTED_COLUMNS,
     _canonical_bytes,
     _digest,
+    _record_key,
     _semantic_from_bundle,
     build_namespace_export,
     canonical_export_bytes,
@@ -2121,3 +2126,294 @@ def test_v1_0_bundle_cannot_silently_unset_a_stored_added_field(
         assert store.conn.execute(
             "SELECT COUNT(*) FROM memories WHERE skip_embedding=1"
         ).fetchone()[0] == 1
+
+
+def test_table_fields_cover_every_durable_column_of_every_exported_table(
+    portable_home,
+):
+    """The wire field list is checked against the live schema, not a copy of it.
+
+    This is the exact omission that shipped twice: schema v12 added
+    `sessions.succeeds_session` and v13 added `memories.skip_embedding`, and
+    both were durable columns that simply never reached `_TABLE_FIELDS`, so
+    every export silently dropped them and every round-trip test still passed.
+    Nothing compared the two lists. Walking `PRAGMA table_info` does, so a
+    future minor's column fails here instead of going missing on the wire.
+
+    The exclusions are pinned rather than merely allowed: adding to
+    `_UNEXPORTED_COLUMNS` has to be a deliberate edit of this assertion, not a
+    way to quiet the coverage check.
+    """
+    with Store("coverage") as store:
+        assert (
+            int(store.conn.execute("SELECT value FROM meta WHERE key='schema_version'")
+                .fetchone()[0])
+            == SCHEMA_VERSION
+        )
+        live = {
+            table: [row[1] for row in store.conn.execute(f"PRAGMA table_info({table})")]
+            for table in _TABLE_FIELDS
+        }
+
+    for table, columns in live.items():
+        assert columns, f"{table} is not a real table in the current schema"
+        uncovered = [
+            column
+            for column in columns
+            if column not in _TABLE_FIELDS[table]
+            and (table, column) not in _UNEXPORTED_COLUMNS
+        ]
+        assert not uncovered, (
+            f"{table} has durable columns missing from _TABLE_FIELDS: {uncovered}. "
+            "Export them in a new format minor, or add them to "
+            "_UNEXPORTED_COLUMNS with a reason."
+        )
+        # The reverse direction too: a renamed or dropped column must not sit
+        # in _TABLE_FIELDS naming nothing, where it would fail at SELECT time.
+        phantom = [field for field in _TABLE_FIELDS[table] if field not in columns]
+        assert not phantom, f"_TABLE_FIELDS[{table!r}] names no such column: {phantom}"
+
+    assert _UNEXPORTED_COLUMNS == frozenset(
+        {("memories", "embedding"), ("memories", "content_hash")}
+    ), "the excluded-column set changed; justify it in EXPORT_FORMAT.md first"
+    assert all(
+        column in live[table] for table, column in _UNEXPORTED_COLUMNS
+    ), "an excluded column no longer exists, so the exclusion is stale"
+
+
+def test_minor_field_defaults_cover_every_added_field():
+    """Every added field has a defined 1.0 meaning, and no default is orphaned.
+
+    `_apply_records` reads `_MINOR_FIELD_DEFAULTS[table][field]` directly, so a
+    field added to `_MINOR_ADDED_FIELDS` without a default is a KeyError at
+    import of the first older bundle rather than at review.
+    """
+    added: dict[str, set[str]] = {}
+    for fields in _MINOR_ADDED_FIELDS.values():
+        for table, names in fields.items():
+            added.setdefault(table, set()).update(names)
+
+    for table, names in added.items():
+        assert table in _MINOR_FIELD_DEFAULTS, f"no defaults declared for {table}"
+        missing = names - set(_MINOR_FIELD_DEFAULTS[table])
+        assert not missing, f"{table} added fields without a 1.0 default: {missing}"
+        assert names <= set(_TABLE_FIELDS[table]), (
+            f"{table} declares added fields it does not export: "
+            f"{names - set(_TABLE_FIELDS[table])}"
+        )
+
+    assert set(_MINOR_FIELD_DEFAULTS) == set(added), (
+        "_MINOR_FIELD_DEFAULTS covers tables no minor added fields to"
+    )
+    for table, defaults in _MINOR_FIELD_DEFAULTS.items():
+        assert set(defaults) == added[table], (
+            f"{table} defaults do not match its added fields exactly"
+        )
+
+
+def test_v1_0_import_readmits_source_excluded_content_into_the_vector_index(
+    portable_home, tmp_path, monkeypatch
+):
+    """Pins the documented cost of a 1.0 bundle, which is not "embedding work".
+
+    EXPORT_FORMAT.md now says the excluded row is re-admitted all the way into
+    the vector index and becomes semantically recallable, not merely that it
+    costs CPU. This follows the specific row the source excluded through the
+    whole path -- default, queue, rebuild -- so the doc's claim is measured
+    rather than asserted, and so a change that made 1.0 imports honest would
+    fail here and force the doc to be corrected back.
+    """
+    excluded = {
+        row["id"]
+        for row in json.loads(_GOLDEN_V1_1.read_bytes())["records"]["memories"]
+        if row["skip_embedding"] == 1
+    }
+    assert len(excluded) == 1
+    excluded_id = excluded.pop()
+
+    _switch_home(monkeypatch, tmp_path / "readmitted")
+    import_namespace_bytes(_LEGACY_V1_0.read_bytes())
+    with open_existing("golden") as store:
+        content, flag = store.conn.execute(
+            "SELECT content, skip_embedding FROM memories WHERE id=?", (excluded_id,)
+        ).fetchone()
+        assert content.strip(), "a blank row would be skipped for being blank"
+        # The source's exclusion is not merely unrecorded here; it is undone.
+        assert flag == 0
+        assert _queued(store, excluded_id)
+
+        with (
+            patch("haunt.store.embed_state", return_value=_FAKE_STATE),
+            patch("haunt.store.embed_texts", side_effect=_fake_embed_texts),
+            patch("haunt.store.ensure_vec_table", side_effect=_plain_vec_table),
+            patch.object(store, "vec_ok", return_value=True),
+        ):
+            rebuilt = store.reembed()
+
+        assert rebuilt["skipped"] == 0
+        vectored = {
+            row["id"] for row in store.conn.execute("SELECT id FROM vec_memories")
+        }
+        assert excluded_id in vectored, (
+            "the withheld content reached the vector index, which is the cost "
+            "EXPORT_FORMAT.md documents"
+        )
+
+    # The same bundle at 1.1 keeps it out, so the loss is the 1.0 wire format's
+    # and not the importer's: same destination code, same rows, both outcomes.
+    _switch_home(monkeypatch, tmp_path / "not-readmitted")
+    import_namespace_bytes(_GOLDEN_V1_1.read_bytes())
+    with open_existing("golden") as store:
+        assert store.conn.execute(
+            "SELECT skip_embedding FROM memories WHERE id=?", (excluded_id,)
+        ).fetchone()[0] == 1
+        assert not _queued(store, excluded_id)
+
+
+def test_both_mixed_minor_orders_are_refused_and_leave_the_destination_as_found(
+    portable_home, tmp_path, monkeypatch
+):
+    """1.0-then-1.1 is refused too, so a degraded destination stays degraded.
+
+    Only the 1.1-then-1.0 order was covered. The other order is the one a
+    reader would reach for as a repair -- "just import the new bundle on top"
+    -- and it is refused, which is correct and fail-closed but means there is
+    no in-place upgrade. EXPORT_FORMAT.md now says so; this is what says it in
+    code, including that the refusal leaves the 1.0 state exactly intact.
+    """
+    _switch_home(monkeypatch, tmp_path / "degraded-then-upgrade")
+    import_namespace_bytes(_LEGACY_V1_0.read_bytes())
+    with open_existing("golden") as store:
+        before = _durable_snapshot(store)
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE skip_embedding=1"
+        ).fetchone()[0] == 0
+
+    with pytest.raises(ImportConflictError, match="identity conflicts"):
+        import_namespace_bytes(_GOLDEN_V1_1.read_bytes())
+
+    with open_existing("golden") as store:
+        assert _durable_snapshot(store) == before
+        # Still degraded: the re-import repaired nothing, which is the point.
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE skip_embedding=1"
+        ).fetchone()[0] == 0
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE succeeds_session IS NOT NULL"
+        ).fetchone()[0] == 0
+
+    # The refusal is a disagreement, not a version check: a 1.1 bundle whose
+    # added fields all hold their 1.0 defaults agrees with what is stored and
+    # is accepted, inserting nothing. So the bundle worth re-importing -- the
+    # one carrying real exclusions and links -- is exactly the refused one.
+    flat = copy.deepcopy(json.loads(_GOLDEN_V1_1.read_bytes()))
+    for row in flat["records"]["sessions"]:
+        row["succeeds_session"] = None
+    for row in flat["records"]["memories"]:
+        row["skip_embedding"] = 0
+    report = import_namespace_bytes(_redigest(flat))
+    assert sum(report["inserted"].values()) == 0
+    with open_existing("golden") as store:
+        after = _durable_snapshot(store)
+        assert {k: v for k, v in after.items() if k != "meta"} == {
+            k: v for k, v in before.items() if k != "meta"
+        }
+        # The one permitted difference: an accepted import records its receipt
+        # even when it inserts nothing, which is what makes it replayable.
+        added = dict(after["meta"]).keys() - dict(before["meta"]).keys()
+        assert all(key.startswith("import_receipt:") for key in added)
+
+    # The documented remediation: a home that does not already carry the
+    # namespace takes the 1.1 bundle and lands the added fields correctly.
+    _switch_home(monkeypatch, tmp_path / "fresh-remediation")
+    import_namespace_bytes(_GOLDEN_V1_1.read_bytes())
+    with open_existing("golden") as store:
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE skip_embedding=1"
+        ).fetchone()[0] == 1
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE succeeds_session IS NOT NULL"
+        ).fetchone()[0] == 1
+
+
+def _extra_session(template: dict, index: int) -> dict:
+    """A synthetic session row shaped exactly like an exported one."""
+    row = dict(template)
+    row["id"] = f"00000000-0000-4000-8000-{index:012d}"
+    row["succeeds_session"] = None
+    return row
+
+
+def _recanonicalize_sessions(bundle: dict) -> None:
+    """Restore canonical record order after editing the sessions array."""
+    bundle["records"]["sessions"].sort(
+        key=lambda row: _record_key(row, _PRIMARY_KEYS["sessions"])
+    )
+
+
+@pytest.mark.parametrize("length", [2, 3])
+def test_session_succession_cycles_fail_before_namespace_mutation(
+    portable_home, tmp_path, monkeypatch, length
+):
+    """Import is the only gate on a state the live store cannot mint.
+
+    `_successor_session` only ever points a freshly minted session id at an
+    existing one, so succession is acyclic by construction in the store and
+    the column carries no foreign key to enforce it. Self-succession was
+    already refused; a cycle is the same impossible state one or more links
+    further out, so closure draws the line at acyclic rather than at length.
+    """
+    _seed_durable_fields()
+    bundle = build_namespace_export("durable")
+    sessions = bundle["records"]["sessions"]
+    template = dict(sessions[0])
+    while len(sessions) < length:
+        sessions.append(_extra_session(template, len(sessions)))
+
+    ring = sessions[:length]
+    for index, session in enumerate(ring):
+        session["succeeds_session"] = ring[(index + 1) % length]["id"]
+    # Everything outside the ring must stay closed, or a different error wins.
+    for session in sessions[length:]:
+        session["succeeds_session"] = None
+    _recanonicalize_sessions(bundle)
+
+    _switch_home(monkeypatch, tmp_path / f"cycle-{length}")
+    with pytest.raises(ImportBundleError, match="succession contains a cycle"):
+        import_namespace_bytes(_redigest(bundle))
+    assert not namespace_exists_readonly("durable")
+
+
+def test_succession_cycle_check_accepts_every_shape_the_store_can_mint(
+    portable_home, tmp_path, monkeypatch
+):
+    """Acyclicity must not narrow what a legitimate namespace may say.
+
+    Succession is a forest, not a list: several sessions may succeed the same
+    predecessor, and a chain may be arbitrarily long. Both round-trip.
+    """
+    _seed_durable_fields()
+    bundle = build_namespace_export("durable")
+    sessions = bundle["records"]["sessions"]
+    root = sessions[0]["id"]
+    template = dict(sessions[0])
+
+    # A fan-out of siblings on one root, plus a chain hanging off the last.
+    previous = root
+    for index in range(1, 6):
+        sibling = _extra_session(template, index)
+        sibling["succeeds_session"] = root if index < 4 else previous
+        previous = sibling["id"]
+        sessions.append(sibling)
+    expected = len(sessions)
+    _recanonicalize_sessions(bundle)
+
+    _switch_home(monkeypatch, tmp_path / "forest")
+    import_namespace_bytes(_redigest(bundle))
+    with open_existing("durable") as store:
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE succeeds_session=?", (root,)
+        ).fetchone()[0] == 3
+        assert (
+            store.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == expected
+        )
