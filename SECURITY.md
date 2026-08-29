@@ -108,6 +108,20 @@ rather than merely unfound; nothing generalises that to every possible encoding,
 and the scan cannot be read as saying the value is gone in every form. It says
 the values it erased are not sitting in the file verbatim.
 
+The sweep is namespace-wide, and so is the rotation. Reconcile copies rows
+keeping their primary keys, so one memory id names the same row in every
+namespace and in every backup of one — a backup of one namespace really does
+hold another's rows once they have been reconciled. Nothing identifies which
+namespace a backup belongs to: the database stores no namespace id or label
+(the identity lives in the registry, keyed by the live file's path), `retire`
+deletes the identity row outright, and the filename is a lossy `safe_name` that
+two different labels can share. So a purge in one namespace rewrites and rotates
+every namespace backup on the machine, not only that namespace's. The cost is
+that restoring an unrelated namespace's backup afterwards refuses bundles
+exported before a purge that never touched it; re-export from the live namespace
+is the remedy. Purge cost scales with the total number of backups, not with the
+purged namespace.
+
 `backups_scanned` counts every candidate file the sweep examined, so it can be
 compared against the directory listing. `backups_erased` counts backups that
 held the row and then passed every check above. `backups_unerased` describes

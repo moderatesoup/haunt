@@ -983,3 +983,64 @@ def test_purge_removes_session_metadata_that_only_json_decoding_reveals(haunt_en
             row["meta"] for row in store.conn.execute("SELECT meta FROM sessions")
         ]
     assert any("kept-session-metadata" in (meta or "") for meta in metas)
+
+
+def test_a_backup_can_hold_rows_from_more_than_one_namespace(haunt_env):
+    """Why the sweep is namespace-wide, and cannot be scoped to one namespace.
+
+    Rotating the privacy head in every backup the sweep opens has a cost: a
+    purge in one namespace moves the head in another namespace's backups too,
+    so restoring one of those refuses bundles exported before a purge that
+    never touched it. Scoping the rotation to "this namespace's backups"
+    would remove that cost, and this test is why it is not done -- nothing
+    identifies which namespace a backup belongs to:
+
+      - The namespace database stores no namespace id or label. Its `meta`
+        table holds schema_version, current_session, graph_evidence_version
+        and the privacy head; the identity lives only in the registry, keyed
+        by the live database's path, which a backup does not have.
+      - `retire` deregisters the namespace, deleting the identity row, so its
+        backups -- the ones most likely to hold purged content -- can never
+        be attributed to anything at all.
+      - The filename is `safe_name(label)`, which is lossy: labels "a/b" and
+        "a-b" both produce "a-b".
+
+    And the premise itself does not hold: reconcile copies rows keeping their
+    primary keys, so one backup legitimately holds rows from several
+    namespaces, as asserted below. "The backups belonging to this namespace"
+    is not a well-defined set of files, nor of rows within a file.
+    """
+    from haunt.paths import safe_name
+    from haunt.store import Store, register_namespace
+
+    assert safe_name("a/b") == safe_name("a-b"), (
+        "filename matching would confuse these two labels for one another"
+    )
+
+    for label in ("multi-alpha", "multi-gamma", "multi-beta"):
+        register_namespace(label)
+        with Store(label) as store:
+            store.observe(f"ROW-FROM-{label}", defer_embedding=True)
+    _reconcile_into("multi-alpha", "multi-beta")
+    # This second reconcile backs multi-beta up after it absorbed alpha's row.
+    _reconcile_into("multi-gamma", "multi-beta")
+
+    mixed = []
+    for backup in _namespace_backups(haunt_env):
+        if not backup.name.startswith("namespace-multi-beta-"):
+            continue
+        check = sqlite3.connect(f"{backup.as_uri()}?mode=ro", uri=True)
+        try:
+            contents = {row[0] for row in check.execute("SELECT content FROM memories")}
+        finally:
+            check.close()
+        if {"ROW-FROM-multi-alpha", "ROW-FROM-multi-beta"} <= contents:
+            mixed.append(backup.name)
+    assert mixed, "a backup of one namespace must be shown holding another's rows"
+
+    # The namespace database carries no identity of its own to scope by.
+    with Store("multi-beta") as store:
+        keys = {
+            str(row["key"]) for row in store.conn.execute("SELECT key FROM meta")
+        }
+    assert not {key for key in keys if "namespace" in key or "label" in key}, keys
