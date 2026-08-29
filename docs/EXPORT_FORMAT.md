@@ -1,8 +1,9 @@
 # Haunt canonical namespace export v1
 
-This document defines `haunt.namespace-export` version 1.0. It is a portable
-representation of one namespace's durable memory semantics, not a SQLite
-backup and not an MP UIIR/ExportBundle compatibility claim.
+This document defines `haunt.namespace-export` version 1.1, and the version 1.0
+bundles it still accepts. It is a portable representation of one namespace's
+durable memory semantics, not a SQLite backup and not an MP UIIR/ExportBundle
+compatibility claim.
 
 Exports contain potentially sensitive verbatim conversations, tool data,
 provenance, and correction history. Protect them like the namespace database.
@@ -11,7 +12,10 @@ signature.
 
 ## Container and canonical encoding
 
-- Media type: `application/vnd.haunt.namespace-export+json;version=1`
+- Media type: `application/vnd.haunt.namespace-export+json;version=1`. The
+  media type is major-scoped and does not move with a compatible minor: a
+  minor adds fields an older reader refuses outright, not a different
+  container to negotiate.
 - Encoding: strict UTF-8 JSON. Duplicate object keys, invalid Unicode,
   non-finite JSON numbers, trailing bytes, and compressed input are rejected.
 - Canonical bytes: object keys are sorted lexicographically, arrays retain
@@ -27,9 +31,32 @@ signature.
   semantic digest. Changing it changes the file bytes but not the represented
   namespace state.
 
-Version 1.0 is the only accepted version today. An unknown major or minor is
-rejected before mutation. A future compatible minor must ship an explicit,
-tested migration before the importer accepts it.
+## Versioning and the 1.0 compatibility rule
+
+Exports are written at 1.1. Both 1.0 and 1.1 are accepted; an unknown major, an
+unknown newer minor, and a negative minor are all rejected before mutation. A
+future compatible minor must ship an explicit, tested migration before the
+importer accepts it, because its added fields would carry meaning this reader
+has no defined default for.
+
+A minor adds record fields and never changes how a field an earlier minor
+already emitted is read. A bundle is validated against the exact field set of
+the minor it declares: a 1.0 bundle carrying a 1.1 field is rejected, and so is
+a 1.1 bundle missing one. The declared version is inside the semantic digest,
+so a 1.0 bundle keeps the digest its exporter published and its import receipt
+stays replayable; re-exporting it produces a 1.1 bundle with a new digest.
+
+A 1.0 default is what that bundle's silence means, not a value it may impose on
+a destination. Importing a 1.0 bundle onto rows that already carry the added
+fields is therefore an ordinary record conflict, refused before any write, not
+a silent un-exclusion or a dropped successor link.
+
+1.1 adds exactly two fields, both durable store columns that 1.0 dropped:
+
+| Field | Added | 1.0 default | Why that default is safe |
+|---|---|---|---|
+| `sessions.succeeds_session` | schema v12 | `NULL` | A 1.0 bundle records no succession anywhere, so `NULL` — the column's own value for a session that continues nothing — is the only non-fabricating choice, and it is what a 1.0 bundle already imported as. A 1.0 bundle exported from a pre-v12 namespace may carry a stale `succeeds_session` key inside `sessions.meta`; it is imported verbatim as opaque caller metadata and deliberately not promoted to the column, because rewriting `meta` would make the stored row differ from the bundle record and break receipt replay, and leaving both would give privacy purge a second carrier to rekey. |
+| `memories.skip_embedding` | schema v13 | `0` | The capture-policy decision is genuinely absent from a 1.0 bundle, not merely unread: the store infers it from "no vector, no queue row, non-blank content", and a bundle carries neither vectors nor queue rows by construction. `0` is what a 1.0 bundle already imported as, so old bundles keep meaning exactly what they meant. The harm is asymmetric — defaulting to `1` would silently drop every memory in every legacy bundle out of the vector index and out of `reembed()`, with no error and no way to tell which rows were genuinely excluded, while `0` at worst re-admits rows a source had excluded, which is visible in the index, costs only embedding work, and is corrected by re-exporting from the source at 1.1. Absence of a recorded exclusion is not evidence of one. |
 
 ## Envelope
 
@@ -38,7 +65,7 @@ The root object has exactly these fields:
 ```json
 {
   "format": "haunt.namespace-export",
-  "version": {"major": 1, "minor": 0},
+  "version": {"major": 1, "minor": 1},
   "temporal_cut": "2026-08-26T12:00:00.000000+00:00",
   "namespace": {
     "namespace_id": "stable-id",
@@ -82,12 +109,13 @@ home preserves the bundle head exactly.
 `records` has exactly the arrays below. Every record has exactly the listed
 fields, including nullable fields:
 
-- `sessions`: `id`, `started_at`, `ended_at`, `source`, `meta`
+- `sessions`: `id`, `started_at`, `ended_at`, `source`, `meta`,
+  `succeeds_session` (1.1)
 - `events`: `id`, `idempotency_key`, `session_id`, `ts`, `event_time`, `role`,
   `content`, `tool_name`, `tool_input`, `tool_output`, `origin`, `tier`, `meta`,
   `provenance`, `recall_class`
 - `memories`: `id`, `event_id`, `tier`, `content`, `valid_from`, `valid_to`,
-  `created_at`
+  `created_at`, `skip_embedding` (1.1)
 - `lineage_tombstones`: `schema_version`, `tombstone_id`, `status`, `erased_at`
 - `corrections`: `id`, `target_memory_id`, `target_tombstone_id`,
   `replacement_memory_id`, `replacement_tombstone_id`, `corrected_at`,
@@ -101,7 +129,13 @@ fields, including nullable fields:
 Structured event provenance remains the canonical stored v1 JSON TEXT defined
 in [PROVENANCE.md](PROVENANCE.md). Referential closure is mandatory: every
 event/session, memory/event, correction endpoint, entity mention, and relation
-evidence reference must resolve inside the bundle.
+evidence reference must resolve inside the bundle. A non-null
+`sessions.succeeds_session` must name another session in the same bundle and
+may not name its own row; the column carries no SQLite foreign key, so import
+is the only gate on a dangling successor link. `memories.skip_embedding` must
+be exactly the integer `0` or `1` — the column has no CHECK constraint, and
+every reader treats it as a two-valued flag, so any other value would read as
+excluded.
 
 SQLite BLOBs and legacy non-finite REAL values cannot be represented as normal
 JSON scalars. V1 preserves them exactly with these closed tagged objects:
@@ -158,6 +192,19 @@ identity, and other caches. Import rebuilds FTS for TEXT memories and graph
 relations from durable evidence. It queues non-empty TEXT memories for the
 destination's configured embedding model; source model identity, dimension,
 and vectors do not transfer.
+
+A memory with `skip_embedding=1` is still indexed for FTS and is not queued,
+exactly as the store admits one: the persisted exclusion withholds the vector
+index only, and it survives a later full `reembed()` at the destination rather
+than being re-derived from the destination's own environment.
+
+`memories.content_hash` is likewise rebuilt rather than transferred. It is a
+pure function of the stored `content` the bundle already carries, so import
+writes exactly the store's own `_content_hash(content)` for every TEXT memory,
+at every accepted version — a 1.0 bundle gains it too. Carrying it on the wire
+would only add a second value that validation would have to reconcile against
+this one, and a bundle whose hash disagreed with its content would be
+meaningless. Non-TEXT (legacy BLOB) content has no defined hash and stays NULL.
 
 ## Import validation, limits, and atomicity
 

@@ -40,6 +40,7 @@ from haunt.store import (
     SCHEMA_VERSION,
     PRIVACY_LINEAGE_KEY,
     _claim_fresh_namespace_db_with_configuration_lock,
+    _content_hash,
     _ensure_namespace_schema,
     _init_namespace_schema,
     _namespace_migration_lock,
@@ -59,7 +60,9 @@ from haunt.util import now_iso, parse_iso, utc_iso
 
 FORMAT_NAME = "haunt.namespace-export"
 FORMAT_MAJOR = 1
-FORMAT_MINOR = 0
+FORMAT_MINOR = 1
+# Media type is major-scoped: a compatible minor adds fields an older reader
+# would refuse, not a different container, so the negotiated type is unchanged.
 MEDIA_TYPE = "application/vnd.haunt.namespace-export+json;version=1"
 
 _DIGEST_PREFIX = "sha256:"
@@ -131,7 +134,7 @@ def resolve_import_limits(**overrides: int | float | None) -> ImportLimits:
 
 
 _TABLE_FIELDS: dict[str, tuple[str, ...]] = {
-    "sessions": ("id", "started_at", "ended_at", "source", "meta"),
+    "sessions": ("id", "started_at", "ended_at", "source", "meta", "succeeds_session"),
     "events": (
         "id",
         "idempotency_key",
@@ -157,6 +160,7 @@ _TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "valid_from",
         "valid_to",
         "created_at",
+        "skip_embedding",
     ),
     "lineage_tombstones": (
         "schema_version",
@@ -210,6 +214,38 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 _IMPORT_ORDER = tuple(_TABLE_FIELDS)
+
+# Record fields a compatible minor added, keyed by the minor that introduced
+# them. Additive only: a field may join this table, never leave it, and no
+# entry here may change how a field an older minor already emitted is read.
+_MINOR_ADDED_FIELDS: dict[int, dict[str, tuple[str, ...]]] = {
+    1: {"sessions": ("succeeds_session",), "memories": ("skip_embedding",)},
+}
+
+# The value an older bundle's silence means. Both are the destination column's
+# own default, so an accepted older bundle lands exactly as it always did and
+# the added fields change what a bundle can say, not what one already said.
+_MINOR_FIELD_DEFAULTS: dict[str, dict[str, Any]] = {
+    "sessions": {"succeeds_session": None},
+    "memories": {"skip_embedding": 0},
+}
+
+
+def _fields_by_minor() -> dict[int, dict[str, tuple[str, ...]]]:
+    """Exact accepted field set per supported minor, newest backwards."""
+    table: dict[int, dict[str, tuple[str, ...]]] = {}
+    fields = dict(_TABLE_FIELDS)
+    for minor in range(FORMAT_MINOR, -1, -1):
+        table[minor] = dict(fields)
+        removed = _MINOR_ADDED_FIELDS.get(minor, {})
+        fields = {
+            name: tuple(f for f in columns if f not in removed.get(name, ()))
+            for name, columns in fields.items()
+        }
+    return table
+
+
+_TABLE_FIELDS_BY_MINOR = _fields_by_minor()
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -300,6 +336,28 @@ def _decode_sqlite(value: Any) -> Any:
 
 def _encode_row(row: sqlite3.Row, fields: Sequence[str]) -> dict[str, Any]:
     return {field: _encode_sqlite(row[field]) for field in fields}
+
+
+def _decoded_at_current_minor(
+    table: str,
+    record: Mapping[str, Any],
+    bundle_fields: Mapping[str, tuple[str, ...]],
+) -> dict[str, Any]:
+    """Decode one record and fill the fields its minor could not carry.
+
+    The upgrade lands only in the decoded row used for writing. The bundle's
+    own bytes are left alone, so an older bundle still hashes to the digest
+    its exporter published and its import receipt stays replayable.
+    """
+    present = set(bundle_fields[table])
+    return {
+        field: (
+            _decode_sqlite(record[field])
+            if field in present
+            else _MINOR_FIELD_DEFAULTS[table][field]
+        )
+        for field in _TABLE_FIELDS[table]
+    }
 
 
 def _record_key(record: Mapping[str, Any], fields: Sequence[str]) -> bytes:
@@ -964,10 +1022,15 @@ def _validate_bundle(
         raise ImportBundleError(
             f"unsupported export major {version['major']}; supported major is {FORMAT_MAJOR}"
         )
-    if version["minor"] != FORMAT_MINOR:
+    # Older minors are read with their own field set and upgraded below; an
+    # unknown newer one fails closed, because its added fields carry meaning
+    # this reader cannot supply a default for.
+    if not 0 <= version["minor"] <= FORMAT_MINOR:
         raise ImportBundleError(
-            f"unsupported export minor {version['minor']}; supported minor is {FORMAT_MINOR}"
+            f"unsupported export minor {version['minor']}; "
+            f"supported minors are 0 through {FORMAT_MINOR}"
         )
+    bundle_fields = _TABLE_FIELDS_BY_MINOR[version["minor"]]
     _parse_cut(bundle["temporal_cut"])
 
     creation = bundle["creation"]
@@ -1100,7 +1163,7 @@ def _validate_bundle(
             check_deadline()
             if not isinstance(record, dict):
                 raise ImportBundleError(f"records.{table} item must be an object")
-            _require_keys(record, set(_TABLE_FIELDS[table]), f"records.{table} item")
+            _require_keys(record, set(bundle_fields[table]), f"records.{table} item")
             record_size = len(_canonical_bytes(record))
             check_deadline()
             if record_size > limits.record_bytes:
@@ -1118,9 +1181,7 @@ def _validate_bundle(
                 raise ImportBundleError(f"records.{table} are not canonically ordered")
             seen.add(key)
             prior_key = key
-            decoded_rows.append(
-                {field: _decode_sqlite(record[field]) for field in _TABLE_FIELDS[table]}
-            )
+            decoded_rows.append(_decoded_at_current_minor(table, record, bundle_fields))
         decoded[table] = decoded_rows
 
     manifest = bundle["manifest"]
@@ -1261,6 +1322,16 @@ def _validate_record_references(
         if _identity_token(value) not in available:
             raise ImportBundleError(message)
 
+    # sessions.succeeds_session carries no SQLite foreign key, so the scratch
+    # insert cannot catch a dangling successor link; this is the only gate.
+    for session in records["sessions"]:
+        check_deadline()
+        predecessor = session["succeeds_session"]
+        if predecessor is None:
+            continue
+        require(predecessor, sessions, "session references missing predecessor")
+        if _identity_token(predecessor) == _identity_token(session["id"]):
+            raise ImportBundleError("session cannot succeed itself")
     for event in records["events"]:
         check_deadline()
         require(event["session_id"], sessions, "event references missing session")
@@ -1356,12 +1427,20 @@ def _validate_enumerated_columns(
     ``events.tier``, ``memories.tier`` and ``entities.type`` are plain TEXT,
     so an import is the only gate between a crafted bundle and every reader
     that treats those columns as a known vocabulary.
+    ``memories.skip_embedding`` is a plain INTEGER with no CHECK, and every
+    reader of it (``reembed``, the queue drain) tests it as a two-valued
+    flag, so anything but 0 or 1 would silently read as excluded.
     """
     for table in ("events", "memories"):
         for record in records[table]:
             check_deadline()
             if record["tier"] not in TIERS:
                 raise ImportBundleError(f"invalid {table}.tier")
+    for memory in records["memories"]:
+        check_deadline()
+        skip = memory["skip_embedding"]
+        if type(skip) is not int or skip not in (0, 1):
+            raise ImportBundleError("invalid memories.skip_embedding")
     for entity in records["entities"]:
         check_deadline()
         if entity["type"] not in ENTITY_TYPES:
@@ -1457,11 +1536,24 @@ def _apply_records(
         conn.execute("DELETE FROM memories_fts WHERE id=?", (record["id"],))
         content = record["content"]
         if isinstance(content, str):
+            # content_hash is a pure function of stored content, so it is
+            # recomputed rather than carried: the bundle already determines it,
+            # and a second copy on the wire would only be a value validation
+            # would have to reconcile against this one. Non-TEXT content has no
+            # defined hash -- _content_hash takes str, and the store's own
+            # backfill cannot hash a legacy BLOB either -- so it stays NULL.
+            conn.execute(
+                "UPDATE memories SET content_hash=? WHERE id=?",
+                (_content_hash(content), record["id"]),
+            )
             conn.execute(
                 "INSERT INTO memories_fts(id,content) VALUES (?,?)",
                 (record["id"], content),
             )
-        if isinstance(content, str) and content.strip():
+        # FTS is unconditional but the queue is not, exactly as observe()
+        # writes them: the persisted capture-policy exclusion keeps the row
+        # keyword-searchable and out of the vector index.
+        if isinstance(content, str) and content.strip() and not record["skip_embedding"]:
             conn.execute(
                 "INSERT OR IGNORE INTO embedding_jobs(memory_id,queued_at) VALUES (?,?)",
                 (record["id"], record["created_at"]),
