@@ -1973,3 +1973,85 @@ def test_embedding_jobs_stays_out_of_the_plans_per_table_report(reconcile_home):
     plan = reconcile_namespaces("jobs-report-src", "jobs-report-dst")
     assert set(plan["tables"]) == {table for table, _pk, _ig in _RECONCILE_TABLES}
     assert "embedding_jobs" not in plan["tables"]
+
+
+def test_table_columns_is_defined_once_and_keeps_the_declared_order(reconcile_home):
+    """One definition, returning a list in PRAGMA order.
+
+    A second `_table_columns` returning a `set` was added later in the same
+    module and silently shadowed this one for every caller, including the
+    apply below. Both the count and the type are pinned: a set brings back
+    the shadowing, and a sorted list brings back a different order than the
+    table declares.
+    """
+    import inspect
+
+    source = inspect.getsource(store)
+    assert source.count("\ndef _table_columns(") == 1, (
+        "a second _table_columns shadows the first for every caller below it"
+    )
+
+    register_namespace("cols-one")
+    with Store("cols-one") as st:
+        conn = st.conn
+        for table in ("memories", "events", "sessions"):
+            declared = [
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            ]
+            columns = store._table_columns(conn, table)
+            assert isinstance(columns, list), type(columns)
+            assert columns == declared, table
+        # Callers rely on a missing table degrading rather than raising.
+        assert store._table_columns(conn, "no_such_table_here") == []
+
+
+def test_reconcile_apply_inserts_columns_in_the_declared_order(reconcile_home, monkeypatch):
+    """The INSERT the apply emits is the table's own column order, every run.
+
+    `_execute_reconciliation_writes` walks the column collection twice -- once
+    for the column list, once for the value tuple -- so a `set` kept the two
+    agreeing with each other while agreeing with nothing else: the same
+    reconcile emitted a different column order in every process, because
+    string hashing is seeded per process. Pinning the emitted SQL is the only
+    assertion that fails for that and passes for the fix.
+    """
+    statements: list[str] = []
+    real_writes = store._execute_reconciliation_writes
+
+    def traced(source_conn, target_conn, *, expected_content_digest):
+        target_conn.set_trace_callback(statements.append)
+        try:
+            return real_writes(
+                source_conn,
+                target_conn,
+                expected_content_digest=expected_content_digest,
+            )
+        finally:
+            target_conn.set_trace_callback(None)
+
+    monkeypatch.setattr(store, "_execute_reconciliation_writes", traced)
+
+    register_namespace("order-src")
+    register_namespace("order-dst")
+    with Store("order-src") as st:
+        st.observe("a row that reconcile has to copy", defer_embedding=True)
+    with Store("order-dst") as st:
+        st.observe("an unrelated destination row", defer_embedding=True)
+
+    _plan_and_apply("order-src", "order-dst")
+
+    inserts = [
+        text
+        for text in statements
+        if text.startswith("INSERT INTO memories(")
+    ]
+    assert inserts, f"the apply emitted no memories INSERT: {statements}"
+
+    with Store("order-dst") as st:
+        declared = [
+            str(row["name"])
+            for row in st.conn.execute("PRAGMA table_info(memories)").fetchall()
+        ]
+    emitted = inserts[0].split("(", 1)[1].split(")", 1)[0].split(",")
+    assert emitted == declared, inserts[0]

@@ -53,9 +53,13 @@ identifiable. They are unkeyed hashes, not signatures or authenticity claims.
 Export excludes local paths, embeddings, indexes, and previously purged bytes,
 but anyone who can read a bundle can read its surviving plaintext content.
 An opaque namespace history head rotates in the hard-purge transaction, and in
-every namespace backup the purge sweeps, so an older or independently diverged
-bundle cannot be replayed into that namespace, or into a database restored from
-one of its backups, to restore erased rows. The head is not a secret, signature, or defense against
+every namespace backup the purge sweeps — including the backups that never held
+the purged row, since the head is what a restored file answers with and not a
+property of the row. So an older or independently diverged bundle cannot be
+replayed into that namespace, or into a database restored from one of the
+backups the sweep rewrote, to restore erased rows. A backup the sweep could not
+rewrite keeps its old head and is named in `backups_unerased`. The head is not a
+secret, signature, or defense against
 a same-user attacker who can directly rewrite Haunt's files. Interrupted fresh
 imports recover only files still matching the fsynced intent's exact token,
 digest, device, and inode ownership; replacement links fail closed.
@@ -90,10 +94,29 @@ memory content.
 
 A rewritten backup counts as erased only after the sweep re-reads it: integrity
 and foreign-key checks pass, the row is gone, the privacy head has moved, and a
-raw scan of the file's bytes finds none of the erased values. `backups_erased`
-counts backups that passed all of that; `backups_unerased` names every one that
-did not, whether it could not be opened — locked, corrupt, or holding a vector
-table whose extension would not load — or was rewritten but failed a check. A
+raw scan of the file's bytes finds none of the erased values.
+
+That last scan is a transcription check, not an independent proof. It looks for
+the erased values as they were stored, which is the same comparison the
+sanitizer made when it decided what to remove, so it catches a copy of those
+bytes the rewrite missed — a stale page, an index entry, a field the erasure did
+not know to visit — and it does not catch a value some other row re-encoded.
+Base64, compression, an escaped copy nested inside another document: none of
+those contain the erased bytes to find. The sanitizer decodes JSON-encoded
+session metadata before it decides, so a value one `json.loads` deep is removed
+rather than merely unfound; nothing generalises that to every possible encoding,
+and the scan cannot be read as saying the value is gone in every form. It says
+the values it erased are not sitting in the file verbatim.
+
+`backups_scanned` counts every candidate file the sweep examined, so it can be
+compared against the directory listing. `backups_erased` counts backups that
+held the row and then passed every check above. `backups_unerased` describes
+every candidate the sweep could not prove free of the row, with the reason: one
+it could not open (locked, corrupt, or holding a vector table whose extension
+would not load), one it declined to rewrite (not a regular file, hard-linked
+under another name, or no longer at the private 0600 mode Haunt wrote it with —
+each of which leaves the file exactly as it was found), and one it rewrote that
+then failed a check. A candidate in neither counter held no copy of the row. A
 non-empty `backups_unerased` means the erasure did not complete. Sweeping
 rewrites the file, so the sha256 the migration report recorded for that backup
 no longer matches it.

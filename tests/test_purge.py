@@ -390,10 +390,18 @@ def test_purge_erases_the_canary_from_the_backups_haunt_wrote(haunt_env):
     assert result["backups_erased"] >= 2, (
         "the reconcile-source and retire backups both held the row"
     )
+    # Not >= : a candidate the sweep passes over in silence is exactly the
+    # failure mode here, and only an equality against the directory catches it.
+    assert result["backups_scanned"] == len(_namespace_backups(haunt_env))
 
 
 def test_purge_leaves_backups_that_never_held_the_row_alone(haunt_env):
-    """Sweeping is per-row, not a retention policy on the whole directory."""
+    """Sweeping is per-row, not a retention policy on the whole directory.
+
+    Rows only: the privacy head of every backup the sweep opens does move,
+    including this one's -- see
+    test_a_backup_that_never_held_the_row_still_rotates_its_privacy_head.
+    """
     from haunt.store import reconcile_namespaces, register_namespace
 
     register_namespace("keep-src")
@@ -648,6 +656,7 @@ def test_purge_erases_every_reachable_canary_from_every_backup(haunt_env):
 
     assert result["backups_unerased"] == []
     assert result["backups_erased"] >= 1
+    assert result["backups_scanned"] == len(_namespace_backups(haunt_env))
     assert _raw_hits(_backup_files(haunt_env), BACKUP_CANARIES) == {}
 
 
@@ -746,3 +755,231 @@ def test_backups_unerased_names_a_backup_whose_erasure_cannot_be_proven(
     assert result["backups_scanned"] >= 1
     assert result["backups_erased"] == 0
     assert result["backups_unerased"], "a backup left incompletely erased must be named"
+
+
+def _namespace_backups(home: Path) -> list[Path]:
+    root = home / "backups"
+    return sorted(root.glob("namespace-*.db")) if root.is_dir() else []
+
+
+def _entry_for(unerased: list[str], path: Path) -> str:
+    """The one `backups_unerased` entry naming this file, or a failure."""
+    matches = [entry for entry in unerased if entry.startswith(path.name)]
+    assert len(matches) == 1, f"expected one entry for {path.name}, got {unerased}"
+    return matches[0]
+
+
+@pytest.mark.parametrize("damage", ["mode-0644", "mode-0400", "hard-link", "fifo"])
+def test_a_backup_the_sweep_declines_to_rewrite_is_reported_not_skipped(
+    haunt_env, damage
+):
+    """Declining to touch a backup is not evidence the row is not in it.
+
+    The sweep refuses to rewrite a candidate that is not the private,
+    single-named regular file it wrote. Each refusal used to `continue`
+    silently, so `backups_unerased == []` was reported over a file still
+    holding the erased content in plaintext -- the exact claim the sweep
+    exists to make true. Every refusal is now named, with its reason.
+    """
+    import os
+
+    from haunt.store import open_existing, register_namespace
+
+    canary = "DECLINED-BACKUP-CANARY-30c4"
+    register_namespace("declined-src")
+    register_namespace("declined-dst")
+    with Store("declined-src") as store:
+        memory_id = store.observe(canary, defer_embedding=True).memory_id
+    with Store("declined-dst") as store:
+        store.observe("an unrelated destination row", defer_embedding=True)
+    _reconcile_into("declined-src", "declined-dst")
+
+    victims = [
+        path
+        for path in _namespace_backups(haunt_env)
+        if path.name.startswith("namespace-declined-src-")
+    ]
+    assert len(victims) == 1, victims
+    victim = victims[0]
+    assert victim.read_bytes().count(canary.encode()) > 0
+
+    if damage == "mode-0644":
+        victim.chmod(0o644)
+        expected = "mode 0644"
+    elif damage == "mode-0400":
+        victim.chmod(0o400)
+        expected = "mode 0400"
+    elif damage == "hard-link":
+        os.link(victim, victim.with_name(victim.name + ".other"))
+        expected = "hard links"
+    else:
+        # A named pipe standing where a backup was: not a regular file, and
+        # opening it read-write would block rather than erase anything.
+        victim.unlink()
+        os.mkfifo(victim, 0o600)
+        expected = "not a regular file"
+
+    with open_existing("declined-dst") as store:
+        result = store.purge(memory_id)
+
+    assert result["ok"] is True
+    entry = _entry_for(result["backups_unerased"], victim)
+    assert expected in entry, entry
+    if damage != "fifo":
+        assert victim.read_bytes().count(canary.encode()) > 0, (
+            "the point of the report is that these bytes are still there"
+        )
+    # Every candidate is counted, including the one the sweep refused, so the
+    # report can be checked against the directory rather than trusted.
+    assert result["backups_scanned"] == len(_namespace_backups(haunt_env))
+
+
+def test_a_backup_that_never_held_the_row_still_rotates_its_privacy_head(haunt_env):
+    """The head is the namespace's answer, not a property of the erased row.
+
+    reconcile backs TARGET up inside the apply transaction, before the copy,
+    so that backup never holds the row the purge later erases from TARGET.
+    Rotating only the backups that held the row left that one answering with
+    the pre-purge head: restore it and the bundle exported before the purge
+    is accepted, putting the erased plaintext back into the live namespace.
+    """
+    from haunt.portability import (
+        ImportConflictError,
+        build_namespace_export,
+        canonical_export_bytes,
+        import_namespace_bytes,
+    )
+    from haunt.store import Store, open_existing, register_namespace
+
+    canary = "UNROTATED-BACKUP-CANARY-6b19"
+    register_namespace("rotate-src")
+    register_namespace("rotate-dst")
+    with Store("rotate-src") as store:
+        memory_id = store.observe(canary, defer_embedding=True).memory_id
+    with Store("rotate-dst") as store:
+        store.observe("an unrelated destination row", defer_embedding=True)
+
+    _reconcile_into("rotate-src", "rotate-dst")
+    stale = canonical_export_bytes(build_namespace_export("rotate-dst"))
+    assert canary.encode() in stale
+
+    with open_existing("rotate-dst") as store:
+        result = store.purge(memory_id)
+    assert result["backups_unerased"] == []
+
+    target_backups = [
+        path
+        for path in _namespace_backups(haunt_env)
+        if path.name.startswith("namespace-rotate-dst-reconcile-target-")
+    ]
+    assert len(target_backups) == 1, target_backups
+    check = sqlite3.connect(f"{target_backups[0].as_uri()}?mode=ro", uri=True)
+    try:
+        held = check.execute(
+            "SELECT 1 FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+    finally:
+        check.close()
+    assert held is None, "this backup is only interesting if it never held the row"
+
+    _restore_backup(target_backups[0], "rotate-dst")
+    with open_existing("rotate-dst") as store:
+        assert store.get_memory(memory_id) is None
+
+    with pytest.raises(ImportConflictError, match="privacy lineage"):
+        import_namespace_bytes(stale)
+
+    with open_existing("rotate-dst") as store:
+        assert store.get_memory(memory_id) is None
+
+
+def _json_decoded_strings(value: object, depth: int = 0) -> list[str]:
+    """Every string reachable from stored metadata through repeated json.loads."""
+    import json
+
+    found: list[str] = []
+    if isinstance(value, str):
+        found.append(value)
+        if depth < 8:
+            try:
+                child = json.loads(value)
+            except Exception:
+                return found
+            if child != value:
+                found.extend(_json_decoded_strings(child, depth + 1))
+        return found
+    if isinstance(value, dict):
+        for key, child in value.items():
+            found.extend(_json_decoded_strings(key, depth))
+            found.extend(_json_decoded_strings(child, depth))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_json_decoded_strings(child, depth))
+    return found
+
+
+def test_purge_removes_session_metadata_that_only_json_decoding_reveals(haunt_env):
+    """Session metadata is judged on what it decodes to, not on its bytes.
+
+    A caller that stores `json.dumps({"prompt": secret})` in session metadata
+    stores the escaped form of the secret, so the substring comparison the
+    sanitizer makes does not see it -- and neither does the raw byte scan the
+    sweep runs afterwards, which is the same comparison over the same values.
+    Both agreed the file was clean while one `json.loads` handed the secret
+    back, in the live namespace and in the backup alike.
+    """
+    import json
+
+    from haunt.store import Store, open_existing, register_namespace
+
+    secret = "JSON-NESTED-CANARY-éé-8d15"
+    session = "session-holding-nested-json"
+    register_namespace("nested-src")
+    register_namespace("nested-dst")
+    with Store("nested-src") as store:
+        store.ensure_session(
+            session,
+            meta={
+                "resumed": json.dumps({"prompt": secret}),
+                "unrelated": "kept-session-metadata",
+            },
+        )
+        # The erasure's markers are whole stored field values, so the secret
+        # has to be the erased content rather than a fragment of it.
+        memory_id = store.observe(
+            secret, session_id=session, defer_embedding=True
+        ).memory_id
+        store.observe(SURVIVOR_TEXT, session_id=session, defer_embedding=True)
+    with Store("nested-dst") as store:
+        store.observe("an unrelated destination row", defer_embedding=True)
+    _reconcile_into("nested-src", "nested-dst")
+
+    escaped = json.dumps(secret)[1:-1]
+    assert escaped != secret, "this test needs an encoding that actually escapes"
+
+    with open_existing("nested-dst") as store:
+        result = store.purge(memory_id)
+    assert result["backups_unerased"] == []
+
+    from haunt.paths import namespace_db_path
+
+    leaks: dict[str, list[str]] = {}
+    for path in [namespace_db_path("nested-dst"), *_namespace_backups(haunt_env)]:
+        check = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        check.row_factory = sqlite3.Row
+        try:
+            for row in check.execute("SELECT id, meta FROM sessions"):
+                if any(
+                    secret in text for text in _json_decoded_strings(row["meta"])
+                ):
+                    leaks.setdefault(path.name, []).append(str(row["id"]))
+        finally:
+            check.close()
+    assert leaks == {}, f"the secret is one json.loads away from readable: {leaks}"
+
+    # Only the erased context goes; unrelated metadata on the same session stays.
+    with open_existing("nested-dst") as store:
+        metas = [
+            row["meta"] for row in store.conn.execute("SELECT meta FROM sessions")
+        ]
+    assert any("kept-session-metadata" in (meta or "") for meta in metas)

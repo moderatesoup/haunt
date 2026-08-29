@@ -349,6 +349,13 @@ PURGE_SAFE_SESSION_SOURCE = "privacy-sanitized"
 # an origin, a tier or an empty JSON object: text ordinary surviving rows
 # carry, which would make every taint check and every sweep look positive.
 ERASURE_MARKER_MIN_LEN = 8
+# How many json.loads layers session metadata is unwrapped through when
+# deciding whether it still carries erased context. Callers nest encoded
+# documents inside metadata (a serialized prompt, a captured payload), and an
+# escaped marker is not a substring of the value that holds it. Bounded only
+# as a guard: each decoded layer is strictly shorter than its encoding, so
+# real nesting terminates well inside this.
+SESSION_META_DECODE_DEPTH = 8
 PURGE_SAFE_PROVENANCE = provenance_json(
     {
         "schema_version": 1,
@@ -4160,6 +4167,21 @@ _RECONCILE_SECONDARY_UNIQUE_KEYS: dict[str, tuple[str, ...]] = {
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """Column names of one ordinary table, in the order the table declares them.
+
+    The order is load-bearing for `_execute_reconciliation_writes`, which
+    builds an INSERT's column list and its value tuple from two separate
+    walks of this result: a set would make the pair agree with each other and
+    with nothing else, so the same reconcile would emit a different column
+    order in every process. It is also the only definition -- a second one
+    returning a set once shadowed this and silently took those four callers
+    with it.
+
+    A missing table yields `[]` rather than raising, which callers rely on:
+    a backup is never migrated, so one can predate a column the erasure reads,
+    and degrading to what a file actually holds keeps an old backup erasable
+    instead of failing its whole sweep.
+    """
     return [
         str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
     ]
@@ -4552,16 +4574,6 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     )
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    """Column names of one ordinary table.
-
-    Backups are never migrated, so one can predate a column this erasure
-    reads or scrubs. Degrading to what a file actually holds keeps an old
-    backup erasable instead of failing its whole sweep.
-    """
-    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
-
-
 def _sanitize_correction_replacement_event(
     conn: sqlite3.Connection,
     correction: sqlite3.Row,
@@ -4697,16 +4709,26 @@ def _purge_safe_session_context(
     not_json = object()
     original = loads(meta_text, default=not_json)
 
-    def contains_tainted(value: Any) -> bool:
+    def contains_tainted(value: Any, depth: int = 0) -> bool:
         if tainted(value):
             return True
         if isinstance(value, dict):
             return any(
-                contains_tainted(key) or contains_tainted(child)
+                contains_tainted(key, depth) or contains_tainted(child, depth)
                 for key, child in value.items()
             )
         if isinstance(value, list):
-            return any(contains_tainted(child) for child in value)
+            return any(contains_tainted(child, depth) for child in value)
+        if isinstance(value, str) and depth < SESSION_META_DECODE_DEPTH:
+            # A caller that stored `json.dumps({"prompt": secret})` stored a
+            # string whose bytes are the *escaped* form of the secret, so the
+            # substring comparison above misses it while one json.loads gets
+            # it straight back. Decode what decodes and compare that too.
+            # Each layer is strictly shorter than the one that encoded it, so
+            # the depth cap is a guard, not the terminating condition.
+            child = loads(value, default=not_json)
+            if child is not not_json and child != value:
+                return contains_tainted(child, depth + 1)
         return False
 
     if not tainted(original_meta) and (
@@ -4718,11 +4740,16 @@ def _purge_safe_session_context(
 
     def sanitize(value: Any) -> Any:
         if isinstance(value, str):
-            return dropped if tainted(value) else value
+            # contains_tainted, not tainted: a string that is itself an
+            # encoded document has to be judged on what it decodes to. The
+            # whole string is dropped rather than re-encoded clean, because
+            # a caller's encoding is theirs and privacy is not the place to
+            # guess at round-tripping it.
+            return dropped if contains_tainted(value) else value
         if isinstance(value, dict):
             clean: dict[Any, Any] = {}
             for key, child in value.items():
-                if isinstance(key, str) and tainted(key):
+                if isinstance(key, str) and contains_tainted(key):
                     continue
                 sanitized = sanitize(child)
                 if sanitized is not dropped:
@@ -5223,8 +5250,16 @@ def _erase_memory_from_backup(
     that already refuses every bundle exported before the purge, instead of
     one that still answers with the pre-purge head.
 
+    A backup that never held the row still gets the rotation, and `None` is
+    still returned for it. The head is not a property of the erased row; it
+    is the namespace's answer to "has anything been purged since you took
+    this bundle", and a backup restored still holding the pre-purge answer
+    accepts every bundle exported before the purge -- including one carrying
+    the row just erased. Rotating only the backups that held it would leave
+    exactly the file the purge did nothing to as the way back in.
+
     Returns the erasure markers so the caller can prove the rewritten file
-    no longer holds them.
+    no longer holds them, or None when there was no row here to erase.
     """
     report: dict[str, Any] = {}
     conn.execute("BEGIN IMMEDIATE")
@@ -5233,8 +5268,7 @@ def _erase_memory_from_backup(
             conn, memory_id, namespace_id=None, report=report
         )
         if markers is None:
-            conn.rollback()
-            return None
+            _rotate_privacy_lineage_head(conn, None)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -5249,7 +5283,9 @@ def _verify_backup_erasure(
 
     Checked inside the sweep rather than left to a caller, so an empty
     `backups_unerased` cannot cover a file that is corrupt, still holds the
-    row, or still answers with the head every stale bundle carries.
+    row, or still answers with the head every stale bundle carries. Applied
+    to every backup the sweep rewrites, including one that never held the
+    row and so was rewritten for the rotation alone.
     """
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if str(integrity) != "ok":
@@ -5277,34 +5313,94 @@ def _purge_backup_copies(memory_id: str) -> dict[str, Any]:
     also hold, so a backup cannot be published from a pre-purge snapshot
     while the sweep is deciding what exists.
 
-    Returns `scanned`, `erased`, and `unerased`. `erased` counts only backups
-    the sweep re-read and found consistent, rowless, rotated off their
-    pre-purge privacy head, and free of the erased bytes; `unerased` names
-    every other file it touched, whether it could not be opened (locked,
-    corrupt, or a vec table whose module would not load) or was rewritten and
-    failed one of those checks. A non-empty `unerased` means the erasure did
-    not complete. Sweeping rewrites the file, so the sha256 an earlier
-    migration report recorded for that backup no longer matches it.
+    Returns `scanned`, `erased`, and `unerased`.
+
+    `scanned` counts every candidate the sweep examined -- every file under
+    the backup root named the way `_backup_namespace_database` names one --
+    including the ones it could not stat, could not open, or declined to
+    rewrite. It is deliberately not "files successfully processed": a count
+    that dropped whatever went wrong could not be compared against the
+    directory listing to notice a file the sweep passed over in silence.
+
+    `erased` counts only backups that held the row and that the sweep then
+    re-read and found consistent, rowless, rotated off their pre-purge
+    privacy head, and free of the erased bytes.
+
+    `unerased` describes every candidate the sweep could not prove is free of
+    the row: one it could not stat or open (locked, corrupt, or a vec table
+    whose module would not load), one it declined to rewrite (not a regular
+    file, hard-linked elsewhere, or no longer at the private mode haunt wrote
+    it with), and one it rewrote that then failed a check. Each entry is
+    `"<name> (<reason>)"`, and the one entry that names no file says so in
+    place of a name: a backup root this process cannot verify is reported
+    against the directory itself. A non-empty `unerased` means the erasure
+    did not complete.
+
+    A candidate that is scanned and appears in neither counter held no copy
+    of the row -- it was rewritten for the privacy rotation alone, or it is
+    not a namespace database at all.
+
+    Sweeping rewrites the file, so the sha256 an earlier migration report
+    recorded for that backup no longer matches it.
     """
     result: dict[str, Any] = {"scanned": 0, "erased": 0, "unerased": []}
     try:
         if not (haunt_home() / "backups").is_dir():
             return result
         backup_root, backup_root_fd = _private_backup_root()
-    except Exception:
+    except Exception as exc:
         # The live erasure is already committed, so a directory this
         # process cannot verify must be reported, not raised: the caller
         # would otherwise see a failure for work that succeeded.
-        result["unerased"].append("backups")
+        _record_unerased_backup(result, None, f"could not be verified: {exc}")
         return result
     try:
         _sweep_backup_copies(backup_root, backup_root_fd, memory_id, result)
-    except Exception:
+    except Exception as exc:
         # Same reason as the root failure above: the purge itself is done.
-        result["unerased"].append("backups")
+        _record_unerased_backup(result, None, f"could not be swept: {exc}")
     finally:
         os.close(backup_root_fd)
     return result
+
+
+def _record_unerased_backup(
+    result: dict[str, Any], name: str | None, reason: str
+) -> None:
+    """Name one backup the sweep could not prove erased, and why.
+
+    Every entry is a string so the CLI, MCP and console can keep joining the
+    list for a human. `name` is None only for the backup directory itself,
+    which is not a file the sweep chose to skip but the place it could not
+    read at all; the entry says that rather than silently reading as a
+    filename.
+    """
+    subject = "the HAUNT_HOME/backups directory" if name is None else name
+    result["unerased"].append(f"{subject} ({reason})")
+
+
+def _backup_rewrite_refusal(info: os.stat_result) -> str | None:
+    """Why this directory entry must not be rewritten in place, or None.
+
+    Each condition is a reason the file is not the private, single-named
+    copy `_backup_namespace_database` created, and rewriting it either would
+    not erase every path to those bytes or would be writing to something
+    this process cannot account for. None of them is a reason to believe the
+    row is not in there, which is why the caller reports rather than skips.
+    """
+    if not stat.S_ISREG(info.st_mode):
+        return "is not a regular file"
+    if int(info.st_nlink) != 1:
+        return (
+            f"has {int(info.st_nlink)} hard links, so rewriting this name "
+            "would leave the other names holding the same bytes"
+        )
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        return (
+            f"has mode {stat.S_IMODE(info.st_mode):04o}, not the private 0600 "
+            "haunt wrote it with"
+        )
+    return None
 
 
 def _sweep_backup_copies(
@@ -5322,44 +5418,54 @@ def _sweep_backup_copies(
         and (name.startswith("namespace-") or name.startswith(".namespace-backup-"))
     )
     for name in names:
+        # Counted before anything can go wrong with it. A candidate dropped
+        # from the count on its way to being skipped is a file the report
+        # cannot be checked against the directory listing to find.
+        result["scanned"] += 1
         try:
             info = os.stat(name, dir_fd=backup_root_fd, follow_symlinks=False)
-        except OSError:
+        except OSError as exc:
+            _record_unerased_backup(result, name, f"could not be examined: {exc}")
             continue
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or int(info.st_nlink) != 1
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
+        refusal = _backup_rewrite_refusal(info)
+        if refusal is not None:
+            # Declining to rewrite is not evidence the row is absent, and the
+            # sweep has no way to acquire that evidence without opening the
+            # file it just refused. Reporting is the only honest outcome:
+            # silence here is a report claiming success over a backup the
+            # sweep knows it left exactly as it found it.
+            _record_unerased_backup(result, name, refusal)
             continue
         try:
             conn = _open_backup_copy(backup_root / name)
-        except Exception:
-            result["unerased"].append(name)
+        except Exception as exc:
+            _record_unerased_backup(result, name, f"could not be opened: {exc}")
             continue
         markers: set[str] | None = None
+        failure: str | None = None
         try:
             if not _table_exists(conn, "memories"):
                 # Belt and braces behind the name filter: a file named like a
                 # namespace backup but holding no memories is not one, and is
                 # left alone rather than rebuilt.
                 continue
-            result["scanned"] += 1
             previous_head = _stored_privacy_lineage_head(conn)
             markers = _erase_memory_from_backup(conn, memory_id)
-            if markers is None:
-                continue
-            # The copy is byte-for-byte, so it carries the source file's free
-            # pages too -- pages that can hold an older copy of the row this
-            # sweep just unlinked. Only the rebuild removes those, and it must
-            # not spill the surviving plaintext to a temp directory doing it.
-            conn.execute("PRAGMA temp_store=MEMORY")
-            conn.execute("VACUUM")
+            if markers is not None:
+                # The copy is byte-for-byte, so it carries the source file's
+                # free pages too -- pages that can hold an older copy of the
+                # row this sweep just unlinked. Only the rebuild removes
+                # those, and it must not spill the surviving plaintext to a
+                # temp directory doing it. A backup that never held the row
+                # freed no page holding it, so it is not rebuilt: it was
+                # opened only to move its privacy head.
+                conn.execute("PRAGMA temp_store=MEMORY")
+                conn.execute("VACUUM")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             _verify_backup_erasure(conn, memory_id, previous_head)
-        except Exception:
+        except Exception as exc:
             markers = None
-            result["unerased"].append(name)
+            failure = f"was rewritten but not proven erased: {exc}"
         finally:
             conn.close()
             for suffix in ("-wal", "-shm"):
@@ -5367,7 +5473,12 @@ def _sweep_backup_copies(
                     os.unlink(f"{name}{suffix}", dir_fd=backup_root_fd)
                 except OSError:
                     pass
+        if failure is not None:
+            _record_unerased_backup(result, name, failure)
+            continue
         if markers is None:
+            # Nothing of this row was here to erase, so nothing counts as
+            # erased. The rotation above still happened, and was verified.
             continue
         # Every logical check above passed on a connection; this one reads the
         # bytes on disk, because the leak this sweep exists for is exactly a
@@ -5376,11 +5487,15 @@ def _sweep_backup_copies(
             residue = _residual_erasure_markers(
                 _read_relative_file(backup_root_fd, name), markers
             )
-        except OSError:
-            result["unerased"].append(name)
+        except OSError as exc:
+            _record_unerased_backup(result, name, f"could not be re-read: {exc}")
             continue
         if residue:
-            result["unerased"].append(name)
+            _record_unerased_backup(
+                result,
+                name,
+                f"still holds {len(residue)} erased value(s) after the rewrite",
+            )
         else:
             result["erased"] += 1
     os.fsync(backup_root_fd)
