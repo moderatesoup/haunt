@@ -201,7 +201,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | command | what |
 |---|---|
 | `haunt bootstrap [--reembed]` | first-run setup; installs desktop shortcut; exits 1 if sqlite-vec fails (unless `HAUNT_FTS_ONLY=1`) |
-| `haunt init [name] [--repo PATH]` | create a namespace |
+| `haunt init [name] [--repo PATH]` | create a namespace; an explicit `name` is used as given, so two checkouts can deliberately share one, while an inferred name forks to `name-<digest>` when another repository already owns it |
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
 | `haunt recall QUERY [--as-of --since --until --clock --tier --k] [--include-residue] [--json]` | read-only hybrid recall (vec + FTS5 + RRF); ranked results exclude tool/task residue unless explicitly requested; `--json` emits explanations |
 | `haunt maintenance [-n NAMESPACE] [--limit 64] [--json]` | explicit mutating embedding upgrade/job-drain surface; never run by recall and never creates an unknown namespace |

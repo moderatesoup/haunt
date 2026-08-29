@@ -2214,13 +2214,30 @@ def _foreign_repository_owner(
     db_path: str,
     repo_identity: str | None,
     repo_path: str | None,
+    explicit_label: bool,
 ) -> str | None:
     """Name the repository already owning this namespace, if it is not the caller.
 
     Returns ``None`` when the namespace is unowned, when the caller owns it,
-    or when the caller names no repository at all -- an explicitly selected
-    label (``HAUNT_NAMESPACE``, ``haunt init NAME``) asserts no ownership and
-    so is never refused here.
+    when the caller names no repository at all, or when *explicit_label* says
+    a human chose this label rather than deriving it from a repository.
+
+    Ownership is only ever contested between *derived* labels. Inference mints
+    a label from a repository, so two repositories whose lossy labels collide
+    each believe they are minting a private namespace, and handing them one is
+    a silent commingling neither asked for. A label a human typed carries the
+    opposite intent: ``haunt init team --repo A`` followed by
+    ``haunt init team --repo B`` is a request to share ``team`` across two
+    checkouts, which is a supported workflow, so it binds both rather than
+    forking the second to ``team-<digest>``. That is not a reopened race --
+    the raced and sequential outcomes are identical, because both callers
+    named the same namespace on purpose.
+
+    ``HAUNT_NAMESPACE`` reaches registration with ``repo_path=None`` at every
+    entry point (see infer_namespace_context() and the hooks' namespace
+    context helpers), so the "names no repository" rule already covers it;
+    *explicit_label* covers the one remaining case, ``haunt init NAME
+    --repo PATH``, where a chosen label does arrive with a repository.
 
     A blank ``repo_path`` names no repository, so it is never evidence of
     another owner: that is the rule _registered_namespace_for_repo() applies
@@ -2228,6 +2245,8 @@ def _foreign_repository_owner(
     transaction -- read outside it, the answer is a snapshot another writer
     can invalidate before the binding lands.
     """
+    if explicit_label:
+        return None
     if not repo_identity and not repo_path:
         return None
     bindings = conn.execute(
@@ -2322,15 +2341,26 @@ def _bind_repository(
 
 
 def _register_namespace_once(
-    name: str, repo_path: str | None = None
+    name: str, repo_path: str | None = None, *, explicit_label: bool = False
 ) -> tuple[str, Path]:
     """Run one complete registry/namespace publication under one writer lock."""
     with _sqlite_configuration_lock():
-        return _register_namespace_once_with_configuration_lock(name, repo_path)
+        return _register_namespace_once_with_configuration_lock(
+            name, repo_path, explicit_label=explicit_label
+        )
 
 
 def _registration_candidates(label: str, discriminator: str | None) -> list[str]:
-    """The labels to publish under, in order: the requested one, then its fork."""
+    """The labels to publish under, in order: the requested one, then its fork.
+
+    Never empty, which is what makes the caller's loop total.
+
+    The list is one entry when there is nothing to fork on (no discriminator),
+    and also when the fork is a fixed point: *label* is already this
+    discriminator's fork and is long enough that appending the digest again
+    truncates back to *label* itself. Retrying an identical candidate could
+    only fail identically, so such a label gets one attempt, not two.
+    """
     if not discriminator:
         return [label]
     forked = disambiguate_namespace_label(label, discriminator)
@@ -2338,7 +2368,7 @@ def _registration_candidates(label: str, discriminator: str | None) -> list[str]
 
 
 def _register_namespace_once_with_configuration_lock(
-    name: str, repo_path: str | None = None
+    name: str, repo_path: str | None = None, *, explicit_label: bool = False
 ) -> tuple[str, Path]:
     """Publish *name*, forking when another repository already owns it.
 
@@ -2346,27 +2376,42 @@ def _register_namespace_once_with_configuration_lock(
     differs from *name* only on a fork, so a caller that resolves *name*
     afterwards instead of the returned label opens the other repository's
     namespace -- the outcome this exists to prevent.
+
+    Raises NamespaceCollisionError when every candidate is owned elsewhere.
     """
     label = safe_name(name)
     repo_identity, repo = _repository_context(repo_path)
     # The fork digest depends on nothing but this repository's own strongest
-    # identifier, so whichever registration loses a race lands on exactly the
-    # label paths.py would have inferred for it had it simply run second.
-    failure: _NamespaceOwnedElsewhere | None = None
-    for candidate in _registration_candidates(label, repo_identity or repo):
+    # identifier, so a registration that loses a race lands on the same label
+    # paths.py would have inferred for it had it simply run second -- as long
+    # as that fork target is itself free. See register_namespace_context() for
+    # the one case where raced and sequential losers diverge.
+    candidates = _registration_candidates(label, repo_identity or repo)
+    for candidate in candidates[:-1]:
         try:
             return _publish_namespace_with_configuration_lock(
-                candidate, repo_identity, repo
+                candidate, repo_identity, repo, explicit_label=explicit_label
             )
-        except _NamespaceOwnedElsewhere as owned:
-            failure = owned
-    if failure is None:
-        raise AssertionError("unreachable namespace registration candidate exhaustion")
-    raise NamespaceCollisionError(str(failure)) from failure
+        except _NamespaceOwnedElsewhere:
+            continue
+    # The last candidate has nothing left to fall back to, so its refusal is
+    # the caller's. Splitting it out this way is what makes the loop total:
+    # _registration_candidates() never returns an empty list, so this
+    # statement always runs unless an earlier candidate already returned.
+    try:
+        return _publish_namespace_with_configuration_lock(
+            candidates[-1], repo_identity, repo, explicit_label=explicit_label
+        )
+    except _NamespaceOwnedElsewhere as owned:
+        raise NamespaceCollisionError(str(owned)) from owned
 
 
 def _publish_namespace_with_configuration_lock(
-    label: str, repo_identity: str | None, repo: str | None
+    label: str,
+    repo_identity: str | None,
+    repo: str | None,
+    *,
+    explicit_label: bool = False,
 ) -> tuple[str, Path]:
     """Publish and bind *label* in one transaction, or raise if it is owned."""
     norm = normalize_namespace_label(label)
@@ -2419,6 +2464,7 @@ def _publish_namespace_with_configuration_lock(
                     db_path=str(db),
                     repo_identity=repo_identity,
                     repo_path=repo,
+                    explicit_label=explicit_label,
                 )
                 if owner is not None:
                     raise _NamespaceOwnedElsewhere(canonical, owner)
@@ -2516,7 +2562,7 @@ def _publish_namespace_with_configuration_lock(
 
 
 def register_namespace_context(
-    name: str, repo_path: str | None = None
+    name: str, repo_path: str | None = None, *, explicit_label: bool = False
 ) -> tuple[str, Path]:
     """Register a namespace, retrying only recognized registry handoffs.
 
@@ -2527,6 +2573,28 @@ def register_namespace_context(
     caller must resolve afterwards -- resolving *name* would open the other
     repository's namespace.
 
+    Pass ``explicit_label=True`` when a human chose *name* rather than
+    inference deriving it from *repo_path*. Such a label is never forked and
+    never refused: see _foreign_repository_owner() for why sharing one
+    deliberately named namespace across checkouts is a request to honour, not
+    a collision to break up. The only caller that needs it is
+    ``haunt init NAME --repo PATH``; every other explicit-selection path
+    already arrives with ``repo_path=None``.
+
+    Determinism, stated exactly. A derived label that loses the race for a
+    bare label forks to ``disambiguate_namespace_label(label, discriminator)``
+    over its own strongest identifier, which is precisely what inference would
+    have minted for it had it run second -- *provided that fork target is
+    itself free*. It is not universal. When a third repository already owns the
+    fork target, the raced loser has no candidate left and fails closed with
+    NamespaceCollisionError, while a sequential loser would have inferred the
+    fork label first, arrived here asking for *it*, and forked once more to
+    ``label-digest-digest``. Both outcomes are safe -- nothing is commingled
+    either way -- but they are not the same outcome, and re-running the failed
+    caller does not converge on the sequential one: it fails closed again,
+    identically, until an operator intervenes with
+    ``haunt namespace reconcile``.
+
     A failed attempt may have committed the identity before a subsequent
     mapped-DB validation sees a changing WAL sidecar.  Re-entering the
     idempotent registration path is safe in that narrow case.  Do not retry
@@ -2535,7 +2603,9 @@ def register_namespace_context(
     """
     for attempt in range(8):
         try:
-            return _register_namespace_once(name, repo_path)
+            return _register_namespace_once(
+                name, repo_path, explicit_label=explicit_label
+            )
         except (NamespacePathError, sqlite3.Error) as exc:
             if not is_concurrent_registry_change(exc) or attempt == 7:
                 raise
@@ -2543,14 +2613,18 @@ def register_namespace_context(
     raise AssertionError("unreachable namespace registration retry exhaustion")
 
 
-def register_namespace(name: str, repo_path: str | None = None) -> Path:
+def register_namespace(
+    name: str, repo_path: str | None = None, *, explicit_label: bool = False
+) -> Path:
     """Register a namespace and return its database path.
 
     Callers that resolve the namespace by label afterwards want
     register_namespace_context() instead: this signature cannot report the
     disambiguated label a fork publishes.
     """
-    return register_namespace_context(name, repo_path)[1]
+    return register_namespace_context(
+        name, repo_path, explicit_label=explicit_label
+    )[1]
 
 
 def namespace_exists(name: str) -> bool:

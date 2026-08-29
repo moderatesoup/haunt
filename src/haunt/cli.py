@@ -223,8 +223,15 @@ def init_cmd(
         repo_path = str(repo) if repo else inferred_repo_path
     try:
         # Registration reports the label it published: an inferred name can
-        # fork when another repository already owns it.
-        ns, db = register_namespace_context(ns, repo_path=repo_path)
+        # fork when another repository already owns it. A name the user typed
+        # cannot -- `haunt init team --repo A` then `--repo B` is a request to
+        # share `team`, and typing a name must produce that name. Without this
+        # flag `--repo` would silently reroute the second one to
+        # `team-<digest>`, because it is the only path that hands registration
+        # a chosen label together with a repository to assert ownership with.
+        ns, db = register_namespace_context(
+            ns, repo_path=repo_path, explicit_label=name is not None
+        )
         with Store(ns) as st:
             stats = st.stats()
     except (NamespaceCollisionError, NamespacePathError) as exc:

@@ -66,9 +66,11 @@ from haunt.cli import app
 from haunt.paths import (
     disambiguate_namespace_label,
     infer_namespace_context,
+    namespaces_dir,
     registry_path,
 )
 from haunt.store import (
+    NamespaceCollisionError,
     Store,
     init_registry,
     namespace_exists,
@@ -917,3 +919,347 @@ def test_legacy_repo_path_row_without_a_binding_still_owns_its_label(
     owner, _ = register_namespace_context("api7", str(first.resolve()))
     assert owner == "api7"
     assert _namespaces_with_two_repository_owners() == {}
+
+
+# ---------------------------------------------------------------------------
+# Candidate exhaustion. Forking is what keeps a raced registration off another
+# repository's namespace, so it has exactly one fallback: the label inference
+# would have minted for this repository had it run second. When a third
+# repository already owns that too, there is nothing left to fall back to and
+# registration refuses. Nothing below asserts that refusing is pleasant --
+# only that it refuses, leaves no half-registration behind, and that the
+# divergence it creates from the sequential outcome is the documented one.
+# ---------------------------------------------------------------------------
+
+
+def _namespace_db_files() -> list[str]:
+    """Every namespace database file on disk, so an orphan is visible."""
+    root = namespaces_dir()
+    if not root.is_dir():
+        return []
+    return sorted(entry.name for entry in root.iterdir())
+
+
+def _alias_rows() -> list[tuple[str, str]]:
+    conn = sqlite3.connect(registry_path())
+    try:
+        return sorted(
+            (str(a), str(b))
+            for a, b in conn.execute(
+                "SELECT normalized_label, namespace_id FROM namespace_aliases"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+
+def _squat(label: str, project: Path) -> None:
+    """Give *project* ownership of exactly *label*, whatever label that is."""
+    taken, _ = register_namespace_context(label, str(project.resolve()))
+    assert taken == label, f"squatter was itself forked to {taken!r}"
+
+
+def test_exhausted_fork_candidates_refuse_rather_than_commingle(
+    repo_env, monkeypatch
+):
+    """Both the bare label and the fork target are foreign-owned.
+
+    This is the fix's only hard-failure branch. `second` cannot have the bare
+    label -- `first` published it -- and cannot have its own fork either,
+    because `third` holds that. Binding it to either would be exactly the
+    commingling the fork exists to prevent, so registration refuses.
+    """
+    first = repo_env / "cA" / "api8"
+    second = repo_env / "cB" / "api8"
+    third = repo_env / "cC" / "squatter8"
+    for project in (first, second, third):
+        project.mkdir(parents=True)
+    _patch_git_contexts(
+        monkeypatch,
+        {first: (None, first), second: (None, second), third: (None, third)},
+    )
+
+    owner, _ = register_namespace_context("api8", str(first.resolve()))
+    assert owner == "api8"
+    fork = disambiguate_namespace_label("api8", str(second.resolve()))
+    _squat(fork, third)
+
+    before_dbs = _namespace_db_files()
+    before_names = sorted(str(row["name"]) for row in _namespace_rows())
+    before_aliases = _alias_rows()
+
+    with pytest.raises(NamespaceCollisionError) as refused:
+        register_namespace_context("api8", str(second.resolve()))
+
+    # The message names the label it could not have and who holds it, so an
+    # operator can act without reading the registry by hand.
+    assert fork in str(refused.value)
+    assert str(third.resolve()) in str(refused.value)
+
+    # No binding written for the refused repository...
+    assert _binding_count(repo_path=str(second.resolve())) == 0
+    # ...no orphan namespace database left behind by the rolled-back attempt...
+    assert _namespace_db_files() == before_dbs
+    # ...and no registry row or alias invented for it either.
+    assert sorted(str(row["name"]) for row in _namespace_rows()) == before_names
+    assert _alias_rows() == before_aliases
+    # The whole point: nothing was commingled to make the refusal go away.
+    assert _namespaces_with_two_repository_owners() == {}
+    # Refusing is idempotent -- retrying does not eventually let it through.
+    with pytest.raises(NamespaceCollisionError):
+        register_namespace_context("api8", str(second.resolve()))
+    assert _binding_count(repo_path=str(second.resolve())) == 0
+    # The repositories that did register are untouched by the refusal.
+    assert register_namespace_context("api8", str(first.resolve()))[0] == "api8"
+    assert register_namespace_context(fork, str(third.resolve()))[0] == fork
+
+
+def test_raced_and_sequential_losers_diverge_when_the_fork_target_is_taken(
+    repo_env, monkeypatch
+):
+    """The precise exception to "the loser lands where it would have run second".
+
+    The claim holds whenever the fork target is free, which is the ordinary
+    case. It does not hold here. A loser that inferred *before* the winner
+    published asks for the bare label and has one fallback, which `third`
+    holds, so it fails closed. A loser that inferred *after* asks for the fork
+    label itself and still has a fallback -- forking a second time -- so it
+    succeeds on `label-digest-digest`. Both fail safe; they do not agree, and
+    register_namespace_context()'s docstring says so.
+    """
+    first = repo_env / "dA" / "api9"
+    raced = repo_env / "dB" / "api9"
+    sequential = repo_env / "dC" / "api9"
+    third = repo_env / "dD" / "squatter9"
+    fourth = repo_env / "dE" / "squatter9b"
+    for project in (first, raced, sequential, third, fourth):
+        project.mkdir(parents=True)
+    _patch_git_contexts(
+        monkeypatch,
+        {
+            first: (None, first),
+            raced: (None, raced),
+            sequential: (None, sequential),
+            third: (None, third),
+            fourth: (None, fourth),
+        },
+    )
+    register_namespace_context("api9", str(first.resolve()))
+    raced_fork = disambiguate_namespace_label("api9", str(raced.resolve()))
+    sequential_fork = disambiguate_namespace_label(
+        "api9", str(sequential.resolve())
+    )
+    _squat(raced_fork, third)
+    _squat(sequential_fork, fourth)
+
+    # Raced: inference ran before `first` published, so the label asked for is
+    # the bare one and the single fallback is already `third`'s.
+    with pytest.raises(NamespaceCollisionError):
+        register_namespace_context("api9", str(raced.resolve()))
+
+    # Sequential: inference ran after, so it asks for its own fork label --
+    # and forks off that, one level deeper than the raced caller could reach.
+    inferred, inferred_repo = infer_namespace_context(sequential)
+    assert inferred == sequential_fork
+    landed, _ = register_namespace_context(inferred, inferred_repo)
+    assert landed == disambiguate_namespace_label(
+        sequential_fork, str(sequential.resolve())
+    )
+    assert landed != sequential_fork
+    assert _namespaces_with_two_repository_owners() == {}
+
+
+def test_registration_candidates_are_never_empty(repo_env):
+    """What makes the publication loop total.
+
+    The loop attempts every candidate but the last, then attempts the last
+    outside the loop and converts its refusal. That is only exhaustive because
+    there is always a last candidate -- there is no "ran out without failing"
+    state to handle, and no unreachable assertion standing in for one.
+    """
+    from haunt.store import _registration_candidates
+
+    for label, discriminator in (
+        ("api", None),
+        ("api", ""),
+        ("api", "/checkouts/api"),
+        ("x" * 80, "/checkouts/api"),
+        ("", "/checkouts/api"),
+    ):
+        candidates = _registration_candidates(label, discriminator)
+        assert candidates, (label, discriminator)
+        assert candidates[0] == label
+
+
+def test_a_label_that_is_its_own_fork_is_attempted_once_not_twice(
+    repo_env, monkeypatch
+):
+    """The `forked == label` short-circuit, exercised rather than assumed.
+
+    disambiguate_namespace_label() truncates its base to 69 characters before
+    appending an 11-character suffix, so a label that is already this
+    discriminator's fork and already 80 characters long forks to itself. A
+    second attempt at the identical candidate could only fail identically, so
+    the candidate list collapses to one entry -- and the refusal below is the
+    single-candidate exhaustion path, not the two-candidate one above.
+    """
+    from haunt import store as store_module
+
+    project = repo_env / "eA" / ("x" * 69)
+    squatter = repo_env / "eB" / "squatter10"
+    for path in (project, squatter):
+        path.mkdir(parents=True)
+    _patch_git_contexts(
+        monkeypatch, {project: (None, project), squatter: (None, squatter)}
+    )
+    discriminator = str(project.resolve())
+    fixed_point = disambiguate_namespace_label("x" * 69, discriminator)
+    assert len(fixed_point) == 80
+    assert disambiguate_namespace_label(fixed_point, discriminator) == fixed_point
+
+    _squat(fixed_point, squatter)
+
+    published = store_module._publish_namespace_with_configuration_lock
+    attempts: list[str] = []
+
+    def counted(label, *args, **kwargs):
+        attempts.append(label)
+        return published(label, *args, **kwargs)
+
+    monkeypatch.setattr(
+        store_module, "_publish_namespace_with_configuration_lock", counted
+    )
+
+    with pytest.raises(NamespaceCollisionError):
+        register_namespace_context(fixed_point, discriminator)
+
+    # Without the short-circuit this is [fixed_point, fixed_point].
+    assert attempts == [fixed_point]
+    assert _binding_count(repo_path=discriminator) == 0
+    assert _namespaces_with_two_repository_owners() == {}
+
+
+# ---------------------------------------------------------------------------
+# Explicit selection. A label a human typed is not a label inference derived,
+# and only one entry point hands registration both at once
+# (`haunt init NAME --repo PATH`). Typing a name must produce that name --
+# deliberately pointing two checkouts at one namespace is a supported
+# workflow, not a collision to break up -- while everything that *derives* a
+# label from a repository stays forkable.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_init_explicit_name_with_repo_binds_rather_than_forking(
+    repo_env, monkeypatch
+):
+    """`haunt init team --repo A` then `--repo B` leaves both on `team`."""
+    first = repo_env / "fA" / "checkout"
+    second = repo_env / "fB" / "checkout"
+    for project in (first, second):
+        project.mkdir(parents=True)
+    _patch_git_contexts(
+        monkeypatch, {first: (None, first), second: (None, second)}
+    )
+    runner = CliRunner()
+
+    for project in (first, second):
+        result = runner.invoke(
+            app, ["init", "team10", "--repo", str(project)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "namespace  team10\n" in result.output
+
+    assert [str(row["name"]) for row in _namespace_rows()] == ["team10"]
+    assert _binding_count(repo_path=str(first.resolve())) == 1
+    assert _binding_count(repo_path=str(second.resolve())) == 1
+    # Deliberate sharing is the one place two owners on one namespace is the
+    # requested outcome, so it is also the one place this is not the defect.
+    shared = _namespaces_with_two_repository_owners()
+    assert list(shared.values()) == [
+        sorted([str(first.resolve()), str(second.resolve())])
+    ]
+
+
+def test_explicit_label_flag_is_the_only_thing_suppressing_the_fork(
+    repo_env, monkeypatch
+):
+    """The control for the test above: the same label and the same shape of
+    repository, derived instead of chosen. A derived label must still fork, or
+    the flag would be disabling the race fix rather than narrowing it -- and a
+    chosen one must still land on the name that was typed."""
+    first = repo_env / "gA" / "checkout"
+    second = repo_env / "gB" / "checkout"
+    third = repo_env / "gC" / "checkout"
+    for project in (first, second, third):
+        project.mkdir(parents=True)
+    _patch_git_contexts(
+        monkeypatch,
+        {first: (None, first), second: (None, second), third: (None, third)},
+    )
+
+    assert register_namespace_context("team11", str(first.resolve()))[0] == "team11"
+
+    derived, _ = register_namespace_context("team11", str(second.resolve()))
+    assert derived == disambiguate_namespace_label(
+        "team11", str(second.resolve())
+    )
+    assert _namespaces_with_two_repository_owners() == {}
+
+    chosen, _ = register_namespace_context(
+        "team11", str(third.resolve()), explicit_label=True
+    )
+    assert chosen == "team11"
+    assert _binding_count(repo_path=str(third.resolve())) == 1
+
+
+def test_explicit_label_does_not_repoint_an_already_bound_repository(
+    repo_env, monkeypatch
+):
+    """The flag narrows the ownership decision; it does not defeat the older
+    one-namespace-per-repository rule. A checkout that already has a namespace
+    cannot be moved onto another by naming it -- that is
+    `haunt namespace reconcile`'s reversible, operator-invoked job."""
+    project = repo_env / "iA" / "checkout"
+    other = repo_env / "iB" / "checkout"
+    for path in (project, other):
+        path.mkdir(parents=True)
+    _patch_git_contexts(
+        monkeypatch, {project: (None, project), other: (None, other)}
+    )
+    register_namespace_context("mine13", str(project.resolve()))
+    register_namespace_context("theirs13", str(other.resolve()))
+
+    with pytest.raises(NamespaceCollisionError):
+        register_namespace_context(
+            "theirs13", str(project.resolve()), explicit_label=True
+        )
+    assert _binding_count(repo_path=str(project.resolve())) == 1
+    assert _namespaces_with_two_repository_owners() == {}
+
+
+def test_haunt_namespace_reaches_registration_without_a_repository(
+    repo_env, monkeypatch
+):
+    """HAUNT_NAMESPACE is non-forkable because it names no repository, not
+    because of the flag -- assert that, so a future caller cannot quietly
+    start passing a repo_path along with it."""
+    project = repo_env / "hA" / "checkout"
+    project.mkdir(parents=True)
+    _patch_git_contexts(monkeypatch, {project: (None, project)})
+    monkeypatch.setenv("HAUNT_NAMESPACE", "chosen12")
+
+    assert infer_namespace_context(project) == ("chosen12", None)
+
+    from haunt.claude_hook import _hook_namespace_context
+    from haunt.cursor_hook import hook_namespace_context
+
+    payload = {"cwd": str(project)}
+    assert _hook_namespace_context(payload) == ("chosen12", None)
+    assert hook_namespace_context(payload) == ("chosen12", None)
+
+    # And with no repository named, an already-owned label is never contested.
+    monkeypatch.delenv("HAUNT_NAMESPACE")
+    register_namespace_context("chosen12", str(project.resolve()))
+    monkeypatch.setenv("HAUNT_NAMESPACE", "chosen12")
+    ns, repo_path = infer_namespace_context(project)
+    assert register_namespace_context(ns, repo_path)[0] == "chosen12"
