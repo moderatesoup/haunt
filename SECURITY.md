@@ -52,9 +52,10 @@ Canonical export digests detect corruption and make exact import replay
 identifiable. They are unkeyed hashes, not signatures or authenticity claims.
 Export excludes local paths, embeddings, indexes, and previously purged bytes,
 but anyone who can read a bundle can read its surviving plaintext content.
-An opaque namespace history head rotates in the hard-purge transaction, so an
-older or independently diverged bundle cannot be replayed into that namespace
-to restore erased rows. The head is not a secret, signature, or defense against
+An opaque namespace history head rotates in the hard-purge transaction, and in
+every namespace backup the purge sweeps, so an older or independently diverged
+bundle cannot be replayed into that namespace, or into a database restored from
+one of its backups, to restore erased rows. The head is not a secret, signature, or defense against
 a same-user attacker who can directly rewrite Haunt's files. Interrupted fresh
 imports recover only files still matching the fsynced intent's exact token,
 digest, device, and inode ownership; replacement links fail closed.
@@ -76,23 +77,32 @@ way; the older copies stay readable until a later purge rebuilds the file.
 
 Haunt writes full plaintext copies of a namespace database itself, under
 `<HAUNT_HOME>/backups`, whenever `haunt namespaces reconcile --apply` or
-`haunt namespaces retire --apply` runs. Purge sweeps those: it erases the row
-from every namespace backup holding it and rebuilds each one it touches,
-matching on the memory id, which reconcile preserves when it copies rows, so a
-backup of a different namespace is covered as well. The registry backups that
-share the directory are left alone; they record labels and migration audit
-state, never memory content. `backups_erased` counts the
-backups rewritten and `backups_unerased` names the ones that could not be —
-locked, corrupt, or holding a vector table whose extension would not load.
-A non-empty `backups_unerased` means the erasure did not complete. Sweeping
+`haunt namespaces retire --apply` runs. Purge sweeps those, running the erasure
+it runs in the live namespace: the same content deletion, the same correction
+lineage scrubbing, the same purge-safe session rekeying and metadata
+sanitization, and the same privacy head rotation. It matches on the memory id,
+which reconcile preserves when it copies rows, so a backup of a different
+namespace is covered as well, and it rebuilds each file it touches. Restoring a
+swept backup therefore restores a database that has already had the purge, down
+to refusing every bundle exported before it. The registry backups that share the
+directory are left alone; they record labels and migration audit state, never
+memory content.
+
+A rewritten backup counts as erased only after the sweep re-reads it: integrity
+and foreign-key checks pass, the row is gone, the privacy head has moved, and a
+raw scan of the file's bytes finds none of the erased values. `backups_erased`
+counts backups that passed all of that; `backups_unerased` names every one that
+did not, whether it could not be opened — locked, corrupt, or holding a vector
+table whose extension would not load — or was rewritten but failed a check. A
+non-empty `backups_unerased` means the erasure did not complete. Sweeping
 rewrites the file, so the sha256 the migration report recorded for that backup
-no longer matches it, and a swept backup restores a namespace whose erased
-content is gone but whose session and event identifiers were never rekeyed.
+no longer matches it.
 
 Everything else is out of reach and is not covered: export bundles, an
 operator's own `cp` of a namespace file, Time Machine or other filesystem
 snapshots, a backup on removable or network storage, and anything already
-copied elsewhere. Purge one namespace and its bundles remain. Nor does it
+copied elsewhere. Purge one namespace and its bundles remain readable; the head
+rotation only stops them being imported back, it does not erase them. Nor does it
 reach blocks the filesystem has already released: truncation, copy-on-write
 snapshots, and SSD wear-levelling can leave the original blocks intact on the
 physical device. Full-disk encryption, not purge, is the answer to an attacker

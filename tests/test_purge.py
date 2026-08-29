@@ -426,3 +426,323 @@ def test_purge_leaves_backups_that_never_held_the_row_alone(haunt_env):
     else:
         pytest.fail("the surviving row was swept out of every backup")
     assert result["backups_unerased"] == []
+
+
+# Every content-bearing surface a purged memory can be reached through. The
+# session id is one of them: callers choose it, so it carries private bytes
+# exactly as often as content does.
+BACKUP_CANARIES = {
+    "content": "BACKUP-CONTENT-CANARY-a41f",
+    "session": "BACKUP-SESSION-CANARY-b52a",
+    # Only erased context is dropped from session metadata, in a backup as in
+    # the live namespace, so this canary names the session it belongs to.
+    "session_meta": "BACKUP-SESSION-CANARY-b52a/resumed-transcript",
+    "tool_input": "BACKUP-TOOLIN-CANARY-d74c",
+    "tool_output": "BACKUP-TOOLOUT-CANARY-e85d",
+    "event_meta": "BACKUP-EVENTMETA-CANARY-f96e",
+    "provenance": "BACKUP-PROVENANCE-CANARY-0a7f",
+    "reason": "BACKUP-REASON-CANARY-1b80",
+    "idempotency": "BACKUP-IDEMPOTENCY-CANARY-2c91",
+}
+SURVIVOR_TEXT = "an unrelated note sharing the erased session"
+REPLACEMENT_TEXT = "the correction replacement that outlives the purge"
+
+
+def _seed_backup_canaries(namespace: str) -> tuple[str, dict[str, int]]:
+    """Plant every canary in one namespace, then return the target and its counts.
+
+    Counts are read before any purge so a later assertion can name the exact
+    surviving population rather than a plausible-looking one.
+    """
+    from haunt.store import Store
+
+    with Store(namespace) as store:
+        store.ensure_session(
+            BACKUP_CANARIES["session"],
+            meta={
+                "erased": BACKUP_CANARIES["session_meta"],
+                "unrelated": "kept-session-metadata",
+            },
+        )
+        target = store.observe(
+            f"leaked credential {BACKUP_CANARIES['content']} rotate it",
+            session_id=BACKUP_CANARIES["session"],
+            tool_name="Bash",
+            tool_input=BACKUP_CANARIES["tool_input"],
+            tool_output=BACKUP_CANARIES["tool_output"],
+            meta={"trace": BACKUP_CANARIES["event_meta"]},
+            provenance={
+                "schema_version": 1,
+                "kind": "import",
+                "source_platform": "legacy-transcripts",
+                "source_native_id": BACKUP_CANARIES["provenance"],
+                "imported_at": "2026-01-01T00:00:00+00:00",
+                "fidelity": "lossless",
+                "original_blob_sha256": None,
+            },
+            defer_embedding=True,
+        )
+        # A second event in the same session: rekeying must move it, not drop it.
+        store.observe(
+            SURVIVOR_TEXT,
+            session_id=BACKUP_CANARIES["session"],
+            defer_embedding=True,
+        )
+        for i in range(5):
+            store.observe(f"filler note {i} about deployments", defer_embedding=True)
+        store.contradict(
+            target.memory_id,
+            replacement=REPLACEMENT_TEXT,
+            idempotency_key=BACKUP_CANARIES["idempotency"],
+            reason=BACKUP_CANARIES["reason"],
+        )
+        store.conn.commit()
+        counts = _table_counts(store.conn)
+    return target.memory_id, counts
+
+
+def _table_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    tables = (
+        "meta",
+        "sessions",
+        "events",
+        "memories",
+        "corrections",
+        "lineage_tombstones",
+        "entities",
+        "relations",
+        "relation_evidence",
+        "entity_mentions",
+    )
+    return {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in tables
+    }
+
+
+def _raw_hits(paths, needles) -> dict[str, dict[str, int]]:
+    """Raw byte occurrences of each needle in each file that exists."""
+    hits: dict[str, dict[str, int]] = {}
+    for path in paths:
+        if not Path(path).exists():
+            continue
+        data = Path(path).read_bytes()
+        found = {
+            name: data.count(value.encode())
+            for name, value in needles.items()
+            if data.count(value.encode())
+        }
+        if found:
+            hits[Path(path).name] = found
+    return hits
+
+
+def _backup_files(home: Path) -> list[Path]:
+    root = home / "backups"
+    return sorted(root.iterdir()) if root.is_dir() else []
+
+
+def _restore_backup(source: Path, namespace: str) -> Path:
+    """Put a backup's bytes back as the live namespace database."""
+    import shutil
+
+    from haunt.paths import namespace_db_path
+
+    destination = namespace_db_path(namespace)
+    for suffix in ("-wal", "-shm"):
+        Path(f"{destination}{suffix}").unlink(missing_ok=True)
+    shutil.copyfile(source, destination)
+    destination.chmod(0o600)
+    return destination
+
+
+def _swept_source_backup(home: Path, namespace: str) -> Path:
+    matches = [
+        path
+        for path in _backup_files(home)
+        if path.name.startswith(f"namespace-{namespace}-reconcile-source-")
+    ]
+    assert len(matches) == 1, f"expected one source backup, got {matches}"
+    return matches[0]
+
+
+def _reconcile_into(source: str, target: str) -> None:
+    from haunt.store import reconcile_namespaces
+
+    plan = reconcile_namespaces(source, target)
+    reconcile_namespaces(source, target, apply=True, plan_digest=plan["plan_digest"])
+
+
+def test_pre_purge_bundle_cannot_resurrect_a_memory_through_a_swept_backup(haunt_env):
+    """Restoring a swept backup must not reopen the door a purge closed.
+
+    Sweeping erases the row from the backup, but a bundle exported before the
+    purge is an external artifact no erasure reaches. The live purge rotates
+    the namespace's opaque privacy head so that bundle is refused; a backup
+    that keeps its pre-purge head restores a database which accepts it, and
+    the erased row walks back in.
+    """
+    from haunt.portability import (
+        ImportConflictError,
+        build_namespace_export,
+        canonical_export_bytes,
+        import_namespace_bytes,
+    )
+    from haunt.store import Store, open_existing, register_namespace
+
+    register_namespace("resurrect-src")
+    register_namespace("resurrect-dst")
+    memory_id, _ = _seed_backup_canaries("resurrect-src")
+    with Store("resurrect-dst") as store:
+        store.observe("an unrelated destination row", defer_embedding=True)
+
+    stale = canonical_export_bytes(build_namespace_export("resurrect-src"))
+    assert BACKUP_CANARIES["content"].encode() in stale
+
+    _reconcile_into("resurrect-src", "resurrect-dst")
+    with open_existing("resurrect-dst") as store:
+        assert store.purge(memory_id)["backups_unerased"] == []
+
+    restored = _restore_backup(
+        _swept_source_backup(haunt_env, "resurrect-src"), "resurrect-src"
+    )
+    # Only the content canary here; the full surface sweep is its own test, and
+    # this one has to reach the import to say anything about resurrection.
+    content_only = {"content": BACKUP_CANARIES["content"]}
+    assert _raw_hits([restored], content_only) == {}
+    with open_existing("resurrect-src") as store:
+        assert store.get_memory(memory_id) is None
+
+    with pytest.raises(ImportConflictError, match="privacy lineage"):
+        import_namespace_bytes(stale)
+
+    with open_existing("resurrect-src") as store:
+        assert store.get_memory(memory_id) is None
+    assert _raw_hits([restored], content_only) == {}
+
+
+def test_purge_erases_every_reachable_canary_from_every_backup(haunt_env):
+    """Raw bytes, not row counts: the leak this sweep exists for is unqueried.
+
+    Session identifiers and metadata, tool payloads, structured provenance and
+    correction request context are all reachable from the purged memory and
+    all were left legible in a backup while the report said the sweep was
+    complete.
+    """
+    from haunt.store import Store, open_existing, register_namespace
+
+    register_namespace("canary-src")
+    register_namespace("canary-dst")
+    memory_id, _ = _seed_backup_canaries("canary-src")
+    with Store("canary-dst") as store:
+        store.observe("an unrelated destination row", defer_embedding=True)
+
+    _reconcile_into("canary-src", "canary-dst")
+    before = _raw_hits(_backup_files(haunt_env), BACKUP_CANARIES)
+    assert set(before) and set(next(iter(before.values()))) == set(BACKUP_CANARIES), (
+        f"the backup never held every canary to begin with: {before}"
+    )
+
+    with open_existing("canary-dst") as store:
+        result = store.purge(memory_id)
+
+    assert result["backups_unerased"] == []
+    assert result["backups_erased"] >= 1
+    assert _raw_hits(_backup_files(haunt_env), BACKUP_CANARIES) == {}
+
+
+def test_swept_backup_erases_exactly_what_the_live_purge_erased(haunt_env):
+    """The two erasures must agree row for row, not merely both look erased.
+
+    Reconcile leaves the source untouched, so its backup and its live database
+    hold the same rows going into the purge. Every table therefore has to come
+    out at the same count on both sides, and the restored backup has to still
+    be a usable database.
+    """
+    from haunt.store import Store, open_existing, register_namespace
+
+    register_namespace("survive-src")
+    register_namespace("survive-dst")
+    memory_id, before = _seed_backup_canaries("survive-src")
+    with Store("survive-dst") as store:
+        store.observe("an unrelated destination row", defer_embedding=True)
+
+    _reconcile_into("survive-src", "survive-dst")
+    with open_existing("survive-src") as store:
+        assert _table_counts(store.conn) == before, "reconcile moved the source"
+        assert store.purge(memory_id)["backups_unerased"] == []
+        live = _table_counts(store.conn)
+
+    backup = _swept_source_backup(haunt_env, "survive-src")
+    check = sqlite3.connect(f"{backup.as_uri()}?mode=ro", uri=True)
+    check.row_factory = sqlite3.Row
+    try:
+        assert _table_counts(check) == live
+    finally:
+        check.close()
+    assert live["memories"] == before["memories"] - 1
+    assert live["lineage_tombstones"] == before["lineage_tombstones"] + 1
+
+    _restore_backup(backup, "survive-src")
+    with open_existing("survive-src") as store:
+        conn = store.conn
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert store.get_memory(memory_id) is None
+        surviving = {
+            row["content"] for row in conn.execute("SELECT content FROM memories")
+        }
+        assert SURVIVOR_TEXT in surviving
+        assert REPLACEMENT_TEXT in surviving
+        assert {f"filler note {i} about deployments" for i in range(5)} <= surviving
+        # The rekeyed session keeps the metadata that was never erased context.
+        metas = [row["meta"] for row in conn.execute("SELECT meta FROM sessions")]
+        assert any("kept-session-metadata" in (meta or "") for meta in metas)
+
+
+@pytest.mark.parametrize("broken", ["privacy-lineage", "session-metadata"])
+def test_backups_unerased_names_a_backup_whose_erasure_cannot_be_proven(
+    haunt_env, monkeypatch, broken
+):
+    """The report is derived from checking the file, not asserted beside it.
+
+    Each parameter breaks one half of the erasure a different check has to
+    catch: a backup left on its pre-purge privacy head, and erased context
+    copied onward into the replacement session's metadata.
+    """
+    from haunt import store as store_module
+    from haunt.store import Store, open_existing, register_namespace
+
+    real_rotate = store_module._rotate_privacy_lineage_head
+
+    def unrotated(conn, namespace_id):
+        if namespace_id is None:
+            return "sha256:" + "0" * 64
+        return real_rotate(conn, namespace_id)
+
+    def unsanitized(conn, session_id, sensitive_values):
+        row = conn.execute(
+            "SELECT started_at, ended_at, source, meta FROM sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        return row["started_at"], row["ended_at"], row["source"], row["meta"]
+
+    register_namespace("honest-src")
+    register_namespace("honest-dst")
+    memory_id, _ = _seed_backup_canaries("honest-src")
+    with Store("honest-dst") as store:
+        store.observe("an unrelated destination row", defer_embedding=True)
+    _reconcile_into("honest-src", "honest-dst")
+
+    if broken == "privacy-lineage":
+        monkeypatch.setattr(store_module, "_rotate_privacy_lineage_head", unrotated)
+    else:
+        monkeypatch.setattr(store_module, "_purge_safe_session_context", unsanitized)
+
+    with open_existing("honest-dst") as store:
+        result = store.purge(memory_id)
+
+    assert result["ok"] is True
+    assert result["backups_scanned"] >= 1
+    assert result["backups_erased"] == 0
+    assert result["backups_unerased"], "a backup left incompletely erased must be named"
