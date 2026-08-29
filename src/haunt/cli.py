@@ -640,7 +640,10 @@ def namespace_reconcile_cmd(
     SOURCE is never written to. Both databases are backed up before TARGET is
     touched. Refuses -- writing nothing -- if any row's id collides with
     different content, if idempotency keys collide, or if either namespace is
-    not at the current schema version. Embeddings are dropped and re-queued
+    not at the current schema version. The single exception to "verbatim" is
+    a session window: a session both sides recorded is widened to hold every
+    event either side has for it, and the dry-run's `window_merges` lists
+    every such window with the values it will take. Embeddings are dropped and re-queued
     rather than copied; run this again to pick up rows added since. This does
     not touch the registry: both labels remain independently resolvable.
     """

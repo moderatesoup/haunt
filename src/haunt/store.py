@@ -4080,7 +4080,10 @@ def retire_namespace_alias(label: str, *, apply: bool = False) -> dict[str, Any]
 #     present on both sides with byte-identical content (ignoring
 #     `embedding`) is a no-op; present on both sides with *different*
 #     content is a hard, whole-operation refusal -- never a guess, never a
-#     partial merge. Graph rows (entities/relations/mentions/evidence) are
+#     partial merge -- with exactly one exception, `sessions.started_at`
+#     and `sessions.ended_at`, described under
+#     `_RECONCILE_WINDOW_COLUMNS` below. Graph rows
+#     (entities/relations/mentions/evidence) are
 #     copied by the same id-preserving rule; this does not attempt to
 #     resolve two differently-`id`'d entities that merely share a name --
 #     that is entity resolution, a different and harder problem this does
@@ -4109,6 +4112,37 @@ _RECONCILE_TABLES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
 _RECONCILE_DIGEST_ONLY_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("embedding_jobs", ("memory_id",)),
 )
+
+# The one place reconcile merges instead of copying or refusing: a
+# session's window.
+#
+# A session that was still live when the namespace changed over exists in
+# both databases, and each recorded when *it* first saw that session, so the
+# two rows differ on `started_at`/`ended_at` and on nothing else -- `id`,
+# `source`, `meta` and `succeeds_session` are identical. Refusing the whole
+# reconcile over that is wrong (the two rows describe one session), and so
+# is keeping either side's window, which would leave the merged database
+# holding events outside the window that contains them.
+#
+# The merged window is the union of everything either database can attest
+# to: the earliest `started_at` and the latest `ended_at` recorded on either
+# side, clamped outward to the first and last event the merged database will
+# hold for that session. It never narrows -- a recorded `ended_at` later
+# than the last event is kept, because `end_session`'s sweep is a real end
+# signal and the quiet gap after the last event is real too.
+#
+# NULL is unknown, never epoch and never now: a NULL end is ignored as a
+# candidate rather than treated as a bound, and an `ended_at` NULL on both
+# sides stays NULL -- an unrecorded end is an open session, not a session
+# that ended at its last event.
+#
+# The clock is the durable write/audit clock -- `events.ts`, the column
+# `_default_temporal_cut` (portability.py) groups with these two -- and not
+# `event_time`, which an import may legitimately backdate years behind the
+# session that recorded it.
+_RECONCILE_WINDOW_COLUMNS: dict[str, tuple[str, ...]] = {
+    "sessions": ("started_at", "ended_at"),
+}
 
 # Columns outside the primary key that are also required to be globally
 # unique (enforced by a partial UNIQUE index). A SOURCE row queued for
@@ -4197,6 +4231,13 @@ class _TableDiff:
     already_present: int
     colliding_pks: list[tuple[Any, ...]]
     secondary_collisions: list[tuple[str, Any]]
+    # Primary keys present on both sides differing *only* on this table's
+    # window columns: not a collision, and not already consistent either.
+    window_conflicts: list[tuple[Any, ...]] = field(default_factory=list)
+    # One record per window the apply will actually change, resolved against
+    # both databases' events. Empty for every table without window columns,
+    # and empty when every window already holds.
+    window_merges: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _diff_reconcile_table(
@@ -4205,10 +4246,12 @@ def _diff_reconcile_table(
     secondary_keys: tuple[str, ...],
     source_rows: dict[tuple[Any, ...], dict[str, Any]],
     target_rows: dict[tuple[Any, ...], dict[str, Any]],
+    window_columns: tuple[str, ...] = (),
 ) -> _TableDiff:
     to_insert: list[dict[str, Any]] = []
     already_present = 0
     colliding: list[tuple[Any, ...]] = []
+    window_conflicts: list[tuple[Any, ...]] = []
     for pk in sorted(source_rows, key=_reconcile_sort_key):
         row = source_rows[pk]
         existing = target_rows.get(pk)
@@ -4216,6 +4259,12 @@ def _diff_reconcile_table(
             to_insert.append(row)
         elif _rows_equal(row, existing, ignore_columns):
             already_present += 1
+        elif window_columns and _rows_equal(
+            row, existing, ignore_columns | frozenset(window_columns)
+        ):
+            # Same session, two observers, two answers about when it began
+            # or ended. Everything else about the row already agrees.
+            window_conflicts.append(pk)
         else:
             colliding.append(pk)
     secondary_collisions: list[tuple[str, Any]] = []
@@ -4227,7 +4276,204 @@ def _diff_reconcile_table(
             value = row.get(column)
             if value is not None and value in target_values:
                 secondary_collisions.append((column, value))
-    return _TableDiff(table, to_insert, already_present, colliding, secondary_collisions)
+    return _TableDiff(
+        table,
+        to_insert,
+        already_present,
+        colliding,
+        secondary_collisions,
+        window_conflicts,
+    )
+
+
+def _window_instant(value: Any, what: str) -> tuple[Any, Any]:
+    """Chronological sort key for one stored window/event timestamp.
+
+    Parsed, never compared as raw text: two databases that reached the same
+    instant by different routes can spell it differently, and a window
+    merged on a lexical comparison would then clamp the wrong way. Mirrors
+    `portability._at_or_before`, including its refusal to order a value it
+    cannot parse -- guessing here would silently move a real boundary.
+    """
+    if not isinstance(value, str):
+        raise NamespaceMigrationError(
+            f"cannot order non-text timestamp {what}; refusing to guess a "
+            "session window"
+        )
+    try:
+        return (parse_iso(value), value)
+    except (TypeError, ValueError) as exc:
+        raise NamespaceMigrationError(
+            f"cannot order invalid timestamp {what} ({value!r}); refusing to "
+            "guess a session window"
+        ) from exc
+
+
+def _session_event_extents(
+    conn: sqlite3.Connection, session_ids: set[Any]
+) -> dict[Any, tuple[str, str]]:
+    """First and last `events.ts` per named session in one database."""
+    buckets: dict[Any, list[str]] = {}
+    if not session_ids:
+        return buckets
+    for row in conn.execute("SELECT session_id, ts FROM events").fetchall():
+        if row["session_id"] in session_ids:
+            buckets.setdefault(row["session_id"], []).append(row["ts"])
+    return {
+        session_id: (
+            min(values, key=lambda ts: _window_instant(ts, "events.ts")),
+            max(values, key=lambda ts: _window_instant(ts, "events.ts")),
+        )
+        for session_id, values in buckets.items()
+    }
+
+
+def _merged_window(
+    window_columns: tuple[str, ...],
+    rows: tuple[dict[str, Any] | None, ...],
+    extents: tuple[tuple[str, str] | None, ...],
+) -> tuple[Any, ...]:
+    """Union window: earliest of every start, latest of every end.
+
+    Candidates are the values recorded on either side, each bound outward to
+    the real first and last event the merged session will hold. NULL is
+    unknown and contributes no candidate: it never acts as epoch, as now, or
+    as a bound of any kind.
+
+    An end nobody recorded stays NULL even when the session has events. The
+    invariant is that a window contains every event inside it, and an open
+    end is unbounded above, so it already does -- while writing the last
+    event's timestamp there would assert something nothing observed, close a
+    session that is still live, and send `ensure_session` off to mint a
+    successor for the next write. The event clamp widens a boundary that was
+    recorded; it never invents one that was not.
+    """
+    start_column, end_column = window_columns
+    starts = [
+        row[start_column]
+        for row in rows
+        if row is not None and row.get(start_column) is not None
+    ]
+    ends = [
+        row[end_column]
+        for row in rows
+        if row is not None and row.get(end_column) is not None
+    ]
+    recorded_end = bool(ends)
+    for extent in extents:
+        if extent is not None:
+            starts.append(extent[0])
+            if recorded_end:
+                ends.append(extent[1])
+    started_at = (
+        min(
+            starts,
+            key=lambda value: _window_instant(value, f"sessions.{start_column}"),
+        )
+        if starts
+        else None
+    )
+    ended_at = (
+        max(ends, key=lambda value: _window_instant(value, f"sessions.{end_column}"))
+        if ends
+        else None
+    )
+    return (started_at, ended_at)
+
+
+def _resolve_window_merges(
+    source_conn: sqlite3.Connection,
+    target_conn: sqlite3.Connection,
+    diff: _TableDiff,
+    window_columns: tuple[str, ...],
+    pk_columns: tuple[str, ...],
+    source_rows: dict[tuple[Any, ...], dict[str, Any]],
+    target_rows: dict[tuple[Any, ...], dict[str, Any]],
+) -> None:
+    """Resolve every window SOURCE knows about, and record only real changes.
+
+    Every SOURCE session is considered, not only the ones whose rows differ:
+    merging SOURCE's events into a session whose row TARGET already holds
+    byte-identically can put an event outside the window that contains it,
+    and that is the same defect as a disagreeing pair. Rows already refused
+    as collisions are skipped -- the whole operation is about to refuse.
+
+    A record is emitted only when the merged window differs from what TARGET
+    would otherwise end up holding, which is what makes this idempotent: the
+    second cycle recomputes the same union, finds it already written, and
+    reports (and writes) nothing. `to_insert` rows are replaced by clamped
+    *copies*; the fetched rows themselves stay untouched because the caller
+    hashes them into the content digest after this returns.
+    """
+    colliding = set(diff.colliding_pks)
+    candidates = [
+        pk
+        for pk in sorted(source_rows, key=_reconcile_sort_key)
+        if pk not in colliding
+    ]
+    if not candidates:
+        return
+    session_ids = {pk[0] for pk in candidates}
+    source_extents = _session_event_extents(source_conn, session_ids)
+    target_extents = _session_event_extents(target_conn, session_ids)
+    start_column, end_column = window_columns
+    records: list[dict[str, Any]] = []
+    clamped_by_pk: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for pk in candidates:
+        source_row = source_rows[pk]
+        target_row = target_rows.get(pk)
+        session_id = pk[0]
+        source_extent = source_extents.get(session_id)
+        target_extent = target_extents.get(session_id)
+        merged = _merged_window(
+            window_columns, (source_row, target_row), (source_extent, target_extent)
+        )
+        baseline = target_row if target_row is not None else source_row
+        if merged == tuple(baseline[column] for column in window_columns):
+            continue
+        if target_row is None:
+            clamped = dict(source_row)
+            for column, value in zip(window_columns, merged):
+                clamped[column] = value
+            clamped_by_pk[pk] = clamped
+        present = [e for e in (source_extent, target_extent) if e is not None]
+        events = None
+        if present:
+            events = {
+                "first": min(
+                    (e[0] for e in present),
+                    key=lambda ts: _window_instant(ts, "events.ts"),
+                ),
+                "last": max(
+                    (e[1] for e in present),
+                    key=lambda ts: _window_instant(ts, "events.ts"),
+                ),
+            }
+        records.append(
+            {
+                "pk": [json_safe_sqlite(value) for value in pk],
+                "id": json_safe_sqlite(session_id),
+                "in_target": target_row is not None,
+                "source": {
+                    start_column: source_row[start_column],
+                    end_column: source_row[end_column],
+                },
+                "target": None
+                if target_row is None
+                else {
+                    start_column: target_row[start_column],
+                    end_column: target_row[end_column],
+                },
+                "events": events,
+                "merged": {start_column: merged[0], end_column: merged[1]},
+            }
+        )
+    if clamped_by_pk:
+        diff.to_insert = [
+            clamped_by_pk.get(tuple(row[column] for column in pk_columns), row)
+            for row in diff.to_insert
+        ]
+    diff.window_merges = records
 
 
 def _reconcile_content_state_digest(
@@ -4275,13 +4521,25 @@ def _reconcile_content_state_digest(
             )
         source_rows = _fetch_rows_by_pk(source_conn, table, pk_columns)
         target_rows = _fetch_rows_by_pk(target_conn, table, pk_columns)
+        window_columns = _RECONCILE_WINDOW_COLUMNS.get(table, ())
         diffs[table] = _diff_reconcile_table(
             table,
             ignore_columns,
             _RECONCILE_SECONDARY_UNIQUE_KEYS.get(table, ()),
             source_rows,
             target_rows,
+            window_columns,
         )
+        if window_columns:
+            _resolve_window_merges(
+                source_conn,
+                target_conn,
+                diffs[table],
+                window_columns,
+                pk_columns,
+                source_rows,
+                target_rows,
+            )
         per_table_digest[table] = {
             "source": sorted(
                 _canonical_json({"pk": list(pk), "row": _json_safe_row(row)})
@@ -4380,11 +4638,25 @@ def _plan_namespace_reconciliation(source_label: str, target_label: str) -> dict
                             {"column": column, "value": json_safe_sqlite(value)}
                             for column, value in diff.secondary_collisions
                         ],
+                        # The rows that would have been refused before:
+                        # present on both sides, differing only on their
+                        # window. Reported like `colliding_ids` because it
+                        # is the same population, no longer fatal.
+                        "window_conflicts": [
+                            list(pk) for pk in diff.window_conflicts
+                        ],
+                        # Every window this will change, with the values it
+                        # will change to -- a count alone would leave the
+                        # operator authorizing a boundary move sight unseen.
+                        "window_merges": diff.window_merges,
                     }
                     for table, diff in diffs.items()
                 },
                 "total_rows_to_insert": sum(
                     len(diff.to_insert) for diff in diffs.values()
+                ),
+                "total_window_merges": sum(
+                    len(diff.window_merges) for diff in diffs.values()
                 ),
             }
             report["content_state_digest"] = content_digest
@@ -4830,7 +5102,7 @@ def _execute_reconciliation_writes(
     # `[]` rather than raising).
     source_has_embedding_jobs = bool(_table_columns(source_conn, "embedding_jobs"))
     table_results: dict[str, dict[str, int]] = {}
-    for table, _pk_columns, _ignore in _RECONCILE_TABLES:
+    for table, pk_columns, _ignore in _RECONCILE_TABLES:
         diff = diffs[table]
         columns = _table_columns(target_conn, table)
         placeholders = ",".join("?" for _ in columns)
@@ -4859,9 +5131,29 @@ def _execute_reconciliation_writes(
                     source_embedded=source_embedded,
                     source_has_embedding_jobs=source_has_embedding_jobs,
                 )
+        # Windows resolved against rows this transaction has just inserted:
+        # the UPDATE only ever widens, and only rows the plan named.
+        window_columns = _RECONCILE_WINDOW_COLUMNS.get(table, ())
+        merged_windows = 0
+        if window_columns:
+            assignments = ",".join(f"{column}=?" for column in window_columns)
+            where = " AND ".join(f"{column}=?" for column in pk_columns)
+            for record in diff.window_merges:
+                if not record["in_target"]:
+                    continue  # already carried by the row inserted above
+                target_conn.execute(
+                    f"UPDATE {table} SET {assignments} WHERE {where}",
+                    (
+                        *(record["merged"][column] for column in window_columns),
+                        *record["pk"],
+                    ),
+                )
+                merged_windows += 1
         table_results[table] = {
             "inserted": inserted,
             "already_consistent": diff.already_present,
+            "windows_merged": len(diff.window_merges),
+            "windows_updated_in_place": merged_windows,
         }
     return table_results
 
@@ -4957,6 +5249,12 @@ def reconcile_namespaces(
     dry-run-then-apply cycle is repeated, but literally replaying one
     already-applied digest is refused rather than silently treated as a
     no-op, consistent with `change_namespace_label`'s digest contract.
+
+    Rows are copied verbatim with one exception the plan always names in
+    full: a session present on both sides with a different `started_at` /
+    `ended_at` is merged into the window that contains every event either
+    database holds for it, rather than refused. See
+    `_RECONCILE_WINDOW_COLUMNS`.
     """
     if not apply:
         return _plan_namespace_reconciliation(source, target)
@@ -5021,6 +5319,18 @@ def _retire_namespace(label: str, *, into: str, apply: bool) -> dict[str, Any]:
                 "reference": (
                     f"{plan['total_rows_to_insert']} row(s) absent from "
                     f"{plan['target']}"
+                ),
+            }
+        )
+    # A window this namespace still holds evidence for is undrained content
+    # too: removing the file would strand the boundary, not just a row.
+    if plan["total_window_merges"]:
+        blockers.append(
+            {
+                "kind": "unmerged-session-windows",
+                "reference": (
+                    f"{plan['total_window_merges']} session window(s) not yet "
+                    f"merged into {plan['target']}"
                 ),
             }
         )
@@ -5121,9 +5431,11 @@ def _retire_namespace(label: str, *, into: str, apply: bool) -> dict[str, Any]:
         finally:
             target_ro.close()
         stranded = {
-            table: len(diff.to_insert) + len(diff.colliding_pks)
+            table: len(diff.to_insert)
+            + len(diff.colliding_pks)
+            + len(diff.window_merges)
             for table, diff in diffs.items()
-            if diff.to_insert or diff.colliding_pks
+            if diff.to_insert or diff.colliding_pks or diff.window_merges
         }
         report["backup"] = dict(backup)
         report["stranded_rows"] = stranded
