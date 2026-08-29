@@ -36,11 +36,13 @@ Artifacts:
   `HAUNT_OFFLINE=1` and network denial.
 - `reports/hybrid-blocked.json`: deterministic pinned-hybrid blocker report
   using a hashed local cache with `HAUNT_OFFLINE` unset inside network denial.
-- `hybrid-model-manifest.json`: the only accepted BGE-M3 artifact identity. It
-  locks all five selected ONNX-directory files by relative path, size, and
-  SHA-256, requires the external-data sidecar, and rejects quantized, root-level,
-  missing, zero-byte, wrong-size, wrong-hash, and extra selected variants before
-  embedding initialization.
+- `src/haunt/data/hybrid-model-manifest.json`: the only accepted BGE-M3
+  artifact identity. It ships as package data rather than beside this README
+  because the same file gates embedding initialization in an installed wheel,
+  where this directory is absent. It locks all five selected ONNX-directory
+  files by relative path, size, and SHA-256, requires the external-data
+  sidecar, and rejects quantized, root-level, missing, zero-byte, wrong-size,
+  wrong-hash, and extra selected variants before embedding initialization.
 - `reports/latency.json`: non-gating 1k/10k/100k timing observation. Its
   deterministic gate is one batched coverage statement for the fixed top five;
   absolute timings are machine-specific.

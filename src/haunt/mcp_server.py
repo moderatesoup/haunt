@@ -913,10 +913,12 @@ def memory_procedure(
         "FTS index, vector embedding, graph relations/entities tied to the event, "
         "and the event itself if no other memories reference it. "
         "This is a hard purge, not a supersede: the database file is rebuilt "
-        "without the erased bytes, so the text is no longer readable in it. "
-        "Copies outside that file — exports, backups, filesystem snapshots — "
-        "are untouched; `bytes_overwritten` is false if a concurrent reader "
-        "blocked the rebuild. "
+        "without the erased bytes, so the text is no longer readable in it, "
+        "and the namespace backups Haunt wrote under HAUNT_HOME/backups are "
+        "rewritten without it too. Copies Haunt did not write — exports, an "
+        "operator's own copy, filesystem snapshots — are untouched; "
+        "`bytes_overwritten` is false if a concurrent reader blocked the "
+        "rebuild and `backups_unerased` names any backup that still holds it. "
         "Use memory_contradict to supersede (set valid_to) without deleting."
     ),
     annotations=ToolAnnotations(

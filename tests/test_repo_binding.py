@@ -509,3 +509,173 @@ def test_mcp_admin_explicit_namespace_does_not_inherit_process_repo(repo_env, mo
 
     rows = {r["name"]: r["repo_path"] for r in _namespace_rows()}
     assert rows["totally-unrelated"] is None
+
+
+# ---------------------------------------------------------------------------
+# Namespace collisions: two unrelated repositories must never derive the same
+# label. Both derivation paths lose information -- the remote path rewrites
+# "/" to "-" (so "acme/foo-bar" and "acme-foo/bar" flatten alike), and the
+# remote-less path keeps only the checkout's basename (so every "api"
+# directory looks identical). Registration is what makes a label a claim, so
+# the guard fires on the second repository only: the first keeps the label it
+# already has, which is what stops this from re-routing anyone's memory.
+# ---------------------------------------------------------------------------
+
+
+def test_separator_collision_between_distinct_remotes_forks(repo_env, monkeypatch):
+    """`github.com/acme/foo-bar` and `github.com/acme-foo/bar` both sanitize
+    to `github.com-acme-foo-bar`, well under the 80-character threshold that
+    triggers namespace_for_repo_identity()'s hash. Pre-fix the second
+    repository silently landed in the first's database."""
+    first = repo_env / "foo-bar"
+    first.mkdir()
+    _patch_git_context(monkeypatch, "git@github.com:acme/foo-bar.git", first)
+    first_ns, first_repo = infer_namespace_context(first)
+    with Store(first_ns, first_repo):
+        pass
+    assert first_ns == "github.com-acme-foo-bar"
+
+    second = repo_env / "bar"
+    second.mkdir()
+    _patch_git_context(monkeypatch, "git@github.com:acme-foo/bar.git", second)
+    second_ns, second_repo = infer_namespace_context(second)
+
+    assert second_ns != first_ns
+    assert second_ns.startswith("github.com-acme-foo-bar-")
+    assert second_repo == str(second.resolve())
+
+
+def test_basename_collision_between_remoteless_repos_forks(repo_env, monkeypatch):
+    """R8: with no git remote, inference falls back to the checkout's
+    basename, so `clientA/api` and `clientB/api` both resolve to `api`."""
+    first = repo_env / "clientA" / "api"
+    first.mkdir(parents=True)
+    _patch_git_context(monkeypatch, None, first)
+    first_ns, first_repo = infer_namespace_context(first)
+    with Store(first_ns, first_repo):
+        pass
+    assert first_ns == "api"
+
+    second = repo_env / "clientB" / "api"
+    second.mkdir(parents=True)
+    _patch_git_context(monkeypatch, None, second)
+    second_ns, second_repo = infer_namespace_context(second)
+
+    assert second_ns != first_ns
+    assert second_ns.startswith("api-")
+    assert second_repo == str(second.resolve())
+
+
+def test_colliding_label_is_stable_across_repeated_inference(repo_env, monkeypatch):
+    """The disambiguator is a digest of the repository's own identity, not a
+    counter or a random suffix, so the forked repository stabilizes on one
+    label instead of minting a fresh namespace on every inference."""
+    first = repo_env / "foo-bar2"
+    first.mkdir()
+    _patch_git_context(monkeypatch, "git@github.com:acme/foo-bar2.git", first)
+    first_ns, first_repo = infer_namespace_context(first)
+    with Store(first_ns, first_repo):
+        pass
+
+    second = repo_env / "bar2"
+    second.mkdir()
+    _patch_git_context(monkeypatch, "git@github.com:acme-foo/bar2.git", second)
+    seen = set()
+    for _ in range(5):
+        ns, repo_path = infer_namespace_context(second)
+        with Store(ns, repo_path):
+            pass
+        seen.add(ns)
+
+    assert len(seen) == 1
+    assert seen != {first_ns}
+    assert len(_namespace_rows()) == 2
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility for the collision guard. Changing a derivation
+# function re-routes every namespace it already produced, which is the exact
+# damage `haunt namespace reconcile` exists to heal. Registered labels must
+# therefore keep resolving unchanged; only a label a *second* repository
+# would newly steal is allowed to move.
+# ---------------------------------------------------------------------------
+
+
+def test_registered_collision_prone_label_still_resolves(repo_env, monkeypatch):
+    """A namespace registered under exactly what the pre-fix derivation
+    produced -- a dashed repo name, so a label the guard now recognises as
+    collision-prone -- must still resolve to itself, bare digest-free label
+    and all, with no second namespace minted."""
+    project = repo_env / "foo-bar3"
+    project.mkdir()
+    _patch_git_context(monkeypatch, "git@github.com:acme/foo-bar3.git", project)
+    register_namespace("github.com-acme-foo-bar3", str(project.resolve()))
+
+    for _ in range(3):
+        ns, repo_path = infer_namespace_context(project)
+        assert ns == "github.com-acme-foo-bar3"
+        assert repo_path == str(project.resolve())
+
+    assert len(_namespace_rows()) == 1
+
+
+def test_registration_wins_over_a_label_the_formula_cannot_produce(
+    repo_env, monkeypatch
+):
+    """The load-bearing back-compat case: a namespace whose label no
+    derivation would ever mint for this repo.
+
+    The sibling tests register the label the formula happens to produce, so
+    they cannot tell a registry lookup apart from a re-derivation that
+    coincidentally agrees. This one can: nothing about `acme/foo-bar4`
+    yields `legacy-ns-from-before-c1`, so returning it proves resolution
+    came from the binding, not the formula."""
+    project = repo_env / "foo-bar4"
+    project.mkdir()
+    _patch_git_context(monkeypatch, "git@github.com:acme/foo-bar4.git", project)
+    register_namespace("legacy-ns-from-before-c1", str(project.resolve()))
+
+    for _ in range(3):
+        ns, repo_path = infer_namespace_context(project)
+        assert ns == "legacy-ns-from-before-c1"
+        assert repo_path == str(project.resolve())
+
+    assert len(_namespace_rows()) == 1
+
+
+def test_registered_basename_label_still_resolves(repo_env, monkeypatch):
+    """The same guarantee for R8's derivation path: a remote-less checkout
+    whose basename-derived namespace already exists keeps resolving to it."""
+    project = repo_env / "clientA" / "api2"
+    project.mkdir(parents=True)
+    _patch_git_context(monkeypatch, None, project)
+    register_namespace("api2", str(project.resolve()))
+
+    for _ in range(3):
+        ns, repo_path = infer_namespace_context(project)
+        assert ns == "api2"
+        assert repo_path == str(project.resolve())
+
+    assert len(_namespace_rows()) == 1
+
+
+def test_blank_repo_path_row_does_not_count_as_a_collision(repo_env, monkeypatch):
+    """A blank-repo_path row is the pre-C1 hook/MCP registration shape: it
+    ties nothing to any repository, so it cannot be evidence that some
+    *other* repository owns the label. Treating it as a collision would
+    fork every legacy namespace away from the repository that has been
+    using it -- the opposite of the intent -- so the repository that
+    derives the name still adopts the row, exactly as before this guard.
+    See _registered_namespace_for_repo()'s docstring for the blank-row rule
+    this composes with."""
+    project = repo_env / "widgets9"
+    project.mkdir()
+    register_namespace("github.com-acme-widgets9")  # blank repo_path, no binding
+    _patch_git_context(monkeypatch, "git@github.com:acme/widgets9.git", project)
+
+    ns, repo_path = infer_namespace_context(project)
+
+    assert ns == "github.com-acme-widgets9"
+    with Store(ns, repo_path):
+        pass
+    assert len(_namespace_rows()) == 1

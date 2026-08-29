@@ -490,6 +490,244 @@ def test_mismatched_schema_version_refuses_in_either_direction(reconcile_home):
 
 
 # ---------------------------------------------------------------------------
+# Column ordinals may differ; column sets and declarations may not.
+# ---------------------------------------------------------------------------
+
+# The v1 table definitions verbatim, from before any column that schema
+# versions 2-13 append with ALTER TABLE existed. `_init_namespace_schema`
+# creates tables with IF NOT EXISTS, so laying these down first and stamping
+# the database at v1 makes a later open run the real migration ladder over
+# them. Nothing else reproduces the ordinals a migrated namespace carries.
+_V1_NAMESPACE_SCHEMA = """
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    source TEXT,
+    meta TEXT
+);
+CREATE TABLE events (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tool_name TEXT,
+    tool_input TEXT,
+    tool_output TEXT,
+    origin TEXT,
+    tier TEXT NOT NULL,
+    meta TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+CREATE TABLE memories (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    content TEXT NOT NULL,
+    embedding BLOB,
+    valid_from TEXT NOT NULL,
+    valid_to TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (event_id) REFERENCES events(id)
+);
+"""
+
+
+def _seed_namespace_tables(home: Path, label: str, script: str, version: int) -> None:
+    """Register `label` and pre-create some of its tables from raw DDL.
+
+    Whatever `script` does not define is created normally on the first open;
+    `version` is what that open sees, so it decides which migrations run.
+    """
+    register_namespace(label)
+    conn = sqlite3.connect(str(_db_path(home, label)))
+    try:
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS meta ("
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL);\n" + script
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+            (str(version),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _column_names(home: Path, label: str, table: str) -> list[str]:
+    conn = sqlite3.connect(str(_db_path(home, label)))
+    try:
+        return [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")]
+    finally:
+        conn.close()
+
+
+def _stored_schema_version(home: Path, label: str) -> int:
+    conn = sqlite3.connect(str(_db_path(home, label)))
+    try:
+        return int(
+            conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+
+def test_alter_migrated_and_fresh_namespaces_reconcile_across_column_ordinals(
+    reconcile_home,
+):
+    """A namespace that reached the current schema through ALTER TABLE
+    reconciles with one created fresh at it, in both directions.
+
+    This is the pairing reconcile exists for -- a legacy namespace and the
+    fork that superseded it -- and the two ways of arriving at schema v13
+    order `events` differently: `idempotency_key` is created second but
+    appended thirteenth. The column sets are identical and every row is
+    read, diffed, and inserted by column name, so the ordinals are not a
+    difference in anything the copy depends on.
+    """
+    _seed_namespace_tables(reconcile_home, "migrated-ns", _V1_NAMESPACE_SCHEMA, 1)
+    with Store("migrated-ns") as st:
+        source_ids = [st.observe(f"migrated memory {i}").memory_id for i in range(4)]
+
+    register_namespace("created-fresh-ns")
+    with Store("created-fresh-ns") as st:
+        target_ids = [st.observe(f"fresh memory {i}").memory_id for i in range(3)]
+
+    # The divergence under test, asserted rather than assumed: both are at the
+    # current schema version, `events` holds the same columns in both, and
+    # they sit at different ordinals.
+    assert _stored_schema_version(reconcile_home, "migrated-ns") == SCHEMA_VERSION
+    assert _stored_schema_version(reconcile_home, "created-fresh-ns") == SCHEMA_VERSION
+    migrated = _column_names(reconcile_home, "migrated-ns", "events")
+    fresh = _column_names(reconcile_home, "created-fresh-ns", "events")
+    assert sorted(migrated) == sorted(fresh)
+    assert migrated != fresh
+    assert migrated.index("idempotency_key") != fresh.index("idempotency_key")
+
+    # Dry-run only, and taken before the apply below changes either side.
+    reverse = reconcile_namespaces("created-fresh-ns", "migrated-ns")
+    assert reverse["tables"]["memories"]["insert_into_target"] == len(target_ids)
+
+    plan, applied = _plan_and_apply("migrated-ns", "created-fresh-ns")
+    assert plan["tables"]["memories"]["insert_into_target"] == len(source_ids)
+    assert applied["applied"] is True
+
+    with Store("created-fresh-ns", create=False) as st:
+        for mid in source_ids + target_ids:
+            assert st.get_memory(mid) is not None, f"missing {mid} after reconcile"
+        assert st.stats()["memories"] == len(source_ids) + len(target_ids)
+        # Every copied row landed under the right column, not merely present:
+        # a positional copy between these two tables would silently transpose
+        # `idempotency_key` into `session_id`.
+        for i, mid in enumerate(source_ids):
+            assert st.get_memory(mid)["content"] == f"migrated memory {i}"
+
+
+def test_column_present_in_only_one_namespace_still_refuses(reconcile_home):
+    """An added column is a real difference and still refuses, both ways.
+
+    ALTER TABLE does not touch `meta`, so both namespaces keep reporting the
+    current schema version and this reaches the column check rather than the
+    version check above it.
+    """
+    register_namespace("stray-src")
+    register_namespace("stray-dst")
+    with Store("stray-src") as st:
+        st.observe("src content")
+    with Store("stray-dst") as st:
+        st.observe("dst content")
+
+    conn = sqlite3.connect(str(_db_path(reconcile_home, "stray-src")))
+    conn.execute("ALTER TABLE events ADD COLUMN stray_column TEXT")
+    conn.commit()
+    conn.close()
+
+    assert _stored_schema_version(reconcile_home, "stray-src") == SCHEMA_VERSION
+    with pytest.raises(NamespaceMigrationError, match="stray_column"):
+        reconcile_namespaces("stray-src", "stray-dst")
+    with pytest.raises(NamespaceMigrationError, match="stray_column"):
+        reconcile_namespaces("stray-dst", "stray-src")
+
+
+def _relax_events_content_not_null(home: Path, label: str) -> None:
+    """Rebuild `label`'s events table with `content` nullable, rows preserved.
+
+    The replacement is generated from the live table's own PRAGMA table_info,
+    so column names, order, types, defaults, and primary key all survive
+    untouched and `notnull` on `content` is the only thing that moves. CHECK
+    constraints and foreign keys are lost in the rebuild; table_info reports
+    neither, so neither is what the column check compares.
+    """
+    conn = sqlite3.connect(str(_db_path(home, label)))
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        # Keeps the RENAME below from reparsing `memories`, whose foreign key
+        # still names a table that is dropped part-way through the rebuild.
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        rows = conn.execute("PRAGMA table_info(events)").fetchall()
+        parts = []
+        for _cid, name, ctype, notnull, default, pk in rows:
+            decl = f"{name} {ctype}"
+            if pk:
+                decl += " PRIMARY KEY"
+            if notnull and name != "content":
+                decl += " NOT NULL"
+            if default is not None:
+                decl += f" DEFAULT {default}"
+            parts.append(decl)
+        conn.executescript(
+            "CREATE TABLE events_rebuilt (\n    "
+            + ",\n    ".join(parts)
+            + "\n);\n"
+            "INSERT INTO events_rebuilt SELECT * FROM events;\n"
+            "DROP TABLE events;\n"
+            "ALTER TABLE events_rebuilt RENAME TO events;\n"
+            "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);\n"
+            "CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time);\n"
+            "CREATE INDEX IF NOT EXISTS idx_events_tier ON events(tier);\n"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_same_columns_in_same_order_with_a_changed_declaration_refuses(reconcile_home):
+    """Dropping NOT NULL from `events.content` refuses even though the column
+    names and their ordinal positions match exactly.
+
+    Comparing by name is not the same as comparing names only. This pair is
+    indistinguishable to a comparison that reads names out of PRAGMA
+    table_info and nothing else, and merging it would push a NULL `content`
+    into a table that forbids one, part-way through the copy.
+    """
+    register_namespace("decl-src")
+    register_namespace("decl-dst")
+    with Store("decl-src") as st:
+        st.observe("src content")
+    with Store("decl-dst") as st:
+        st.observe("dst content")
+
+    _relax_events_content_not_null(reconcile_home, "decl-src")
+
+    # Both namespaces are otherwise untouched, so `events.content` is the only
+    # thing that differs -- and it differs in nothing PRAGMA table_info reports
+    # except `notnull`.
+    assert _stored_schema_version(reconcile_home, "decl-src") == SCHEMA_VERSION
+    assert _column_names(reconcile_home, "decl-src", "events") == _column_names(
+        reconcile_home, "decl-dst", "events"
+    )
+    with pytest.raises(NamespaceMigrationError, match="content"):
+        reconcile_namespaces("decl-src", "decl-dst")
+    with pytest.raises(NamespaceMigrationError, match="content"):
+        reconcile_namespaces("decl-dst", "decl-src")
+
+
+# ---------------------------------------------------------------------------
 # State drift between dry-run and apply is refused.
 # ---------------------------------------------------------------------------
 
@@ -1669,3 +1907,69 @@ def test_namespace_backup_carries_rows_that_are_still_only_in_the_wal(reconcile_
         assert found == 1, "the backup dropped a committed row that lived in the WAL"
     finally:
         backup.close()
+
+
+def test_embedding_jobs_drift_between_the_dry_run_and_the_apply_is_refused(
+    reconcile_home,
+):
+    """The apply copies embedding_jobs rows, so the digest must cover them.
+
+    `attempts`/`last_error` are mutable queue state a background drain moves.
+    They were copied verbatim into TARGET while sitting outside
+    content_state_digest, so the operator authorized one plan and the apply
+    wrote values that plan never saw.
+    """
+    register_namespace("jobs-src")
+    with Store("jobs-src") as st:
+        queued = st.observe("a source row waiting to be embedded").memory_id
+        assert st.conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (queued,)
+        ).fetchone() is not None
+    register_namespace("jobs-dst")
+    with Store("jobs-dst") as st:
+        st.observe("an unrelated dst row")
+
+    plan = reconcile_namespaces("jobs-src", "jobs-dst")
+
+    with Store("jobs-src") as st:
+        st.conn.execute(
+            "UPDATE embedding_jobs SET attempts=4, last_error='drift' WHERE memory_id=?",
+            (queued,),
+        )
+        st.conn.commit()
+
+    with pytest.raises(NamespaceMigrationError, match="digest"):
+        reconcile_namespaces(
+            "jobs-src", "jobs-dst", apply=True, plan_digest=plan["plan_digest"]
+        )
+
+    with Store("jobs-dst", create=False) as st:
+        assert st.conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE memory_id=?", (queued,)
+        ).fetchone() is None, "nothing may be written once the digest is refused"
+
+    # A fresh cycle authorizes the drifted state and then copies it.
+    replan = reconcile_namespaces("jobs-src", "jobs-dst")
+    reconcile_namespaces(
+        "jobs-src", "jobs-dst", apply=True, plan_digest=replan["plan_digest"]
+    )
+    with Store("jobs-dst", create=False) as st:
+        job = st.conn.execute(
+            "SELECT attempts, last_error FROM embedding_jobs WHERE memory_id=?",
+            (queued,),
+        ).fetchone()
+        assert (job["attempts"], job["last_error"]) == (4, "drift")
+
+
+def test_embedding_jobs_stays_out_of_the_plans_per_table_report(reconcile_home):
+    """Digest-only means digest-only: no diff, no collision semantics."""
+    register_namespace("jobs-report-src")
+    with Store("jobs-report-src") as st:
+        st.observe("source row")
+    register_namespace("jobs-report-dst")
+    with Store("jobs-report-dst") as st:
+        st.observe("dst row")
+
+    plan = reconcile_namespaces("jobs-report-src", "jobs-report-dst")
+    assert set(plan["tables"]) == {table for table, _pk, _ig in _RECONCILE_TABLES}
+    assert "embedding_jobs" not in plan["tables"]

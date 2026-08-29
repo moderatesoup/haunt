@@ -39,7 +39,7 @@ BGE_M3_PATTERNS = [
     "onnx/config.json",
 ]
 # The revision whose onnx/ file sizes and SHA-256s are the ones in
-# tests/fixtures/abstention_eval/v1/hybrid-model-manifest.json, which
+# src/haunt/data/hybrid-model-manifest.json, which ships in the wheel and which
 # abstention_eval.verify_local_hybrid_cache enforces byte for byte.
 BGE_M3_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 BGE_M3_QUANT_REPO = "onnx-community/bge-m3-ONNX"
@@ -223,8 +223,8 @@ def _verify_bge_m3_cache(root: Path) -> None:
     fastembed fallback rather than executing an unattested graph. Skipped --
     with a diag each time, never silently -- when the operator opted into the
     quantized variant no committed manifest covers, when the manifest is not
-    reachable (it ships with the repo, not with the wheel), or when
-    HAUNT_EMBED_SKIP_MODEL_VERIFY is set for a deliberately hand-placed model.
+    reachable (it is package data, so only a damaged install loses it), or
+    when HAUNT_EMBED_SKIP_MODEL_VERIFY is set for a hand-placed model.
     """
     if env_flag("HAUNT_EMBED_SKIP_MODEL_VERIFY"):
         diag("embed_m3_unverified", reason="HAUNT_EMBED_SKIP_MODEL_VERIFY")

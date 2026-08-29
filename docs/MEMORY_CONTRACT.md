@@ -94,6 +94,12 @@ kind of correction. After erasure, trace and export **MUST** fail honest: they
 may report that a lineage member was erased, but **MUST NOT** reconstruct or
 retain the erased bytes merely to preserve audit completeness.
 
+A purge **MUST** also erase the selected content from every namespace-database
+copy Haunt itself wrote under its own backup directory, and **MUST** report the
+copies it could not. Copies Haunt did not write — export bundles, operator
+copies, filesystem snapshots, removable media — are outside the guarantee, and
+documentation **MUST NOT** imply otherwise.
+
 When a surviving chain needs an erased-gap marker, its public/exported
 tombstone has exactly four fields: `schema_version`, a fresh random
 `tombstone_id` that is not derived from erased data, `status="erased"`, and

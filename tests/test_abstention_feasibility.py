@@ -33,6 +33,8 @@ from haunt.store import Store, open_existing_readonly
 
 FIXTURE = Path(__file__).parent / "fixtures" / "abstention_eval" / "v1"
 REPORTS = FIXTURE / "reports"
+# Package data, not a fixture: the runtime embed check reads this same file.
+HYBRID_MANIFEST = abstention_eval.HYBRID_MANIFEST_DIR / "hybrid-model-manifest.json"
 
 
 def _hit(
@@ -65,7 +67,7 @@ def _hit(
 
 
 def _sparse_manifest_cache(root: Path) -> dict:
-    manifest = json.loads((FIXTURE / "hybrid-model-manifest.json").read_text("utf-8"))
+    manifest = json.loads(HYBRID_MANIFEST.read_text("utf-8"))
     for row in manifest["files"]:
         path = root / row["relative_path"]
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -595,9 +597,7 @@ def test_hybrid_manifest_rejects_cache_shape_before_hashing(
     if mutation == "missing":
         cache.mkdir()
     elif mutation == "zero":
-        manifest = json.loads(
-            (FIXTURE / "hybrid-model-manifest.json").read_text("utf-8")
-        )
+        manifest = json.loads(HYBRID_MANIFEST.read_text("utf-8"))
         for row in manifest["files"]:
             path = cache / row["relative_path"]
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -616,7 +616,7 @@ def test_hybrid_manifest_rejects_cache_shape_before_hashing(
                 b"wrong variant"
             )
     with pytest.raises(RuntimeError, match=message):
-        abstention_eval.verify_local_hybrid_cache(cache, fixture_dir=FIXTURE)
+        abstention_eval.verify_local_hybrid_cache(cache)
 
 
 def test_same_dimension_wrong_cache_fails_hash_before_embed_init(tmp_path, monkeypatch):
@@ -640,15 +640,16 @@ def test_same_dimension_wrong_cache_fails_hash_before_embed_init(tmp_path, monke
 
 
 def test_manifest_id_cannot_bless_alternate_artifact_hashes(tmp_path):
-    fixture = tmp_path / "altered-manifest"
-    shutil.copytree(FIXTURE, fixture)
-    manifest_path = fixture / "hybrid-model-manifest.json"
-    manifest = json.loads(manifest_path.read_text("utf-8"))
+    altered = tmp_path / "altered-manifest"
+    altered.mkdir()
+    manifest = json.loads(HYBRID_MANIFEST.read_text("utf-8"))
     manifest["files"][0]["sha256"] = "0" * 64
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (altered / "hybrid-model-manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
     with pytest.raises(RuntimeError, match="manifest identity"):
         abstention_eval.verify_local_hybrid_cache(
-            tmp_path / "unused-cache", fixture_dir=fixture
+            tmp_path / "unused-cache", manifest_dir=altered
         )
 
 

@@ -629,6 +629,9 @@ async function doPurge(){
     // pages. CLI and MCP both report this; the console must not be the one
     // surface that says "deleted" and stops there.
     if(r.bytes_overwritten===false)alert("Memory deleted, but the database file was not rebuilt (bytes_overwritten=false) — a concurrent reader held it open. Erased text may still be readable in free pages until a later purge rebuilds the file. Close other haunt processes and purge again.");
+    // Same reasoning for the copies haunt wrote itself: a backup it could
+    // not rewrite still holds the erased text in full.
+    if(r.backups_unerased&&r.backups_unerased.length)alert("Memory deleted, but the erased text remains in "+r.backups_unerased.length+" backup(s) under HAUNT_HOME/backups: "+r.backups_unerased.join(", "));
   }else{
     alert("Delete failed: "+(r.error||"unknown error"));
   }

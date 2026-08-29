@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "httpx"]
+dev = ["pytest>=8.0", "httpx", "setuptools>=68"]
 
 [project.scripts]
 haunt = "haunt.cli:main"
@@ -33,6 +33,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The BGE-M3 artifact manifest gates embedding initialization at runtime, so a
+# wheel install has to carry it; without this the check no-ops off-repo.
+[tool.setuptools.package-data]
+haunt = ["data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

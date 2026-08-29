@@ -1441,10 +1441,62 @@ def namespace_for_repo_identity(identity: str) -> str:
     return f"{cleaned[:69]}-{digest}"
 
 
+def disambiguate_namespace_label(label: str, discriminator: str) -> str:
+    """Append a digest of *discriminator* to *label*.
+
+    The digest depends on nothing but *discriminator*, so a repository that
+    needs disambiguating derives the same label on every inference and on
+    every machine. The result stays inside safe_name()'s 80-character budget
+    so it survives registry lookup and namespace_db_path() unshortened.
+    """
+    digest = sha256(discriminator.encode("utf-8")).hexdigest()[:10]
+    return f"{safe_name(label)[:69].rstrip('-.')}-{digest}"
+
+
+@dataclass(frozen=True)
+class _RepoRegistryMatch:
+    """What the registry knows about a repository and the label it would mint."""
+
+    namespace: str | None
+    mint_label_taken: bool
+
+
+def _mint_label_is_taken(
+    mint_label: str,
+    rows: list[sqlite3.Row],
+    bindings: list[sqlite3.Row],
+) -> bool:
+    """Report that *mint_label* already belongs to a different repository.
+
+    Only consulted once the registry has been searched for the current
+    repository and come back empty, so any registration naming a repository
+    here names some other one. A blank ``repo_path`` with no binding row
+    names no repository at all and so is not evidence of another owner --
+    the same rule, for the same reason, that keeps
+    _registered_namespace_for_repo() from matching such a row.
+    """
+    if bindings:
+        return True
+    normalized = normalize_namespace_label(mint_label)
+    return any(
+        normalize_namespace_label(str(row["name"])) == normalized
+        and str(row["repo_path"] or "").strip()
+        for row in rows
+    )
+
+
 def _registered_namespace_for_repo(
-    *, remote_identity: str | None, repo_root: Path | None
-) -> str | None:
+    *,
+    remote_identity: str | None,
+    repo_root: Path | None,
+    mint_label: str | None = None,
+) -> _RepoRegistryMatch:
     """Preserve an existing namespace already registered to this repository.
+
+    Reports separately, in ``mint_label_taken``, whether *mint_label* -- the
+    label the caller would otherwise mint -- is already registered to a
+    different repository, so the caller can fork instead of opening another
+    repository's database.
 
     Never matches a registry row whose ``repo_path`` is blank, even when its
     name equals the checkout's directory basename. A blank row stores nothing
@@ -1458,7 +1510,7 @@ def _registered_namespace_for_repo(
     """
     path = registry_path()
     if not path.is_file():
-        return None
+        return _RepoRegistryMatch(None, False)
     conn: sqlite3.Connection | None = None
     primary: SQLitePrimaryGuard | None = None
     sidecars: SQLiteSidecarGuard | None = None
@@ -1469,6 +1521,7 @@ def _registered_namespace_for_repo(
     storage_before: SQLiteStorageSnapshot | None = None
     candidate: str | None = None
     rows: list[sqlite3.Row] = []
+    bindings: list[sqlite3.Row] = []
     try:
         SQLITE_OPEN_LOCK.acquire()
         locked = True
@@ -1534,8 +1587,18 @@ def _registered_namespace_for_repo(
                     candidate = str(row["canonical_label"])
         if candidate is None:
             rows = conn.execute("SELECT name, repo_path FROM namespaces").fetchall()
+            if mint_label and {"namespace_aliases", "repository_bindings"} <= tables:
+                bindings = conn.execute(
+                    """
+                    SELECT b.repository_identity, b.repo_path
+                    FROM namespace_aliases a
+                    JOIN repository_bindings b ON b.namespace_id=a.namespace_id
+                    WHERE a.normalized_label=?
+                    """,
+                    (normalize_namespace_label(mint_label),),
+                ).fetchall()
     except sqlite3.Error:
-        return None
+        return _RepoRegistryMatch(None, False)
     finally:
         if conn is not None:
             conn.close()
@@ -1563,7 +1626,7 @@ def _registered_namespace_for_repo(
             "namespace registry changed during repository resolution"
         )
     if candidate is not None:
-        return candidate
+        return _RepoRegistryMatch(candidate, False)
     resolved_root = repo_root.resolve() if repo_root else None
     for row in rows:
         stored = str(row["repo_path"] or "").strip()
@@ -1573,14 +1636,17 @@ def _registered_namespace_for_repo(
             # such row exists.
             continue
         if remote_identity and repository_identity(stored) == remote_identity:
-            return safe_name(str(row["name"]))
+            return _RepoRegistryMatch(safe_name(str(row["name"])), False)
         if resolved_root and repository_identity(stored) is None:
             try:
                 if Path(stored).expanduser().resolve() == resolved_root:
-                    return safe_name(str(row["name"]))
+                    return _RepoRegistryMatch(safe_name(str(row["name"])), False)
             except OSError:
                 continue
-    return None
+    taken = mint_label is not None and _mint_label_is_taken(
+        mint_label, rows, bindings
+    )
+    return _RepoRegistryMatch(None, taken)
 
 
 def _git_repo_context(root: Path) -> tuple[str | None, Path | None]:
@@ -1635,11 +1701,32 @@ def infer_namespace_context(cwd: Path | None = None) -> tuple[str, str | None]:
         root = cwd.resolve()
     remote_url, repo_root = _git_repo_context(root)
     identity = repository_identity(remote_url)
-    registered = _registered_namespace_for_repo(
+    # Both derivations below are lossy -- the remote one rewrites every "/"
+    # to "-", the fallback keeps only a basename -- so two unrelated
+    # repositories can derive one label (github.com/acme/foo-bar against
+    # github.com/acme-foo/bar; any two checkouts named api). Pair the label
+    # each would mint with the strongest identifier that tells this
+    # repository apart from whoever else could mint it: a remote identity is
+    # the same on every machine, while a remote-less checkout has nothing
+    # portable but its own path.
+    mint_label: str | None = None
+    discriminator = ""
+    if identity:
+        mint_label, discriminator = namespace_for_repo_identity(identity), identity
+    elif repo_root:
+        mint_label, discriminator = safe_name(repo_root.name), str(repo_root)
+    match = _registered_namespace_for_repo(
         remote_identity=identity,
         repo_root=repo_root,
+        mint_label=mint_label,
     )
     repo_path = str(repo_root) if repo_root is not None else None
+    if mint_label is not None and match.mint_label_taken:
+        # The label is another repository's already. Fork: two namespaces are
+        # a visible, reversible split, while commingled memory has no clean
+        # undo and no signal that it happened.
+        mint_label = disambiguate_namespace_label(mint_label, discriminator)
+    registered = match.namespace
     if registered:
         # _registered_namespace_for_repo() only returns a name here via an
         # exact repository_bindings match or a legacy row whose repo_path
@@ -1659,7 +1746,7 @@ def infer_namespace_context(cwd: Path | None = None) -> tuple[str, str | None]:
         # honest, one-time fork for a repository whose only prior
         # registration predates repo_path tracking. Healing that split is
         # backlog C3, not this function.
-        return namespace_for_repo_identity(identity), repo_path
+        return mint_label, repo_path
     # No repository identity was found. Never let a bare directory silently
     # mint (or keep re-targeting) a namespace (backlog C2):
     #  - the home directory must never become a namespace name, even if a
@@ -1672,7 +1759,7 @@ def infer_namespace_context(cwd: Path | None = None) -> tuple[str, str | None]:
     if _is_user_home(root):
         return "default", None
     if repo_root:
-        return safe_name(repo_root.name), repo_path
+        return mint_label, repo_path
     if root.name and root.name not in {".", "/", ""}:
         candidate = safe_name(root.name)
         existing = _registered_alias(candidate)

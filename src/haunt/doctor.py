@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,12 +12,21 @@ from pathlib import Path
 from haunt.bootstrap import probe_sqlite_vec
 from haunt.embed import _env_model, _local_bge_m3_ready, _wants_bge_m3, fts_only
 from haunt.hosts import HostStatus, doctor_all_hosts
+from haunt.paths import (
+    NamespacePathError,
+    _registered_namespace_for_repo,
+    normalize_namespace_label,
+    registry_path,
+    repository_identity,
+)
+from haunt.store import _readonly_registry
 
 REQUIRED_CHECKS = (
     "sqlite-vec",
     "haunt-mcp",
     "mcp-python",
     "embed",
+    "namespaces",
     "cursor.hooks",
     "cursor.mcp",
     "cursor.rule",
@@ -42,26 +52,49 @@ class Check:
     ok: bool
     detail: str
     path: str | None = None
+    advisory: bool = False
+
+
+@dataclass(frozen=True)
+class NamespaceCollision:
+    """One registered namespace that more than one repository resolves to."""
+
+    namespace: str
+    repositories: tuple[str, ...]
 
 
 @dataclass
 class DoctorReport:
     checks: list[Check] = field(default_factory=list)
     hosts: list[HostStatus] = field(default_factory=list)
+    collisions: list[NamespaceCollision] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
+        """False only for checks the operator must fix. Advisories never fail."""
         names = {c.name for c in self.checks}
         if any(req not in names for req in REQUIRED_CHECKS):
             return False
-        return all(c.ok for c in self.checks)
+        return all(c.ok or c.advisory for c in self.checks)
 
     @property
     def issues(self) -> list[str]:
         missing = [req for req in REQUIRED_CHECKS if req not in {c.name for c in self.checks}]
         skipped = [f"{name}: check was not run" for name in missing]
-        failed = [f"{c.name}: {c.detail}" for c in self.checks if not c.ok]
+        failed = [
+            f"{c.name}: {c.detail}"
+            for c in self.checks
+            if not c.ok and not c.advisory
+        ]
         return skipped + failed
+
+    @property
+    def advisories(self) -> list[str]:
+        return [
+            f"{c.name}: {c.detail}"
+            for c in self.checks
+            if c.advisory and not c.ok
+        ]
 
     @property
     def host_file_issues(self) -> bool:
@@ -216,6 +249,168 @@ def _check_embed() -> Check:
     )
 
 
+@dataclass(frozen=True)
+class _BoundRepository:
+    """A repository the registry ties to a namespace, in the guard's terms."""
+
+    identity: str | None
+    root: Path | None
+    label: str
+
+
+def _bound_repositories(
+    conn: sqlite3.Connection, tables: set[str]
+) -> list[_BoundRepository]:
+    """List every repository the registry ties to some namespace.
+
+    A ``namespaces`` row whose ``repo_path`` is blank contributes nothing. It
+    records no repository at all -- those are pre-C1 hook/MCP registrations --
+    so it is never evidence that something else owns the label. This is the
+    rule _registered_namespace_for_repo() applies for the same reason; without
+    it every legacy namespace would be reported as a collision.
+    """
+    found: list[_BoundRepository] = []
+    identities: set[str] = set()
+    roots: set[str] = set()
+    if "repository_bindings" in tables:
+        # _bind_repository() merges a repository's remote and path into one
+        # row and both columns are uniquely indexed, so a binding row is
+        # exactly one distinct repository.
+        for row in conn.execute(
+            "SELECT repository_identity, repo_path FROM repository_bindings"
+        ).fetchall():
+            identity = str(row["repository_identity"] or "").strip() or None
+            stored = str(row["repo_path"] or "").strip()
+            if identity is None and not stored:
+                continue
+            if identity:
+                identities.add(identity)
+            if stored:
+                roots.add(stored)
+            found.append(
+                _BoundRepository(
+                    identity, Path(stored) if stored else None, identity or stored
+                )
+            )
+    if "namespaces" in tables:
+        for row in conn.execute("SELECT repo_path FROM namespaces").fetchall():
+            stored = str(row["repo_path"] or "").strip()
+            if not stored:
+                continue
+            identity = repository_identity(stored)
+            # register_namespace() fills this column and the binding row from
+            # one value, so drop the copy the bindings above already counted.
+            if stored in roots or (identity is not None and identity in identities):
+                continue
+            found.append(
+                _BoundRepository(
+                    identity, None if identity else Path(stored), stored
+                )
+            )
+    return found
+
+
+def _registered_namespace_count(conn: sqlite3.Connection, tables: set[str]) -> int:
+    """Count namespaces, falling back to the pre-E3 table when it is all there is."""
+    if "namespace_identities" in tables:
+        return int(
+            conn.execute("SELECT COUNT(*) FROM namespace_identities").fetchone()[0]
+        )
+    if "namespaces" in tables:
+        return int(conn.execute("SELECT COUNT(*) FROM namespaces").fetchone()[0])
+    return 0
+
+
+def _check_namespace_collisions() -> tuple[Check, list[NamespaceCollision]]:
+    """Report namespaces already shared by two repositories. Never migrates.
+
+    Resolves each registered repository through the mint-time guard itself
+    (_registered_namespace_for_repo) and groups the answers, so a pair the
+    guard would fork today but that registered before it landed is reported
+    rather than left silent. The guard only fixes new mints, on purpose:
+    re-deriving an existing namespace would re-route it and hide the memory
+    already stored under it.
+    """
+    path = registry_path()
+    if not path.is_file():
+        return Check("namespaces", True, "no registry yet", str(path)), []
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _readonly_registry()
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        repositories = _bound_repositories(conn, tables)
+        total = _registered_namespace_count(conn, tables)
+    except (FileNotFoundError, NamespacePathError, sqlite3.Error, OSError) as exc:
+        return (
+            Check(
+                "namespaces",
+                False,
+                f"registry could not be read: {exc}",
+                str(path),
+                advisory=True,
+            ),
+            [],
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
+    labels: dict[str, str] = {}
+    owners: dict[str, list[str]] = {}
+    try:
+        for repository in repositories:
+            match = _registered_namespace_for_repo(
+                remote_identity=repository.identity, repo_root=repository.root
+            )
+            if match.namespace is None:
+                continue
+            # The registry's own uniqueness key, so two legacy rows differing
+            # only by case group together the way their database files do.
+            norm = normalize_namespace_label(match.namespace)
+            labels.setdefault(norm, match.namespace)
+            owners.setdefault(norm, []).append(repository.label)
+    except (NamespacePathError, sqlite3.Error, OSError) as exc:
+        return (
+            Check(
+                "namespaces",
+                False,
+                f"registry changed while scanning: {exc}",
+                str(path),
+                advisory=True,
+            ),
+            [],
+        )
+
+    collisions = [
+        NamespaceCollision(labels[norm], tuple(dict.fromkeys(found)))
+        for norm, found in sorted(owners.items())
+        if len(dict.fromkeys(found)) > 1
+    ]
+    if not collisions:
+        return (
+            Check(
+                "namespaces",
+                True,
+                f"{total} registered, none shared by more than one repository",
+            ),
+            [],
+        )
+    return (
+        Check(
+            "namespaces",
+            False,
+            f"{len(collisions)} of {total} are shared by more than one repository",
+            advisory=True,
+        ),
+        collisions,
+    )
+
+
 def _issues_matching(status: HostStatus, *needles: str) -> list[str]:
     found: list[str] = []
     for issue in status.issues:
@@ -297,6 +492,8 @@ def diagnose(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> DoctorReport:
     report.checks.append(_check_wrapper(mcp_cmd))
     report.checks.append(_check_mcp_python(mcp_cmd))
     report.checks.append(_check_embed())
+    namespaces, report.collisions = _check_namespace_collisions()
+    report.checks.append(namespaces)
 
     report.hosts = doctor_all_hosts(haunt_home, hook_cmd, mcp_cmd)
     seen_hosts = {s.host for s in report.hosts}
@@ -324,14 +521,19 @@ def diagnose(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> DoctorReport:
     return report
 
 
+def _flag(check: Check) -> str:
+    if check.ok:
+        return "ok"
+    return "WARN" if check.advisory else "FAIL"
+
+
 def format_doctor(report: DoctorReport) -> str:
     lines: list[str] = ["[runtime]"]
-    runtime = {"sqlite-vec", "haunt-mcp", "mcp-python", "embed"}
+    runtime = {"sqlite-vec", "haunt-mcp", "mcp-python", "embed", "namespaces"}
     for check in report.checks:
         if check.name not in runtime:
             continue
-        flag = "ok" if check.ok else "FAIL"
-        lines.append(f"  {check.name:<12} {flag}  {check.detail}")
+        lines.append(f"  {check.name:<12} {_flag(check)}  {check.detail}")
 
     by_host: dict[str, list[Check]] = {}
     extras: list[Check] = []
@@ -357,11 +559,23 @@ def format_doctor(report: DoctorReport) -> str:
                 lines.append(f"  {kind:<8} FAIL  {check.detail}{path}")
 
     for check in extras:
-        flag = "ok" if check.ok else "FAIL"
-        lines.append(f"  {check.name:<12} {flag}  {check.detail}")
+        lines.append(f"  {check.name:<12} {_flag(check)}  {check.detail}")
 
     if not report.ok:
         lines.append("")
         for issue in report.issues:
             lines.append(f"  ! {issue}")
+    if report.advisories:
+        lines.append("")
+        for advisory in report.advisories:
+            lines.append(f"  ~ {advisory}")
+        for collision in report.collisions:
+            lines.append(f"      {collision.namespace}")
+            for repository in collision.repositories:
+                lines.append(f"        {repository}")
+        if report.collisions:
+            lines.append("    Reported only; nothing was changed. Merge a pair with")
+            lines.append(
+                "    `haunt namespace reconcile SOURCE TARGET` (dry-run unless --apply)."
+            )
     return "\n".join(lines)

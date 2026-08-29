@@ -118,7 +118,15 @@ _OPEN_SUCCESSOR_SESSIONS = f"""
 #     session id was ended; and living in caller-writable meta it was
 #     forgeable. One reserved column is also one place for privacy purge to
 #     rekey, instead of a key hiding in every other session's metadata.
-SCHEMA_VERSION = 12
+# 13: memories.skip_embedding column, so the C6 capture-policy exclusion
+#     survives the row it was applied to. The decision lived only in
+#     observe()'s parameter, which made it admission-time only: reembed()
+#     re-embeds every row in `memories` regardless of embedding_jobs, so a
+#     model change resurrected every excluded Bash/Read/ceremony row into
+#     the vector index. Backfilled from the signature those rows already
+#     carry -- see _backfill_skip_embedding for what that signature cannot
+#     prove.
+SCHEMA_VERSION = 13
 SCHEMA_VERSION_KEY = "schema_version"
 PRIVACY_LINEAGE_KEY = "privacy_lineage_head"
 CONTENT_HASH_BACKFILL_BATCH = 1000
@@ -1330,6 +1338,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             valid_to TEXT,
             created_at TEXT NOT NULL,
             content_hash TEXT,
+            skip_embedding INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (event_id) REFERENCES events(id)
         );
         CREATE TABLE IF NOT EXISTS entities (
@@ -1598,6 +1607,35 @@ def _backfill_content_hashes(conn: sqlite3.Connection) -> int:
         total += len(rows)
 
 
+def _backfill_skip_embedding(conn: sqlite3.Connection) -> int:
+    """Mark pre-v13 rows that carry the capture-policy exclusion signature.
+
+    Nothing recorded the decision before v13, so this infers it. A row that
+    was admitted with `skip_embedding=True` is the only one observe() leaves
+    with no vector, no queue row, and non-blank content: every other
+    non-blank row is either embedded or queued, and neither
+    process_embedding_jobs nor reembed ever removes a queue row without
+    writing the vector it stood for. Blank-content rows share the "never
+    embedded" outcome but not the reason, so they are left at 0.
+
+    The inference is one-directional. It never marks a row that was embedded
+    or queued, so it cannot newly exclude something the operator embedded on
+    purpose; it does miss excluded rows whose queue row was manufactured
+    afterwards, by the v3 migration or by a `reembed()` that ran with no
+    model available (both enqueue every non-blank unembedded row). Those
+    stay at 0 and keep behaving as they do today. Returns rows marked.
+    """
+    cursor = conn.execute(
+        """
+        UPDATE memories SET skip_embedding=1
+        WHERE embedding IS NULL
+          AND TRIM(content) != ''
+          AND id NOT IN (SELECT memory_id FROM embedding_jobs)
+        """
+    )
+    return int(cursor.rowcount or 0)
+
+
 def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
     """Create tables and run one-time migrations. Not invoked per query."""
     _init_namespace_schema(conn)
@@ -1750,6 +1788,32 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
                AND json_valid(meta)
                AND json_type(meta) = 'object'
                AND json_extract(meta, '$.{SESSION_SUCCEEDS_KEY}') IS NOT NULL
+            """
+        )
+    if current < 13:
+        memory_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "skip_embedding" not in memory_columns:
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN skip_embedding "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        # After the v3 enqueue above, deliberately: a namespace old enough to
+        # reach that branch predates the capture policy entirely, so it has
+        # no exclusions to recover and the enqueue's job rows correctly leave
+        # every row at 0.
+        _backfill_skip_embedding(conn)
+        # Queue rows for excluded memories can exist from before the flag --
+        # v3 and a model-less reembed() both enqueue every non-blank
+        # unembedded row. The drain filters on the flag, so leaving them
+        # would park `remaining` above zero forever.
+        conn.execute(
+            """
+            DELETE FROM embedding_jobs WHERE memory_id IN (
+                SELECT id FROM memories WHERE skip_embedding=1
+            )
             """
         )
     _ensure_correction_invariant_triggers(conn)
@@ -4034,6 +4098,18 @@ _RECONCILE_TABLES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
     ("corrections", ("id",), frozenset()),
 )
 
+# Tables the apply reads and writes without merging them row-for-row, so
+# they have no collision semantics: two namespaces disagreeing about one
+# memory's `attempts` is queue state, not a content conflict, and refusing
+# the whole reconcile over it would be wrong. They are still hashed into
+# content_state_digest, because the operator authorizes a digest and
+# everything the apply writes has to be inside it -- `embedding_jobs` is
+# copied verbatim by _reconcile_requeue_embedding, `attempts`/`last_error`
+# included, and a background drain moves both.
+_RECONCILE_DIGEST_ONLY_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("embedding_jobs", ("memory_id",)),
+)
+
 # Columns outside the primary key that are also required to be globally
 # unique (enforced by a partial UNIQUE index). A SOURCE row queued for
 # insertion whose value collides with a *different* TARGET row on one of
@@ -4055,6 +4131,33 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [
         str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
     ]
+
+
+def _table_column_signatures(
+    conn: sqlite3.Connection, table: str
+) -> dict[str, tuple[str, int, Any, int]]:
+    """Map every column name to its declared (type, notnull, default, pk).
+
+    Keyed by name, so ordinal position -- the one thing PRAGMA table_info
+    reports that two namespaces at the same schema version may legitimately
+    disagree about -- is deliberately excluded. A missing table yields `{}`,
+    matching `_table_columns`.
+
+    What table_info cannot see is not compared: CHECK constraints, foreign
+    keys, and indexes (including the partial UNIQUE indexes behind
+    `_RECONCILE_SECONDARY_UNIQUE_KEYS`) are absent from its output, so two
+    tables comparing equal here are equal in column set, affinity,
+    nullability, default, and primary key -- not in every possible respect.
+    """
+    return {
+        str(row["name"]): (
+            str(row["type"]),
+            int(row["notnull"]),
+            row["dflt_value"],
+            int(row["pk"]),
+        )
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
 
 
 def _reconcile_sort_key(pk: tuple[Any, ...]) -> tuple[str, ...]:
@@ -4137,17 +4240,38 @@ def _reconcile_content_state_digest(
     just the rows that would move -- any change to either namespace's
     existing content between a dry-run and its apply must be detected, not
     only a change to what would be inserted.
+
+    ``_RECONCILE_DIGEST_ONLY_TABLES`` are hashed but not diffed, so they
+    move the digest without ever appearing in the returned diffs or in the
+    plan's per-table report. A table missing from one side hashes as null
+    rather than as an empty list: SOURCE is a never-migrated read-only
+    connection and can genuinely predate ``embedding_jobs``, which is not
+    the same state as having the table and no rows.
     """
     diffs: dict[str, _TableDiff] = {}
     per_table_digest: dict[str, Any] = {}
     for table, pk_columns, ignore_columns in _RECONCILE_TABLES:
-        source_columns = _table_columns(source_conn, table)
-        target_columns = _table_columns(target_conn, table)
+        # Compared by name, never by ordinal. A namespace created fresh at
+        # the current schema and one that reached it through ALTER TABLE
+        # order their columns differently for the same version -- `events`
+        # carries `idempotency_key` second when created fresh and thirteenth
+        # when migrated -- and that pair is precisely what reconcile exists
+        # to heal. Nothing downstream reads a column by position: rows are
+        # fetched into name-keyed dicts, diffed by name, and the apply's
+        # INSERT builds its own column list from TARGET's PRAGMA order while
+        # pulling each value out of the SOURCE row by name.
+        source_columns = _table_column_signatures(source_conn, table)
+        target_columns = _table_column_signatures(target_conn, table)
         if source_columns != target_columns:
+            differing = sorted(
+                name
+                for name in set(source_columns) | set(target_columns)
+                if source_columns.get(name) != target_columns.get(name)
+            )
             raise NamespaceMigrationError(
-                f"{table!r} column layout differs between the two namespaces "
-                "even though both report the current schema version; "
-                "refusing to guess a mapping"
+                f"{table!r} columns differ between the two namespaces even "
+                "though both report the current schema version "
+                f"({', '.join(differing)}); refusing to guess a mapping"
             )
         source_rows = _fetch_rows_by_pk(source_conn, table, pk_columns)
         target_rows = _fetch_rows_by_pk(target_conn, table, pk_columns)
@@ -4167,6 +4291,18 @@ def _reconcile_content_state_digest(
                 _canonical_json({"pk": list(pk), "row": _json_safe_row(row)})
                 for pk, row in target_rows.items()
             ),
+        }
+    for table, pk_columns in _RECONCILE_DIGEST_ONLY_TABLES:
+        per_table_digest[table] = {
+            role: (
+                None
+                if not _table_columns(conn, table)
+                else sorted(
+                    _canonical_json({"pk": list(pk), "row": _json_safe_row(row)})
+                    for pk, row in _fetch_rows_by_pk(conn, table, pk_columns).items()
+                )
+            )
+            for role, conn in (("source", source_conn), ("target", target_conn))
         }
     return _state_digest(per_table_digest), diffs
 
@@ -4370,6 +4506,214 @@ def _backup_namespace_database(store: "ReadOnlyStore", *, purpose: str) -> _Veri
         os.close(backup_root_fd)
 
 
+def _open_backup_copy(path: Path) -> sqlite3.Connection:
+    """Open one backup database as its own authorized privacy purge.
+
+    A backup is not a registered namespace, so none of the sidecar/primary
+    guard machinery applies to it; it is a loose file in a directory this
+    process already verified. The vec0 module has to be loaded even though
+    nothing here queries it: VACUUM opens every table, and a `vec_memories`
+    whose module is missing fails the rebuild the erasure depends on.
+    """
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.create_function("haunt_privacy_purge_authorized", 0, lambda: 1)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA secure_delete=ON")
+    from haunt.embed import fts_only
+
+    if not fts_only():
+        try:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            # Not fatal on its own: a backup taken from an FTS-only
+            # namespace has no vec_memories to open. If it does have one,
+            # the VACUUM below fails and the caller reports the file as
+            # still holding the row.
+            pass
+    return conn
+
+
+def _backup_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Table presence read from the catalog, never from PRAGMA table_info.
+
+    `vec_memories` is a virtual table: table_info on it needs its module,
+    which a backup connection may not have loaded.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _erase_memory_from_backup(conn: sqlite3.Connection, memory_id: str) -> bool:
+    """Erase one memory's content from an opened backup, or report absence.
+
+    Mirrors the content-bearing half of `Store.purge`: the memory row, its
+    FTS and vector entries, the graph evidence of its event, and the event
+    itself. Corrections naming it are deleted outright rather than
+    tombstoned -- a backup is a restore artifact, not a lineage the store
+    reads, and a tombstone would only add a row to a file being discarded.
+
+    Deliberately not mirrored: the identifier rekeying purge does in the
+    live namespace (purge-safe sessions, correction request scrubbing).
+    Restoring a swept backup restores a pre-purge database whose erased
+    row's content is gone but whose session and event identifiers are the
+    original ones.
+    """
+    row = conn.execute(
+        "SELECT event_id FROM memories WHERE id=?", (memory_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    event_id = row["event_id"]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        if _backup_table_exists(conn, "memories_fts"):
+            conn.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
+            conn.execute("INSERT INTO memories_fts(memories_fts) VALUES ('optimize')")
+        if _backup_table_exists(conn, "vec_memories"):
+            conn.execute("DELETE FROM vec_memories WHERE id=?", (memory_id,))
+        if _backup_table_exists(conn, "corrections"):
+            conn.execute(
+                "DELETE FROM corrections WHERE target_memory_id=? "
+                "OR replacement_memory_id=?",
+                (memory_id, memory_id),
+            )
+        from haunt.graph import remove_event_evidence
+
+        remove_event_evidence(conn, event_id)
+        survivors = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
+        ).fetchone()[0]
+        if survivors == 0:
+            conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+        else:
+            # Another memory still needs this event row to satisfy its
+            # foreign key, but every content-bearing column on it belongs
+            # to the erased memory.
+            conn.execute(
+                """
+                UPDATE events
+                SET content='', tool_name=NULL, tool_input=NULL,
+                    tool_output=NULL, meta=?
+                WHERE id=?
+                """,
+                (dumps({}), event_id),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return True
+
+
+def _purge_backup_copies(memory_id: str) -> dict[str, Any]:
+    """Erase one memory from every namespace backup under HAUNT_HOME/backups.
+
+    Both backup-creating paths (`reconcile_namespaces`, `retire_namespace`)
+    write full plaintext copies of a namespace database here, so without
+    this a hard purge leaves the erased row trivially readable in a file
+    Haunt itself wrote. Every backup is swept, not just the purged
+    namespace's: reconcile copies rows keeping their primary keys, so one
+    memory id names the same row in every namespace and every backup of one.
+
+    Held under the cross-process migration lock, which both creating paths
+    also hold, so a backup cannot be published from a pre-purge snapshot
+    while the sweep is deciding what exists.
+
+    Returns `scanned`, `erased`, and `unerased` -- the names of backups that
+    could not be swept (locked, corrupt, or a vec table whose module would
+    not load). A non-empty `unerased` means the erasure did not complete.
+    Sweeping rewrites the file, so the sha256 an earlier migration report
+    recorded for that backup no longer matches it.
+    """
+    result: dict[str, Any] = {"scanned": 0, "erased": 0, "unerased": []}
+    try:
+        if not (haunt_home() / "backups").is_dir():
+            return result
+        backup_root, backup_root_fd = _private_backup_root()
+    except Exception:
+        # The live erasure is already committed, so a directory this
+        # process cannot verify must be reported, not raised: the caller
+        # would otherwise see a failure for work that succeeded.
+        result["unerased"].append("backups")
+        return result
+    try:
+        _sweep_backup_copies(backup_root, backup_root_fd, memory_id, result)
+    except Exception:
+        # Same reason as the root failure above: the purge itself is done.
+        result["unerased"].append("backups")
+    finally:
+        os.close(backup_root_fd)
+    return result
+
+
+def _sweep_backup_copies(
+    backup_root: Path, backup_root_fd: int, memory_id: str, result: dict[str, Any]
+) -> None:
+    """Walk the verified backup directory, accumulating into `result`."""
+    names = sorted(
+        name
+        for name in os.listdir(backup_root_fd)
+        # Only what _backup_namespace_database writes, by its own naming.
+        # The registry backups sharing this directory hold no memory content
+        # and are recorded by sha256 in namespace_migrations; opening them
+        # read-write would put that record at risk for nothing.
+        if name.endswith(".db")
+        and (name.startswith("namespace-") or name.startswith(".namespace-backup-"))
+    )
+    for name in names:
+        try:
+            info = os.stat(name, dir_fd=backup_root_fd, follow_symlinks=False)
+        except OSError:
+            continue
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or int(info.st_nlink) != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            continue
+        try:
+            conn = _open_backup_copy(backup_root / name)
+        except Exception:
+            result["unerased"].append(name)
+            continue
+        try:
+            if not _backup_table_exists(conn, "memories"):
+                # Belt and braces behind the name filter: a file named like a
+                # namespace backup but holding no memories is not one, and is
+                # left alone rather than rebuilt.
+                continue
+            result["scanned"] += 1
+            if not _erase_memory_from_backup(conn, memory_id):
+                continue
+            # The copy is byte-for-byte, so it carries the source file's free
+            # pages too -- pages that can hold an older copy of the row this
+            # sweep just unlinked. Only the rebuild removes those, and it must
+            # not spill the surviving plaintext to a temp directory doing it.
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("VACUUM")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            result["erased"] += 1
+        except Exception:
+            result["unerased"].append(name)
+        finally:
+            conn.close()
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.unlink(f"{name}{suffix}", dir_fd=backup_root_fd)
+                except OSError:
+                    pass
+    os.fsync(backup_root_fd)
+
+
 def _reconcile_requeue_embedding(
     source_conn: sqlite3.Connection,
     target_conn: sqlite3.Connection,
@@ -4399,6 +4743,11 @@ def _reconcile_requeue_embedding(
       - SOURCE had neither -> do not enqueue. Policy-excluded at admission (or
         blank content); TARGET must preserve the exclusion, not resurrect it.
 
+    A row copied with `skip_embedding` set short-circuits all three: the
+    persisted exclusion (schema v13) travels with the row, and TARGET's
+    drain filters on it, so an enqueue here would only park an undrainable
+    job row in TARGET's queue.
+
     `source_has_embedding_jobs` exists because SOURCE is a ReadOnlyStore
     connection, which deliberately never migrates schema on open. A namespace
     old enough to predate `embedding_jobs` can genuinely lack the table, and
@@ -4408,6 +4757,8 @@ def _reconcile_requeue_embedding(
     exactly like "no job row": no positive signal, so no enqueue.
     """
     memory_id = values["id"]
+    if values.get("skip_embedding"):
+        return
     if source_embedded:
         target_conn.execute(
             """
@@ -4640,7 +4991,7 @@ def _remove_namespace_database(db_path: Path, identity: tuple[int, int]) -> None
         db_path.unlink()
 
 
-def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str, Any]:
+def _retire_namespace(label: str, *, into: str, apply: bool) -> dict[str, Any]:
     """Deregister and remove a namespace ``into`` already holds every row of.
 
     This is the operator step `reconcile_namespaces` deliberately leaves
@@ -4788,6 +5139,21 @@ def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str,
     report["database_removed"] = not stranded and not db_path.exists()
     report["retired"] = True
     return report
+
+
+def retire_namespace(label: str, *, into: str, apply: bool = False) -> dict[str, Any]:
+    """Plan or apply the retirement of a namespace drained into ``into``.
+
+    See `_retire_namespace` for what apply does. The lock is the same one
+    `reconcile_namespaces` takes, and is held for the same reason plus one
+    more: a hard purge sweeps the backup directory under it, so the backup
+    this writes cannot be published from a pre-purge snapshot after that
+    sweep has already looked.
+    """
+    if not apply:
+        return _retire_namespace(label, into=into, apply=False)
+    with _namespace_migration_lock():
+        return _retire_namespace(label, into=into, apply=True)
 
 
 def verbatim_text(
@@ -5293,14 +5659,13 @@ class Store:
         # every other caller's behavior, including MCP and CLI, unchanged
         # by default.
         #
-        # Reversibility: a skip_embedding row is never added to
-        # embedding_jobs, so process_embedding_jobs's queue drain can never
-        # pick it up -- excluded stays excluded under normal operation.
-        # Store.reembed() (a full, explicit, operator-triggered rebuild) is
-        # the deliberate exception: it re-embeds every row in `memories`
-        # regardless of embedding_jobs membership, so it also covers
-        # previously-excluded rows. That is the escape hatch today; there
-        # is no per-row "un-exclude just this one" command.
+        # Reversibility: the decision is persisted on the row
+        # (memories.skip_embedding, schema v13), not just applied at
+        # admission. The row is never added to embedding_jobs and both
+        # process_embedding_jobs and reembed() filter on the stored flag, so
+        # a model change or an operator-triggered full rebuild no longer
+        # resurrects it. Clearing the column is the only un-exclude; there
+        # is no per-row command for it.
         skip_embedding: bool = False,
         commit: bool = True,
     ) -> ObserveResult:
@@ -5408,10 +5773,13 @@ class Store:
                 """
                 INSERT INTO memories(
                     id, event_id, tier, content, embedding, valid_from, valid_to, created_at,
-                    content_hash
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    content_hash, skip_embedding
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
-                (memory_id, event_id, tier, text, blob, vf, vt, ts, content_hash),
+                (
+                    memory_id, event_id, tier, text, blob, vf, vt, ts, content_hash,
+                    1 if skip_embedding else 0,
+                ),
             )
             # Unconditional -- runs regardless of skip_embedding (or
             # defer_embedding, or blob). This is what makes a capture-policy
@@ -5581,7 +5949,7 @@ class Store:
             SELECT j.memory_id, m.content
             FROM embedding_jobs j
             JOIN memories m ON m.id=j.memory_id
-            WHERE j.attempts < ?
+            WHERE j.attempts < ? AND m.skip_embedding=0
             ORDER BY j.queued_at ASC, j.rowid ASC
             LIMIT ?
             """,
@@ -5738,7 +6106,11 @@ class Store:
         from the queue's view.
         """
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM embedding_jobs WHERE attempts >= ?",
+            """
+            SELECT COUNT(*) FROM embedding_jobs j
+            JOIN memories m ON m.id=j.memory_id
+            WHERE j.attempts >= ? AND m.skip_embedding=0
+            """,
             (max_attempts,),
         ).fetchone()
         return int(row[0]) if row else 0
@@ -5746,12 +6118,19 @@ class Store:
     def _pending_embedding_jobs(self, max_attempts: int) -> int:
         """Count rows still eligible for process_embedding_jobs's SELECT
         (attempts < max_attempts) -- the complement of
-        _exhausted_embedding_jobs. The pre-existing `embedding_jobs` count
-        in stats() (raw COUNT(*) over the whole table) always equals this
-        plus _exhausted_embedding_jobs.
+        _exhausted_embedding_jobs.
+
+        Both mirror that SELECT's capture-policy filter as well as its
+        attempts cap. A queue row for a `skip_embedding` memory is never
+        drained, so counting it would leave drain_embedding_queue reporting
+        `remaining` above zero on a queue it has fully drained.
         """
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM embedding_jobs WHERE attempts < ?",
+            """
+            SELECT COUNT(*) FROM embedding_jobs j
+            JOIN memories m ON m.id=j.memory_id
+            WHERE j.attempts < ? AND m.skip_embedding=0
+            """,
             (max_attempts,),
         ).fetchone()
         return int(row[0]) if row else 0
@@ -5881,26 +6260,41 @@ class Store:
         return False
 
     def reembed(self) -> dict[str, Any]:
-        """Rebuild every memory embedding with the currently loaded model.
+        """Rebuild every embeddable memory's vector with the loaded model.
 
         ``updated`` is the number of rows that actually landed in
         ``vec_memories``, not blob writes to ``memories.embedding``.
+
+        Rows carrying the persisted capture-policy exclusion
+        (``memories.skip_embedding``, schema v13) are not rebuilt and not
+        requeued: this is a full rebuild of the vector index, not a review
+        of what belongs in it. ``total`` counts the rows considered, so it
+        is short of the namespace's memory count by ``skipped``.
         """
         es = embed_state()
-        rows = self.conn.execute("SELECT id, content FROM memories").fetchall()
+        rows = self.conn.execute(
+            "SELECT id, content FROM memories WHERE skip_embedding=0"
+        ).fetchall()
+        skipped = int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE skip_embedding=1"
+            ).fetchone()[0]
+        )
         self.conn.execute("DROP TABLE IF EXISTS vec_memories")
         if not es.available:
             self.conn.execute("UPDATE memories SET embedding=NULL")
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
-                SELECT id, created_at FROM memories WHERE TRIM(content) != ''
+                SELECT id, created_at FROM memories
+                WHERE TRIM(content) != '' AND skip_embedding=0
                 """
             )
             self.conn.commit()
             return {
                 "updated": 0,
                 "total": len(rows),
+                "skipped": skipped,
                 "model": es.model_id,
                 "dim": es.dim,
                 "available": False,
@@ -5938,6 +6332,7 @@ class Store:
         return {
             "updated": updated,
             "total": len(rows),
+            "skipped": skipped,
             "model": es.model_id,
             "dim": es.dim,
             "available": True,
@@ -6039,9 +6434,9 @@ class Store:
         # coverage percentage from these fields today, but anyone who
         # later does (e.g. memories_embedded / memories * 100) will land
         # short of 100% forever on a namespace with policy-excluded rows,
-        # even once every embeddable row really is embedded. If that
-        # bucket ever needs its own counter, it is `memories` rows with
-        # `embedding IS NULL` and no matching `embedding_jobs` row.
+        # even once every embeddable row really is embedded. Since schema
+        # v13 that bucket has a column of its own if it ever needs a
+        # counter: `memories.skip_embedding`, plus blank-content rows.
         max_attempts = _embed_max_attempts()
         vec_count = self._vec_memories_count()
         # C7 phase 1: content_hash only exists once a writer has completed
@@ -6261,6 +6656,12 @@ class Store:
         leaves the erasure incomplete -- pages freed before this purge may
         still hold older copies of the row -- until the caller runs
         `overwrite_erased_pages()` itself. Nothing else does it for them.
+
+        Every purge also erases the row from the namespace backups Haunt
+        wrote under `<HAUNT_HOME>/backups`, rebuilding each one it touches.
+        `backups_unerased` names the backups that still hold it; a
+        surprising cost here is that a namespace with backups pays a rebuild
+        per backup, and `rebuild=False` does not defer it.
         """
         row = self.conn.execute(
             """
@@ -6290,6 +6691,9 @@ class Store:
             "event_deleted": False,
             "session_deleted": False,
             "bytes_overwritten": False,
+            "backups_scanned": 0,
+            "backups_erased": 0,
+            "backups_unerased": [],
         }
 
         # A plain DELETE unlinks the cell and leaves its bytes readable in the
@@ -6569,6 +6973,14 @@ class Store:
                 self._privacy_purge_thread_id = None
             if rebuild:
                 deleted["bytes_overwritten"] = self.overwrite_erased_pages()
+        # Not deferred by rebuild=False. That flag trades a stale free page
+        # for speed; a backup holds the whole row, and leaving one behind
+        # would make the erasure claim false rather than merely incomplete.
+        with _namespace_migration_lock():
+            swept = _purge_backup_copies(memory_id)
+        deleted["backups_scanned"] = swept["scanned"]
+        deleted["backups_erased"] = swept["erased"]
+        deleted["backups_unerased"] = swept["unerased"]
         try:
             touch_namespace(self.name, namespace_id=self.namespace_id)
         except Exception:

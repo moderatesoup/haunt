@@ -12,15 +12,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import subprocess
+import sys
+import zipfile
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
 
+import haunt
 from haunt import abstention_eval, embed
 from haunt.abstention_eval import canonical_hash, verify_local_hybrid_cache
 from haunt.paths import models_dir
 
-FIXTURE = Path(__file__).parent / "fixtures" / "abstention_eval" / "v1"
+PACKAGE_DIR = Path(haunt.__file__).resolve().parent
+HYBRID_MANIFEST = abstention_eval.HYBRID_MANIFEST_DIR / "hybrid-model-manifest.json"
+PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
 
 def _fake_cache(root: Path) -> Path:
@@ -129,7 +137,7 @@ def test_planted_quantized_files_do_not_skip_verification(tmp_path, monkeypatch)
 def test_an_uninstalled_manifest_is_reported_not_assumed(
     tmp_path, monkeypatch, capsys
 ):
-    """The manifest ships with the repo, not the wheel; absence is not consent."""
+    """The manifest ships inside the package now; absence means a broken install."""
     _clean_env(monkeypatch, tmp_path)
     root = _fake_cache(tmp_path)
 
@@ -147,7 +155,7 @@ def _synthetic_fixture(
     tmp_path: Path, cache: Path, contents: dict[str, bytes]
 ) -> tuple[Path, str]:
     """A manifest over throwaway files, keyed to the real one's structure."""
-    manifest = json.loads((FIXTURE / "hybrid-model-manifest.json").read_text("utf-8"))
+    manifest = json.loads(HYBRID_MANIFEST.read_text("utf-8"))
     manifest["files"] = [
         {
             "relative_path": relative,
@@ -156,7 +164,7 @@ def _synthetic_fixture(
         }
         for relative, body in contents.items()
     ]
-    fixture = tmp_path / "fixture"
+    fixture = tmp_path / "manifest"
     fixture.mkdir()
     (fixture / "hybrid-model-manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8"
@@ -188,7 +196,7 @@ def test_hash_cap_checks_oversized_files_by_size_and_the_rest_by_content(
     capped_cache,
 ):
     cache, fixture = capped_cache
-    report = verify_local_hybrid_cache(cache, fixture_dir=fixture, hash_max_bytes=16)
+    report = verify_local_hybrid_cache(cache, manifest_dir=fixture, hash_max_bytes=16)
     assert report["files"] == [
         {
             "relative_path": "BAAI-bge-m3/onnx/model.onnx",
@@ -207,7 +215,7 @@ def test_hash_cap_still_catches_a_substituted_graph(capped_cache):
     cache, fixture = capped_cache
     (cache / "BAAI-bge-m3/onnx/model.onnx").write_bytes(b"other-graph")
     with pytest.raises(RuntimeError, match="artifact hash mismatch"):
-        verify_local_hybrid_cache(cache, fixture_dir=fixture, hash_max_bytes=16)
+        verify_local_hybrid_cache(cache, manifest_dir=fixture, hash_max_bytes=16)
 
 
 def test_hash_cap_catches_a_resized_sidecar_but_not_a_restuffed_one(capped_cache):
@@ -215,15 +223,60 @@ def test_hash_cap_catches_a_resized_sidecar_but_not_a_restuffed_one(capped_cache
     cache, fixture = capped_cache
     sidecar = cache / "BAAI-bge-m3/onnx/model.onnx_data"
     sidecar.write_bytes(b"X" * len(SIDECAR))
-    verify_local_hybrid_cache(cache, fixture_dir=fixture, hash_max_bytes=16)
+    verify_local_hybrid_cache(cache, manifest_dir=fixture, hash_max_bytes=16)
 
     sidecar.write_bytes(b"X" * (len(SIDECAR) + 1))
     with pytest.raises(RuntimeError, match="size_mismatch"):
-        verify_local_hybrid_cache(cache, fixture_dir=fixture, hash_max_bytes=16)
+        verify_local_hybrid_cache(cache, manifest_dir=fixture, hash_max_bytes=16)
 
 
 def test_uncapped_verification_still_hashes_every_file(capped_cache):
     cache, fixture = capped_cache
     (cache / "BAAI-bge-m3/onnx/model.onnx_data").write_bytes(b"X" * len(SIDECAR))
     with pytest.raises(RuntimeError, match="artifact hash mismatch"):
-        verify_local_hybrid_cache(cache, fixture_dir=fixture)
+        verify_local_hybrid_cache(cache, manifest_dir=fixture)
+
+
+def test_the_manifest_the_check_reads_lives_inside_the_package():
+    """A wheel ships the package, never tests/, so the gate has to live here.
+
+    Under tests/fixtures the check resolved through a repo checkout root that
+    does not exist off-repo, and every wheel install fell through the
+    FileNotFoundError leg above with verification never running.
+    """
+    assert HYBRID_MANIFEST.is_file()
+    assert PACKAGE_DIR in HYBRID_MANIFEST.resolve().parents
+
+
+def test_the_wheel_declares_the_manifest_as_package_data():
+    """Living under src/haunt is not enough; setuptools ships listed data only."""
+    text = PYPROJECT.read_text("utf-8")
+    section = text.partition("[tool.setuptools.package-data]")[2].partition("\n[")[0]
+    relative = HYBRID_MANIFEST.resolve().relative_to(PACKAGE_DIR)
+    patterns = re.findall(r'"([^"]+)"', section)
+    assert any(fnmatch(str(relative), pattern) for pattern in patterns), section
+
+
+def test_a_built_wheel_actually_contains_the_manifest(tmp_path):
+    """The end of the chain: what pip installs, not what the checkout holds."""
+    built = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(tmp_path),
+            str(PYPROJECT.parent),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if built.returncode != 0:
+        pytest.skip(f"cannot build a wheel here: {built.stderr.strip()[-300:]}")
+    wheel = next(iter(tmp_path.glob("haunt-*.whl")))
+    relative = HYBRID_MANIFEST.resolve().relative_to(PACKAGE_DIR)
+    with zipfile.ZipFile(wheel) as archive:
+        assert f"haunt/{relative}" in archive.namelist()

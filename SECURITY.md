@@ -74,13 +74,29 @@ The report's `bytes_overwritten` is the honest signal: it is false when a
 concurrent reader blocked the rebuild. What this purge freed is zeroed either
 way; the older copies stay readable until a later purge rebuilds the file.
 
-This covers Haunt's own file, and nothing else. Export bundles, backups,
-filesystem snapshots, and any copy someone already made are untouched — purge
-one namespace and its bundles remain. Nor does it reach blocks the filesystem
-has already released: truncation, copy-on-write snapshots, and SSD
-wear-levelling can leave the original blocks intact on the physical device.
-Full-disk encryption, not purge, is the answer to an attacker with the raw
-device.
+Haunt writes full plaintext copies of a namespace database itself, under
+`<HAUNT_HOME>/backups`, whenever `haunt namespaces reconcile --apply` or
+`haunt namespaces retire --apply` runs. Purge sweeps those: it erases the row
+from every namespace backup holding it and rebuilds each one it touches,
+matching on the memory id, which reconcile preserves when it copies rows, so a
+backup of a different namespace is covered as well. The registry backups that
+share the directory are left alone; they record labels and migration audit
+state, never memory content. `backups_erased` counts the
+backups rewritten and `backups_unerased` names the ones that could not be —
+locked, corrupt, or holding a vector table whose extension would not load.
+A non-empty `backups_unerased` means the erasure did not complete. Sweeping
+rewrites the file, so the sha256 the migration report recorded for that backup
+no longer matches it, and a swept backup restores a namespace whose erased
+content is gone but whose session and event identifiers were never rekeyed.
+
+Everything else is out of reach and is not covered: export bundles, an
+operator's own `cp` of a namespace file, Time Machine or other filesystem
+snapshots, a backup on removable or network storage, and anything already
+copied elsewhere. Purge one namespace and its bundles remain. Nor does it
+reach blocks the filesystem has already released: truncation, copy-on-write
+snapshots, and SSD wear-levelling can leave the original blocks intact on the
+physical device. Full-disk encryption, not purge, is the answer to an attacker
+with the raw device.
 
 The rebuild is proportional to the namespace, not to the erased row, so a purge
 on a large namespace is slow. `secure_delete` is scoped to the purge
