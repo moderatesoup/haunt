@@ -985,6 +985,22 @@ def test_purge_removes_session_metadata_that_only_json_decoding_reveals(haunt_en
     assert any("kept-session-metadata" in (meta or "") for meta in metas)
 
 
+# Every key haunt itself writes into a namespace database's `meta` table.
+# Which of them a given file holds depends on configuration -- `repo_path` only
+# when a repository is bound, the embed pair only when a model is configured --
+# so this is the vocabulary, not the contents of any one namespace.
+NAMESPACE_META_KEYS = {
+    "bootstrapped",
+    "current_session",
+    "embed_dim",
+    "embed_model",
+    "graph_evidence_version",
+    "privacy_lineage_head",
+    "repo_path",
+    "schema_version",
+}
+
+
 def test_a_backup_can_hold_rows_from_more_than_one_namespace(haunt_env):
     """Why the sweep is namespace-wide, and cannot be scoped to one namespace.
 
@@ -995,10 +1011,22 @@ def test_a_backup_can_hold_rows_from_more_than_one_namespace(haunt_env):
     would remove that cost, and this test is why it is not done -- nothing
     identifies which namespace a backup belongs to:
 
-      - The namespace database stores no namespace id or label. Its `meta`
-        table holds schema_version, current_session, graph_evidence_version
-        and the privacy head; the identity lives only in the registry, keyed
-        by the live database's path, which a backup does not have.
+      - The namespace database stores no namespace id or label. Its whole
+        `meta` vocabulary is NAMESPACE_META_KEYS below -- schema_version,
+        bootstrapped, current_session, graph_evidence_version,
+        privacy_lineage_head, embed_model, embed_dim, repo_path -- and the
+        identity lives only in the registry, keyed by the live database's
+        path, which a backup does not have.
+      - `repo_path` is the nearest thing to an identity signal in the file
+        and is the one the next attempt will reach for, so: it is written
+        only when a repository is bound (the `if repo:` guard in
+        `_register_namespace_once_with_configuration_lock`), so it is absent
+        for a `HAUNT_NAMESPACE` namespace and for `haunt init NAME` without
+        `--repo`. It names a repository, not a namespace, and reaches one
+        only through `repository_bindings` in the registry. And even when it
+        is present and correctly attributed it answers the wrong question:
+        attribution says whose file this is, while the sweep needs to know
+        whose rows are in it -- and those differ, as below.
       - `retire` deregisters the namespace, deleting the identity row, so its
         backups -- the ones most likely to hold purged content -- can never
         be attributed to anything at all.
@@ -1039,8 +1067,14 @@ def test_a_backup_can_hold_rows_from_more_than_one_namespace(haunt_env):
     assert mixed, "a backup of one namespace must be shown holding another's rows"
 
     # The namespace database carries no identity of its own to scope by.
+    # Pinned as a set so the enumeration in the docstring above cannot drift
+    # into being wrong again: a new meta key has to be classified here, by
+    # someone who then has to decide whether it identifies a namespace.
     with Store("multi-beta") as store:
         keys = {
             str(row["key"]) for row in store.conn.execute("SELECT key FROM meta")
         }
-    assert not {key for key in keys if "namespace" in key or "label" in key}, keys
+    assert keys <= NAMESPACE_META_KEYS, keys - NAMESPACE_META_KEYS
+    assert not {
+        key for key in NAMESPACE_META_KEYS if "namespace" in key or "label" in key
+    }, NAMESPACE_META_KEYS
