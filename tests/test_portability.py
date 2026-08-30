@@ -680,7 +680,27 @@ def test_export_never_returns_pre_purge_canary_after_concurrent_purge(
         thread.join(10)
         writer.close()
     assert not thread.is_alive()
-    assert failures == []
+
+    # Two outcomes are correct, and which one occurs is a genuine race.
+    #
+    # purge() rebuilds the namespace file to erase bytes, which changes its
+    # inode -- and build_namespace_export compares db_inode (among other
+    # stable identity fields) before and after its cut, refusing an export
+    # whose file was rebuilt underneath it. When the rebuild wins the race the
+    # refusal is the guard working; when a pinned reader blocks the rebuild
+    # (reported as bytes_overwritten=False) the export completes.
+    #
+    # Asserting only the second made this test fail about once in twenty on
+    # both this tree and 10963523 -- measured over 26 base and 46 head runs
+    # across three harnesses. What must never happen is the third outcome: an
+    # export that succeeds and still carries the purged canary.
+    if failures:
+        assert len(failures) == 1, failures
+        assert isinstance(failures[0], ExportError), failures[0]
+        assert "registry identity changed during export" in str(failures[0])
+        assert not result, "export both failed and returned a bundle"
+        return
+
     raw = canonical_export_bytes(result[0])
     assert canary.encode() not in raw
     assert base64.b64encode(canary.encode()) not in raw
