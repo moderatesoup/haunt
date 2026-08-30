@@ -4134,7 +4134,10 @@ _RECONCILE_DIGEST_ONLY_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
 # NULL is unknown, never epoch and never now: a NULL end is ignored as a
 # candidate rather than treated as a bound, and an `ended_at` NULL on both
 # sides stays NULL -- an unrecorded end is an open session, not a session
-# that ended at its last event.
+# that ended at its last event. A NULL end on TARGET's row is stronger
+# still: it is live control state that `end_session` and `ensure_session`
+# read, so an end recorded only by SOURCE is not adopted over it. See
+# `_merged_window` for why the mirror shape is deliberately not symmetric.
 #
 # The clock is the durable write/audit clock -- `events.ts`, the column
 # `_default_temporal_cut` (portability.py) groups with these two -- and not
@@ -4238,6 +4241,10 @@ class _TableDiff:
     # both databases' events. Empty for every table without window columns,
     # and empty when every window already holds.
     window_merges: list[dict[str, Any]] = field(default_factory=list)
+    # Primary keys whose own recorded window holds a timestamp that cannot
+    # be ordered. Named, never guessed at, and never written -- and never a
+    # reason to refuse the rest of the operation.
+    unresolvable_windows: list[tuple[Any, ...]] = field(default_factory=list)
 
 
 def _diff_reconcile_table(
@@ -4286,38 +4293,64 @@ def _diff_reconcile_table(
     )
 
 
-def _window_instant(value: Any, what: str) -> tuple[Any, Any]:
-    """Chronological sort key for one stored window/event timestamp.
+def _orderable_instant(value: Any) -> tuple[Any, Any] | None:
+    """Chronological sort key for one stored timestamp, or None.
 
     Parsed, never compared as raw text: two databases that reached the same
     instant by different routes can spell it differently, and a window
     merged on a lexical comparison would then clamp the wrong way. Mirrors
-    `portability._at_or_before`, including its refusal to order a value it
-    cannot parse -- guessing here would silently move a real boundary.
+    `portability._at_or_before`'s parse, but not its refusal: a value that
+    cannot be parsed has no place on a timeline, and the callers here drop
+    it rather than guess one for it or refuse the whole operation over it.
     """
     if not isinstance(value, str):
-        raise NamespaceMigrationError(
-            f"cannot order non-text timestamp {what}; refusing to guess a "
-            "session window"
-        )
+        return None
     try:
         return (parse_iso(value), value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
+        return None
+
+
+def _window_instant(value: Any, what: str) -> tuple[Any, Any]:
+    """`_orderable_instant` for a value the caller has already vetted.
+
+    Every `min`/`max` below is fed a list filtered through
+    `_orderable_instant` first, so this is a guard against that filtering
+    being dropped later, not a path a corrupt database can reach.
+    """
+    instant = _orderable_instant(value)
+    if instant is None:
         raise NamespaceMigrationError(
-            f"cannot order invalid timestamp {what} ({value!r}); refusing to "
-            "guess a session window"
-        ) from exc
+            f"cannot order timestamp {what} ({value!r}); refusing to guess a "
+            "session window"
+        )
+    return instant
 
 
 def _session_event_extents(
     conn: sqlite3.Connection, session_ids: set[Any]
 ) -> dict[Any, tuple[str, str]]:
-    """First and last `events.ts` per named session in one database."""
+    """First and last *orderable* `events.ts` per named session.
+
+    A `ts` that cannot be parsed contributes no extent instead of refusing
+    the operation. This is the only code that parses `events.ts`, and it is
+    reached by both reconcile and retire, so a hard refusal here would let a
+    single corrupt row strand a whole namespace -- unable to be drained and
+    unable to be retired -- where before this existed the same namespace
+    reconciled fine. An unorderable timestamp cannot be placed on the
+    timeline at all, so it neither widens a window nor narrows one; a
+    session whose every `ts` is unorderable ends up in the same state as a
+    session with no events. Refusing is still right for the two window
+    columns themselves (see `_resolve_window_merges`), because those are
+    values this has to *write*, not evidence it is reading.
+    """
     buckets: dict[Any, list[str]] = {}
     if not session_ids:
-        return buckets
+        return {}
     for row in conn.execute("SELECT session_id, ts FROM events").fetchall():
-        if row["session_id"] in session_ids:
+        if row["session_id"] not in session_ids:
+            continue
+        if _orderable_instant(row["ts"]) is not None:
             buckets.setdefault(row["session_id"], []).append(row["ts"])
     return {
         session_id: (
@@ -4330,7 +4363,8 @@ def _session_event_extents(
 
 def _merged_window(
     window_columns: tuple[str, ...],
-    rows: tuple[dict[str, Any] | None, ...],
+    source_row: dict[str, Any] | None,
+    target_row: dict[str, Any] | None,
     extents: tuple[tuple[str, str] | None, ...],
 ) -> tuple[Any, ...]:
     """Union window: earliest of every start, latest of every end.
@@ -4343,22 +4377,43 @@ def _merged_window(
     An end nobody recorded stays NULL even when the session has events. The
     invariant is that a window contains every event inside it, and an open
     end is unbounded above, so it already does -- while writing the last
-    event's timestamp there would assert something nothing observed, close a
-    session that is still live, and send `ensure_session` off to mint a
-    successor for the next write. The event clamp widens a boundary that was
-    recorded; it never invents one that was not.
+    event's timestamp there would assert something nothing observed. The
+    event clamp widens a boundary that was recorded; it never invents one
+    that was not.
+
+    A NULL end on TARGET's row means more than "unknown", and this is the
+    one place the merge is deliberately asymmetric. TARGET is the surviving
+    namespace, and there `ended_at IS NULL` is live control state:
+    `end_session`'s sweep selects on it and `ensure_session` reads it to
+    decide whether the session id can be continued. Writing an end into it
+    closes a session that is still open and sends the next write off to mint
+    a successor. So an end SOURCE recorded for a session TARGET still holds
+    open is not adopted -- unbounded-above is the wider of the two ends, and
+    this merge only ever widens.
+
+    The mirror shape is not symmetric and must not be: SOURCE's NULL over an
+    end TARGET already swept would *reopen* a session TARGET closed, and
+    discard a real end signal, so there the recorded end still wins. That
+    mirror is the common cutover shape (SOURCE abandoned mid-session, TARGET
+    swept it closed later) and it is unaffected by any of this.
     """
     start_column, end_column = window_columns
+    rows = (source_row, target_row)
     starts = [
         row[start_column]
         for row in rows
         if row is not None and row.get(start_column) is not None
     ]
-    ends = [
-        row[end_column]
-        for row in rows
-        if row is not None and row.get(end_column) is not None
-    ]
+    if target_row is not None and target_row.get(end_column) is None:
+        # TARGET holds this session open. Unbounded above is already the
+        # widest end there is, and closing it is the one move forbidden here.
+        ends: list[Any] = []
+    else:
+        ends = [
+            row[end_column]
+            for row in rows
+            if row is not None and row.get(end_column) is not None
+        ]
     recorded_end = bool(ends)
     for extent in extents:
         if extent is not None:
@@ -4390,13 +4445,24 @@ def _resolve_window_merges(
     source_rows: dict[tuple[Any, ...], dict[str, Any]],
     target_rows: dict[tuple[Any, ...], dict[str, Any]],
 ) -> None:
-    """Resolve every window SOURCE knows about, and record only real changes.
+    """Resolve every window either database can name, and record real changes.
 
-    Every SOURCE session is considered, not only the ones whose rows differ:
+    The candidate set is the union of three things, not SOURCE's sessions
+    table alone: SOURCE's session primary keys, TARGET's session primary
+    keys, and the `session_id` of every event either side holds. Deriving it
+    from SOURCE's rows made the containment invariant depend on SOURCE's own
+    `events -> sessions` foreign key having held: an event whose session had
+    no SOURCE row was copied into TARGET without widening the TARGET window
+    that then had to contain it, and a session only TARGET had was never
+    looked at. The invariant has to hold structurally, not by luck.
+
+    Every candidate is considered, not only the ones whose rows differ:
     merging SOURCE's events into a session whose row TARGET already holds
     byte-identically can put an event outside the window that contains it,
     and that is the same defect as a disagreeing pair. Rows already refused
-    as collisions are skipped -- the whole operation is about to refuse.
+    as collisions are skipped -- the whole operation is about to refuse --
+    as is a session id that no row on either side declares, which has no row
+    to widen and is itself a symptom of that broken foreign key.
 
     A record is emitted only when the merged window differs from what TARGET
     would otherwise end up holding, which is what makes this idempotent: the
@@ -4404,12 +4470,27 @@ def _resolve_window_merges(
     reports (and writes) nothing. `to_insert` rows are replaced by clamped
     *copies*; the fetched rows themselves stay untouched because the caller
     hashes them into the content digest after this returns.
+
+    A session whose own recorded window cannot be ordered is named in
+    `unresolvable_windows` and left exactly as it is -- not guessed at, and
+    not allowed to refuse an operation the rest of which is fine. That
+    matters more now the candidate set includes rows only TARGET has: a
+    corrupt row TARGET has held for months must not brick a drain of SOURCE.
     """
     colliding = set(diff.colliding_pks)
+    pks = set(source_rows) | set(target_rows)
+    if pk_columns == ("id",):
+        for conn in (source_conn, target_conn):
+            pks |= {
+                (row["session_id"],)
+                for row in conn.execute(
+                    "SELECT DISTINCT session_id FROM events"
+                ).fetchall()
+            }
     candidates = [
         pk
-        for pk in sorted(source_rows, key=_reconcile_sort_key)
-        if pk not in colliding
+        for pk in sorted(pks, key=_reconcile_sort_key)
+        if pk not in colliding and (pk in source_rows or pk in target_rows)
     ]
     if not candidates:
         return
@@ -4418,15 +4499,24 @@ def _resolve_window_merges(
     target_extents = _session_event_extents(target_conn, session_ids)
     start_column, end_column = window_columns
     records: list[dict[str, Any]] = []
+    unresolvable: list[tuple[Any, ...]] = []
     clamped_by_pk: dict[tuple[Any, ...], dict[str, Any]] = {}
     for pk in candidates:
-        source_row = source_rows[pk]
+        source_row = source_rows.get(pk)
         target_row = target_rows.get(pk)
+        if any(
+            value is not None and _orderable_instant(value) is None
+            for row in (source_row, target_row)
+            if row is not None
+            for value in (row[start_column], row[end_column])
+        ):
+            unresolvable.append(pk)
+            continue
         session_id = pk[0]
         source_extent = source_extents.get(session_id)
         target_extent = target_extents.get(session_id)
         merged = _merged_window(
-            window_columns, (source_row, target_row), (source_extent, target_extent)
+            window_columns, source_row, target_row, (source_extent, target_extent)
         )
         baseline = target_row if target_row is not None else source_row
         if merged == tuple(baseline[column] for column in window_columns):
@@ -4454,7 +4544,9 @@ def _resolve_window_merges(
                 "pk": [json_safe_sqlite(value) for value in pk],
                 "id": json_safe_sqlite(session_id),
                 "in_target": target_row is not None,
-                "source": {
+                "source": None
+                if source_row is None
+                else {
                     start_column: source_row[start_column],
                     end_column: source_row[end_column],
                 },
@@ -4474,6 +4566,7 @@ def _resolve_window_merges(
             for row in diff.to_insert
         ]
     diff.window_merges = records
+    diff.unresolvable_windows = unresolvable
 
 
 def _reconcile_content_state_digest(
@@ -4649,6 +4742,11 @@ def _plan_namespace_reconciliation(source_label: str, target_label: str) -> dict
                         # will change to -- a count alone would leave the
                         # operator authorizing a boundary move sight unseen.
                         "window_merges": diff.window_merges,
+                        # Windows left exactly as they are because a stored
+                        # timestamp in them cannot be ordered.
+                        "unresolvable_windows": [
+                            list(pk) for pk in diff.unresolvable_windows
+                        ],
                     }
                     for table, diff in diffs.items()
                 },
@@ -5253,7 +5351,8 @@ def reconcile_namespaces(
     Rows are copied verbatim with one exception the plan always names in
     full: a session present on both sides with a different `started_at` /
     `ended_at` is merged into the window that contains every event either
-    database holds for it, rather than refused. See
+    database holds for it, rather than refused. The merge only ever widens,
+    and a session TARGET still holds open is never closed by it. See
     `_RECONCILE_WINDOW_COLUMNS`.
     """
     if not apply:
