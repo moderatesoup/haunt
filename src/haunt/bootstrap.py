@@ -206,14 +206,27 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                 entry["namespace"] = row["name"]
                 entry["auto"] = True
                 reembed_report.append(entry)
-    from haunt.desktop import install_desktop_icon
-    icon_result = install_desktop_icon()
+    from haunt.hosts import host_install_refusal, install_all_hosts
 
-    from haunt.hosts import install_all_hosts
+    # One decision for both global-config writes below, so the report tells a
+    # single coherent story. bootstrap() skips rather than aborts: every other
+    # step above (layout, launchers, registry, embeddings) is still useful and
+    # still correct for an alternate home. The skip is reported loudly by
+    # format_report() -- silence here is the failure mode this guard exists for.
+    refusal = host_install_refusal(str(home))
+
+    from haunt.desktop import install_desktop_icon
+    icon_result = (
+        install_desktop_icon()
+        if refusal is None
+        else {"written": False, "reason": "haunt home is not the default home"}
+    )
 
     hook_cmd = str(bin_dir() / "haunt-hook")
     mcp_cmd = str(bin_dir() / "haunt-mcp")
-    host_reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+    host_reports = (
+        install_all_hosts(str(home), hook_cmd, mcp_cmd) if refusal is None else []
+    )
 
     hook_launcher = bin_dir() / "haunt-hook"
     report = {
@@ -222,6 +235,9 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
         "hook_launcher": str(hook_launcher.resolve()),
         "models_dir": str(models_dir()),
         "desktop_icon": icon_result.get("path") if icon_result.get("written") else None,
+        "desktop_icon_reason": (
+            None if icon_result.get("written") else icon_result.get("reason")
+        ),
         "sqlite_vec": vec,
         "embed": {
             "requested": embed_state.requested,
@@ -233,6 +249,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
             # None for a non-ONNX backend, or a cache predating the marker.
             "source": bge_m3_source() if embed_state.backend == "onnx" else None,
         },
+        "hosts_skipped": str(refusal) if refusal is not None else None,
         "default_namespace": default_namespace,
         "default_db": str(db),
         "python": sys.executable,
@@ -271,11 +288,15 @@ def _format_sqlite_vec_line(report: dict) -> str:
 def format_report(report: dict) -> str:
     home = report.get('haunt_home', '')
     icon = report.get('desktop_icon')
+    # Never claim "unsupported platform" for a skip that had another cause.
+    icon_line = icon or (
+        "skipped (" + str(report.get("desktop_icon_reason") or "unsupported platform") + ")"
+    )
     lines = [
         f"haunt home    {home}",
         f"launcher      {report['launcher']}",
         f"hook          {report.get('hook_launcher', '')}",
-        f"desktop icon  {icon or 'skipped (unsupported platform)'}",
+        f"desktop icon  {icon_line}",
         f"python        {report['python']}",
         f"sqlite-vec    {_format_sqlite_vec_line(report)}",
         f"embed         loaded={report['embed']['loaded']} dim={report['embed']['dim']} requested={report['embed']['requested']}"
@@ -347,6 +368,12 @@ def format_report(report: dict) -> str:
         lines.append(
             "            BAAI/bge-m3 can download (~2.28 GB)."
         )
+    skipped = report.get("hosts_skipped")
+    if skipped:
+        lines.append("")
+        lines.append("HOST BIND SKIPPED — editor hooks were NOT installed or updated.")
+        for line in str(skipped).splitlines():
+            lines.append("  " + line)
     for h in report.get("hosts") or []:
         status = "seeded" if h.get("seeded") else "merged"
         lines.append(

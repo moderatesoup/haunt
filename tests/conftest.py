@@ -29,6 +29,11 @@ def _host_model_cache() -> Path | None:
     return None
 
 
+# Pinned now, while HOME and HAUNT_HOME are still the host's own: the autouse
+# fixture below redirects HOME, and models_dir() follows it.
+_host_model_cache()
+
+
 @pytest.fixture(autouse=True)
 def _dashboard_security_defaults():
     """Every test starts with a configured launch token and loopback bind host."""
@@ -50,6 +55,21 @@ def isolate_host_homes(tmp_path, monkeypatch):
         monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "cursor-home"))
     if not os.environ.get("CLAUDE_CONFIG_DIR"):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    # bootstrap() also writes a desktop shortcut into Path.home(), which no
+    # env var above redirects -- the suite was dropping a file on the real
+    # Desktop. Redirecting HOME contains that, and means a test that forgets
+    # HAUNT_HOME lands in a temp ~/.haunt instead of the operator's live
+    # memory store. The model cache was pinned at import, above.
+    fake_home = tmp_path / "user-home"
+    fake_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    # The alternate-home guard refuses to bind global host config from a
+    # HAUNT_HOME that is not ~/.haunt. Every test runs from a tmp HAUNT_HOME
+    # with every host target redirected above, so an alternate-home bind here
+    # is intended and lands nowhere real. Tests for the guard itself delete
+    # this variable.
+    monkeypatch.setenv("HAUNT_ALLOW_ALT_HOME_HOST_INSTALL", "1")
 
 
 @pytest.fixture

@@ -8,9 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from haunt.hosts import (
+    DanglingHook,
     HostReport,
     HostStatus,
+    check_host_install_allowed,
     command_leaf,
+    hook_command_defect,
     hook_command_issues,
     mcp_command_issues,
     read_json_object,
@@ -174,8 +177,15 @@ def _install_rule(cursor_dir: Path) -> Path:
     return dest
 
 
-def install(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostReport:
-    """Bind Cursor: hooks.json + mcp.json + haunt.mdc."""
+def install(
+    haunt_home: str, hook_cmd: str, mcp_cmd: str, *, force: bool = False
+) -> HostReport:
+    """Bind Cursor: hooks.json + mcp.json + haunt.mdc.
+
+    Refuses a non-default haunt_home before the first write; ~/.cursor is
+    global config the same way ~/.claude is.
+    """
+    check_host_install_allowed(haunt_home, force=force)
     cdir = _cursor_dir()
     seeded = not cdir.exists()
 
@@ -226,6 +236,12 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
                     missing_events.append(event)
                     continue
                 for cmd in haunt_cmds:
+                    # Per event, before the per-command dedup: see claude.py.
+                    defect = hook_command_defect(cmd)
+                    if defect is not None:
+                        status.dangling_hooks.append(
+                            DanglingHook(HOST_NAME, event, cmd, defect)
+                        )
                     if cmd in seen_cmds:
                         continue
                     seen_cmds.add(cmd)

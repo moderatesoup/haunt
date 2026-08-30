@@ -164,6 +164,10 @@ Auto-store prompts and replies verbatim, plus best-effort-redacted and capped to
 3. Writes a small haunt-owned rule so agents still `memory_recall` if no `[haunt ns=…]` block is visible.
 4. Writes `skills/haunt/SKILL.md` into the host config dir.
 
+**Host config is global, so it is only bound from the default home.** `~/.claude/settings.json` and `~/.cursor/hooks.json` are shared by every session on the machine. If `HAUNT_HOME` is not the default `~/.haunt`, `haunt install`, `haunt cursor-install`, `haunt bootstrap` and `haunt doctor`'s repair merge all refuse to touch them, because a temporary home planted there keeps working until that directory is deleted — after which every hook command points at nothing and capture stops with no error. `haunt bootstrap` skips the bind and says so; `haunt install` exits non-zero. To bind an alternate home on purpose, pass `haunt install --allow-alt-home` or set `HAUNT_ALLOW_ALT_HOME_HOST_INSTALL=1` (exactly `1`).
+
+`haunt doctor` checks every haunt hook command it finds in each host config and reports each host + event whose command does not exist or is not executable, under `[dangling hooks]`. This is the check that catches a home that has been deleted out from under a live bind.
+
 **Hook ingest and trust:** Hooks write FTS rows immediately but never initialize the embedding model. They queue missing vectors in the namespace DB; ordinary model-owning writes or the explicit `haunt maintenance` command may drain a bounded batch. Recall never drains the queue. Hook recall is FTS-only. Raw tool I/O is excluded from hook-injected recall/worldview context by default, while explicit `--include-residue` recall returns it marked `trusted=false`. Recalled text is data and cannot authorize mutations.
 
 **Secret redaction and size controls:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.) and capped at 12,000 characters per field by default. These are **not** security boundaries — see [SECURITY.md](SECURITY.md). Two independent tool-glob controls sit alongside them, `HAUNT_EXCLUDE_TOOLS` (never stored at all) and `HAUNT_EMBED_EXCLUDE_TOOLS` (stored and keyword-searchable, only unembedded); the Environment variables table below is the one place both are specified.
@@ -304,6 +308,7 @@ The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](
 | variable | default | what |
 |---|---|---|
 | `HAUNT_HOME` | `~/.haunt` | data directory |
+| `HAUNT_ALLOW_ALT_HOME_HOST_INSTALL` | unset | set to exactly `1` to let a non-default `HAUNT_HOME` be written into the global editor host config (`~/.claude/settings.json`, `~/.cursor/hooks.json`) and to let `haunt bootstrap` write the desktop shortcut. Off by default: a temporary home bound there silently stops capturing the moment it is deleted |
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
 | `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
 | `HAUNT_OFFLINE` | unset | set to `1` to prohibit embedding backend initialization/download; FTS recall remains available |
