@@ -310,6 +310,7 @@ The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](
 |---|---|---|
 | `HAUNT_HOME` | `~/.haunt` | data directory |
 | `HAUNT_ALLOW_ALT_HOME_HOST_INSTALL` | unset | set to exactly `1` to let a non-default `HAUNT_HOME` be written into the global editor host config (`~/.claude/settings.json`, `~/.cursor/hooks.json`) and to let `haunt bootstrap` write the desktop shortcut. Off by default: a temporary home bound there silently stops capturing the moment it is deleted |
+| `HAUNT_ALLOW_UNSAFE_HOOK_COMMAND` | unset | set to exactly `1` to write a hook command containing characters a shell would not run verbatim — a space, `$`, a backtick, a quote. Off by default: the editors run hook commands through a shell, so such a path either fails to start (capture stops with no error, and `haunt doctor` cannot see it because the file exists) or executes the embedded expression on every hook event. The usual trigger is a home directory containing a space. Separate from `HAUNT_ALLOW_ALT_HOME_HOST_INSTALL` on purpose: these are different risks |
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
 | `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
 | `HAUNT_OFFLINE` | unset | set to `1` to prohibit embedding backend initialization/download; FTS recall remains available |

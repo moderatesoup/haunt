@@ -24,6 +24,7 @@ class HostConfigError(ValueError):
 
 
 ALT_HOME_ENV = "HAUNT_ALLOW_ALT_HOME_HOST_INSTALL"
+UNSAFE_HOOK_ENV = "HAUNT_ALLOW_UNSAFE_HOOK_COMMAND"
 
 
 class AlternateHomeRefused(RuntimeError):
@@ -179,12 +180,32 @@ class UnsafeHookCommandRefused(RuntimeError):
             "  Editor hook commands are executed through a shell. This path would\n"
             "  either fail to start (capture stops with no error) or execute the\n"
             "  embedded expression on every hook event.\n"
-            "  Move HAUNT_HOME somewhere without these characters and re-run."
+            "  Usually this is a home directory containing a space. Point\n"
+            "  HAUNT_HOME at a path without these characters and re-run, e.g.\n"
+            "    HAUNT_HOME=/opt/haunt haunt install --allow-alt-home\n"
+            f"  If your editor execs hooks directly rather than through a shell,\n"
+            f"  set {UNSAFE_HOOK_ENV}=1 (exactly 1) to write it anyway."
         )
 
 
+def unsafe_hook_command_allowed() -> bool:
+    """True only for an exact UNSAFE_HOOK_ENV=1. Nothing else counts as consent."""
+    return os.environ.get(UNSAFE_HOOK_ENV, "").strip() == "1"
+
+
 def check_hook_command_safe(command: str) -> None:
-    """Raise UnsafeHookCommandRefused unless a shell would run `command` verbatim."""
+    """Raise UnsafeHookCommandRefused unless a shell would run `command` verbatim.
+
+    Overridable, deliberately. The common trigger is a home directory holding a
+    space -- `/Users/First Last/.haunt/bin/haunt-hook` -- which the operator
+    cannot simply rename, and which some hosts may exec directly rather than
+    hand to a shell. Refusing by default keeps the silent-capture-loss case
+    loud; a separate, narrowly named variable lets someone who knows their host
+    proceed. It is deliberately NOT the alternate-home variable: these are
+    different risks and consenting to one is not consenting to the other.
+    """
+    if unsafe_hook_command_allowed():
+        return
     if not _SHELL_SAFE_COMMAND.match(command):
         raise UnsafeHookCommandRefused(command)
 

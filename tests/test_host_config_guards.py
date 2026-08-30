@@ -540,3 +540,69 @@ def test_the_escape_hatch_still_allows_a_deliberate_foreign_target(
     cmds = _use_home(monkeypatch, sandbox["default_home"])
     claude.install(cmds["home"], cmds["hook_cmd"], cmds["mcp_cmd"])
     assert (foreign_config / "settings.json").is_file()
+
+
+# --- a home directory with a space ------------------------------------------
+# `/Users/First Last/.haunt/bin/haunt-hook` is an ordinary macOS home, not an
+# exotic input. The editors run hook commands through a shell, so that path
+# starts nothing and capture stops with no error -- and doctor does not catch
+# it, because the file exists. Refusing at install is the loud version of a
+# failure that was previously silent, but it must stay escapable: nobody can
+# rename their home directory.
+
+
+def test_a_hook_command_with_a_space_is_refused(sandbox, monkeypatch):
+    from haunt.hosts import UnsafeHookCommandRefused, check_hook_command_safe
+
+    monkeypatch.delenv("HAUNT_ALLOW_UNSAFE_HOOK_COMMAND", raising=False)
+    with pytest.raises(UnsafeHookCommandRefused):
+        check_hook_command_safe("/Users/First Last/.haunt/bin/haunt-hook")
+
+
+def test_command_substitution_in_a_hook_command_is_refused(sandbox, monkeypatch):
+    from haunt.hosts import UnsafeHookCommandRefused, check_hook_command_safe
+
+    monkeypatch.delenv("HAUNT_ALLOW_UNSAFE_HOOK_COMMAND", raising=False)
+    for hostile in (
+        "/tmp/x$(id -un)/bin/haunt-hook",
+        "/tmp/x`id -un`/bin/haunt-hook",
+        "/tmp/x;touch /tmp/pwned;/bin/haunt-hook",
+    ):
+        with pytest.raises(UnsafeHookCommandRefused):
+            check_hook_command_safe(hostile)
+
+
+def test_an_ordinary_path_is_allowed(sandbox):
+    from haunt.hosts import check_hook_command_safe
+
+    check_hook_command_safe("/Users/aronriley/.haunt/bin/haunt-hook")
+
+
+@pytest.mark.parametrize("value", ["", " ", "0", "true", "yes", "2", "TRUE"])
+def test_only_exactly_one_overrides_the_hook_command_check(
+    sandbox, monkeypatch, value
+):
+    from haunt.hosts import UnsafeHookCommandRefused, check_hook_command_safe
+
+    monkeypatch.setenv("HAUNT_ALLOW_UNSAFE_HOOK_COMMAND", value)
+    with pytest.raises(UnsafeHookCommandRefused):
+        check_hook_command_safe("/Users/First Last/.haunt/bin/haunt-hook")
+
+
+def test_the_override_is_separate_from_the_alternate_home_consent(
+    sandbox, monkeypatch
+):
+    """Consenting to one risk must not consent to the other."""
+    from haunt.hosts import (
+        ALT_HOME_ENV,
+        UnsafeHookCommandRefused,
+        check_hook_command_safe,
+    )
+
+    monkeypatch.setenv(ALT_HOME_ENV, "1")
+    monkeypatch.delenv("HAUNT_ALLOW_UNSAFE_HOOK_COMMAND", raising=False)
+    with pytest.raises(UnsafeHookCommandRefused):
+        check_hook_command_safe("/Users/First Last/.haunt/bin/haunt-hook")
+
+    monkeypatch.setenv("HAUNT_ALLOW_UNSAFE_HOOK_COMMAND", "1")
+    check_hook_command_safe("/Users/First Last/.haunt/bin/haunt-hook")
