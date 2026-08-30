@@ -1506,8 +1506,10 @@ audit does not re-report settled work.
     counters. If a kill can inflate `attempts` toward the cap, a crash-looping
     background drain would silently exhaust the whole queue, since exhaustion
     is permanent and `reembed()` is the only reset. **A background drain must
-    not ship while the SIGBUS is unexplained** — that is the same failure mode,
-    already observed once in the wild.
+    not ship while the SIGBUS is unfixed** — D11 characterizes the mechanism but
+    deliberately does not fix it, and knowing the cause does not remove the
+    hazard. A crash-looping background drain meets exactly that failure mode,
+    and exhaustion at the attempts cap is permanent.
   - **M6 coverage-vs-quality curve** — replicate the existing synthetic
     experiment with more queries (the SE ≈ 0.08 floor is what stops it
     separating 75% from 0%), sample the unmeasured 6–75% region, and run once
