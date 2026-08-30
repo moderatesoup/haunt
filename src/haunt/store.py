@@ -375,10 +375,14 @@ PURGE_SAFE_PROVENANCE = provenance_json(
 EMBED_MAX_ATTEMPTS_DEFAULT = 5
 
 # C4: rows-per-namespace bound on Store.drain_embedding_queue() (see
-# _embed_drain_limit). Hook writes always queue with defer_embedding=True
-# and nothing upstream of `haunt bootstrap` drains that queue except read
-# traffic hitting recall() -- a namespace that is written to but rarely
-# searched can grow an unbounded backlog. 500 is enough to clear a normal
+# _embed_drain_limit). Hook writes always queue with defer_embedding=True.
+# Nothing drains that queue on a timer or in the background. The only
+# production drains are `haunt bootstrap` (this bound), `haunt maintenance`
+# (one process_embedding_jobs batch, default 64, ceiling 100), and the 32-row
+# opportunistic drain inside observe() on the `commit and not
+# defer_embedding` path. recall() explicitly does not drain -- it reports
+# observed_not_drained -- so a namespace written to only by hooks and never
+# explicitly maintained grows an unbounded backlog. 500 is enough to clear a normal
 # session's worth of deferred writes in one `haunt bootstrap` call without
 # risking an operator's terminal hanging on a pathological backlog (real
 # dogfooded example: 1363 queued rows in one namespace).
@@ -4369,7 +4373,8 @@ _RECONCILE_TABLES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
 # content_state_digest, because the operator authorizes a digest and
 # everything the apply writes has to be inside it -- `embedding_jobs` is
 # copied verbatim by _reconcile_requeue_embedding, `attempts`/`last_error`
-# included, and a background drain moves both.
+# included, and any drain moves both -- all of them operator-invoked or
+    # write-triggered, never background.
 _RECONCILE_DIGEST_ONLY_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("embedding_jobs", ("memory_id",)),
 )
@@ -7363,7 +7368,13 @@ class Store:
         )
 
     def process_embedding_jobs(self, *, limit: int = 64) -> dict[str, Any]:
-        """Embed queued hook writes in a persistent, model-owning process.
+        """Embed queued hook writes from a model-owning caller.
+
+        There is no daemon and no timer behind this. Every call is either an
+        explicit operator command (`haunt maintenance`, and `haunt bootstrap`
+        via drain_embedding_queue) or opportunistic inside a caller that
+        already owns the model -- observe() on the `commit and not
+        defer_embedding` path, and the evaluation harnesses.
 
         C5: two failure-isolation guarantees on top of the historical
         behavior, both required because this queue is unattended -- nothing
@@ -7557,6 +7568,40 @@ class Store:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def _embeddable_memories(self) -> int:
+        """Rows that are supposed to end up with a vector.
+
+        The denominator every coverage question needs, and the reason there was
+        never an honest one: memories_embedded / memories lands short of 100%
+        forever on a namespace holding policy-excluded rows. This mirrors the
+        enqueue predicate in observe() exactly -- skip_embedding=0 and
+        non-blank content -- so full coverage really can reach 1.0.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM memories "
+            "WHERE skip_embedding=0 AND TRIM(COALESCE(content, '')) != ''"
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def _oldest_pending_embedding(self, max_attempts: int) -> str | None:
+        """queued_at of the oldest still-drainable job, or None.
+
+        The only one of these numbers that separates "a drain just ran" from
+        "this queue has been stalled for a week": depth alone cannot, because a
+        shallow queue that never empties looks healthy. Index-only via
+        idx_embedding_jobs_queued. Returns the raw timestamp rather than an age
+        so the value is stable across readers.
+        """
+        row = self.conn.execute(
+            """
+            SELECT MIN(j.queued_at) AS oldest FROM embedding_jobs j
+            JOIN memories m ON m.id=j.memory_id
+            WHERE j.attempts < ? AND m.skip_embedding=0
+            """,
+            (max_attempts,),
+        ).fetchone()
+        return row["oldest"] if row and row["oldest"] else None
+
     def _pending_embedding_jobs(self, max_attempts: int) -> int:
         """Count rows still eligible for process_embedding_jobs's SELECT
         (attempts < max_attempts) -- the complement of
@@ -7618,9 +7663,11 @@ class Store:
         per namespace from `haunt bootstrap`, independent of any recall.
 
         HARD CONSTRAINT: never call this from a hook's synchronous path.
-        Hooks run under a watchdog with a short timeout and embedding is
-        slow; this loop can legitimately run for a while against a real
-        backlog. It exists to be invoked from an explicit, out-of-band
+        Embedding is slow and this loop can legitimately run for a while
+        against a real backlog, while a hook must return promptly or the turn
+        stalls. haunt itself imposes no watchdog -- an earlier version of this
+        sentence claimed one and there is none in this repository; any timeout
+        is the host editor's, outside our control. It exists to be invoked from an explicit, out-of-band
         operator command only.
 
         Bounded by HAUNT_EMBED_DRAIN_LIMIT rows per call (see
@@ -7891,6 +7938,14 @@ class Store:
             str(row["name"])
             for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()
         }
+        embeddable = (
+            self._embeddable_memories() if "skip_embedding" in memory_columns else 0
+        )
+        coverage = (
+            round(min(1.0, (vec_count or 0) / embeddable), 4)
+            if vec_count is not None and embeddable > 0
+            else None
+        )
         duplicate_memories = 0
         duplicate_content_values = 0
         if "content_hash" in memory_columns:
@@ -7927,8 +7982,19 @@ class Store:
                 "last_event_time": last["event_time"] if last else None,
                 "wal": True,
                 "memories_embedded": vec_count if vec_count is not None else 0,
+                "memories_embeddable": embeddable,
+                # None, never 0.0, when there is no denominator or no vector
+                # index: an FTS-only namespace and a namespace whose embedding
+                # has never run would both read as "0% coverage, unhealthy",
+                # which is the opposite of true. No threshold is attached to
+                # this on purpose -- the only measurement that exists is
+                # non-monotonic in coverage, so no single cutoff is honest.
+                "embedding_coverage": coverage,
                 "embedding_pending": self._pending_embedding_jobs(max_attempts),
                 "embedding_exhausted": self._exhausted_embedding_jobs(max_attempts),
+                "embedding_oldest_pending": self._oldest_pending_embedding(
+                    max_attempts
+                ),
                 "vector_index": vec_count is not None,
                 "vector_index_version": self.vec_version(),
                 "duplicate_memories": duplicate_memories,

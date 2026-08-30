@@ -275,8 +275,17 @@ def test_haunt_health_shows_the_duplicate_and_coverage_counts(dup_env):
     result = CliRunner().invoke(cli.app, ["health", "-n", "dup-test"])
     assert result.exit_code == 0, result.output
     assert "duplicates    memories=2 content=1" in result.output
-    assert "embedding     embedded=0 pending=" in result.output
+    # Every embedding number stats() computes has to reach this surface,
+    # including the denominator and the queue age added for the drain
+    # decision -- the whole point of this test.
+    assert "embedding     embedded=0/3" in result.output
+    assert "pending=" in result.output
+    assert "exhausted=" in result.output
     assert "index=False" in result.output
+    # None, not 0.0: this namespace is FTS-only, and "0% coverage" would read
+    # as unhealthy when there is simply no vector index to be covered.
+    assert "coverage=n/a" in result.output
+    assert "oldest queued " in result.output
 
 
 # ---------------------------------------------------------------------------

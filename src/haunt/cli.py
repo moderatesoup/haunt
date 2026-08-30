@@ -766,11 +766,19 @@ def health_cmd(
             f"sessions={s['sessions']} entities={s['entities']} relations={s['relations']}"
         )
         typer.echo(f"tiers         {s['tiers']}")
+        coverage = s.get("embedding_coverage")
         typer.echo(
-            f"embedding     embedded={s['memories_embedded']} "
+            f"embedding     embedded={s['memories_embedded']}"
+            f"/{s.get('memories_embeddable', 0)} "
+            f"coverage={'n/a' if coverage is None else f'{coverage:.1%}'} "
             f"pending={s['embedding_pending']} exhausted={s['embedding_exhausted']} "
             f"index={s['vector_index']}"
         )
+        oldest = s.get("embedding_oldest_pending")
+        if oldest:
+            # Depth alone cannot distinguish "a drain just ran" from "this
+            # queue has been stalled for days"; the age of the oldest job can.
+            typer.echo(f"              oldest queued {oldest}")
         typer.echo(
             f"duplicates    memories={s['duplicate_memories']} "
             f"content={s['duplicate_content_values']}"

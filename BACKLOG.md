@@ -1446,6 +1446,72 @@ audit does not re-report settled work.
   rides the existing `pytest tests/`. R21's mypy half is untouched and remains
   open.
 
+- **D10 — explicit maintenance vs. a singleton background drain: OPEN, and not
+  yet decidable (2026-08-30).** Do not implement either until the measurements
+  below exist. Recorded so the question is not settled by whichever option
+  someone reaches for first.
+
+  *Not in dispute, established from call sites.* No timer, daemon, thread,
+  plist or scheduled job drains the queue — the only `threading.Thread` in
+  `src/` is the dashboard's browser-opener. Three product drains exist:
+  `haunt bootstrap` (≤500/namespace/run), `haunt maintenance` (one batch,
+  default 64, ceiling 100), and `observe()` on the non-deferred path (≤32).
+  Hooks always defer and never drain; `recall()` reports
+  `observed_not_drained`. Draining from a hook's synchronous path is already
+  ruled out by design.
+
+  *Option A* — keep draining human-invoked; improve discoverability and make
+  `haunt maintenance` loop rather than run a single batch.
+  *Option B* — drain on the MCP server's idle time. No new process, but it
+  introduces concurrency against a SQLite writer lock that today has exactly
+  one writer at a time.
+
+  *Required before choosing:*
+  - **M1 arrival rate** over a normal 24–72h window, sampled hourly from
+    **copies**, never the live store. If a day's arrivals fit inside one
+    operator command, A suffices; if they exceed any single command's bound,
+    no cadence of A can catch up and B is required.
+  - **M2 queue-age slope** — `MIN(queued_at)` among pending rows across the
+    same window, including a weekend. Flat or sawtooth favours A; monotonically
+    rising is direct evidence human invocation does not happen often enough.
+    Age is the discriminator, not depth: a shallow queue that never empties is
+    still a coverage failure.
+  - **M3 idle catch-up rate** — sustained rows/second at batch 16/32/64/100,
+    *and* the contended figure with a second process holding the writer lock,
+    against measured MCP idle time. B is viable only if idle seconds ×
+    contended rate exceeds M1 with margin.
+  - **M4 resource use per row** — wall, peak RSS, CPU-seconds. If a batch is
+    noticeable inside the MCP process, which also serves interactive recall, B
+    must be rejected in-process.
+  - **M5 crash behaviour mid-drain** — this is a gate, not a preference. Kill
+    between batches, mid-batch after partial commit, and during vec-table
+    creation; then `integrity_check`, `foreign_key_check`, and re-read the
+    counters. If a kill can inflate `attempts` toward the cap, a crash-looping
+    background drain would silently exhaust the whole queue, since exhaustion
+    is permanent and `reembed()` is the only reset. **A background drain must
+    not ship while the SIGBUS is unexplained** — that is the same failure mode,
+    already observed once in the wild.
+  - **M6 coverage-vs-quality curve** — replicate the existing synthetic
+    experiment with more queries (the SE ≈ 0.08 floor is what stops it
+    separating 75% from 0%), sample the unmeasured 6–75% region, and run once
+    on a real transcript corpus. This sets the target, not the mechanism.
+
+  *Required caveat.* One manual drain does not prove the queue stays caught up.
+  The 2026-08-29 repair took four namespaces to full coverage in a single
+  operator loop; that demonstrates the drain works and says nothing about
+  whether coverage *stays* high, because it measured one point immediately
+  after a human intervened. This is a rate question, not a capacity question.
+  Only M1 and M2, observed over days **without** an intervening manual drain,
+  can answer it. A second manual drain would add no evidence. Any claim of the
+  form "the queue is fine now" must cite an age slope, not a coverage snapshot.
+
+  *Do not invent a threshold.* No "healthy coverage" cutoff exists in any
+  product path and none should be added: until D10's M6 lands, the only
+  measurement available is non-monotonic in coverage, so no single cutoff is
+  honest. `stats()` now reports `memories_embeddable`, `embedding_coverage`
+  (None, never 0.0, where there is no denominator or no vector index) and
+  `embedding_oldest_pending` — numbers, with no verdict attached.
+
 ### Integration state (verified)
 
 - `integration/all-work` `d1aec40` = `main` `ed806b2` + #79 + #81 + #83 +
