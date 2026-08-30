@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -258,7 +259,22 @@ def test_the_wheel_declares_the_manifest_as_package_data():
 
 
 def test_a_built_wheel_actually_contains_the_manifest(tmp_path):
-    """The end of the chain: what pip installs, not what the checkout holds."""
+    """The end of the chain: what pip installs, not what the checkout holds.
+
+    Built from a copy under tmp_path, never the checkout. `pip wheel` writes
+    build/ and src/*.egg-info into whatever directory it is pointed at, so
+    building in place left the working tree dirty on every run -- invisible to
+    `git status` because both are gitignored, which is what made it easy to
+    miss. The suite should not write into the source tree it is testing.
+    """
+    source = tmp_path / "source"
+    shutil.copytree(
+        PYPROJECT.parent,
+        source,
+        ignore=shutil.ignore_patterns(
+            ".git", "__pycache__", "*.egg-info", "build", ".pytest_cache"
+        ),
+    )
     built = subprocess.run(
         [
             sys.executable,
@@ -269,7 +285,7 @@ def test_a_built_wheel_actually_contains_the_manifest(tmp_path):
             "--no-build-isolation",
             "--wheel-dir",
             str(tmp_path),
-            str(PYPROJECT.parent),
+            str(source),
         ],
         capture_output=True,
         text=True,
