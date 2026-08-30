@@ -124,7 +124,7 @@ def test_execution_metadata_survives_zero_and_nonzero_recall_surfaces(fts_recall
         if query == "PRESENT-EXECUTION-CANARY":
             assert all(
                 payload["hits"][0]["explanation"]["ordering"]
-                == {"primary": "rrf_score_desc", "ties": "memory_id_asc"}
+                == {"primary": "rrf_score_desc", "ties": "content_hash_asc_then_memory_id_asc"}
                 for payload in payloads
             )
 

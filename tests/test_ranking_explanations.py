@@ -55,7 +55,7 @@ def test_fts_only_explanation_preserves_legacy_fields_and_marks_tool_io(haunt_en
         "rrf_contributions": [
             {"source": "fts", "rank": 1, "value": 1 / 61}
         ],
-        "ordering": {"primary": "rrf_score_desc", "ties": "memory_id_asc"},
+        "ordering": {"primary": "rrf_score_desc", "ties": "content_hash_asc_then_memory_id_asc"},
         "vector": {
             "state": "not_run",
             "reason": "disabled_by_caller",
@@ -505,17 +505,21 @@ class _NativeVecConnection:
         assert "ORDER BY distance" in sql
         assert "ORDER BY distance," not in sql
         # vec0 may choose an arbitrary order for exact equal distances; the
-        # caller settles that returned candidate set deterministically.
+        # caller settles that returned candidate set deterministically. The
+        # content hashes here deliberately contradict the memory-id order, so
+        # this asserts the tie breaks on content and not on the id.
         return _Rows([
-            {"mid": "native-z", "dist": 0.25},
-            {"mid": "native-a", "dist": 0.25},
+            {"mid": "native-z", "dist": 0.25, "chash": "aaa"},
+            {"mid": "native-a", "dist": 0.25, "chash": "bbb"},
         ])
 
 
 class _FallbackVecConnection:
     def execute(self, sql, params=None):
         assert "FROM memories" in sql
-        return _Rows([{"mid": "fallback", "embedding": struct.pack("1f", 1.0)}])
+        return _Rows([
+            {"mid": "fallback", "embedding": struct.pack("1f", 1.0), "chash": "aaa"}
+        ])
 
 
 class _NativeVecStore:
@@ -544,8 +548,8 @@ def test_vector_explanation_identifies_native_cosine_and_fallback_l2():
     fallback = recall_module._vec_hits(_FallbackVecStore(), [0.0], "1=1", [], 8)
 
     assert native == [
-        ("native-a", 1, 0.25, "cosine_distance"),
-        ("native-z", 2, 0.25, "cosine_distance"),
+        ("native-z", 1, 0.25, "cosine_distance"),
+        ("native-a", 2, 0.25, "cosine_distance"),
     ]
     assert fallback == [("fallback", 1, 1.0, "l2_distance")]
     assert all("FROM memories m" not in sql for sql in native_store.conn.calls)

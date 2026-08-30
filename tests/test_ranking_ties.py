@@ -26,7 +26,12 @@ def _hit(memory_id: str, *, score: float = 0.0, fts_rank: int | None = None) -> 
 
 
 def test_recall_ties_ignore_candidate_arrival_order(haunt_env, monkeypatch):
-    """Equal RRF scores use memory IDs even when modality input is reversed."""
+    """Equal RRF scores settle on content even when modality input is reversed.
+
+    Arrival order must not decide the result. The key is the content hash
+    rather than the memory id, because the id is a fresh uuid4 per write and
+    re-randomizes the answer on every ingest of the same corpus.
+    """
     first = observe("RECALL-TIE-FIRST", namespace="default")
     second = observe("RECALL-TIE-SECOND", namespace="default")
     recall_module = importlib.import_module("haunt.recall")
@@ -48,7 +53,20 @@ def test_recall_ties_ignore_candidate_arrival_order(haunt_env, monkeypatch):
         "RECALL-TIE", namespace="default", k=2, use_vectors=False
     )
 
-    expected = sorted([first.memory_id, second.memory_id])
+    import hashlib
+
+    def digest(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    expected = [
+        memory_id
+        for _hash, memory_id in sorted(
+            [
+                (digest("RECALL-TIE-FIRST"), first.memory_id),
+                (digest("RECALL-TIE-SECOND"), second.memory_id),
+            ]
+        )
+    ]
     assert [hit.memory_id for hit in reversed_hits] == expected
     assert [hit.memory_id for hit in forward_hits] == expected
     assert [hit.final_rank for hit in forward_hits] == [1, 2]
@@ -155,3 +173,75 @@ def test_dashboard_all_namespace_groups_preserve_local_ranks(tmp_path, monkeypat
     # beta's larger local score does not move it ahead of the alpha group.
     assert hits[-1]["score"] > hits[0]["score"]
     embed.reset()
+
+
+# --- reproducibility of tie order across ingests ---------------------------
+# memory_id is a fresh uuid4 per write. Ordering exactly-tied rows by it is
+# total within a run but re-rolled on the next one, so the same corpus scored
+# twice returned the same two documents in either order. One LongMemEval
+# question oscillated between gold rank 5 and 6 across ten runs of identical
+# trees for exactly this reason: bm25 equal to the last bit, order decided by
+# whichever uuid4 happened to sort first.
+
+TIE_GOLD = "zeta alpha"
+TIE_DECOY = "zeta bravo"
+
+
+def _tied_pair_order(store, first: str, second: str) -> list[str]:
+    """Ingest two documents that tie exactly on bm25 and return recall order."""
+    store.observe(first, defer_embedding=True)
+    store.observe(second, defer_embedding=True)
+    from haunt.recall import recall
+
+    hits = recall("zeta", namespace=store.name, k=2, use_vectors=False)
+    return [hit.content for hit in hits]
+
+
+def test_tied_documents_order_identically_across_repeated_ingests(
+    haunt_env, monkeypatch
+):
+    """The same corpus must rank the same way every time it is ingested.
+
+    Fresh namespace per trial, so every row gets a brand new uuid4. Under the
+    old id-keyed tie-break each trial was an independent coin flip.
+    """
+    from haunt.store import Store
+
+    orders = []
+    for trial in range(6):
+        with Store(f"tie-repeat-{trial}", create=True) as store:
+            orders.append(_tied_pair_order(store, TIE_GOLD, TIE_DECOY))
+    assert all(order == orders[0] for order in orders), orders
+
+
+def test_tie_order_follows_content_not_the_random_memory_id(haunt_env, monkeypatch):
+    """Force the id order to contradict the content order; content must win.
+
+    Deterministic where the trial-repetition test above is probabilistic: the
+    ids are chosen so an id-keyed tie-break returns the opposite list.
+    """
+    import hashlib
+    import itertools
+
+    from haunt import store as store_module
+    from haunt.store import Store
+
+    def digest(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    lower, higher = sorted([TIE_GOLD, TIE_DECOY], key=digest)
+    # The document with the HIGHER content hash gets the LOWER memory id, so
+    # id-ordering and content-ordering disagree on every field.
+    # Monotonic, so the first row written always gets the lower memory id.
+    # observe() mints several ids per call, so this must not be a fixed list.
+    counter = itertools.count()
+    monkeypatch.setattr(
+        store_module, "new_id", lambda: f"{next(counter):08d}-0000-0000-0000-0000"
+    )
+
+    with Store("tie-forced", create=True) as store:
+        order = _tied_pair_order(store, higher, lower)
+
+    assert order == [lower, higher], (
+        f"tie broke on the memory id, not on content: {order}"
+    )

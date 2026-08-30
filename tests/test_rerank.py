@@ -333,7 +333,7 @@ def test_mmr_rerank_preserves_trust_labelling():
 # ---------------------------------------------------------------------------
 
 CROWDED_QUERY = "alpha bravo charlie delta echo"
-RRF_ORDERING = {"primary": "rrf_score_desc", "ties": "memory_id_asc"}
+RRF_ORDERING = {"primary": "rrf_score_desc", "ties": "content_hash_asc_then_memory_id_asc"}
 
 
 def _seed_crowded_corpus(filler: str = "") -> None:
@@ -446,7 +446,7 @@ def test_enabled_recall_reports_the_order_it_actually_returned(
         item["ordering"]
         == {
             "primary": f"{RERANK_METHOD}_desc",
-            "ties": "memory_id_asc",
+            "ties": "content_hash_asc_then_memory_id_asc",
             "stage": RERANK_METHOD,
             "reordered_from": "rrf_score_desc",
         }
