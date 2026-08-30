@@ -4,8 +4,9 @@
 manifest names before onnxruntime is allowed to execute the graph. That check
 is a *runtime* obligation on every model load, so it cannot live in the
 evaluation harness: importing `haunt.abstention_eval` to reach it pulls in
-`haunt.recall`, `haunt.store`, `haunt.rerank` and the whole `urllib`/`ssl`/
-`email` stack that only the E6 network-deny harness needs.
+`haunt.recall`, `haunt.rerank` and the whole `urllib`/`ssl`/`email` stack that
+only the E6 network-deny harness needs. (`haunt.store` is already loaded
+either way, so it was never part of that cost.)
 
 This module holds the artifact constants, the canonical JSON hashing the
 manifest identity rests on, the cache verifier, and the small JSON/audit
