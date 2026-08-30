@@ -17,12 +17,7 @@ from haunt.paths import (
     repair_private_modes,
 )
 from haunt.store import Store, init_registry, register_namespace, list_namespace_rows, reembed_all_namespaces
-from haunt.util import diag, dumps
-
-
-def _sh_single_quote(value: str) -> str:
-    """Quote a string for /bin/sh so command substitution cannot run."""
-    return "'" + str(value).replace("'", "'\\''") + "'"
+from haunt.util import diag, dumps, sh_single_quote
 
 
 def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
@@ -30,7 +25,7 @@ def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     python = str(Path(sys.executable).absolute())
     sibling = Path(python).parent / sibling_name
-    home = _sh_single_quote(str(haunt_home()))
+    home = sh_single_quote(str(haunt_home()))
     # Do not use export HAUNT_HOME="${HAUNT_HOME:-...}". The default word
     # inside double quotes still runs command substitution.
     prefix = (
@@ -41,9 +36,9 @@ def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
         "fi\n"
     )
     if sibling.is_file():
-        body = prefix + f"exec {_sh_single_quote(str(sibling))} \"$@\"\n"
+        body = prefix + f"exec {sh_single_quote(str(sibling))} \"$@\"\n"
     else:
-        body = prefix + f"exec {_sh_single_quote(python)} -m {module} \"$@\"\n"
+        body = prefix + f"exec {sh_single_quote(python)} -m {module} \"$@\"\n"
     dest.write_text(body, encoding="utf-8")
     dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return dest
@@ -61,11 +56,24 @@ def write_claude_hook_launcher() -> Path:
     )
 
 
+def write_cli_launcher() -> Path:
+    """Space-free launcher at ~/.haunt/bin/haunt.
+
+    Without this the desktop shortcut has no canonical target and falls back to
+    `shutil.which("haunt")`, which resolves at icon-write time and freezes. On a
+    machine with a pyenv shim ahead of the haunt venv on PATH that pins the
+    launcher to an interpreter whose sqlite3 was built without extension
+    loading, so the icon opens a console that cannot do vector work.
+    """
+    return _write_sh_wrapper(bin_dir() / "haunt", "haunt", "haunt.cli")
+
+
 def write_launcher() -> Path:
-    """Space-free absolute launchers at ~/.haunt/bin/haunt-{mcp,hook,hook-claude}."""
+    """Space-free absolute launchers at ~/.haunt/bin/haunt{,-mcp,-hook,-hook-claude}."""
     dest = _write_sh_wrapper(bin_dir() / "haunt-mcp", "haunt-mcp", "haunt.mcp_server")
     write_hook_launcher()
     write_claude_hook_launcher()
+    write_cli_launcher()
     return dest
 
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import stat
 import subprocess
@@ -10,9 +9,24 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from haunt.paths import bin_dir
+from haunt.util import desktop_exec_quote, sh_single_quote
+
 
 def _find_haunt_cmd() -> str:
-    """Find the haunt CLI command path."""
+    """Resolve the haunt CLI for a shortcut, preferring the canonical wrapper.
+
+    ~/.haunt/bin/haunt is written by bootstrap and re-exec's the interpreter
+    haunt is actually installed into, so it keeps working across PATH changes
+    and venv rebuilds. shutil.which resolves once, at icon-write time, and then
+    freezes -- on a machine with a pyenv shim ahead of the haunt venv that
+    pinned the shortcut to an interpreter whose sqlite3 cannot load extensions,
+    so the console opened but no vector search worked. Keep which() as the
+    fallback for installs that never ran bootstrap.
+    """
+    canonical = bin_dir() / "haunt"
+    if canonical.is_file():
+        return str(canonical)
     which = shutil.which("haunt")
     if which:
         return which
@@ -54,7 +68,7 @@ def _install_linux(haunt_cmd: str, home: Path | None = None) -> dict[str, Any]:
         "Type=Application\n"
         "Name=Haunt Memories\n"
         "Comment=Local memory console for AI agents\n"
-        f"Exec={haunt_cmd} dash\n"
+        f"Exec={desktop_exec_quote(haunt_cmd)} dash\n"
         "Terminal=true\n"
         "Categories=Development;Utility;\n"
         "StartupNotify=false\n"
@@ -85,7 +99,7 @@ def _install_macos(haunt_cmd: str, home: Path | None = None) -> dict[str, Any]:
     script_path = desktop / "Haunt Memories.command"
     script_path.write_text(
         f"#!/bin/bash\n"
-        f'exec "{haunt_cmd}" dash\n',
+        f"exec {sh_single_quote(haunt_cmd)} dash\n",
         encoding="utf-8",
     )
     script_path.chmod(
@@ -102,7 +116,7 @@ def _install_windows(haunt_cmd: str, home: Path | None = None) -> dict[str, Any]
 
     bat_path = desktop / "Haunt Memories.bat"
     bat_path.write_text(
-        f'@echo off\n"{haunt_cmd}" dash\n',
+        '@echo off\n"' + haunt_cmd.replace("%", "%%") + '" dash\n',
         encoding="utf-8",
     )
     return {"written": True, "path": str(bat_path), "platform": "windows"}

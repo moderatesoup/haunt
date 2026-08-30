@@ -283,3 +283,23 @@ def snippet(text: Any, n: int = 160) -> str:
         collapse_whitespace=True,
         sqlite_scalar=True,
     )
+
+
+def sh_single_quote(value: Any) -> str:
+    """Quote a string for /bin/sh so command substitution cannot run."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def desktop_exec_quote(value: str) -> str:
+    """Quote one Exec= argument for a freedesktop .desktop entry.
+
+    Two layers apply and both are required. The Exec value is a desktop-entry
+    *string*, in which a literal backslash is written doubled; inside that, an
+    argument holding reserved characters is wrapped in double quotes and each
+    of " ` $ \\ is escaped with a backslash. Unquoted, a path containing a
+    space is split into two arguments and the launcher silently does nothing.
+    """
+    quoted = "".join(
+        "\\" + char if char in '"`$\\' else char for char in str(value)
+    )
+    return '"' + quoted.replace("\\", "\\\\") + '"'
