@@ -203,12 +203,15 @@ def test_tied_documents_order_identically_across_repeated_ingests(
     """The same corpus must rank the same way every time it is ingested.
 
     Fresh namespace per trial, so every row gets a brand new uuid4. Under the
-    old id-keyed tie-break each trial was an independent coin flip.
+    old id-keyed tie-break each trial was an independent coin flip, so the
+    trial count is the guard strength: 6 trials would let a regression through
+    once in 32 runs. 20 puts that at about two in a million. It can only ever
+    fail open, never flake red.
     """
     from haunt.store import Store
 
     orders = []
-    for trial in range(6):
+    for trial in range(20):
         with Store(f"tie-repeat-{trial}", create=True) as store:
             orders.append(_tied_pair_order(store, TIE_GOLD, TIE_DECOY))
     assert all(order == orders[0] for order in orders), orders
@@ -244,4 +247,86 @@ def test_tie_order_follows_content_not_the_random_memory_id(haunt_env, monkeypat
 
     assert order == [lower, higher], (
         f"tie broke on the memory id, not on content: {order}"
+    )
+
+
+def test_recall_works_on_a_database_no_writer_has_migrated(haunt_env):
+    """content_hash arrives with v10, and recall opens read-only by default.
+
+    ReadOnlyStore never migrates -- that is its documented contract -- so a
+    namespace file no writer has opened at this code version still has no
+    content_hash column. Naming it unguarded in the candidate queries turned
+    every recall against such a file into `no such column: m.content_hash`.
+    Store.stats() already guards the same way for the same reason.
+    """
+    import sqlite3
+
+    from haunt.paths import namespace_db_path
+    from haunt.recall import recall
+    from haunt.store import Store
+
+    with Store("prev10", create=True) as store:
+        store.observe(TIE_GOLD, defer_embedding=True)
+        store.observe(TIE_DECOY, defer_embedding=True)
+
+    db = namespace_db_path("prev10")
+    raw = sqlite3.connect(str(db))
+    raw.execute("DROP INDEX IF EXISTS idx_memories_content_hash")
+    raw.execute("ALTER TABLE memories DROP COLUMN content_hash")
+    raw.execute("UPDATE meta SET value='9' WHERE key='schema_version'")
+    raw.commit()
+    columns = {row[1] for row in raw.execute("PRAGMA table_info(memories)")}
+    raw.close()
+    assert "content_hash" not in columns, "setup failed to remove the column"
+
+    hits = recall("zeta", namespace="prev10", k=5, use_vectors=False)
+    assert sorted(hit.content for hit in hits) == sorted([TIE_GOLD, TIE_DECOY])
+
+
+def test_an_unhashed_row_is_not_promoted_above_hashed_rows(haunt_env):
+    """The fallback is the memory id, not the empty string.
+
+    COALESCE(content_hash, '') sorts every unhashed row ahead of every hashed
+    one at equal score -- a systematic reordering, not a settled tie, and at a
+    k=3 cut it turns a mixed draw into a guaranteed all-unhashed top three.
+    Falling back to the id reduces exactly to the previous (rank, id)
+    behaviour for rows the key cannot cover.
+
+    Asserted across trials rather than once: with the id fallback three of six
+    rows still land in the top three about one run in twenty, so a single
+    trial would be flaky. With the '' fallback they do so every time, which is
+    exactly the difference being pinned.
+    """
+    import sqlite3
+
+    from haunt.paths import namespace_db_path
+    from haunt.recall import recall
+    from haunt.store import Store
+
+    swept = 0
+    trials = 6
+    for trial in range(trials):
+        namespace = f"mixed-{trial}"
+        with Store(namespace, create=True) as store:
+            for index in range(6):
+                store.observe(f"zeta doc{index}", defer_embedding=True)
+
+        raw = sqlite3.connect(str(namespace_db_path(namespace)))
+        raw.row_factory = sqlite3.Row
+        ids = [r["id"] for r in raw.execute("SELECT id FROM memories ORDER BY rowid")]
+        nulled = set(ids[:3])
+        raw.executemany(
+            "UPDATE memories SET content_hash=NULL WHERE id=?",
+            [(i,) for i in nulled],
+        )
+        raw.commit()
+        raw.close()
+
+        hits = recall("zeta", namespace=namespace, k=6, use_vectors=False)
+        positions = [i for i, hit in enumerate(hits) if hit.memory_id in nulled]
+        swept += positions == [0, 1, 2]
+
+    assert swept < trials, (
+        f"unhashed rows swept the top three in all {trials} trials; "
+        "the fallback is promoting them rather than settling a tie"
     )

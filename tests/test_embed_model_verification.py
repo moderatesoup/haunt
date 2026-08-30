@@ -288,15 +288,28 @@ def test_a_built_wheel_actually_contains_the_manifest(tmp_path):
 # that existed purely to dodge a cycle. These four tests pin the boundary.
 
 
-def test_embed_import_does_not_drag_in_the_evaluation_module():
-    """Loading the embedding backend must not import the E6 harness.
+def test_verifying_the_cache_does_not_drag_in_the_evaluation_module():
+    """Verifying the model artifact must not import the E6 harness.
 
     abstention_eval pulls in recall, store, rerank and the whole urllib/ssl/
     email stack that only its network-deny harness needs. None of that belongs
     in a hook's import path.
     """
+    # Importing embed was never the failure mode -- the old import was
+    # function-local, so abstention_eval was already absent at import time.
+    # The regression lives on the *verify call path*, so drive it and check
+    # after. A deferred import re-planted inside _verify_bge_m3_cache passes
+    # an import-only assertion and fails this one.
     code = (
-        "import sys, haunt.embed; "
+        "import sys, haunt.embed as e, pathlib, tempfile\n"
+        "root = pathlib.Path(tempfile.mkdtemp()) / 'BAAI-bge-m3'\n"
+        "(root / 'onnx').mkdir(parents=True)\n"
+        "(root / 'onnx' / 'model.onnx').write_bytes(b'graph')\n"
+        "(root / 'onnx' / 'tokenizer.json').write_text('{}')\n"
+        "try:\n"
+        "    e._verify_bge_m3_cache(root)\n"
+        "except Exception:\n"
+        "    pass\n"
         "print(' '.join(str(int(m in sys.modules)) for m in ("
         "'haunt.abstention_eval','haunt.recall','haunt.rerank',"
         "'urllib.request','http.client','ssl')))"
@@ -359,3 +372,39 @@ def test_the_two_schema_versions_are_independent_and_currently_equal():
     assert model_manifest.MANIFEST_SCHEMA_VERSION == 1
     assert abstention_eval.SCHEMA_VERSION == 1
     assert "SCHEMA_VERSION" not in vars(model_manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", 2),
+        ("manifest_id", "not-the-pinned-id"),
+        ("model_id", "BAAI/bge-small-en-v1.5"),
+        ("dimension", 384),
+        ("backend", "torch"),
+        ("selected_variant", "quantized_onnx"),
+    ],
+)
+def test_a_manifest_that_fails_the_shape_check_is_rejected(tmp_path, field, value):
+    """Covers the or-chain that holds MANIFEST_SCHEMA_VERSION.
+
+    Nothing reached this branch before: every committed test either stops at
+    the canonical-identity check above it or never builds a manifest at all.
+    The schema_version case is the one that matters -- it is the only site that
+    reads MANIFEST_SCHEMA_VERSION, and deleting that leg would otherwise leave
+    the suite green.
+    """
+    manifest = json.loads(HYBRID_MANIFEST.read_text(encoding="utf-8"))
+    manifest[field] = value
+    directory = tmp_path / "manifest"
+    directory.mkdir()
+    # Re-pin the identity to this mutated document, so the canonical-hash gate
+    # passes and execution actually reaches the shape check underneath it.
+    digest = canonical_hash(manifest)
+    (directory / "hybrid-model-manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(model_manifest, "HYBRID_ARTIFACT_MANIFEST_SHA256", digest)
+        with pytest.raises(RuntimeError, match="invalid committed hybrid artifact"):
+            verify_local_hybrid_cache(tmp_path, manifest_dir=directory)

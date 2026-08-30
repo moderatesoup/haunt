@@ -11,6 +11,8 @@ from haunt.hosts import (
     DanglingHook,
     HostReport,
     HostStatus,
+    check_hook_command_safe,
+    check_host_config_target,
     check_host_install_allowed,
     command_leaf,
     hook_command_defect,
@@ -186,6 +188,15 @@ def install(
     global config the same way ~/.claude is.
     """
     check_host_install_allowed(haunt_home, force=force)
+    # Hook entries are run through a shell by both editors, and the command
+    # is written as one unquoted string.
+    check_hook_command_safe(hook_cmd)
+    # The home check above judged the path being written INTO the config.
+    # These judge the config files themselves, which resolve through
+    # environment overrides the home check cannot see.
+    check_host_config_target(_hooks_json_path(), force=force)
+    check_host_config_target(_mcp_json_path(), force=force)
+    check_host_config_target(_cursor_dir(), force=force)
     cdir = _cursor_dir()
     seeded = not cdir.exists()
 

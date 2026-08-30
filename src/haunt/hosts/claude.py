@@ -11,6 +11,8 @@ from haunt.hosts import (
     DanglingHook,
     HostReport,
     HostStatus,
+    check_hook_command_safe,
+    check_host_config_target,
     check_host_install_allowed,
     command_leaf,
     hook_command_defect,
@@ -222,6 +224,15 @@ def install(
     config, and a temp home planted there stops capture when it is deleted.
     """
     check_host_install_allowed(haunt_home, force=force)
+    # Hook entries are run through a shell by both editors, and the command
+    # is written as one unquoted string.
+    check_hook_command_safe(hook_cmd)
+    # The home check above judged the path being written INTO the config.
+    # These judge the config files themselves, which resolve through
+    # environment overrides the home check cannot see.
+    check_host_config_target(_settings_json_path(), force=force)
+    check_host_config_target(_claude_dotfile(), force=force)
+    check_host_config_target(_claude_config_dir(), force=force)
     config_dir = _claude_config_dir()
     seeded = not config_dir.exists()
 

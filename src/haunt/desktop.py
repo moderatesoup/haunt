@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import stat
 import subprocess
@@ -25,7 +26,10 @@ def _find_haunt_cmd() -> str:
     fallback for installs that never ran bootstrap.
     """
     canonical = bin_dir() / "haunt"
-    if canonical.is_file():
+    # Executable, not merely present: a wrapper left behind by a rebuilt venv
+    # names an interpreter that no longer exists (exit 126), and preferring it
+    # over a working PATH haunt would trade one broken shortcut for another.
+    if canonical.is_file() and os.access(canonical, os.X_OK):
         return str(canonical)
     which = shutil.which("haunt")
     if which:

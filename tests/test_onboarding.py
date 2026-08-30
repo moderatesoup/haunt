@@ -17,11 +17,11 @@ AUTO_COMPILE_PHRASE = "compile() runs automatically on memory_recall"
 
 
 @pytest.fixture
-def onboard_env(tmp_path, monkeypatch):
+def onboard_env(tmp_path, monkeypatch, fake_home):
     """Isolated HOME / HAUNT_HOME / Cursor + Claude dirs. FTS-only."""
-    haunt_home = tmp_path / "haunthome"
-    cursor_home = tmp_path / "cursor"
-    claude_dir = tmp_path / "claude-config"
+    haunt_home = fake_home / ".haunt"
+    cursor_home = fake_home / ".cursor"
+    claude_dir = fake_home / ".claude"
     monkeypatch.setenv("HAUNT_HOME", str(haunt_home))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
@@ -287,14 +287,14 @@ def test_doctor_fails_if_wrapper_python_cannot_import_haunt(onboard_env, tmp_pat
     assert "cannot import haunt or sqlite-vec" in blob
 
 
-def test_bootstrap_vec_fail_writes_no_namespace(tmp_path, monkeypatch):
+def test_bootstrap_vec_fail_writes_no_namespace(tmp_path, monkeypatch, fake_home):
     from unittest.mock import patch
 
     from haunt import embed
     from haunt.bootstrap import BootstrapError, bootstrap
     from haunt.paths import namespace_db_path, registry_path
 
-    monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "fresh-home"))
+    monkeypatch.setenv("HAUNT_HOME", str(fake_home / ".haunt"))
     monkeypatch.delenv("HAUNT_FTS_ONLY", raising=False)
     monkeypatch.delenv("HAUNT_EMBED_MODEL", raising=False)
     embed.reset()

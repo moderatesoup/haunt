@@ -176,19 +176,25 @@ def _clocks(clock: str) -> tuple[str, ...]:
     return (c,)
 
 
-def _recall_order(hit: Hit) -> tuple[int, float, str]:
+def _recall_order(hit: Hit) -> tuple[int, float, str, str]:
     """Sort key preserving the order recall() returned a hit in.
 
     recall() owns ranking and an enabled rerank stage replaces RRF order
     with its own, so re-deriving order from ``score`` here would silently
     undo it. With no such stage final_rank is assigned in exactly
-    ``(-score, memory_id)`` order, so this key reproduces it. A Hit built
-    by hand rather than by recall() carries no final_rank and falls back to
-    that score order.
+    ``(-score, content_hash, memory_id)`` order, so this key reproduces it. A
+    Hit built by hand rather than by recall() carries no final_rank and falls
+    back to that score order.
+
+    run_ranked merges hits from several recall runs, so two hits routinely
+    share a final_rank and the tie is decided here rather than inside recall.
+    content_hash leads memory_id for the same reason it does there: the id is
+    a fresh uuid4 per write and would re-roll this order on every ingest.
     """
     return (
         hit.final_rank if hit.final_rank is not None else 0,
         -hit.score,
+        hit.content_hash or hit.memory_id,
         hit.memory_id,
     )
 
@@ -395,9 +401,11 @@ def run_timeline(
                 break
             offset = nxt
     # Preserve chronological order. Only exact values on the selected clock
-    # fall back to the stable memory ID; never sort timeline hits by ID alone.
+    # fall back to the content key; never sort timeline hits by it alone. The
+    # memory id is NOT stable across ingests -- it is a fresh uuid4 per write
+    # -- so content_hash leads and the id only settles byte-identical content.
     hits = list(merged.values())
-    hits.sort(key=lambda hit: hit.memory_id)
+    hits.sort(key=lambda hit: (hit.content_hash or hit.memory_id, hit.memory_id))
     time_attr = "ts" if _clocks(chosen)[0] == "storage_time" else "event_time"
     hits.sort(key=lambda hit: getattr(hit, time_attr) or "", reverse=True)
     hits = hits[:limit]

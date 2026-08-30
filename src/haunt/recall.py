@@ -118,6 +118,11 @@ class Hit:
     # the default -- means final_rank IS the fusion rank.
     rerank_stage: dict[str, Any] | None = None
     references: dict[str, Any] | None = None
+    # The reproducible tie key this hit was ordered by. Falls back to the
+    # memory id on a database whose content_hash column predates v10, so it is
+    # always a usable sort key. Deliberately absent from as_dict(): it is
+    # ordering machinery, not part of the public response.
+    content_hash: str | None = None
     recall_class: str | None = None
     classification_source: str = "legacy_unknown"
     # Keep structured tool detection internal: callers still receive only the
@@ -461,6 +466,27 @@ def _l2(a: list[float], b: list[float]) -> float:
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
+def _stable_tie_key(conn: sqlite3.Connection) -> str:
+    """SQL for the reproducible tie key, degrading where the column is absent.
+
+    content_hash arrives with the v10 migration, which only a writer performs;
+    ReadOnlyStore never migrates (see its class docstring) and recall opens
+    read-only by default. On a database no writer has opened at this code
+    version the column does not exist, and naming it would turn every recall
+    into "no such column". Store.stats() already guards the same way.
+
+    The fallback is m.id, not a constant: falling back to '' would sort every
+    unhashed row ahead of every hashed one, which is a systematic reordering
+    rather than a settled tie. m.id reduces exactly to the previous
+    (rank, id) behaviour for rows the key cannot cover.
+    """
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+    }
+    return "COALESCE(m.content_hash, m.id)" if "content_hash" in columns else "m.id"
+
+
 def _content_keys(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
     """Stable per-row sort keys for a fused candidate set.
 
@@ -473,9 +499,15 @@ def _content_keys(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
     """
     if not ids:
         return {}
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+    }
+    if "content_hash" not in columns:
+        return {}
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
-        f"SELECT id, COALESCE(content_hash, '') AS chash "
+        f"SELECT id, COALESCE(content_hash, id) AS chash "
         f"FROM memories WHERE id IN ({placeholders})",
         ids,
     ).fetchall()
@@ -492,6 +524,7 @@ def _fts_hits(
     match = _fts_match_query(query)
     if not match:
         return []
+    tie = _stable_tie_key(conn)
     sql = f"""
         SELECT f.id AS mid, f.rank AS rnk
         FROM memories_fts f
@@ -499,7 +532,7 @@ def _fts_hits(
         JOIN events e ON e.id = m.event_id
         WHERE memories_fts MATCH ?
           AND {where}
-        ORDER BY f.rank, COALESCE(m.content_hash, ''), f.id
+        ORDER BY f.rank, {tie}, f.id
         LIMIT ?
     """
     rows = conn.execute(sql, [match, *params, limit]).fetchall()
@@ -515,6 +548,7 @@ def _vec_hits(
 ) -> list[tuple[str, int, float, str]]:
     blob = sqlite_vec.serialize_float32(query_vec)
     conn = store.conn
+    tie = _stable_tie_key(conn)
     if store.vec_ok():
         has = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memories'"
@@ -522,7 +556,7 @@ def _vec_hits(
         if has:
             sql = f"""
                 SELECT v.id AS mid, v.distance AS dist,
-                       COALESCE(m.content_hash, '') AS chash
+                       {tie} AS chash
                 FROM vec_memories v
                 JOIN memories m ON m.id = v.id
                 JOIN events e ON e.id = m.event_id
@@ -545,7 +579,7 @@ def _vec_hits(
             ]
     sql = f"""
         SELECT m.id AS mid, m.embedding,
-               COALESCE(m.content_hash, '') AS chash
+               {tie} AS chash
         FROM memories m
         JOIN events e ON e.id = m.event_id
         WHERE m.embedding IS NOT NULL AND {where}
@@ -686,9 +720,10 @@ def recall(
         )
         stable = _content_keys(store.conn, list(rrf)) if fused_tie else {}
         ranked = sorted(
-            rrf.items(), key=lambda kv: (-kv[1], stable.get(kv[0], ""), kv[0])
+            rrf.items(), key=lambda kv: (-kv[1], stable.get(kv[0], kv[0]), kv[0])
         )[: rerank.candidate_pool(k)]
         hits: list[Hit] = []
+        materialize_tie = _stable_tie_key(store.conn)
         recall_class_select = (
             "e.recall_class AS recall_class"
             if recall_class_available
@@ -700,6 +735,7 @@ def recall(
                 SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
                        e.role, e.event_time, e.ts, e.tool_name, e.tool_input,
                        e.tool_output, e.origin,
+                       {materialize_tie} AS content_hash,
                        {recall_class_select}
                 FROM memories m
                 JOIN events e ON e.id = m.event_id
@@ -725,6 +761,7 @@ def recall(
                     score=score,
                     tier=row["tier"],
                     content=row["content"],
+                    content_hash=row["content_hash"],
                     role=row["role"],
                     event_time=row["event_time"],
                     ts=row["ts"],

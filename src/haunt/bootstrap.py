@@ -139,7 +139,11 @@ def _drain_worth_reporting(drained: dict, *, deliberately_off: bool) -> bool:
 def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict:
     home = ensure_layout()
     repair_private_modes(home)
-    launcher = write_launcher()
+    # Probe BEFORE planting wrappers. write_launcher() embeds sys.executable,
+    # so an abort below used to leave ~/.haunt/bin/* naming the very
+    # interpreter that just failed the probe -- and the desktop shortcut now
+    # prefers that wrapper over PATH. Failing before writing keeps a broken
+    # interpreter out of the artifacts that outlive this call.
     vec = probe_sqlite_vec()
     if not vec.get("ok") and not fts_only():
         hint = (
@@ -206,6 +210,8 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                 entry["namespace"] = row["name"]
                 entry["auto"] = True
                 reembed_report.append(entry)
+    launcher = write_launcher()
+
     from haunt.hosts import host_install_refusal, install_all_hosts
 
     # One decision for both global-config writes below, so the report tells a

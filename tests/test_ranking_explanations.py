@@ -499,6 +499,10 @@ class _NativeVecConnection:
 
     def execute(self, sql, params=None):
         self.calls.append(sql)
+        if "PRAGMA table_info" in sql:
+            # recall probes for content_hash before naming it: ReadOnlyStore
+            # never migrates, so on a pre-v10 file the column is absent.
+            return _Rows([{"name": "id"}, {"name": "content_hash"}])
         if "sqlite_master" in sql:
             return _Rows([{"name": "vec_memories"}])
         assert "FROM vec_memories" in sql
@@ -516,6 +520,8 @@ class _NativeVecConnection:
 
 class _FallbackVecConnection:
     def execute(self, sql, params=None):
+        if "PRAGMA table_info" in sql:
+            return _Rows([{"name": "id"}, {"name": "content_hash"}])
         assert "FROM memories" in sql
         return _Rows([
             {"mid": "fallback", "embedding": struct.pack("1f", 1.0), "chash": "aaa"}

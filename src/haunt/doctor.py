@@ -547,7 +547,16 @@ def format_dangling_hooks(dangling: list[DanglingHook]) -> list[str]:
             f"  {d.host:<{host_width}}  {d.event:<{event_width}}  {d.command}  ({d.reason})"
         )
     lines.append(
-        "  Fix: `haunt install` repoints every host hook at the current HAUNT_HOME."
+        "  Fix: `unset HAUNT_HOME && haunt install` repoints every host hook at"
+    )
+    lines.append(
+        "  the default home. The unset matters: these entries usually dangle"
+    )
+    lines.append(
+        "  precisely because a non-default HAUNT_HOME was bound once, and a plain"
+    )
+    lines.append(
+        "  `haunt install` from that same shell is refused and changes nothing."
     )
     lines.append(
         "  `haunt doctor` also re-merges hosts on its own when a host check fails,"

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,103 @@ def check_host_install_allowed(haunt_home: str | Path, *, force: bool = False) -
     refusal = host_install_refusal(haunt_home, force=force)
     if refusal is not None:
         raise refusal
+
+
+class ForeignHostConfigRefused(RuntimeError):
+    """The host config about to be written does not belong to this home.
+
+    host_install_refusal judges the haunt home that would be *written into*
+    the config. It cannot see *which* config, because the target comes from
+    CLAUDE_CONFIG_DIR, CURSOR_HOME or CURSOR_HOOKS_JSON. With HOME redirected
+    to a temp dir and one of those still pointing at the operator's real
+    config, the home check passes -- resolved HAUNT_HOME does equal
+    resolved ~/.haunt for the redirected HOME -- and the temp path is written
+    into the real global settings.json anyway. That is the original incident
+    reproduced with the guard enabled and reporting success.
+    """
+
+    def __init__(self, target: str, home: str) -> None:
+        self.target = target
+        self.home = home
+        super().__init__(
+            "refusing to write host config outside the current home\n"
+            f"  config target {target}\n"
+            f"  current home  {home}\n"
+            "  This path is not under the home whose haunt install was approved,\n"
+            "  so the check that approved it did not judge this file. Unset\n"
+            "  CLAUDE_CONFIG_DIR / CURSOR_HOME / CURSOR_HOOKS_JSON, or point them\n"
+            "  inside the current home.\n"
+            f"  To write it anyway, set {ALT_HOME_ENV}=1 (exactly 1)."
+        )
+
+
+def host_config_target_refusal(
+    target: str | Path, *, force: bool = False
+) -> ForeignHostConfigRefused | None:
+    """The refusal for writing host config at `target`, or None.
+
+    Judges the file about to be written, which host_install_refusal cannot
+    reach. Both sides resolve, so a symlink cannot alias out of the home.
+    """
+    if force or alt_home_install_allowed():
+        return None
+    resolved = _resolved(target)
+    home = Path.home().resolve()
+    try:
+        resolved.relative_to(home)
+    except ValueError:
+        return ForeignHostConfigRefused(str(resolved), str(home))
+    return None
+
+
+def check_host_config_target(target: str | Path, *, force: bool = False) -> None:
+    """Raise ForeignHostConfigRefused unless `target` belongs to this home."""
+    refusal = host_config_target_refusal(target, force=force)
+    if refusal is not None:
+        raise refusal
+
+
+# Conservative: every character a POSIX shell and a Windows .bat both treat as
+# ordinary. Anything else -- space, $, backtick, quote, semicolon, newline --
+# is refused rather than escaped.
+_SHELL_SAFE_COMMAND = re.compile(r"\A[A-Za-z0-9._/+@:=-]+\Z")
+
+
+class UnsafeHookCommandRefused(RuntimeError):
+    """The hook command contains characters the host would hand to a shell.
+
+    Hook entries are written into settings.json / hooks.json as a single
+    `command` string, and the editors run them through a shell. A haunt home
+    containing a space therefore yields "no such file or directory" and capture
+    stops with no error; one containing $(...) or a backtick executes on every
+    hook event.
+
+    This refuses rather than quotes on purpose. MCP server entries in the same
+    files are spawned argv-style, where added quotes would become part of the
+    path, and nothing in the config distinguishes the two at read time. A path
+    that cannot work should fail at install, loudly, instead of being written
+    and silently never running.
+    """
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+        offending = sorted({c for c in command if not _SHELL_SAFE_COMMAND.match(c)})
+        printable = ", ".join(repr(c) for c in offending)
+        super().__init__(
+            "refusing to write a hook command a shell would not run verbatim\n"
+            f"  command   {command}\n"
+            f"  offending {printable}\n"
+            "  Editor hook commands are executed through a shell. This path would\n"
+            "  either fail to start (capture stops with no error) or execute the\n"
+            "  embedded expression on every hook event.\n"
+            "  Move HAUNT_HOME somewhere without these characters and re-run."
+        )
+
+
+def check_hook_command_safe(command: str) -> None:
+    """Raise UnsafeHookCommandRefused unless a shell would run `command` verbatim."""
+    if not _SHELL_SAFE_COMMAND.match(command):
+        raise UnsafeHookCommandRefused(command)
 
 
 HAUNT_MCP_LEAVES = frozenset({"haunt-mcp"})

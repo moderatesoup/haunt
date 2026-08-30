@@ -53,14 +53,14 @@ def sandbox(tmp_path, monkeypatch):
     assert Path.home().resolve() == fake_home.resolve()
     assert default_haunt_home() == (fake_home / ".haunt").resolve()
 
-    cursor_home = tmp_path / "cursor"
-    claude_dir = tmp_path / "claude-config"
+    cursor_home = fake_home / ".cursor"
+    claude_dir = fake_home / ".claude"
     monkeypatch.setenv("CURSOR_HOME", str(cursor_home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_dir))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
     monkeypatch.delenv("CURSOR_HOOKS_JSON", raising=False)
-    # conftest turns the guard off suite-wide; these tests are what it is for.
+    # conftest no longer disables the guard suite-wide; belt and braces.
     monkeypatch.delenv(ALT_HOME_ENV, raising=False)
 
     return {
@@ -454,3 +454,89 @@ def test_incident_shape_regression(sandbox, monkeypatch):
     for event in CLAUDE_EVENTS:
         assert event in text, event
     assert ".smoke-home" in text
+
+
+# --- the config target, not just the home ----------------------------------
+# host_install_refusal judges the haunt home that would be written INTO the
+# config. It cannot see WHICH config: that resolves through CLAUDE_CONFIG_DIR,
+# CURSOR_HOME and CURSOR_HOOKS_JSON. With HOME redirected and one of those
+# still pointing at the operator's real config, the home check passes on its
+# own terms and the temp path lands in the real global settings.json anyway.
+
+
+@pytest.fixture
+def foreign_config(tmp_path):
+    """A host config root deliberately outside the redirected home."""
+    foreign = tmp_path / "elsewhere" / "real-config"
+    foreign.mkdir(parents=True)
+    return foreign
+
+
+def test_home_guard_alone_would_allow_a_foreign_config_target(sandbox, foreign_config):
+    """Pins why the second guard exists: the first one has nothing to object to.
+
+    The home about to be written IS the default home for this HOME, so the
+    home guard is satisfied and stays satisfied no matter where the config
+    file lives. Only the target guard can see the difference.
+    """
+    from haunt.hosts import host_config_target_refusal, host_install_refusal
+
+    assert host_install_refusal(sandbox["default_home"]) is None
+    assert host_config_target_refusal(foreign_config / "settings.json") is not None
+
+
+@pytest.mark.parametrize("variable", ["CLAUDE_CONFIG_DIR", "CURSOR_HOME"])
+def test_a_config_root_outside_the_home_is_refused(
+    sandbox, foreign_config, monkeypatch, variable
+):
+    """The incident, reproduced with the home guard fully enabled."""
+    from haunt.hosts import ForeignHostConfigRefused, claude, cursor
+
+    monkeypatch.setenv(variable, str(foreign_config))
+    installer = claude.install if variable == "CLAUDE_CONFIG_DIR" else cursor.install
+    cmds = _use_home(monkeypatch, sandbox["default_home"])
+    with pytest.raises(ForeignHostConfigRefused):
+        installer(cmds["home"], cmds["hook_cmd"], cmds["mcp_cmd"])
+    assert sorted(foreign_config.iterdir()) == [], "wrote into the foreign config root"
+
+
+def test_cursor_hooks_json_override_cannot_escape_the_home(
+    sandbox, foreign_config, monkeypatch
+):
+    """CURSOR_HOOKS_JSON overrides the file directly, past CURSOR_HOME."""
+    from haunt.hosts import ForeignHostConfigRefused, cursor
+
+    target = foreign_config / "hooks.json"
+    monkeypatch.setenv("CURSOR_HOOKS_JSON", str(target))
+    cmds = _use_home(monkeypatch, sandbox["default_home"])
+    with pytest.raises(ForeignHostConfigRefused):
+        cursor.install(cmds["home"], cmds["hook_cmd"], cmds["mcp_cmd"])
+    assert not target.exists()
+
+
+def test_a_symlinked_config_root_cannot_alias_back_inside_the_home(
+    sandbox, foreign_config, monkeypatch
+):
+    """Both sides resolve, so a symlink under the home does not launder it."""
+    from haunt.hosts import ForeignHostConfigRefused, claude
+
+    link = sandbox["fake_home"] / "looks-local"
+    link.symlink_to(foreign_config)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(link))
+    cmds = _use_home(monkeypatch, sandbox["default_home"])
+    with pytest.raises(ForeignHostConfigRefused):
+        claude.install(cmds["home"], cmds["hook_cmd"], cmds["mcp_cmd"])
+    assert sorted(foreign_config.iterdir()) == []
+
+
+def test_the_escape_hatch_still_allows_a_deliberate_foreign_target(
+    sandbox, foreign_config, monkeypatch
+):
+    """One consent variable, exactly 1, covers both guards."""
+    from haunt.hosts import ALT_HOME_ENV, claude
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(foreign_config))
+    monkeypatch.setenv(ALT_HOME_ENV, "1")
+    cmds = _use_home(monkeypatch, sandbox["default_home"])
+    claude.install(cmds["home"], cmds["hook_cmd"], cmds["mcp_cmd"])
+    assert (foreign_config / "settings.json").is_file()

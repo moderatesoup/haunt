@@ -43,10 +43,10 @@ def honesty_env(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def host_env(tmp_path, monkeypatch):
-    haunt_home = tmp_path / "haunthome"
-    cursor_home = tmp_path / "cursor"
-    claude_dir = tmp_path / "claude-config"
+def host_env(tmp_path, monkeypatch, fake_home):
+    haunt_home = fake_home / ".haunt"
+    cursor_home = fake_home / ".cursor"
+    claude_dir = fake_home / ".claude"
     monkeypatch.setenv("HAUNT_HOME", str(haunt_home))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
