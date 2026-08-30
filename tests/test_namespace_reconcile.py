@@ -2536,3 +2536,257 @@ def test_identical_session_row_still_widens_for_the_events_arriving_with_it(
     # And still idempotent: the second cycle recomputes the same union.
     second = reconcile_namespaces("grow-src", "grow-dst")
     assert second["total_window_merges"] == 0
+
+
+def _raw_conn(home: Path, label: str) -> sqlite3.Connection:
+    """A connection with foreign keys deliberately *off*.
+
+    The shapes below (an event whose session has no row, a stored timestamp
+    that is not a timestamp) are ones the store's own write path cannot
+    produce. Reconcile still has to survive meeting them.
+    """
+    conn = sqlite3.connect(str(_db_path(home, label)))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _insert_orphan_event(
+    home: Path, label: str, *, event_id: str, session_id: str, ts: str
+) -> None:
+    conn = _raw_conn(home, label)
+    try:
+        columns = [
+            row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()
+        ]
+        values = {
+            "id": event_id,
+            "idempotency_key": None,
+            "session_id": session_id,
+            "ts": ts,
+            "event_time": ts,
+            "role": "user",
+            "content": f"{event_id} content",
+            "tool_name": None,
+            "tool_input": None,
+            "tool_output": None,
+            "origin": "python",
+            "tier": "episodic",
+            "meta": "{}",
+            "recall_class": None,
+            "provenance": None,
+        }
+        conn.execute(
+            f"INSERT INTO events({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            tuple(values[column] for column in columns),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_merge_never_closes_a_session_target_still_holds_open(reconcile_home):
+    """The cutover shape the NULL rule exists for, in both directions.
+
+    SOURCE was abandoned and swept closed; TARGET is the surviving namespace
+    and is still writing to that session. `ended_at IS NULL` in TARGET is not
+    merely an unknown boundary -- it is the live control state `end_session`
+    sweeps on and `ensure_session` reads, so writing SOURCE's end into it
+    closes a session that is still open and the next write to that id gets a
+    successor instead of the session. Unbounded above is the wider end, and
+    this merge only ever widens, so SOURCE's end is not adopted.
+    """
+    _empty_pair("live-src", "live-dst")
+    _seed_session(
+        reconcile_home, "live-src", session_id="S",
+        started_at=_at("09:00"), ended_at=_at("09:30"),
+        event_ts=(_at("09:10"),), event_tag="src",
+    )
+    _seed_session(
+        reconcile_home, "live-dst", session_id="S",
+        started_at=_at("09:05"), ended_at=None,
+        event_ts=(_at("09:20"),), event_tag="dst",
+    )
+    with Store("live-dst") as st:
+        st.set_meta("current_session", "S")
+        assert st.ensure_session("S") == "S"
+
+    plan = reconcile_namespaces("live-src", "live-dst")
+    # The start still widens; only the end is held open.
+    assert _window_records(plan)["S"]["merged"] == {
+        "started_at": _at("09:00"), "ended_at": None
+    }
+    reconcile_namespaces(
+        "live-src", "live-dst", apply=True, plan_digest=plan["plan_digest"]
+    )
+    assert _window(reconcile_home, "live-dst", "S") == (_at("09:00"), None)
+    with Store("live-dst") as st:
+        assert st.ensure_session("S") == "S", (
+            "the merge closed TARGET's live session, so ensure_session minted "
+            "a successor instead of continuing it"
+        )
+
+    # The mirror is deliberately not symmetric: SOURCE's NULL over an end
+    # TARGET already swept would *reopen* a closed session, so there the
+    # recorded end still wins. This is the owner's real conflict shape.
+    _empty_pair("swept-src", "swept-dst")
+    _seed_session(
+        reconcile_home, "swept-src", session_id="S",
+        started_at=_at("09:00"), ended_at=None,
+        event_ts=(_at("09:10"),), event_tag="src",
+    )
+    _seed_session(
+        reconcile_home, "swept-dst", session_id="S",
+        started_at=_at("09:05"), ended_at=_at("11:00"),
+        event_ts=(_at("09:20"),), event_tag="dst",
+    )
+    mirror = reconcile_namespaces("swept-src", "swept-dst")
+    assert _window_records(mirror)["S"]["merged"] == {
+        "started_at": _at("09:00"), "ended_at": _at("11:00")
+    }
+    reconcile_namespaces(
+        "swept-src", "swept-dst", apply=True, plan_digest=mirror["plan_digest"]
+    )
+    assert _window(reconcile_home, "swept-dst", "S") == (_at("09:00"), _at("11:00"))
+
+
+def test_window_widens_for_an_event_whose_session_row_source_never_had(
+    reconcile_home,
+):
+    """The candidate set is the union of both sessions tables and the events.
+
+    Deriving it from SOURCE's sessions table alone made containment depend on
+    SOURCE's own `events -> sessions` foreign key having held: the event below
+    is copied into TARGET, and nothing widened the TARGET window that then had
+    to contain it.
+
+    Reachability is low -- this needs a SOURCE database already violating that
+    foreign key, and no supported write path produces one (the fixture turns
+    foreign keys off to build it). It is fixed anyway because the invariant
+    should hold structurally rather than by luck.
+    """
+    _empty_pair("orphan-src", "orphan-dst")
+    _seed_session(
+        reconcile_home, "orphan-dst", session_id="S",
+        started_at=_at("10:00"), ended_at=_at("10:30"),
+        event_ts=(_at("10:10"),), event_tag="dst",
+    )
+    _insert_orphan_event(
+        reconcile_home, "orphan-src",
+        event_id="S-orphan-0", session_id="S", ts=_at("23:00"),
+    )
+
+    plan = reconcile_namespaces("orphan-src", "orphan-dst")
+    assert plan["total_window_merges"] == 1, plan["tables"]["sessions"]
+    record = _window_records(plan)["S"]
+    assert record["in_target"] is True
+    assert record["source"] is None
+    assert record["merged"] == {
+        "started_at": _at("10:00"), "ended_at": _at("23:00")
+    }
+    reconcile_namespaces(
+        "orphan-src", "orphan-dst", apply=True, plan_digest=plan["plan_digest"]
+    )
+    started, ended = _window(reconcile_home, "orphan-dst", "S")
+    conn = _raw_conn(reconcile_home, "orphan-dst")
+    try:
+        last = conn.execute(
+            "SELECT MAX(ts) AS last FROM events WHERE session_id='S'"
+        ).fetchone()["last"]
+    finally:
+        conn.close()
+    assert last == _at("23:00")
+    assert (started, ended) == (_at("10:00"), _at("23:00"))
+    assert reconcile_namespaces("orphan-src", "orphan-dst")["total_window_merges"] == 0
+
+
+def test_target_only_session_narrower_than_its_own_events_is_widened(
+    reconcile_home,
+):
+    """A session only TARGET has was never a candidate, so its own window was
+    left holding events outside it. Same invariant, same fix."""
+    _empty_pair("tonly-src", "tonly-dst")
+    _seed_session(
+        reconcile_home, "tonly-dst", session_id="T",
+        started_at=_at("12:00"), ended_at=_at("12:10"),
+        event_ts=(_at("11:00"), _at("18:00")), event_tag="dst",
+    )
+
+    plan = reconcile_namespaces("tonly-src", "tonly-dst")
+    record = _window_records(plan)["T"]
+    assert record["in_target"] is True and record["source"] is None
+    assert record["merged"] == {
+        "started_at": _at("11:00"), "ended_at": _at("18:00")
+    }
+    reconcile_namespaces(
+        "tonly-src", "tonly-dst", apply=True, plan_digest=plan["plan_digest"]
+    )
+    assert _window(reconcile_home, "tonly-dst", "T") == (_at("11:00"), _at("18:00"))
+    assert reconcile_namespaces("tonly-src", "tonly-dst")["total_window_merges"] == 0
+
+
+def test_one_unparsable_event_timestamp_cannot_strand_a_namespace(reconcile_home):
+    """A `ts` nothing can order contributes no extent, and refuses nothing.
+
+    This is the only code that parses `events.ts`, and both reconcile and
+    retire reach it, so a hard refusal let one corrupt row leave a namespace
+    that could be neither drained nor retired -- where before this code
+    existed the same namespace reconciled fine.
+    """
+    _empty_pair("badts-src", "badts-dst")
+    _seed_session(
+        reconcile_home, "badts-src", session_id="S",
+        started_at=_at("10:00"), ended_at=_at("11:00"),
+        event_ts=(_at("20:00"),), event_tag="src",
+    )
+    _insert_orphan_event(
+        reconcile_home, "badts-src",
+        event_id="S-src-bad", session_id="S", ts="not-a-timestamp",
+    )
+
+    plan = reconcile_namespaces("badts-src", "badts-dst")
+    # The orderable event still clamps; the unorderable one is simply not on
+    # the timeline, so it neither widens the window nor narrows it.
+    record = _window_records(plan)["S"]
+    assert record["events"] == {"first": _at("20:00"), "last": _at("20:00")}
+    assert record["merged"] == {
+        "started_at": _at("10:00"), "ended_at": _at("20:00")
+    }
+    reconcile_namespaces(
+        "badts-src", "badts-dst", apply=True, plan_digest=plan["plan_digest"]
+    )
+    assert _window(reconcile_home, "badts-dst", "S") == (_at("10:00"), _at("20:00"))
+    # And the namespace can still be retired once it is drained.
+    assert store.retire_namespace("badts-src", into="badts-dst")["safe"] is True
+
+
+def test_a_window_that_cannot_be_ordered_is_named_and_left_alone(reconcile_home):
+    """The two window columns are values this has to *write*, so an
+    unorderable one is not guessed at -- but it is also not a reason to
+    refuse an operation the rest of which is fine. Now the candidate set
+    includes rows only TARGET has, a corrupt row TARGET has held for months
+    must not be able to brick a drain of SOURCE."""
+    _empty_pair("badwin-src", "badwin-dst")
+    _seed_session(
+        reconcile_home, "badwin-src", session_id="S",
+        started_at=_at("10:00"), ended_at=_at("10:05"),
+        event_ts=(_at("09:00"),), event_tag="src",
+    )
+    conn = _raw_conn(reconcile_home, "badwin-dst")
+    try:
+        conn.execute(
+            "INSERT INTO sessions(id,started_at,ended_at,source,meta) "
+            "VALUES ('CORRUPT','whenever',NULL,'cli','{}')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    plan = reconcile_namespaces("badwin-src", "badwin-dst")
+    assert plan["tables"]["sessions"]["unresolvable_windows"] == [["CORRUPT"]]
+    assert sorted(_window_records(plan)) == ["S"]
+    reconcile_namespaces(
+        "badwin-src", "badwin-dst", apply=True, plan_digest=plan["plan_digest"]
+    )
+    assert _window(reconcile_home, "badwin-dst", "CORRUPT") == ("whenever", None)
+    assert _window(reconcile_home, "badwin-dst", "S") == (_at("09:00"), _at("10:05"))
