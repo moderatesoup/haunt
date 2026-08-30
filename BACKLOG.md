@@ -537,9 +537,12 @@ state). Four gaps stand between here and merge.
   (`src/haunt/portability.py:86`) consumes about 13 s of the default 30 s
   `timeout_seconds` (`:92`). Raising `input_bytes` toward the 256 MiB clamp
   (`:95`) without raising `timeout_seconds` yields an opaque timeout. (R24)
-- `FORMAT_MINOR = 0` (`src/haunt/portability.py:61`) leaves "Accept known older
-  minor versions through explicit migrations" with no exercised path. Recorded
-  as an accepted caveat on that criterion, not as scheduled work. (R25)
+- ~~`FORMAT_MINOR = 0` leaves "Accept known older minor versions through
+  explicit migrations" with no exercised path.~~ **Obsolete 2026-08-30:**
+  `FORMAT_MINOR` is `1` (`portability.py`), `_fields_by_minor()` implements the
+  per-minor field table, and `tests/fixtures/export/v1/legacy-v1.0.json` and
+  `golden-v1.1.json` both exist. The criterion is exercised; the caveat no
+  longer applies. (R25)
 - Import validates `recall_class` against `RECALL_CLASSES`
   (`src/haunt/portability.py:38`, `:1344`) but never validates `tier`, which it
   carries as a plain field (`:146`, `:154`) into columns with no CHECK
@@ -859,7 +862,16 @@ and is ready for a normal Haunt release.
 
 ## Corpus health and capture policy (C-series)
 
-**Status:** Ready
+**Status:** Mostly shipped — corrected 2026-08-30. This section read "Ready"
+(no implementation active) while most of it was already in the tree, which is
+the largest single correctness defect the documentation pass found and is
+invisible to any byte-reduction sweep. Verified against the current tree:
+C1 (hooks and MCP pass `repo_path` to `Store`), C2, C3 (`reconcile_namespaces`,
+executed against real namespaces), C4 (`drain_embedding_queue`), C5 (attempts
+cap), C6 (`tests/test_capture_policy.py`), C10 (`idx_memories_current`), C11,
+and C12 are all implemented; C7 phase 1 shipped and phase 2 was dropped under
+D3. **Genuinely open: C8** (folded into E6 as a fixture) **and C9** (FTS
+tokenizer, whose camelCase half is already recorded as dropped under R30).
 
 The E-series above adopts new capabilities. The C-series repairs what Haunt
 already does to a live store. These items were found on 2026-08-26 by measuring
@@ -1119,8 +1131,10 @@ evidence below. A third pass at `integration/followups` `3c4bb1e` records the
 PR #85 review (14 findings fixed, 1 refuted), closes R8 and L12, and adds the
 real-namespace reconcile proof with its four findings (L17-L20). This register
 supersedes every prior audit of this repository. **Audits written against
-`88f607f` are 15 commits stale** — that revision is 15 commits behind
-`main`, and most of what those audits report was fixed in between. The closed
+`88f607f` are badly stale** — that revision is 87 commits behind `main` as of
+2026-08-30 (it read 15 when written; the number was never updated, which is
+itself the argument for not putting counts in prose), and most of what those
+audits report was fixed in between. The closed
 table below is the list; do not re-open anything in it without new evidence.
 
 `Checked` reads: `verified` — citation re-checked during this reconciliation, at
@@ -1315,7 +1329,7 @@ audit does not re-report settled work.
 | Entity resolution not attempted (C3) | NOT A DEFECT | deliberate scope decision, documented in `src/haunt/store.py` |
 | Trigram tokenizer rejected (C9) | WELL-FOUNDED | FTS5 trigram cannot be wrapped by porter; losing stemming on a prose corpus is a net loss |
 | C7 phase 2 (reference-not-copy) dropped | WELL-FOUNDED, restated | see the C7 phase 2 decision above — the grounds changed, the decision did not |
-| R25 — `FORMAT_MINOR = 0` leaves the older-minor path unexercised | NOT SCHEDULED | true but not work; recorded as an accepted E4 caveat (`src/haunt/portability.py:61`) |
+| R25 — `FORMAT_MINOR = 0` leaves the older-minor path unexercised | OBSOLETE | premise false as of 2026-08-30: `FORMAT_MINOR` is `1`, `_fields_by_minor()` walks every minor, and both v1.0 and v1.1 golden fixtures exist |
 | R26 — `_backfill_content_hashes` runs on every store open, inside R5's unprotected loop | REFUTED | it is called once inside `if current < 10:` (`src/haunt/store.py:1703-1717`) and `_ensure_namespace_schema` early-returns when `current >= SCHEMA_VERSION` (`:1610-1615`). One-shot migration. It is unbounded within that single pass; cheap batching is welcome, heavy machinery is not |
 | R27 — `idx_memories_content_hash` costs a write per INSERT to serve one diagnostic | REFUTED twice | `EXPLAIN QUERY PLAN` shows `SEARCH memories USING COVERING INDEX idx_memories_content_hash`, so the index is used. The residual worry that a fresh v11 database never gets the C7/C10 indexes is false: a fresh database stamps at `SCHEMA_VERSION` 11 and receives both `idx_memories_content_hash` (`src/haunt/store.py:1709-1711`) and `idx_memories_current` (`:1723-1726`), 20 `idx_` indexes total |
 | R29 — missing `UNIQUE(norm_name, type)` on the entities index | DROPPED | latent invariant gap; the race is unreachable today via `observe` |
@@ -1520,7 +1534,10 @@ audit does not re-report settled work.
 - The schema ladder merged sequentially and correctly: v9 `recall_class` (main)
   to v10 `content_hash` plus index plus backfill (C7) to v11
   `idx_memories_current` partial index (C10). No duplicate version numbers;
-  `SCHEMA_VERSION = 11` (`src/haunt/store.py:101`).
+  `SCHEMA_VERSION` is `13` in `src/haunt/store.py` as of 2026-08-30 — the
+  ladder continued past v11 to v12 (`succeeds_session`) and v13
+  (`skip_embedding`), both described elsewhere in this document. This line read
+  `11` with a line-number citation that had drifted by 29 lines.
 - `portability`, `rerank`, and `abstention_eval` all co-import.
 - `integration/all-work` `413f8b9` adds the E6 guard, store-correctness,
   dashboard-XSS, surface-polish, resilience, embed-batching, E0-gate,
