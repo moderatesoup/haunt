@@ -15,13 +15,13 @@
         "negative_strength": 0.6240921914577484,
         "negative_vector_margin": 0.11777719855308533,
         "positive_case_id": "hybrid-fit-a18",
-        "positive_strength": 0.49531108140945435,
-        "positive_vector_margin": 0.003025352954864502
+        "positive_strength": 0.4953111410140991,
+        "positive_vector_margin": 0.0030257105827331543
       },
       {
         "negative_case_id": "hybrid-fit-u10",
         "negative_strength": 0.5516052544116974,
-        "negative_vector_margin": 0.16207394003868103,
+        "negative_vector_margin": 0.16207364201545715,
         "positive_case_id": "hybrid-fit-a16",
         "positive_strength": 0.4281541109085083,
         "positive_vector_margin": 0.03727543354034424
@@ -40,7 +40,7 @@
         "negative_vector_margin": 0.11777719855308533,
         "positive_case_id": "hybrid-fit-a13",
         "positive_strength": 0.5184110403060913,
-        "positive_vector_margin": 0.10594147443771362
+        "positive_vector_margin": 0.1059415340423584
       },
       {
         "negative_case_id": "hybrid-fit-u04",
@@ -48,7 +48,7 @@
         "negative_vector_margin": 0.11777719855308533,
         "positive_case_id": "hybrid-fit-a08",
         "positive_strength": 0.5226686596870422,
-        "positive_vector_margin": 0.025953292846679688
+        "positive_vector_margin": 0.025953233242034912
       },
       {
         "negative_case_id": "hybrid-fit-u04",
@@ -60,8 +60,8 @@
       },
       {
         "negative_case_id": "hybrid-fit-u08",
-        "negative_strength": 0.5147672593593597,
-        "negative_vector_margin": 0.10156425833702087,
+        "negative_strength": 0.5147671699523926,
+        "negative_vector_margin": 0.10156416893005371,
         "positive_case_id": "hybrid-fit-a16",
         "positive_strength": 0.4281541109085083,
         "positive_vector_margin": 0.03727543354034424
@@ -79,8 +79,8 @@
         "negative_strength": 0.6240921914577484,
         "negative_vector_margin": 0.11777719855308533,
         "positive_case_id": "hybrid-fit-a17",
-        "positive_strength": 0.5472633540630341,
-        "positive_vector_margin": 0.03306511044502258
+        "positive_strength": 0.5472631752490997,
+        "positive_vector_margin": 0.03306493163108826
       },
       {
         "negative_case_id": "hybrid-fit-u19",
@@ -92,8 +92,8 @@
       },
       {
         "negative_case_id": "hybrid-fit-u01",
-        "negative_strength": 0.4864453673362732,
-        "negative_vector_margin": 0.08215951919555664,
+        "negative_strength": 0.48644548654556274,
+        "negative_vector_margin": 0.08215963840484619,
         "positive_case_id": "hybrid-fit-a16",
         "positive_strength": 0.4281541109085083,
         "positive_vector_margin": 0.03727543354034424
@@ -101,15 +101,15 @@
       {
         "negative_case_id": "hybrid-fit-u10",
         "negative_strength": 0.5516052544116974,
-        "negative_vector_margin": 0.16207394003868103,
+        "negative_vector_margin": 0.16207364201545715,
         "positive_case_id": "hybrid-fit-a18",
-        "positive_strength": 0.49531108140945435,
-        "positive_vector_margin": 0.003025352954864502
+        "positive_strength": 0.4953111410140991,
+        "positive_vector_margin": 0.0030257105827331543
       },
       {
         "negative_case_id": "hybrid-fit-u10",
         "negative_strength": 0.5516052544116974,
-        "negative_vector_margin": 0.16207394003868103,
+        "negative_vector_margin": 0.16207364201545715,
         "positive_case_id": "hybrid-fit-a14",
         "positive_strength": 0.5123729109764099,
         "positive_vector_margin": 0.019845247268676758
@@ -119,8 +119,8 @@
         "negative_strength": 0.6240921914577484,
         "negative_vector_margin": 0.11777719855308533,
         "positive_case_id": "hybrid-fit-a03",
-        "positive_strength": 0.5851231813430786,
-        "positive_vector_margin": 0.051501303911209106
+        "positive_strength": 0.5851232409477234,
+        "positive_vector_margin": 0.05150127410888672
       },
       {
         "negative_case_id": "hybrid-fit-u04",
@@ -133,15 +133,15 @@
       {
         "negative_case_id": "hybrid-fit-u10",
         "negative_strength": 0.5516052544116974,
-        "negative_vector_margin": 0.16207394003868103,
+        "negative_vector_margin": 0.16207364201545715,
         "positive_case_id": "hybrid-fit-a13",
         "positive_strength": 0.5184110403060913,
-        "positive_vector_margin": 0.10594147443771362
+        "positive_vector_margin": 0.1059415340423584
       },
       {
         "negative_case_id": "hybrid-fit-u05",
-        "negative_strength": 0.4579218029975891,
-        "negative_vector_margin": 0.08424800634384155,
+        "negative_strength": 0.4579213261604309,
+        "negative_vector_margin": 0.08424752950668335,
         "positive_case_id": "hybrid-fit-a16",
         "positive_strength": 0.4281541109085083,
         "positive_vector_margin": 0.03727543354034424
@@ -149,15 +149,15 @@
       {
         "negative_case_id": "hybrid-fit-u10",
         "negative_strength": 0.5516052544116974,
-        "negative_vector_margin": 0.16207394003868103,
+        "negative_vector_margin": 0.16207364201545715,
         "positive_case_id": "hybrid-fit-a08",
         "positive_strength": 0.5226686596870422,
-        "positive_vector_margin": 0.025953292846679688
+        "positive_vector_margin": 0.025953233242034912
       },
       {
         "negative_case_id": "hybrid-fit-u10",
         "negative_strength": 0.5516052544116974,
-        "negative_vector_margin": 0.16207394003868103,
+        "negative_vector_margin": 0.16207364201545715,
         "positive_case_id": "hybrid-fit-a01",
         "positive_strength": 0.5269922018051147,
         "positive_vector_margin": 0.10097736120223999
@@ -165,18 +165,18 @@
       {
         "negative_case_id": "hybrid-fit-u11",
         "negative_strength": 0.5166952311992645,
-        "negative_vector_margin": 0.005960941314697266,
+        "negative_vector_margin": 0.005960911512374878,
         "positive_case_id": "hybrid-fit-a18",
-        "positive_strength": 0.49531108140945435,
-        "positive_vector_margin": 0.003025352954864502
+        "positive_strength": 0.4953111410140991,
+        "positive_vector_margin": 0.0030257105827331543
       },
       {
         "negative_case_id": "hybrid-fit-u08",
-        "negative_strength": 0.5147672593593597,
-        "negative_vector_margin": 0.10156425833702087,
+        "negative_strength": 0.5147671699523926,
+        "negative_vector_margin": 0.10156416893005371,
         "positive_case_id": "hybrid-fit-a18",
-        "positive_strength": 0.49531108140945435,
-        "positive_vector_margin": 0.003025352954864502
+        "positive_strength": 0.4953111410140991,
+        "positive_vector_margin": 0.0030257105827331543
       },
       {
         "negative_case_id": "hybrid-fit-u04",
@@ -184,12 +184,12 @@
         "negative_vector_margin": 0.11777719855308533,
         "positive_case_id": "hybrid-fit-a09",
         "positive_strength": 0.6120381355285645,
-        "positive_vector_margin": 0.04402029514312744
+        "positive_vector_margin": 0.04402008652687073
       },
       {
         "negative_case_id": "hybrid-fit-u10",
         "negative_strength": 0.5516052544116974,
-        "negative_vector_margin": 0.16207394003868103,
+        "negative_vector_margin": 0.16207364201545715,
         "positive_case_id": "hybrid-fit-a05",
         "positive_strength": 0.5423463582992554,
         "positive_vector_margin": 0.05984598398208618
@@ -197,15 +197,15 @@
       {
         "negative_case_id": "hybrid-fit-u10",
         "negative_strength": 0.5516052544116974,
-        "negative_vector_margin": 0.16207394003868103,
+        "negative_vector_margin": 0.16207364201545715,
         "positive_case_id": "hybrid-fit-a17",
-        "positive_strength": 0.5472633540630341,
-        "positive_vector_margin": 0.03306511044502258
+        "positive_strength": 0.5472631752490997,
+        "positive_vector_margin": 0.03306493163108826
       },
       {
         "negative_case_id": "hybrid-fit-u08",
-        "negative_strength": 0.5147672593593597,
-        "negative_vector_margin": 0.10156425833702087,
+        "negative_strength": 0.5147671699523926,
+        "negative_vector_margin": 0.10156416893005371,
         "positive_case_id": "hybrid-fit-a14",
         "positive_strength": 0.5123729109764099,
         "positive_vector_margin": 0.019845247268676758
@@ -215,8 +215,8 @@
         "negative_strength": 0.49605995416641235,
         "negative_vector_margin": 0.08477306365966797,
         "positive_case_id": "hybrid-fit-a18",
-        "positive_strength": 0.49531108140945435,
-        "positive_vector_margin": 0.003025352954864502
+        "positive_strength": 0.4953111410140991,
+        "positive_vector_margin": 0.0030257105827331543
       }
     ],
     "finding": "Approved raw retrieval evidence cannot separate related but absent attributes from semantic answers in the pinned hybrid fit cohort.",
@@ -322,13 +322,13 @@
           "negative_strength": 0.6240921914577484,
           "negative_vector_margin": 0.11777719855308533,
           "positive_case_id": "hybrid-fit-a18",
-          "positive_strength": 0.49531108140945435,
-          "positive_vector_margin": 0.003025352954864502
+          "positive_strength": 0.4953111410140991,
+          "positive_vector_margin": 0.0030257105827331543
         },
         {
           "negative_case_id": "hybrid-fit-u10",
           "negative_strength": 0.5516052544116974,
-          "negative_vector_margin": 0.16207394003868103,
+          "negative_vector_margin": 0.16207364201545715,
           "positive_case_id": "hybrid-fit-a16",
           "positive_strength": 0.4281541109085083,
           "positive_vector_margin": 0.03727543354034424
@@ -347,7 +347,7 @@
           "negative_vector_margin": 0.11777719855308533,
           "positive_case_id": "hybrid-fit-a13",
           "positive_strength": 0.5184110403060913,
-          "positive_vector_margin": 0.10594147443771362
+          "positive_vector_margin": 0.1059415340423584
         },
         {
           "negative_case_id": "hybrid-fit-u04",
@@ -355,7 +355,7 @@
           "negative_vector_margin": 0.11777719855308533,
           "positive_case_id": "hybrid-fit-a08",
           "positive_strength": 0.5226686596870422,
-          "positive_vector_margin": 0.025953292846679688
+          "positive_vector_margin": 0.025953233242034912
         },
         {
           "negative_case_id": "hybrid-fit-u04",
@@ -367,8 +367,8 @@
         },
         {
           "negative_case_id": "hybrid-fit-u08",
-          "negative_strength": 0.5147672593593597,
-          "negative_vector_margin": 0.10156425833702087,
+          "negative_strength": 0.5147671699523926,
+          "negative_vector_margin": 0.10156416893005371,
           "positive_case_id": "hybrid-fit-a16",
           "positive_strength": 0.4281541109085083,
           "positive_vector_margin": 0.03727543354034424
@@ -386,8 +386,8 @@
           "negative_strength": 0.6240921914577484,
           "negative_vector_margin": 0.11777719855308533,
           "positive_case_id": "hybrid-fit-a17",
-          "positive_strength": 0.5472633540630341,
-          "positive_vector_margin": 0.03306511044502258
+          "positive_strength": 0.5472631752490997,
+          "positive_vector_margin": 0.03306493163108826
         },
         {
           "negative_case_id": "hybrid-fit-u19",
@@ -399,8 +399,8 @@
         },
         {
           "negative_case_id": "hybrid-fit-u01",
-          "negative_strength": 0.4864453673362732,
-          "negative_vector_margin": 0.08215951919555664,
+          "negative_strength": 0.48644548654556274,
+          "negative_vector_margin": 0.08215963840484619,
           "positive_case_id": "hybrid-fit-a16",
           "positive_strength": 0.4281541109085083,
           "positive_vector_margin": 0.03727543354034424
@@ -408,15 +408,15 @@
         {
           "negative_case_id": "hybrid-fit-u10",
           "negative_strength": 0.5516052544116974,
-          "negative_vector_margin": 0.16207394003868103,
+          "negative_vector_margin": 0.16207364201545715,
           "positive_case_id": "hybrid-fit-a18",
-          "positive_strength": 0.49531108140945435,
-          "positive_vector_margin": 0.003025352954864502
+          "positive_strength": 0.4953111410140991,
+          "positive_vector_margin": 0.0030257105827331543
         },
         {
           "negative_case_id": "hybrid-fit-u10",
           "negative_strength": 0.5516052544116974,
-          "negative_vector_margin": 0.16207394003868103,
+          "negative_vector_margin": 0.16207364201545715,
           "positive_case_id": "hybrid-fit-a14",
           "positive_strength": 0.5123729109764099,
           "positive_vector_margin": 0.019845247268676758
@@ -426,8 +426,8 @@
           "negative_strength": 0.6240921914577484,
           "negative_vector_margin": 0.11777719855308533,
           "positive_case_id": "hybrid-fit-a03",
-          "positive_strength": 0.5851231813430786,
-          "positive_vector_margin": 0.051501303911209106
+          "positive_strength": 0.5851232409477234,
+          "positive_vector_margin": 0.05150127410888672
         },
         {
           "negative_case_id": "hybrid-fit-u04",
@@ -440,15 +440,15 @@
         {
           "negative_case_id": "hybrid-fit-u10",
           "negative_strength": 0.5516052544116974,
-          "negative_vector_margin": 0.16207394003868103,
+          "negative_vector_margin": 0.16207364201545715,
           "positive_case_id": "hybrid-fit-a13",
           "positive_strength": 0.5184110403060913,
-          "positive_vector_margin": 0.10594147443771362
+          "positive_vector_margin": 0.1059415340423584
         },
         {
           "negative_case_id": "hybrid-fit-u05",
-          "negative_strength": 0.4579218029975891,
-          "negative_vector_margin": 0.08424800634384155,
+          "negative_strength": 0.4579213261604309,
+          "negative_vector_margin": 0.08424752950668335,
           "positive_case_id": "hybrid-fit-a16",
           "positive_strength": 0.4281541109085083,
           "positive_vector_margin": 0.03727543354034424
@@ -456,15 +456,15 @@
         {
           "negative_case_id": "hybrid-fit-u10",
           "negative_strength": 0.5516052544116974,
-          "negative_vector_margin": 0.16207394003868103,
+          "negative_vector_margin": 0.16207364201545715,
           "positive_case_id": "hybrid-fit-a08",
           "positive_strength": 0.5226686596870422,
-          "positive_vector_margin": 0.025953292846679688
+          "positive_vector_margin": 0.025953233242034912
         },
         {
           "negative_case_id": "hybrid-fit-u10",
           "negative_strength": 0.5516052544116974,
-          "negative_vector_margin": 0.16207394003868103,
+          "negative_vector_margin": 0.16207364201545715,
           "positive_case_id": "hybrid-fit-a01",
           "positive_strength": 0.5269922018051147,
           "positive_vector_margin": 0.10097736120223999
@@ -472,18 +472,18 @@
         {
           "negative_case_id": "hybrid-fit-u11",
           "negative_strength": 0.5166952311992645,
-          "negative_vector_margin": 0.005960941314697266,
+          "negative_vector_margin": 0.005960911512374878,
           "positive_case_id": "hybrid-fit-a18",
-          "positive_strength": 0.49531108140945435,
-          "positive_vector_margin": 0.003025352954864502
+          "positive_strength": 0.4953111410140991,
+          "positive_vector_margin": 0.0030257105827331543
         },
         {
           "negative_case_id": "hybrid-fit-u08",
-          "negative_strength": 0.5147672593593597,
-          "negative_vector_margin": 0.10156425833702087,
+          "negative_strength": 0.5147671699523926,
+          "negative_vector_margin": 0.10156416893005371,
           "positive_case_id": "hybrid-fit-a18",
-          "positive_strength": 0.49531108140945435,
-          "positive_vector_margin": 0.003025352954864502
+          "positive_strength": 0.4953111410140991,
+          "positive_vector_margin": 0.0030257105827331543
         },
         {
           "negative_case_id": "hybrid-fit-u04",
@@ -491,12 +491,12 @@
           "negative_vector_margin": 0.11777719855308533,
           "positive_case_id": "hybrid-fit-a09",
           "positive_strength": 0.6120381355285645,
-          "positive_vector_margin": 0.04402029514312744
+          "positive_vector_margin": 0.04402008652687073
         },
         {
           "negative_case_id": "hybrid-fit-u10",
           "negative_strength": 0.5516052544116974,
-          "negative_vector_margin": 0.16207394003868103,
+          "negative_vector_margin": 0.16207364201545715,
           "positive_case_id": "hybrid-fit-a05",
           "positive_strength": 0.5423463582992554,
           "positive_vector_margin": 0.05984598398208618
@@ -504,15 +504,15 @@
         {
           "negative_case_id": "hybrid-fit-u10",
           "negative_strength": 0.5516052544116974,
-          "negative_vector_margin": 0.16207394003868103,
+          "negative_vector_margin": 0.16207364201545715,
           "positive_case_id": "hybrid-fit-a17",
-          "positive_strength": 0.5472633540630341,
-          "positive_vector_margin": 0.03306511044502258
+          "positive_strength": 0.5472631752490997,
+          "positive_vector_margin": 0.03306493163108826
         },
         {
           "negative_case_id": "hybrid-fit-u08",
-          "negative_strength": 0.5147672593593597,
-          "negative_vector_margin": 0.10156425833702087,
+          "negative_strength": 0.5147671699523926,
+          "negative_vector_margin": 0.10156416893005371,
           "positive_case_id": "hybrid-fit-a14",
           "positive_strength": 0.5123729109764099,
           "positive_vector_margin": 0.019845247268676758
@@ -522,8 +522,8 @@
           "negative_strength": 0.49605995416641235,
           "negative_vector_margin": 0.08477306365966797,
           "positive_case_id": "hybrid-fit-a18",
-          "positive_strength": 0.49531108140945435,
-          "positive_vector_margin": 0.003025352954864502
+          "positive_strength": 0.4953111410140991,
+          "positive_vector_margin": 0.0030257105827331543
         }
       ],
       "fit_positive_retained_at_minimum_negative_boundary": 6,
@@ -540,7 +540,9 @@
       ],
       "possible_under_feature_definition": false,
       "required_fit_positive_retained_for_95pct": 19,
-      "selected_threshold": null
+      "selected_threshold": null,
+      "selected_threshold_fit_gate_validation": null,
+      "selected_threshold_strategy": null
     },
     "cases": [
       {
@@ -592,7 +594,7 @@
               }
             },
             {
-              "candidate_strength": 0.4094858765602112,
+              "candidate_strength": 0.4094858169555664,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -606,8 +608,8 @@
               "logical_id": "cal-r35",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4094858765602112,
-                "distance": 0.5905141234397888,
+                "closeness": 0.4094858169555664,
+                "distance": 0.5905141830444336,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -636,7 +638,7 @@
               }
             },
             {
-              "candidate_strength": 0.3827037811279297,
+              "candidate_strength": 0.38270360231399536,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -650,8 +652,8 @@
               "logical_id": "cal-r13",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3827037811279297,
-                "distance": 0.6172962188720703,
+                "closeness": 0.38270360231399536,
+                "distance": 0.6172963976860046,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -728,7 +730,7 @@
               }
             },
             {
-              "candidate_strength": 0.4704741835594177,
+              "candidate_strength": 0.4704743027687073,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -6.202841852175659,
@@ -742,15 +744,15 @@
               "logical_id": "cal-r22",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4704741835594177,
-                "distance": 0.5295258164405823,
+                "closeness": 0.4704743027687073,
+                "distance": 0.5295256972312927,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 11
               }
             },
             {
-              "candidate_strength": 0.45294564962387085,
+              "candidate_strength": 0.4529457688331604,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -2.2311555850051485,
@@ -764,15 +766,15 @@
               "logical_id": "cal-r03",
               "vector": {
                 "candidate": true,
-                "closeness": 0.45294564962387085,
-                "distance": 0.5470543503761292,
+                "closeness": 0.4529457688331604,
+                "distance": 0.5470542311668396,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 14
               }
             },
             {
-              "candidate_strength": 0.4274061918258667,
+              "candidate_strength": 0.427406370639801,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -2.448632844193376,
@@ -786,15 +788,15 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4274061918258667,
-                "distance": 0.5725938081741333,
+                "closeness": 0.427406370639801,
+                "distance": 0.572593629360199,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 19
               }
             },
             {
-              "candidate_strength": 0.6529185175895691,
+              "candidate_strength": 0.6529185473918915,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -808,8 +810,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.6529185175895691,
-                "distance": 0.3470814824104309,
+                "closeness": 0.6529185473918915,
+                "distance": 0.3470814526081085,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -827,11 +829,11 @@
               "one",
               "month"
             ],
-            "native_cosine_top_two_distance_margin": 0.07785606384277344,
+            "native_cosine_top_two_distance_margin": 0.07785609364509583,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.6529185175895691
+          "strength": 0.6529185473918915
         },
         "fts_only_returned": [
           "cal-r22",
@@ -853,7 +855,7 @@
           "cal-r11",
           "cal-r02"
         ],
-        "strength": 0.6529185175895691,
+        "strength": 0.6529185473918915,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -915,7 +917,7 @@
               }
             },
             {
-              "candidate_strength": 0.41053909063339233,
+              "candidate_strength": 0.4105389714241028,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -3.270835563798912,
@@ -929,15 +931,15 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.41053909063339233,
-                "distance": 0.5894609093666077,
+                "closeness": 0.4105389714241028,
+                "distance": 0.5894610285758972,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 22
               }
             },
             {
-              "candidate_strength": 0.5851231813430786,
+              "candidate_strength": 0.5851232409477234,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -951,15 +953,15 @@
               "logical_id": "cal-r03",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5851231813430786,
-                "distance": 0.4148768186569214,
+                "closeness": 0.5851232409477234,
+                "distance": 0.4148767590522766,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
               }
             },
             {
-              "candidate_strength": 0.5336218774318695,
+              "candidate_strength": 0.5336219668388367,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -973,8 +975,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5336218774318695,
-                "distance": 0.4663781225681305,
+                "closeness": 0.5336219668388367,
+                "distance": 0.46637803316116333,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -990,11 +992,11 @@
               "delivery",
               "schedule"
             ],
-            "native_cosine_top_two_distance_margin": 0.051501303911209106,
+            "native_cosine_top_two_distance_margin": 0.05150127410888672,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.5851231813430786
+          "strength": 0.5851232409477234
         },
         "fts_only_returned": [
           "cal-r20",
@@ -1015,7 +1017,7 @@
           "cal-r03",
           "cal-r34"
         ],
-        "strength": 0.5851231813430786,
+        "strength": 0.5851232409477234,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -1121,7 +1123,7 @@
               }
             },
             {
-              "candidate_strength": 0.42590999603271484,
+              "candidate_strength": 0.4259100556373596,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -1135,8 +1137,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.42590999603271484,
-                "distance": 0.5740900039672852,
+                "closeness": 0.4259100556373596,
+                "distance": 0.5740899443626404,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -1423,7 +1425,7 @@
               }
             },
             {
-              "candidate_strength": 0.444812536239624,
+              "candidate_strength": 0.44481247663497925,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -1437,8 +1439,8 @@
               "logical_id": "cal-r29",
               "vector": {
                 "candidate": true,
-                "closeness": 0.444812536239624,
-                "distance": 0.555187463760376,
+                "closeness": 0.44481247663497925,
+                "distance": 0.5551875233650208,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -1518,7 +1520,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.4074867367744446,
+              "candidate_strength": 0.40748679637908936,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -2.4984955517380225,
@@ -1532,15 +1534,15 @@
               "logical_id": "cal-r27",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4074867367744446,
-                "distance": 0.5925132632255554,
+                "closeness": 0.40748679637908936,
+                "distance": 0.5925132036209106,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 12
               }
             },
             {
-              "candidate_strength": 0.368211030960083,
+              "candidate_strength": 0.3682107925415039,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -2.8232097750685954,
@@ -1554,8 +1556,8 @@
               "logical_id": "cal-r15",
               "vector": {
                 "candidate": true,
-                "closeness": 0.368211030960083,
-                "distance": 0.631788969039917,
+                "closeness": 0.3682107925415039,
+                "distance": 0.6317892074584961,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 20
@@ -1584,7 +1586,7 @@
               }
             },
             {
-              "candidate_strength": 0.6101681888103485,
+              "candidate_strength": 0.6101686060428619,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -1598,8 +1600,8 @@
               "logical_id": "cal-r07",
               "vector": {
                 "candidate": true,
-                "closeness": 0.6101681888103485,
-                "distance": 0.3898318111896515,
+                "closeness": 0.6101686060428619,
+                "distance": 0.38983139395713806,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -1639,11 +1641,11 @@
               "departure",
               "hour"
             ],
-            "native_cosine_top_two_distance_margin": 0.1370777189731598,
+            "native_cosine_top_two_distance_margin": 0.13707813620567322,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.6101681888103485
+          "strength": 0.6101686060428619
         },
         "fts_only_returned": [
           "cal-r32",
@@ -1664,7 +1666,7 @@
           "cal-r07",
           "cal-r31"
         ],
-        "strength": 0.6101681888103485,
+        "strength": 0.6101686060428619,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -1682,7 +1684,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.43897056579589844,
+              "candidate_strength": 0.438970685005188,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.270835563798912,
@@ -1696,8 +1698,8 @@
               "logical_id": "cal-r24",
               "vector": {
                 "candidate": true,
-                "closeness": 0.43897056579589844,
-                "distance": 0.5610294342041016,
+                "closeness": 0.438970685005188,
+                "distance": 0.561029314994812,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -1726,7 +1728,7 @@
               }
             },
             {
-              "candidate_strength": 0.49671536684036255,
+              "candidate_strength": 0.4967154264450073,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -1740,8 +1742,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.49671536684036255,
-                "distance": 0.5032846331596375,
+                "closeness": 0.4967154264450073,
+                "distance": 0.5032845735549927,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -1770,7 +1772,7 @@
               }
             },
             {
-              "candidate_strength": 0.440801739692688,
+              "candidate_strength": 0.4408019781112671,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -1784,8 +1786,8 @@
               "logical_id": "cal-r27",
               "vector": {
                 "candidate": true,
-                "closeness": 0.440801739692688,
-                "distance": 0.559198260307312,
+                "closeness": 0.4408019781112671,
+                "distance": 0.5591980218887329,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -1801,7 +1803,7 @@
               "storage",
               "clients"
             ],
-            "native_cosine_top_two_distance_margin": 0.025953292846679688,
+            "native_cosine_top_two_distance_margin": 0.025953233242034912,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -1842,7 +1844,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.44173663854599,
+              "candidate_strength": 0.44173675775527954,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -2.988686809094214,
@@ -1856,8 +1858,8 @@
               "logical_id": "cal-r27",
               "vector": {
                 "candidate": true,
-                "closeness": 0.44173663854599,
-                "distance": 0.55826336145401,
+                "closeness": 0.44173675775527954,
+                "distance": 0.5582632422447205,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 11
@@ -1886,7 +1888,7 @@
               }
             },
             {
-              "candidate_strength": 0.568017840385437,
+              "candidate_strength": 0.5680180490016937,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -1900,8 +1902,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.568017840385437,
-                "distance": 0.431982159614563,
+                "closeness": 0.5680180490016937,
+                "distance": 0.4319819509983063,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -1961,7 +1963,7 @@
               "renewal",
               "cadence"
             ],
-            "native_cosine_top_two_distance_margin": 0.04402029514312744,
+            "native_cosine_top_two_distance_margin": 0.04402008652687073,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -2024,7 +2026,7 @@
               }
             },
             {
-              "candidate_strength": 0.4375109076499939,
+              "candidate_strength": 0.4375108480453491,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -2038,8 +2040,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4375109076499939,
-                "distance": 0.5624890923500061,
+                "closeness": 0.4375108480453491,
+                "distance": 0.5624891519546509,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -2068,7 +2070,7 @@
               }
             },
             {
-              "candidate_strength": 0.4035571813583374,
+              "candidate_strength": 0.4035569429397583,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -2082,8 +2084,8 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4035571813583374,
-                "distance": 0.5964428186416626,
+                "closeness": 0.4035569429397583,
+                "distance": 0.5964430570602417,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -2123,7 +2125,7 @@
               "pre",
               "nuptials"
             ],
-            "native_cosine_top_two_distance_margin": 0.23434200882911682,
+            "native_cosine_top_two_distance_margin": 0.2343420684337616,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -2184,7 +2186,7 @@
               }
             },
             {
-              "candidate_strength": 0.41192156076431274,
+              "candidate_strength": 0.41192132234573364,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -3.1710473601575897,
@@ -2198,15 +2200,15 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.41192156076431274,
-                "distance": 0.5880784392356873,
+                "closeness": 0.41192132234573364,
+                "distance": 0.5880786776542664,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 19
               }
             },
             {
-              "candidate_strength": 0.3772525191307068,
+              "candidate_strength": 0.37725263833999634,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -3.0771676685739764,
@@ -2220,8 +2222,8 @@
               "logical_id": "cal-r22",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3772525191307068,
-                "distance": 0.6227474808692932,
+                "closeness": 0.37725263833999634,
+                "distance": 0.6227473616600037,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 24
@@ -2326,7 +2328,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.7037047445774078,
+              "candidate_strength": 0.7037048637866974,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": null,
@@ -2340,8 +2342,8 @@
               "logical_id": "cal-r22",
               "vector": {
                 "candidate": true,
-                "closeness": 0.7037047445774078,
-                "distance": 0.29629525542259216,
+                "closeness": 0.7037048637866974,
+                "distance": 0.2962951362133026,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -2392,7 +2394,7 @@
               }
             },
             {
-              "candidate_strength": 0.46671587228775024,
+              "candidate_strength": 0.466715931892395,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -2406,8 +2408,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.46671587228775024,
-                "distance": 0.5332841277122498,
+                "closeness": 0.466715931892395,
+                "distance": 0.533284068107605,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -2448,11 +2450,11 @@
               "entry",
               "date"
             ],
-            "native_cosine_top_two_distance_margin": 0.18772587180137634,
+            "native_cosine_top_two_distance_margin": 0.1877259910106659,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.7037047445774078
+          "strength": 0.7037048637866974
         },
         "fts_only_returned": [],
         "id": "hybrid-fit-a12",
@@ -2469,7 +2471,7 @@
           "cal-r02",
           "cal-r09"
         ],
-        "strength": 0.7037047445774078,
+        "strength": 0.7037048637866974,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -2509,7 +2511,7 @@
               }
             },
             {
-              "candidate_strength": 0.4124695658683777,
+              "candidate_strength": 0.4124695062637329,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -2523,8 +2525,8 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4124695658683777,
-                "distance": 0.5875304341316223,
+                "closeness": 0.4124695062637329,
+                "distance": 0.5875304937362671,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -2553,7 +2555,7 @@
               }
             },
             {
-              "candidate_strength": 0.3986109495162964,
+              "candidate_strength": 0.39861100912094116,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -2567,8 +2569,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3986109495162964,
-                "distance": 0.6013890504837036,
+                "closeness": 0.39861100912094116,
+                "distance": 0.6013889908790588,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -2608,7 +2610,7 @@
               "homecoming",
               "threshold"
             ],
-            "native_cosine_top_two_distance_margin": 0.10594147443771362,
+            "native_cosine_top_two_distance_margin": 0.1059415340423584,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -2691,7 +2693,7 @@
               }
             },
             {
-              "candidate_strength": 0.4913063049316406,
+              "candidate_strength": 0.4913063645362854,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -2705,15 +2707,15 @@
               "logical_id": "cal-r24",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4913063049316406,
-                "distance": 0.5086936950683594,
+                "closeness": 0.4913063645362854,
+                "distance": 0.5086936354637146,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
               }
             },
             {
-              "candidate_strength": 0.47491616010665894,
+              "candidate_strength": 0.47491639852523804,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -2727,8 +2729,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.47491616010665894,
-                "distance": 0.5250838398933411,
+                "closeness": 0.47491639852523804,
+                "distance": 0.525083601474762,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -2828,7 +2830,7 @@
               }
             },
             {
-              "candidate_strength": 0.33181023597717285,
+              "candidate_strength": 0.3318101167678833,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -3.1710473601575897,
@@ -2842,15 +2844,15 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.33181023597717285,
-                "distance": 0.6681897640228271,
+                "closeness": 0.3318101167678833,
+                "distance": 0.6681898832321167,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 12
               }
             },
             {
-              "candidate_strength": 0.5940819680690765,
+              "candidate_strength": 0.5940819978713989,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -2864,15 +2866,15 @@
               "logical_id": "cal-r25",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5940819680690765,
-                "distance": 0.40591803193092346,
+                "closeness": 0.5940819978713989,
+                "distance": 0.4059180021286011,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
               }
             },
             {
-              "candidate_strength": 0.46420902013778687,
+              "candidate_strength": 0.46420931816101074,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -2886,8 +2888,8 @@
               "logical_id": "cal-r29",
               "vector": {
                 "candidate": true,
-                "closeness": 0.46420902013778687,
-                "distance": 0.5357909798622131,
+                "closeness": 0.46420931816101074,
+                "distance": 0.5357906818389893,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -2930,11 +2932,11 @@
               "soil",
               "pile"
             ],
-            "native_cosine_top_two_distance_margin": 0.12987294793128967,
+            "native_cosine_top_two_distance_margin": 0.12987267971038818,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.5940819680690765
+          "strength": 0.5940819978713989
         },
         "fts_only_returned": [
           "cal-r05",
@@ -2954,7 +2956,7 @@
           "cal-r29",
           "cal-r12"
         ],
-        "strength": 0.5940819680690765,
+        "strength": 0.5940819978713989,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -3130,7 +3132,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.5472633540630341,
+              "candidate_strength": 0.5472631752490997,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": null,
@@ -3144,8 +3146,8 @@
               "logical_id": "cal-r27",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5472633540630341,
-                "distance": 0.45273664593696594,
+                "closeness": 0.5472631752490997,
+                "distance": 0.45273682475090027,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -3252,11 +3254,11 @@
               "extension",
               "rule"
             ],
-            "native_cosine_top_two_distance_margin": 0.03306511044502258,
+            "native_cosine_top_two_distance_margin": 0.03306493163108826,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.5472633540630341
+          "strength": 0.5472631752490997
         },
         "fts_only_returned": [],
         "id": "hybrid-fit-a17",
@@ -3273,7 +3275,7 @@
           "cal-r21",
           "cal-r02"
         ],
-        "strength": 0.5472633540630341,
+        "strength": 0.5472631752490997,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -3291,7 +3293,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.49531108140945435,
+              "candidate_strength": 0.4953111410140991,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": null,
@@ -3305,15 +3307,15 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.49531108140945435,
-                "distance": 0.5046889185905457,
+                "closeness": 0.4953111410140991,
+                "distance": 0.5046888589859009,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
               }
             },
             {
-              "candidate_strength": 0.49228572845458984,
+              "candidate_strength": 0.49228543043136597,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -3327,15 +3329,15 @@
               "logical_id": "cal-r28",
               "vector": {
                 "candidate": true,
-                "closeness": 0.49228572845458984,
-                "distance": 0.5077142715454102,
+                "closeness": 0.49228543043136597,
+                "distance": 0.507714569568634,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
               }
             },
             {
-              "candidate_strength": 0.45706987380981445,
+              "candidate_strength": 0.457069993019104,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -3349,8 +3351,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.45706987380981445,
-                "distance": 0.5429301261901855,
+                "closeness": 0.457069993019104,
+                "distance": 0.542930006980896,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -3412,11 +3414,11 @@
               "minimum",
               "remainder"
             ],
-            "native_cosine_top_two_distance_margin": 0.003025352954864502,
+            "native_cosine_top_two_distance_margin": 0.0030257105827331543,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.49531108140945435
+          "strength": 0.4953111410140991
         },
         "fts_only_returned": [],
         "id": "hybrid-fit-a18",
@@ -3433,7 +3435,7 @@
           "cal-r08",
           "cal-r23"
         ],
-        "strength": 0.49531108140945435,
+        "strength": 0.4953111410140991,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -3451,7 +3453,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.6731801629066467,
+              "candidate_strength": 0.6731804311275482,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": null,
@@ -3465,8 +3467,8 @@
               "logical_id": "cal-r29",
               "vector": {
                 "candidate": true,
-                "closeness": 0.6731801629066467,
-                "distance": 0.32681983709335327,
+                "closeness": 0.6731804311275482,
+                "distance": 0.3268195688724518,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -3495,7 +3497,7 @@
               }
             },
             {
-              "candidate_strength": 0.46100980043411255,
+              "candidate_strength": 0.46100956201553345,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -3509,8 +3511,8 @@
               "logical_id": "cal-r15",
               "vector": {
                 "candidate": true,
-                "closeness": 0.46100980043411255,
-                "distance": 0.5389901995658875,
+                "closeness": 0.46100956201553345,
+                "distance": 0.5389904379844666,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -3574,11 +3576,11 @@
               "safe",
               "dishes"
             ],
-            "native_cosine_top_two_distance_margin": 0.20446383953094482,
+            "native_cosine_top_two_distance_margin": 0.2044641077518463,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.6731801629066467
+          "strength": 0.6731804311275482
         },
         "fts_only_returned": [],
         "id": "hybrid-fit-a19",
@@ -3595,7 +3597,7 @@
           "cal-r37",
           "cal-r12"
         ],
-        "strength": 0.6731801629066467,
+        "strength": 0.6731804311275482,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -3613,7 +3615,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.36785048246383667,
+              "candidate_strength": 0.3678504228591919,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.270835563798912,
@@ -3627,15 +3629,15 @@
               "logical_id": "cal-r24",
               "vector": {
                 "candidate": true,
-                "closeness": 0.36785048246383667,
-                "distance": 0.6321495175361633,
+                "closeness": 0.3678504228591919,
+                "distance": 0.6321495771408081,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 13
               }
             },
             {
-              "candidate_strength": 0.615241676568985,
+              "candidate_strength": 0.6152417361736298,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -3649,8 +3651,8 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.615241676568985,
-                "distance": 0.384758323431015,
+                "closeness": 0.6152417361736298,
+                "distance": 0.38475826382637024,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -3701,7 +3703,7 @@
               }
             },
             {
-              "candidate_strength": 0.43112391233444214,
+              "candidate_strength": 0.43112385272979736,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -3715,8 +3717,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.43112391233444214,
-                "distance": 0.5688760876655579,
+                "closeness": 0.43112385272979736,
+                "distance": 0.5688761472702026,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -3735,11 +3737,11 @@
               "homework",
               "assessment"
             ],
-            "native_cosine_top_two_distance_margin": 0.1421860158443451,
+            "native_cosine_top_two_distance_margin": 0.14218607544898987,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.615241676568985
+          "strength": 0.6152417361736298
         },
         "fts_only_returned": [
           "cal-r24"
@@ -3758,7 +3760,7 @@
           "cal-r08",
           "cal-r11"
         ],
-        "strength": 0.615241676568985,
+        "strength": 0.6152417361736298,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -3798,7 +3800,7 @@
               }
             },
             {
-              "candidate_strength": 0.26546359062194824,
+              "candidate_strength": 0.26546376943588257,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -3.0771676685739764,
@@ -3812,15 +3814,15 @@
               "logical_id": "cal-r03",
               "vector": {
                 "candidate": true,
-                "closeness": 0.26546359062194824,
-                "distance": 0.7345364093780518,
+                "closeness": 0.26546376943588257,
+                "distance": 0.7345362305641174,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 28
               }
             },
             {
-              "candidate_strength": 0.4864453673362732,
+              "candidate_strength": 0.48644548654556274,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -3834,8 +3836,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4864453673362732,
-                "distance": 0.5135546326637268,
+                "closeness": 0.48644548654556274,
+                "distance": 0.5135545134544373,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -3898,11 +3900,11 @@
               "recovery",
               "copies"
             ],
-            "native_cosine_top_two_distance_margin": 0.08215951919555664,
+            "native_cosine_top_two_distance_margin": 0.08215963840484619,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.4864453673362732
+          "strength": 0.48644548654556274
         },
         "id": "hybrid-fit-u01",
         "label": "unanswerable",
@@ -3916,7 +3918,7 @@
           "cal-r32",
           "cal-r09"
         ],
-        "strength": 0.4864453673362732,
+        "strength": 0.48644548654556274,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -4022,7 +4024,7 @@
               }
             },
             {
-              "candidate_strength": 0.2778596878051758,
+              "candidate_strength": 0.27785980701446533,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": -2.572465488018406,
@@ -4036,8 +4038,8 @@
               "logical_id": "cal-r22",
               "vector": {
                 "candidate": true,
-                "closeness": 0.2778596878051758,
-                "distance": 0.7221403121948242,
+                "closeness": 0.27785980701446533,
+                "distance": 0.7221401929855347,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 25
@@ -4116,7 +4118,7 @@
               }
             },
             {
-              "candidate_strength": 0.4764353036880493,
+              "candidate_strength": 0.4764356017112732,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -2.323012829397517,
@@ -4130,15 +4132,15 @@
               "logical_id": "cal-r03",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4764353036880493,
-                "distance": 0.5235646963119507,
+                "closeness": 0.4764356017112732,
+                "distance": 0.5235643982887268,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
               }
             },
             {
-              "candidate_strength": 0.3756570816040039,
+              "candidate_strength": 0.37565743923187256,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -2.448632844193376,
@@ -4152,8 +4154,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3756570816040039,
-                "distance": 0.6243429183959961,
+                "closeness": 0.37565743923187256,
+                "distance": 0.6243425607681274,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 6
@@ -4218,11 +4220,11 @@
               "billing",
               "documents"
             ],
-            "native_cosine_top_two_distance_margin": 0.020551085472106934,
+            "native_cosine_top_two_distance_margin": 0.02055138349533081,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.4764353036880493
+          "strength": 0.4764356017112732
         },
         "id": "hybrid-fit-u03",
         "label": "unanswerable",
@@ -4236,7 +4238,7 @@
           "cal-r26",
           "cal-r34"
         ],
-        "strength": 0.4764353036880493,
+        "strength": 0.4764356017112732,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -4415,7 +4417,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.4579218029975891,
+              "candidate_strength": 0.4579213261604309,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.5087394527202775,
@@ -4429,8 +4431,8 @@
               "logical_id": "cal-r28",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4579218029975891,
-                "distance": 0.5420781970024109,
+                "closeness": 0.4579213261604309,
+                "distance": 0.5420786738395691,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -4503,7 +4505,7 @@
               }
             },
             {
-              "candidate_strength": 0.3220900893211365,
+              "candidate_strength": 0.3220903277397156,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": -1.9253732736948816,
@@ -4517,8 +4519,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3220900893211365,
-                "distance": 0.6779099106788635,
+                "closeness": 0.3220903277397156,
+                "distance": 0.6779096722602844,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 14
@@ -4539,11 +4541,11 @@
               "dry",
               "sensor"
             ],
-            "native_cosine_top_two_distance_margin": 0.08424800634384155,
+            "native_cosine_top_two_distance_margin": 0.08424752950668335,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.4579218029975891
+          "strength": 0.4579213261604309
         },
         "id": "hybrid-fit-u05",
         "label": "unanswerable",
@@ -4557,7 +4559,7 @@
           "cal-r01",
           "cal-r11"
         ],
-        "strength": 0.4579218029975891,
+        "strength": 0.4579213261604309,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -4575,7 +4577,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.36907583475112915,
+              "candidate_strength": 0.3690757155418396,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -4.831537394934115,
@@ -4589,8 +4591,8 @@
               "logical_id": "cal-r28",
               "vector": {
                 "candidate": true,
-                "closeness": 0.36907583475112915,
-                "distance": 0.6309241652488708,
+                "closeness": 0.3690757155418396,
+                "distance": 0.6309242844581604,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 7
@@ -4619,7 +4621,7 @@
               }
             },
             {
-              "candidate_strength": 0.2975483536720276,
+              "candidate_strength": 0.29754841327667236,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -1.8647846042429448,
@@ -4633,15 +4635,15 @@
               "logical_id": "cal-r24",
               "vector": {
                 "candidate": true,
-                "closeness": 0.2975483536720276,
-                "distance": 0.7024516463279724,
+                "closeness": 0.29754841327667236,
+                "distance": 0.7024515867233276,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 23
               }
             },
             {
-              "candidate_strength": 0.26920753717422485,
+              "candidate_strength": 0.2692076563835144,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -1.7543697263601388,
@@ -4655,8 +4657,8 @@
               "logical_id": "cal-r03",
               "vector": {
                 "candidate": true,
-                "closeness": 0.26920753717422485,
-                "distance": 0.7307924628257751,
+                "closeness": 0.2692076563835144,
+                "distance": 0.7307923436164856,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 33
@@ -4699,11 +4701,11 @@
               "interface",
               "controls"
             ],
-            "native_cosine_top_two_distance_margin": 0.05862140655517578,
+            "native_cosine_top_two_distance_margin": 0.05862128734588623,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.36907583475112915
+          "strength": 0.3690757155418396
         },
         "id": "hybrid-fit-u06",
         "label": "unanswerable",
@@ -4717,7 +4719,7 @@
           "cal-r03",
           "cal-r31"
         ],
-        "strength": 0.36907583475112915,
+        "strength": 0.3690757155418396,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -4893,7 +4895,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.5147672593593597,
+              "candidate_strength": 0.5147671699523926,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.611810699793394,
@@ -4907,15 +4909,15 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5147672593593597,
-                "distance": 0.48523274064064026,
+                "closeness": 0.5147671699523926,
+                "distance": 0.4852328300476074,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
               }
             },
             {
-              "candidate_strength": 0.3650328516960144,
+              "candidate_strength": 0.36503297090530396,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -3.270835563798912,
@@ -4929,8 +4931,8 @@
               "logical_id": "cal-r24",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3650328516960144,
-                "distance": 0.6349671483039856,
+                "closeness": 0.36503297090530396,
+                "distance": 0.634967029094696,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 6
@@ -5015,11 +5017,11 @@
               "storage",
               "clients"
             ],
-            "native_cosine_top_two_distance_margin": 0.10156425833702087,
+            "native_cosine_top_two_distance_margin": 0.10156416893005371,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.5147672593593597
+          "strength": 0.5147671699523926
         },
         "id": "hybrid-fit-u08",
         "label": "unanswerable",
@@ -5033,7 +5035,7 @@
           "cal-r09",
           "cal-r36"
         ],
-        "strength": 0.5147672593593597,
+        "strength": 0.5147671699523926,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -5274,7 +5276,7 @@
               }
             },
             {
-              "candidate_strength": 0.38953131437301636,
+              "candidate_strength": 0.38953161239624023,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -1.032490974729242e-06,
@@ -5288,8 +5290,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.38953131437301636,
-                "distance": 0.6104686856269836,
+                "closeness": 0.38953161239624023,
+                "distance": 0.6104683876037598,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -5333,7 +5335,7 @@
               "nuptial",
               "location"
             ],
-            "native_cosine_top_two_distance_margin": 0.16207394003868103,
+            "native_cosine_top_two_distance_margin": 0.16207364201545715,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -5391,7 +5393,7 @@
               }
             },
             {
-              "candidate_strength": 0.5107342898845673,
+              "candidate_strength": 0.5107343196868896,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -0.10781699727907337,
@@ -5405,8 +5407,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5107342898845673,
-                "distance": 0.48926571011543274,
+                "closeness": 0.5107343196868896,
+                "distance": 0.48926568031311035,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -5493,7 +5495,7 @@
               "cryptographic",
               "credentials"
             ],
-            "native_cosine_top_two_distance_margin": 0.005960941314697266,
+            "native_cosine_top_two_distance_margin": 0.005960911512374878,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -5595,7 +5597,7 @@
               }
             },
             {
-              "candidate_strength": 0.33700239658355713,
+              "candidate_strength": 0.3370024561882019,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -0.0918572443923684,
@@ -5609,8 +5611,8 @@
               "logical_id": "cal-r03",
               "vector": {
                 "candidate": true,
-                "closeness": 0.33700239658355713,
-                "distance": 0.6629976034164429,
+                "closeness": 0.3370024561882019,
+                "distance": 0.6629975438117981,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 7
@@ -5734,7 +5736,7 @@
               }
             },
             {
-              "candidate_strength": 0.37643229961395264,
+              "candidate_strength": 0.37643224000930786,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -0.10081083861111913,
@@ -5748,8 +5750,8 @@
               "logical_id": "cal-r25",
               "vector": {
                 "candidate": true,
-                "closeness": 0.37643229961395264,
-                "distance": 0.6235677003860474,
+                "closeness": 0.37643224000930786,
+                "distance": 0.6235677599906921,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -5873,7 +5875,7 @@
               }
             },
             {
-              "candidate_strength": 0.3800774812698364,
+              "candidate_strength": 0.3800773620605469,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -0.10781699727907337,
@@ -5887,15 +5889,15 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3800774812698364,
-                "distance": 0.6199225187301636,
+                "closeness": 0.3800773620605469,
+                "distance": 0.6199226379394531,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
               }
             },
             {
-              "candidate_strength": 0.3604055643081665,
+              "candidate_strength": 0.36040574312210083,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -3.265707028955149,
@@ -5909,8 +5911,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3604055643081665,
-                "distance": 0.6395944356918335,
+                "closeness": 0.36040574312210083,
+                "distance": 0.6395942568778992,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -5975,7 +5977,7 @@
               "simultaneous",
               "storage"
             ],
-            "native_cosine_top_two_distance_margin": 0.0025957822799682617,
+            "native_cosine_top_two_distance_margin": 0.0025959014892578125,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -6099,7 +6101,7 @@
               }
             },
             {
-              "candidate_strength": 0.3432537317276001,
+              "candidate_strength": 0.3432536721229553,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": -0.10781699727907337,
@@ -6113,8 +6115,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3432537317276001,
-                "distance": 0.6567462682723999,
+                "closeness": 0.3432536721229553,
+                "distance": 0.6567463278770447,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 13
@@ -6369,7 +6371,7 @@
               }
             },
             {
-              "candidate_strength": 0.3584674596786499,
+              "candidate_strength": 0.358467161655426,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -6383,15 +6385,15 @@
               "logical_id": "cal-r28",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3584674596786499,
-                "distance": 0.6415325403213501,
+                "closeness": 0.358467161655426,
+                "distance": 0.641532838344574,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
               }
             },
             {
-              "candidate_strength": 0.3471105098724365,
+              "candidate_strength": 0.3471105694770813,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -6405,8 +6407,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3471105098724365,
-                "distance": 0.6528894901275635,
+                "closeness": 0.3471105694770813,
+                "distance": 0.6528894305229187,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -6679,7 +6681,7 @@
               }
             },
             {
-              "candidate_strength": 0.4077497124671936,
+              "candidate_strength": 0.40774959325790405,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -6693,15 +6695,15 @@
               "logical_id": "cal-r25",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4077497124671936,
-                "distance": 0.5922502875328064,
+                "closeness": 0.40774959325790405,
+                "distance": 0.592250406742096,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
               }
             },
             {
-              "candidate_strength": 0.38924092054367065,
+              "candidate_strength": 0.389241099357605,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -6715,8 +6717,8 @@
               "logical_id": "cal-r29",
               "vector": {
                 "candidate": true,
-                "closeness": 0.38924092054367065,
-                "distance": 0.6107590794563293,
+                "closeness": 0.389241099357605,
+                "distance": 0.610758900642395,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -6790,7 +6792,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.4271777272224426,
+              "candidate_strength": 0.4271777868270874,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": null,
@@ -6804,8 +6806,8 @@
               "logical_id": "cal-r35",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4271777272224426,
-                "distance": 0.5728222727775574,
+                "closeness": 0.4271777868270874,
+                "distance": 0.5728222131729126,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -6909,11 +6911,11 @@
               "oxygen",
               "ratios"
             ],
-            "native_cosine_top_two_distance_margin": 0.01302558183670044,
+            "native_cosine_top_two_distance_margin": 0.013025641441345215,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.4271777272224426
+          "strength": 0.4271777868270874
         },
         "id": "hybrid-fit-u20",
         "label": "unanswerable",
@@ -6927,7 +6929,7 @@
           "cal-r05",
           "cal-r08"
         ],
-        "strength": 0.4271777272224426,
+        "strength": 0.4271777868270874,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -7029,7 +7031,7 @@
               }
             },
             {
-              "candidate_strength": 0.4384768605232239,
+              "candidate_strength": 0.4384768009185791,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -2.167000951570496,
@@ -7043,8 +7045,8 @@
               "logical_id": "cal-r27",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4384768605232239,
-                "distance": 0.5615231394767761,
+                "closeness": 0.4384768009185791,
+                "distance": 0.5615231990814209,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 7
@@ -7095,7 +7097,7 @@
               }
             },
             {
-              "candidate_strength": 0.6301155090332031,
+              "candidate_strength": 0.6301157176494598,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -7109,8 +7111,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.6301155090332031,
-                "distance": 0.3698844909667969,
+                "closeness": 0.6301157176494598,
+                "distance": 0.36988428235054016,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -7130,11 +7132,11 @@
               "duty",
               "staff"
             ],
-            "native_cosine_top_two_distance_margin": 0.16883426904678345,
+            "native_cosine_top_two_distance_margin": 0.16883447766304016,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.6301155090332031
+          "strength": 0.6301157176494598
         },
         "fts_only_returned": [
           "cal-r21",
@@ -7156,7 +7158,7 @@
           "cal-r05",
           "cal-r11"
         ],
-        "strength": 0.6301155090332031,
+        "strength": 0.6301157176494598,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -7174,7 +7176,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.4127002954483032,
+              "candidate_strength": 0.412700355052948,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -1.1775154747670582,
@@ -7188,8 +7190,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4127002954483032,
-                "distance": 0.5872997045516968,
+                "closeness": 0.412700355052948,
+                "distance": 0.587299644947052,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -7218,7 +7220,7 @@
               }
             },
             {
-              "candidate_strength": 0.39241915941238403,
+              "candidate_strength": 0.3924192190170288,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -1.0663514264498881,
@@ -7232,15 +7234,15 @@
               "logical_id": "cal-r29",
               "vector": {
                 "candidate": true,
-                "closeness": 0.39241915941238403,
-                "distance": 0.607580840587616,
+                "closeness": 0.3924192190170288,
+                "distance": 0.6075807809829712,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 6
               }
             },
             {
-              "candidate_strength": 0.36366719007492065,
+              "candidate_strength": 0.36366695165634155,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -1.1009982236991624,
@@ -7254,8 +7256,8 @@
               "logical_id": "cal-r15",
               "vector": {
                 "candidate": true,
-                "closeness": 0.36366719007492065,
-                "distance": 0.6363328099250793,
+                "closeness": 0.36366695165634155,
+                "distance": 0.6363330483436584,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 12
@@ -7299,7 +7301,7 @@
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.4127002954483032
+          "strength": 0.412700355052948
         },
         "fts_only_returned": [
           "cal-r06",
@@ -7327,7 +7329,7 @@
           "cal-r15",
           "cal-r14"
         ],
-        "strength": 0.4127002954483032,
+        "strength": 0.412700355052948,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -7345,7 +7347,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.5297565758228302,
+              "candidate_strength": 0.5297567844390869,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.611810699793394,
@@ -7359,8 +7361,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5297565758228302,
-                "distance": 0.4702434241771698,
+                "closeness": 0.5297567844390869,
+                "distance": 0.4702432155609131,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -7465,11 +7467,11 @@
               "input",
               "window"
             ],
-            "native_cosine_top_two_distance_margin": 0.022592991590499878,
+            "native_cosine_top_two_distance_margin": 0.022593200206756592,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.5297565758228302
+          "strength": 0.5297567844390869
         },
         "fts_only_returned": [
           "cal-r02"
@@ -7488,7 +7490,7 @@
           "cal-r38",
           "cal-r33"
         ],
-        "strength": 0.5297565758228302,
+        "strength": 0.5297567844390869,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -7572,7 +7574,7 @@
               }
             },
             {
-              "candidate_strength": 0.5929995179176331,
+              "candidate_strength": 0.5929995477199554,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -7586,8 +7588,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5929995179176331,
-                "distance": 0.40700048208236694,
+                "closeness": 0.5929995477199554,
+                "distance": 0.40700045228004456,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -7628,7 +7630,7 @@
               "remains",
               "usable"
             ],
-            "native_cosine_top_two_distance_margin": 0.03114229440689087,
+            "native_cosine_top_two_distance_margin": 0.03114226460456848,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -7670,7 +7672,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.4142301082611084,
+              "candidate_strength": 0.41422998905181885,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -0.10781699727907337,
@@ -7684,15 +7686,15 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4142301082611084,
-                "distance": 0.5857698917388916,
+                "closeness": 0.41422998905181885,
+                "distance": 0.5857700109481812,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 6
               }
             },
             {
-              "candidate_strength": 0.4684075713157654,
+              "candidate_strength": 0.4684075117111206,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -0.0918572443923684,
@@ -7706,8 +7708,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4684075713157654,
-                "distance": 0.5315924286842346,
+                "closeness": 0.4684075117111206,
+                "distance": 0.5315924882888794,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -7736,7 +7738,7 @@
               }
             },
             {
-              "candidate_strength": 0.35833466053009033,
+              "candidate_strength": 0.3583345413208008,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -0.10081083861111913,
@@ -7750,8 +7752,8 @@
               "logical_id": "cal-r25",
               "vector": {
                 "candidate": true,
-                "closeness": 0.35833466053009033,
-                "distance": 0.6416653394699097,
+                "closeness": 0.3583345413208008,
+                "distance": 0.6416654586791992,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 18
@@ -7790,11 +7792,11 @@
               "and",
               "duration"
             ],
-            "native_cosine_top_two_distance_margin": 0.05417746305465698,
+            "native_cosine_top_two_distance_margin": 0.05417752265930176,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.4684075713157654
+          "strength": 0.4684075117111206
         },
         "fts_only_returned": [
           "cal-r02",
@@ -7831,7 +7833,7 @@
           "cal-r25",
           "cal-r36"
         ],
-        "strength": 0.4684075713157654,
+        "strength": 0.4684075117111206,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -7893,7 +7895,7 @@
               }
             },
             {
-              "candidate_strength": 0.44912075996398926,
+              "candidate_strength": 0.44912123680114746,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -7907,8 +7909,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.44912075996398926,
-                "distance": 0.5508792400360107,
+                "closeness": 0.44912123680114746,
+                "distance": 0.5508787631988525,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -8029,7 +8031,7 @@
               }
             },
             {
-              "candidate_strength": 0.3757769465446472,
+              "candidate_strength": 0.3757765293121338,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -2.6509461277762747,
@@ -8043,8 +8045,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3757769465446472,
-                "distance": 0.6242230534553528,
+                "closeness": 0.3757765293121338,
+                "distance": 0.6242234706878662,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 18
@@ -8095,7 +8097,7 @@
               }
             },
             {
-              "candidate_strength": 0.4743269681930542,
+              "candidate_strength": 0.4743267297744751,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -8109,8 +8111,8 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4743269681930542,
-                "distance": 0.5256730318069458,
+                "closeness": 0.4743267297744751,
+                "distance": 0.5256732702255249,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -8171,7 +8173,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.2602223753929138,
+              "candidate_strength": 0.2602224349975586,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.377108199445808,
@@ -8185,8 +8187,8 @@
               "logical_id": "cal-r25",
               "vector": {
                 "candidate": true,
-                "closeness": 0.2602223753929138,
-                "distance": 0.7397776246070862,
+                "closeness": 0.2602224349975586,
+                "distance": 0.7397775650024414,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 39
@@ -8375,7 +8377,7 @@
               }
             },
             {
-              "candidate_strength": 0.43049031496047974,
+              "candidate_strength": 0.4304903745651245,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -8389,15 +8391,15 @@
               "logical_id": "cal-r35",
               "vector": {
                 "candidate": true,
-                "closeness": 0.43049031496047974,
-                "distance": 0.5695096850395203,
+                "closeness": 0.4304903745651245,
+                "distance": 0.5695096254348755,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
               }
             },
             {
-              "candidate_strength": 0.40987658500671387,
+              "candidate_strength": 0.40987634658813477,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -8411,8 +8413,8 @@
               "logical_id": "cal-r29",
               "vector": {
                 "candidate": true,
-                "closeness": 0.40987658500671387,
-                "distance": 0.5901234149932861,
+                "closeness": 0.40987634658813477,
+                "distance": 0.5901236534118652,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -8452,7 +8454,7 @@
               "warning",
               "threshold"
             ],
-            "native_cosine_top_two_distance_margin": 0.16972321271896362,
+            "native_cosine_top_two_distance_margin": 0.16972315311431885,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -8515,7 +8517,7 @@
               }
             },
             {
-              "candidate_strength": 0.5097118616104126,
+              "candidate_strength": 0.5097120404243469,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -1.9253732736948816,
@@ -8529,15 +8531,15 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5097118616104126,
-                "distance": 0.4902881383895874,
+                "closeness": 0.5097120404243469,
+                "distance": 0.4902879595756531,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 6
               }
             },
             {
-              "candidate_strength": 0.4882802367210388,
+              "candidate_strength": 0.4882800579071045,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -1.8647846042429448,
@@ -8551,8 +8553,8 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4882802367210388,
-                "distance": 0.5117197632789612,
+                "closeness": 0.4882800579071045,
+                "distance": 0.5117199420928955,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 10
@@ -8615,7 +8617,7 @@
               "opting",
               "out"
             ],
-            "native_cosine_top_two_distance_margin": 0.07366150617599487,
+            "native_cosine_top_two_distance_margin": 0.07366132736206055,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -8682,7 +8684,7 @@
               }
             },
             {
-              "candidate_strength": 0.48080235719680786,
+              "candidate_strength": 0.48080217838287354,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -2.6509461277762747,
@@ -8696,8 +8698,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.48080235719680786,
-                "distance": 0.5191976428031921,
+                "closeness": 0.48080217838287354,
+                "distance": 0.5191978216171265,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -8849,7 +8851,7 @@
               }
             },
             {
-              "candidate_strength": 0.43499332666397095,
+              "candidate_strength": 0.4349934458732605,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -8863,8 +8865,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.43499332666397095,
-                "distance": 0.565006673336029,
+                "closeness": 0.4349934458732605,
+                "distance": 0.5650065541267395,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -8948,7 +8950,7 @@
               "web",
               "thumbnail"
             ],
-            "native_cosine_top_two_distance_margin": 0.06803268194198608,
+            "native_cosine_top_two_distance_margin": 0.06803256273269653,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -9009,7 +9011,7 @@
               }
             },
             {
-              "candidate_strength": 0.3195752501487732,
+              "candidate_strength": 0.31957513093948364,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -3.270835563798912,
@@ -9023,8 +9025,8 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3195752501487732,
-                "distance": 0.6804247498512268,
+                "closeness": 0.31957513093948364,
+                "distance": 0.6804248690605164,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 34
@@ -9075,7 +9077,7 @@
               }
             },
             {
-              "candidate_strength": 0.47268539667129517,
+              "candidate_strength": 0.47268521785736084,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -9089,8 +9091,8 @@
               "logical_id": "cal-r28",
               "vector": {
                 "candidate": true,
-                "closeness": 0.47268539667129517,
-                "distance": 0.5273146033287048,
+                "closeness": 0.47268521785736084,
+                "distance": 0.5273147821426392,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -9175,7 +9177,7 @@
               }
             },
             {
-              "candidate_strength": 0.6978766918182373,
+              "candidate_strength": 0.6978763937950134,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -9189,8 +9191,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.6978766918182373,
-                "distance": 0.3021233081817627,
+                "closeness": 0.6978763937950134,
+                "distance": 0.3021236062049866,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -9241,7 +9243,7 @@
               }
             },
             {
-              "candidate_strength": 0.491457998752594,
+              "candidate_strength": 0.4914577603340149,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -9255,8 +9257,8 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.491457998752594,
-                "distance": 0.508542001247406,
+                "closeness": 0.4914577603340149,
+                "distance": 0.5085422396659851,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -9276,11 +9278,11 @@
               "reimbursement",
               "request"
             ],
-            "native_cosine_top_two_distance_margin": 0.12832865118980408,
+            "native_cosine_top_two_distance_margin": 0.1283283531665802,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.6978766918182373
+          "strength": 0.6978763937950134
         },
         "fts_only_returned": [
           "cal-r21"
@@ -9299,7 +9301,7 @@
           "cal-r17",
           "cal-r30"
         ],
-        "strength": 0.6978766918182373,
+        "strength": 0.6978763937950134,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -9317,7 +9319,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.3682980537414551,
+              "candidate_strength": 0.36829811334609985,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -1.8647846042429448,
@@ -9331,8 +9333,8 @@
               "logical_id": "cal-r24",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3682980537414551,
-                "distance": 0.6317019462585449,
+                "closeness": 0.36829811334609985,
+                "distance": 0.6317018866539001,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 7
@@ -9383,7 +9385,7 @@
               }
             },
             {
-              "candidate_strength": 0.3002426028251648,
+              "candidate_strength": 0.30024254322052,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -1.7543697263601388,
@@ -9397,15 +9399,15 @@
               "logical_id": "cal-r03",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3002426028251648,
-                "distance": 0.6997573971748352,
+                "closeness": 0.30024254322052,
+                "distance": 0.69975745677948,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 33
               }
             },
             {
-              "candidate_strength": 0.3029700517654419,
+              "candidate_strength": 0.30296993255615234,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": -1.7543697263601388,
@@ -9419,8 +9421,8 @@
               "logical_id": "cal-r28",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3029700517654419,
-                "distance": 0.6970299482345581,
+                "closeness": 0.30296993255615234,
+                "distance": 0.6970300674438477,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 32
@@ -9440,11 +9442,11 @@
               "clinical",
               "specimens"
             ],
-            "native_cosine_top_two_distance_margin": 0.011019527912139893,
+            "native_cosine_top_two_distance_margin": 0.011019587516784668,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.3682980537414551
+          "strength": 0.36829811334609985
         },
         "fts_only_returned": [
           "cal-r23",
@@ -9467,7 +9469,7 @@
           "cal-r03",
           "cal-r28"
         ],
-        "strength": 0.3682980537414551,
+        "strength": 0.36829811334609985,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -9485,7 +9487,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.39415043592453003,
+              "candidate_strength": 0.3941505551338196,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.0771676685739764,
@@ -9499,8 +9501,8 @@
               "logical_id": "cal-r03",
               "vector": {
                 "candidate": true,
-                "closeness": 0.39415043592453003,
-                "distance": 0.60584956407547,
+                "closeness": 0.3941505551338196,
+                "distance": 0.6058494448661804,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 15
@@ -9551,7 +9553,7 @@
               }
             },
             {
-              "candidate_strength": 0.46441471576690674,
+              "candidate_strength": 0.4644145965576172,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -9565,8 +9567,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.46441471576690674,
-                "distance": 0.5355852842330933,
+                "closeness": 0.4644145965576172,
+                "distance": 0.5355854034423828,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -9669,7 +9671,7 @@
               }
             },
             {
-              "candidate_strength": 0.3895544409751892,
+              "candidate_strength": 0.38955461978912354,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -1.2853324720461314,
@@ -9683,8 +9685,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3895544409751892,
-                "distance": 0.6104455590248108,
+                "closeness": 0.38955461978912354,
+                "distance": 0.6104453802108765,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 10
@@ -9903,7 +9905,7 @@
               }
             },
             {
-              "candidate_strength": 0.527680367231369,
+              "candidate_strength": 0.5276803374290466,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -9917,8 +9919,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.527680367231369,
-                "distance": 0.472319632768631,
+                "closeness": 0.5276803374290466,
+                "distance": 0.47231966257095337,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -10022,7 +10024,7 @@
               }
             },
             {
-              "candidate_strength": 0.48132598400115967,
+              "candidate_strength": 0.481326162815094,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -10036,8 +10038,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.48132598400115967,
-                "distance": 0.5186740159988403,
+                "closeness": 0.481326162815094,
+                "distance": 0.518673837184906,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -10122,7 +10124,7 @@
               "phone",
               "details"
             ],
-            "native_cosine_top_two_distance_margin": 0.14106601476669312,
+            "native_cosine_top_two_distance_margin": 0.1410658359527588,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -10161,7 +10163,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.49234145879745483,
+              "candidate_strength": 0.4923415780067444,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.270835563798912,
@@ -10175,8 +10177,8 @@
               "logical_id": "cal-r13",
               "vector": {
                 "candidate": true,
-                "closeness": 0.49234145879745483,
-                "distance": 0.5076585412025452,
+                "closeness": 0.4923415780067444,
+                "distance": 0.5076584219932556,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -10249,7 +10251,7 @@
               }
             },
             {
-              "candidate_strength": 0.46075254678726196,
+              "candidate_strength": 0.4607522487640381,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -10263,8 +10265,8 @@
               "logical_id": "cal-r35",
               "vector": {
                 "candidate": true,
-                "closeness": 0.46075254678726196,
-                "distance": 0.539247453212738,
+                "closeness": 0.4607522487640381,
+                "distance": 0.5392477512359619,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -10282,7 +10284,7 @@
               "sanitation",
               "events"
             ],
-            "native_cosine_top_two_distance_margin": 0.11420142650604248,
+            "native_cosine_top_two_distance_margin": 0.11420130729675293,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -10346,7 +10348,7 @@
               }
             },
             {
-              "candidate_strength": 0.48147690296173096,
+              "candidate_strength": 0.4814770221710205,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -3.270835563798912,
@@ -10360,8 +10362,8 @@
               "logical_id": "cal-r30",
               "vector": {
                 "candidate": true,
-                "closeness": 0.48147690296173096,
-                "distance": 0.518523097038269,
+                "closeness": 0.4814770221710205,
+                "distance": 0.5185229778289795,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 11
@@ -10390,7 +10392,7 @@
               }
             },
             {
-              "candidate_strength": 0.47710514068603516,
+              "candidate_strength": 0.47710520029067993,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -2.5724641700460555,
@@ -10404,8 +10406,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.47710514068603516,
-                "distance": 0.5228948593139648,
+                "closeness": 0.47710520029067993,
+                "distance": 0.5228947997093201,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 12
@@ -10485,7 +10487,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.42334187030792236,
+              "candidate_strength": 0.42334192991256714,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.1710473601575897,
@@ -10499,8 +10501,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.42334187030792236,
-                "distance": 0.5766581296920776,
+                "closeness": 0.42334192991256714,
+                "distance": 0.5766580700874329,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -10573,7 +10575,7 @@
               }
             },
             {
-              "candidate_strength": 0.3297668695449829,
+              "candidate_strength": 0.32976704835891724,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -10587,8 +10589,8 @@
               "logical_id": "cal-r29",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3297668695449829,
-                "distance": 0.6702331304550171,
+                "closeness": 0.32976704835891724,
+                "distance": 0.6702329516410828,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -10607,7 +10609,7 @@
               "shipping",
               "contents"
             ],
-            "native_cosine_top_two_distance_margin": 0.01555246114730835,
+            "native_cosine_top_two_distance_margin": 0.015552401542663574,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -10643,7 +10645,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.5445368587970734,
+              "candidate_strength": 0.5445367693901062,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.611810699793394,
@@ -10657,15 +10659,15 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.5445368587970734,
-                "distance": 0.45546314120292664,
+                "closeness": 0.5445367693901062,
+                "distance": 0.4554632306098938,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
               }
             },
             {
-              "candidate_strength": 0.289054274559021,
+              "candidate_strength": 0.2890542149543762,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -3.1710473601575897,
@@ -10679,15 +10681,15 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.289054274559021,
-                "distance": 0.710945725440979,
+                "closeness": 0.2890542149543762,
+                "distance": 0.7109457850456238,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 32
               }
             },
             {
-              "candidate_strength": 0.4669340252876282,
+              "candidate_strength": 0.4669342637062073,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -10701,8 +10703,8 @@
               "logical_id": "cal-r13",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4669340252876282,
-                "distance": 0.5330659747123718,
+                "closeness": 0.4669342637062073,
+                "distance": 0.5330657362937927,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -10765,11 +10767,11 @@
               "reporting",
               "output"
             ],
-            "native_cosine_top_two_distance_margin": 0.07760283350944519,
+            "native_cosine_top_two_distance_margin": 0.07760250568389893,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.5445368587970734
+          "strength": 0.5445367693901062
         },
         "id": "hybrid-held-u03",
         "label": "unanswerable",
@@ -10783,7 +10785,7 @@
           "cal-r18",
           "cal-r32"
         ],
-        "strength": 0.5445368587970734,
+        "strength": 0.5445367693901062,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -10845,7 +10847,7 @@
               }
             },
             {
-              "candidate_strength": 0.3712879419326782,
+              "candidate_strength": 0.3712877631187439,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -2.4984955517380225,
@@ -10859,15 +10861,15 @@
               "logical_id": "cal-r27",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3712879419326782,
-                "distance": 0.6287120580673218,
+                "closeness": 0.3712877631187439,
+                "distance": 0.6287122368812561,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 8
               }
             },
             {
-              "candidate_strength": 0.316378653049469,
+              "candidate_strength": 0.31637871265411377,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -1.8647846042429448,
@@ -10881,15 +10883,15 @@
               "logical_id": "cal-r29",
               "vector": {
                 "candidate": true,
-                "closeness": 0.316378653049469,
-                "distance": 0.683621346950531,
+                "closeness": 0.31637871265411377,
+                "distance": 0.6836212873458862,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 20
               }
             },
             {
-              "candidate_strength": 0.3195829391479492,
+              "candidate_strength": 0.319582998752594,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": -1.7543697263601388,
@@ -10903,8 +10905,8 @@
               "logical_id": "cal-r28",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3195829391479492,
-                "distance": 0.6804170608520508,
+                "closeness": 0.319582998752594,
+                "distance": 0.680417001247406,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 19
@@ -10959,7 +10961,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.2835296392440796,
+              "candidate_strength": 0.2835298776626587,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.377108199445808,
@@ -10973,15 +10975,15 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.2835296392440796,
-                "distance": 0.7164703607559204,
+                "closeness": 0.2835298776626587,
+                "distance": 0.7164701223373413,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 18
               }
             },
             {
-              "candidate_strength": 0.42695432901382446,
+              "candidate_strength": 0.42695409059524536,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -10995,15 +10997,15 @@
               "logical_id": "cal-r15",
               "vector": {
                 "candidate": true,
-                "closeness": 0.42695432901382446,
-                "distance": 0.5730456709861755,
+                "closeness": 0.42695409059524536,
+                "distance": 0.5730459094047546,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
               }
             },
             {
-              "candidate_strength": 0.3931242823600769,
+              "candidate_strength": 0.39312416315078735,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -11017,8 +11019,8 @@
               "logical_id": "cal-r25",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3931242823600769,
-                "distance": 0.6068757176399231,
+                "closeness": 0.39312416315078735,
+                "distance": 0.6068758368492126,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -11080,11 +11082,11 @@
               "bread",
               "fermentation"
             ],
-            "native_cosine_top_two_distance_margin": 0.03383004665374756,
+            "native_cosine_top_two_distance_margin": 0.03382992744445801,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.42695432901382446
+          "strength": 0.42695409059524536
         },
         "id": "hybrid-held-u05",
         "label": "unanswerable",
@@ -11098,7 +11100,7 @@
           "cal-r33",
           "cal-r12"
         ],
-        "strength": 0.42695432901382446,
+        "strength": 0.42695409059524536,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -11160,7 +11162,7 @@
               }
             },
             {
-              "candidate_strength": 0.3692553639411926,
+              "candidate_strength": 0.3692554831504822,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": -3.3771092319367826,
@@ -11174,8 +11176,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3692553639411926,
-                "distance": 0.6307446360588074,
+                "closeness": 0.3692554831504822,
+                "distance": 0.6307445168495178,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 11
@@ -11363,7 +11365,7 @@
               }
             },
             {
-              "candidate_strength": 0.4034116864204407,
+              "candidate_strength": 0.403411865234375,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -11377,8 +11379,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4034116864204407,
-                "distance": 0.5965883135795593,
+                "closeness": 0.403411865234375,
+                "distance": 0.596588134765625,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -11454,7 +11456,7 @@
               }
             },
             {
-              "candidate_strength": 0.2880627512931824,
+              "candidate_strength": 0.2880626916885376,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -3.377108199445808,
@@ -11468,8 +11470,8 @@
               "logical_id": "cal-r25",
               "vector": {
                 "candidate": true,
-                "closeness": 0.2880627512931824,
-                "distance": 0.7119372487068176,
+                "closeness": 0.2880626916885376,
+                "distance": 0.7119373083114624,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 24
@@ -11611,7 +11613,7 @@
               }
             },
             {
-              "candidate_strength": 0.26563531160354614,
+              "candidate_strength": 0.2656351923942566,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -1.3179723502304148e-06,
@@ -11625,8 +11627,8 @@
               "logical_id": "cal-r22",
               "vector": {
                 "candidate": true,
-                "closeness": 0.26563531160354614,
-                "distance": 0.7343646883964539,
+                "closeness": 0.2656351923942566,
+                "distance": 0.7343648076057434,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 9
@@ -11790,7 +11792,7 @@
               }
             },
             {
-              "candidate_strength": 0.4870682954788208,
+              "candidate_strength": 0.4870681166648865,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -11804,8 +11806,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4870682954788208,
-                "distance": 0.5129317045211792,
+                "closeness": 0.4870681166648865,
+                "distance": 0.5129318833351135,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -11834,7 +11836,7 @@
               }
             },
             {
-              "candidate_strength": 0.4655880928039551,
+              "candidate_strength": 0.4655882716178894,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -11848,8 +11850,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.4655880928039551,
-                "distance": 0.5344119071960449,
+                "closeness": 0.4655882716178894,
+                "distance": 0.5344117283821106,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -11903,7 +11905,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.42166030406951904,
+              "candidate_strength": 0.4216601252555847,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": -3.265707028955149,
@@ -11917,8 +11919,8 @@
               "logical_id": "cal-r34",
               "vector": {
                 "candidate": true,
-                "closeness": 0.42166030406951904,
-                "distance": 0.578339695930481,
+                "closeness": 0.4216601252555847,
+                "distance": 0.5783398747444153,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
@@ -12027,11 +12029,11 @@
               "duty",
               "alerts"
             ],
-            "native_cosine_top_two_distance_margin": 0.020207524299621582,
+            "native_cosine_top_two_distance_margin": 0.020207345485687256,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.42166030406951904
+          "strength": 0.4216601252555847
         },
         "id": "hybrid-held-u11",
         "label": "unanswerable",
@@ -12045,7 +12047,7 @@
           "cal-r16",
           "cal-r38"
         ],
-        "strength": 0.42166030406951904,
+        "strength": 0.4216601252555847,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -12246,7 +12248,7 @@
               }
             },
             {
-              "candidate_strength": 0.3678380250930786,
+              "candidate_strength": 0.36783796548843384,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": -0.10081083861111913,
@@ -12260,8 +12262,8 @@
               "logical_id": "cal-r25",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3678380250930786,
-                "distance": 0.6321619749069214,
+                "closeness": 0.36783796548843384,
+                "distance": 0.6321620345115662,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -12609,7 +12611,7 @@
               }
             },
             {
-              "candidate_strength": 0.3863668441772461,
+              "candidate_strength": 0.3863667845726013,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": -0.0918572443923684,
@@ -12623,8 +12625,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3863668441772461,
-                "distance": 0.6136331558227539,
+                "closeness": 0.3863667845726013,
+                "distance": 0.6136332154273987,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -12666,11 +12668,11 @@
               "service",
               "termination"
             ],
-            "native_cosine_top_two_distance_margin": 0.02374500036239624,
+            "native_cosine_top_two_distance_margin": 0.023744940757751465,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.3863668441772461
+          "strength": 0.3863667845726013
         },
         "id": "hybrid-held-u15",
         "label": "unanswerable",
@@ -12684,7 +12686,7 @@
           "cal-r19",
           "cal-r12"
         ],
-        "strength": 0.3863668441772461,
+        "strength": 0.3863667845726013,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -12790,7 +12792,7 @@
               }
             },
             {
-              "candidate_strength": 0.36932629346847534,
+              "candidate_strength": 0.3693263530731201,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -12804,8 +12806,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.36932629346847534,
-                "distance": 0.6306737065315247,
+                "closeness": 0.3693263530731201,
+                "distance": 0.6306736469268799,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -12901,7 +12903,7 @@
               }
             },
             {
-              "candidate_strength": 0.3774205446243286,
+              "candidate_strength": 0.37742048501968384,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -12915,8 +12917,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3774205446243286,
-                "distance": 0.6225794553756714,
+                "closeness": 0.37742048501968384,
+                "distance": 0.6225795149803162,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -12945,7 +12947,7 @@
               }
             },
             {
-              "candidate_strength": 0.3593357801437378,
+              "candidate_strength": 0.35933566093444824,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -12959,8 +12961,8 @@
               "logical_id": "cal-r35",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3593357801437378,
-                "distance": 0.6406642198562622,
+                "closeness": 0.35933566093444824,
+                "distance": 0.6406643390655518,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -13034,7 +13036,7 @@
               }
             },
             {
-              "candidate_strength": 0.39591723680496216,
+              "candidate_strength": 0.39591729640960693,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -13048,15 +13050,15 @@
               "logical_id": "cal-r35",
               "vector": {
                 "candidate": true,
-                "closeness": 0.39591723680496216,
-                "distance": 0.6040827631950378,
+                "closeness": 0.39591729640960693,
+                "distance": 0.6040827035903931,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
               }
             },
             {
-              "candidate_strength": 0.38727325201034546,
+              "candidate_strength": 0.3872731924057007,
               "final_rank": 3,
               "fts": {
                 "bm25_raw": null,
@@ -13070,8 +13072,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.38727325201034546,
-                "distance": 0.6127267479896545,
+                "closeness": 0.3872731924057007,
+                "distance": 0.6127268075942993,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 3
@@ -13132,7 +13134,7 @@
               "flute",
               "acoustics"
             ],
-            "native_cosine_top_two_distance_margin": 0.0026596784591674805,
+            "native_cosine_top_two_distance_margin": 0.002659618854522705,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
@@ -13234,7 +13236,7 @@
               }
             },
             {
-              "candidate_strength": 0.3960202932357788,
+              "candidate_strength": 0.3960201144218445,
               "final_rank": 4,
               "fts": {
                 "bm25_raw": null,
@@ -13248,8 +13250,8 @@
               "logical_id": "cal-r02",
               "vector": {
                 "candidate": true,
-                "closeness": 0.3960202932357788,
-                "distance": 0.6039797067642212,
+                "closeness": 0.3960201144218445,
+                "distance": 0.6039798855781555,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 4
@@ -13323,7 +13325,7 @@
           "candidate_count": 5,
           "candidates": [
             {
-              "candidate_strength": 0.419155478477478,
+              "candidate_strength": 0.41915565729141235,
               "final_rank": 1,
               "fts": {
                 "bm25_raw": null,
@@ -13337,15 +13339,15 @@
               "logical_id": "cal-r35",
               "vector": {
                 "candidate": true,
-                "closeness": 0.419155478477478,
-                "distance": 0.580844521522522,
+                "closeness": 0.41915565729141235,
+                "distance": 0.5808443427085876,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 1
               }
             },
             {
-              "candidate_strength": 0.403511106967926,
+              "candidate_strength": 0.4035114049911499,
               "final_rank": 2,
               "fts": {
                 "bm25_raw": null,
@@ -13359,8 +13361,8 @@
               "logical_id": "cal-r11",
               "vector": {
                 "candidate": true,
-                "closeness": 0.403511106967926,
-                "distance": 0.596488893032074,
+                "closeness": 0.4035114049911499,
+                "distance": 0.5964885950088501,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 2
@@ -13411,7 +13413,7 @@
               }
             },
             {
-              "candidate_strength": 0.39312487840652466,
+              "candidate_strength": 0.393125057220459,
               "final_rank": 5,
               "fts": {
                 "bm25_raw": null,
@@ -13425,8 +13427,8 @@
               "logical_id": "cal-r19",
               "vector": {
                 "candidate": true,
-                "closeness": 0.39312487840652466,
-                "distance": 0.6068751215934753,
+                "closeness": 0.393125057220459,
+                "distance": 0.606874942779541,
                 "eligible_for_strength": true,
                 "metric": "cosine_distance",
                 "rank": 5
@@ -13442,11 +13444,11 @@
               "pressure",
               "flaking"
             ],
-            "native_cosine_top_two_distance_margin": 0.015644371509552002,
+            "native_cosine_top_two_distance_margin": 0.01564425230026245,
             "rrf_score_read_by_feature": false
           },
           "feature_implementation": "haunt-abstention-feasibility-v1",
-          "strength": 0.419155478477478
+          "strength": 0.41915565729141235
         },
         "id": "hybrid-held-u20",
         "label": "unanswerable",
@@ -13460,7 +13462,7 @@
           "cal-r12",
           "cal-r19"
         ],
-        "strength": 0.419155478477478,
+        "strength": 0.41915565729141235,
         "vector_profile": {
           "candidate_metrics": [
             "cosine_distance"
@@ -13483,15 +13485,15 @@
           "negative_vector_margin": 0.07866066694259644,
           "positive_case_id": "hybrid-held-a12",
           "positive_strength": 0.503026008605957,
-          "positive_vector_margin": 0.06803268194198608
+          "positive_vector_margin": 0.06803256273269653
         },
         {
           "negative_case_id": "hybrid-held-u01",
           "negative_strength": 0.6126964390277863,
           "negative_vector_margin": 0.07866066694259644,
           "positive_case_id": "hybrid-held-a03",
-          "positive_strength": 0.5297565758228302,
-          "positive_vector_margin": 0.022592991590499878
+          "positive_strength": 0.5297567844390869,
+          "positive_vector_margin": 0.022593200206756592
         },
         {
           "negative_case_id": "hybrid-held-u01",
@@ -13507,7 +13509,7 @@
           "negative_vector_margin": 0.1345916986465454,
           "positive_case_id": "hybrid-held-a12",
           "positive_strength": 0.503026008605957,
-          "positive_vector_margin": 0.06803268194198608
+          "positive_vector_margin": 0.06803256273269653
         },
         {
           "negative_case_id": "hybrid-held-u01",
@@ -13523,7 +13525,7 @@
           "negative_vector_margin": 0.14160653948783875,
           "positive_case_id": "hybrid-held-a12",
           "positive_strength": 0.503026008605957,
-          "positive_vector_margin": 0.06803268194198608
+          "positive_vector_margin": 0.06803256273269653
         },
         {
           "negative_case_id": "hybrid-held-u01",
@@ -13535,27 +13537,27 @@
         },
         {
           "negative_case_id": "hybrid-held-u03",
-          "negative_strength": 0.5445368587970734,
-          "negative_vector_margin": 0.07760283350944519,
+          "negative_strength": 0.5445367693901062,
+          "negative_vector_margin": 0.07760250568389893,
           "positive_case_id": "hybrid-held-a12",
           "positive_strength": 0.503026008605957,
-          "positive_vector_margin": 0.06803268194198608
+          "positive_vector_margin": 0.06803256273269653
         },
         {
           "negative_case_id": "hybrid-held-u07",
           "negative_strength": 0.565377950668335,
           "negative_vector_margin": 0.1345916986465454,
           "positive_case_id": "hybrid-held-a03",
-          "positive_strength": 0.5297565758228302,
-          "positive_vector_margin": 0.022592991590499878
+          "positive_strength": 0.5297567844390869,
+          "positive_vector_margin": 0.022593200206756592
         },
         {
           "negative_case_id": "hybrid-held-u06",
           "negative_strength": 0.5568229258060455,
           "negative_vector_margin": 0.14160653948783875,
           "positive_case_id": "hybrid-held-a03",
-          "positive_strength": 0.5297565758228302,
-          "positive_vector_margin": 0.022592991590499878
+          "positive_strength": 0.5297567844390869,
+          "positive_vector_margin": 0.022593200206756592
         },
         {
           "negative_case_id": "hybrid-held-u07",
@@ -13575,11 +13577,11 @@
         },
         {
           "negative_case_id": "hybrid-held-u03",
-          "negative_strength": 0.5445368587970734,
-          "negative_vector_margin": 0.07760283350944519,
+          "negative_strength": 0.5445367693901062,
+          "negative_vector_margin": 0.07760250568389893,
           "positive_case_id": "hybrid-held-a03",
-          "positive_strength": 0.5297565758228302,
-          "positive_vector_margin": 0.022592991590499878
+          "positive_strength": 0.5297567844390869,
+          "positive_vector_margin": 0.022593200206756592
         },
         {
           "negative_case_id": "hybrid-held-u06",
@@ -13671,7 +13673,7 @@
       {
         "details": {
           "boundary": 0.6240921914577485,
-          "fit_report_canonical_sha256": "ed61c2b5a7a87e45be6aa7c381f96681b2e0908675756d6f902c85640248fad3"
+          "fit_report_canonical_sha256": "4039a993396d417f33d5b7071af290eac1ab93c5f5f2ef1ec1ca2ec9edf4c6f2"
         },
         "event": "fit_boundary_complete"
       },
@@ -13775,9 +13777,16 @@
     "vector_metric": "cosine_distance"
   },
   "public_runtime_policy": {
-    "base_revision": "ed806b2",
     "diff": "",
     "diff_empty": true,
+    "e6_commits": [
+      "d5b204c7c7a110c7aa2f6555ca507bebc3ba6798",
+      "b7c557bc6914dbde22c51714ccd0982383404c10",
+      "0a176a49b5e74a7f41c755da5fbb14c46789b19e",
+      "659b852bfd45d37ef6c5f6552d227bad2466ef01",
+      "8170426fca11257af4d846095e5c1cfe74c2137e"
+    ],
+    "history_attributable": true,
     "paths": [
       "pyproject.toml",
       "src/haunt/__init__.py",
@@ -13786,32 +13795,43 @@
       "src/haunt/cli.py",
       "src/haunt/mcp_server.py",
       "src/haunt/dashboard.py"
-    ]
+    ],
+    "uncommitted_paths": [],
+    "uncommitted_unattributed": false
   },
   "report_id": "haunt-abstention-feasibility-hybrid-v1",
   "runtime_policy_shipped": false,
   "schema_version": 1,
   "sealed_e0": {
-    "base_revision": "ed806b2",
     "byte_mismatches": [],
     "diff": "",
     "diff_empty": true,
+    "e6_commits": [
+      "d5b204c7c7a110c7aa2f6555ca507bebc3ba6798",
+      "b7c557bc6914dbde22c51714ccd0982383404c10",
+      "0a176a49b5e74a7f41c755da5fbb14c46789b19e",
+      "659b852bfd45d37ef6c5f6552d227bad2466ef01",
+      "8170426fca11257af4d846095e5c1cfe74c2137e"
+    ],
+    "history_attributable": true,
     "paths": [
       "src/haunt/frozen_retrieval_eval.py",
       "tests/fixtures/retrieval_eval",
       "tests/test_frozen_retrieval_eval.py"
     ],
     "tracked_file_count": 5,
+    "uncommitted_paths": [],
+    "uncommitted_unattributed": false,
     "working_tree_byte_sha256": {
-      "src/haunt/frozen_retrieval_eval.py": "561d3054138a2c040d7d009e4220794d5a739e01713eb05ef4e0e2a95f3cc7ee",
-      "tests/fixtures/retrieval_eval/README.md": "3b8d0d5950fcd199df6d06949a23b8c774cef6d06b72d8dc34e2a2fbbc2de1ee",
-      "tests/fixtures/retrieval_eval/baseline.json": "edd0a15873e547aec29ac372ad0c57c34811faab28b86bb98149ae221a760f85",
-      "tests/fixtures/retrieval_eval/corpus.json": "50cd13d92d8b85e0e75c9fd3a39c9b520b5b2a7905060ecf033be7d8fb14cbc0",
-      "tests/test_frozen_retrieval_eval.py": "d717506a7c46c4085a281f8dd7f7af9abfd2fbd143e8581e1dbaa8131851df38"
+      "src/haunt/frozen_retrieval_eval.py": "21eb4639c1526920e0621a35204563ff85fa9671e27ff3b4ad40bba4d2c847fd",
+      "tests/fixtures/retrieval_eval/README.md": "9d14bb361a278eaf692239164d04ba542af755d9b5a7ad14da4ddf64d47a5013",
+      "tests/fixtures/retrieval_eval/baseline.json": "38697d85ae324ae055a5a624f7166153d3ad7237a656e83634f423a3c3c7d4e3",
+      "tests/fixtures/retrieval_eval/corpus.json": "906061d5c1cc877c1b5ee9e10a2d38027bb7b0b1d55c34797f77537a33562459",
+      "tests/test_frozen_retrieval_eval.py": "fabec348b2ea7aabd5e22f89e8f9ade096b206434d86c8aecc0f8d2b2a78c4b9"
     }
   },
   "separation_from_e0": {
-    "e0_canonical_dataset_sha256": "838e0efbb4bb63e6dc9b064b71a63307d1a942e14782c1d38f60ac4cc451ea09",
+    "e0_canonical_dataset_sha256": "6a73167821408dfdb40293e5f11fb72d39052de10bb62b9e2fe7314f8676c607",
     "e6_logical_id_count": 40,
     "e6_query_hash_count": 160,
     "e6_record_hash_count": 40,

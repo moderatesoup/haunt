@@ -690,7 +690,8 @@ does not support the query.
   physically separate. The held-label file is first opened only after the
   fit-only boundary exists; the composite manifest is first opened and verified
   after held-out scoring, where it reconstructs the same frozen dataset hash.
-- The FTS-only fit cohort is separable at `0.875`; held-out Recall@5,
+- The FTS-only fit cohort is separable at the strict fit-only
+  `nextafter(0.75, +infinity) = 0.7500000000000001` boundary; held-out Recall@5,
   conditional retention, and negative abstention are all `1.0`. This proves the
   harness but does not close E6 because a separate pinned hybrid profile is
   required.

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 import shutil
 import socket
 import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -16,9 +18,12 @@ import pytest
 from haunt import abstention_eval, embed
 from haunt.abstention_eval import (
     FEATURE_DEFINITION,
+    FitLabel,
     FitLabels,
+    RetrievalObservation,
     _coverage_many,
     _evidence,
+    _score,
     analyze_fit,
     canonical_hash,
     classify_vector_profile,
@@ -74,6 +79,109 @@ def _sparse_manifest_cache(root: Path) -> dict:
         with path.open("wb") as stream:
             stream.truncate(row["size"])
     return manifest
+
+
+def _boundary_fit(
+    negative_strengths: list[float], positive_strengths: list[float]
+) -> tuple[list[RetrievalObservation], FitLabels]:
+    observations: list[RetrievalObservation] = []
+    labels: dict[str, FitLabel] = {}
+    for index, strength in enumerate(negative_strengths):
+        case_id = f"negative-{index}"
+        observations.append(
+            RetrievalObservation(
+                case_id=case_id,
+                returned=("irrelevant",),
+                evidence={
+                    "strength": strength,
+                    "diagnostics": {
+                        "native_cosine_top_two_distance_margin": None,
+                    },
+                },
+                vector_profile={},
+            )
+        )
+        labels[case_id] = FitLabel("unanswerable", ())
+    for index, strength in enumerate(positive_strengths):
+        case_id = f"positive-{index}"
+        logical_id = f"relevant-{index}"
+        observations.append(
+            RetrievalObservation(
+                case_id=case_id,
+                returned=(logical_id,),
+                evidence={
+                    "strength": strength,
+                    "diagnostics": {
+                        "native_cosine_top_two_distance_margin": None,
+                    },
+                },
+                vector_profile={},
+            )
+        )
+        labels[case_id] = FitLabel("answerable", (logical_id,))
+    return observations, FitLabels(labels)
+
+
+def test_fit_threshold_separates_adjacent_floats_without_midpoint_rounding():
+    positive = math.nextafter(1.0, math.inf)
+    observations, labels = _boundary_fit([1.0], [positive])
+
+    analysis = analyze_fit(observations, labels)
+
+    assert analysis["possible_under_feature_definition"] is True
+    assert analysis["selected_threshold"] == positive
+    assert analysis["selected_threshold"] > 1.0
+    assert analysis["selected_threshold_strategy"] == (
+        "nextafter_max_negative_toward_positive_infinity"
+    )
+    metrics = _score(observations, labels.by_case, analysis["selected_threshold"])
+    assert metrics["unanswerable_abstained"] == 1
+    assert metrics["conditional_answerable_retained"] == 1
+    assert metrics["gate_100_percent_unanswerable_abstained"] is True
+    assert metrics["gate_95_percent_conditional_answerable_retained"] is True
+    assert analysis["selected_threshold_fit_gate_validation"] == metrics
+
+
+def test_fit_threshold_handles_zero_and_duplicate_adjacent_boundaries():
+    above_zero = math.nextafter(0.0, math.inf)
+    observations, labels = _boundary_fit([0.0, 0.0], [above_zero, above_zero])
+
+    analysis = analyze_fit(observations, labels)
+
+    assert analysis["selected_threshold"] == above_zero
+    assert analysis["selected_threshold"] > 0.0
+    assert (
+        analysis["selected_threshold_fit_gate_validation"][
+            "gate_100_percent_unanswerable_abstained"
+        ]
+        is True
+    )
+
+
+def test_fit_threshold_honestly_reports_duplicate_boundary_as_impossible():
+    observations, labels = _boundary_fit([1.0], [1.0])
+
+    analysis = analyze_fit(observations, labels)
+
+    assert analysis["possible_under_feature_definition"] is False
+    assert analysis["selected_threshold"] is None
+    assert analysis["selected_threshold_strategy"] is None
+    assert analysis["selected_threshold_fit_gate_validation"] is None
+
+
+@pytest.mark.parametrize("strength", [math.inf, -math.inf, math.nan])
+def test_fit_threshold_rejects_nonfinite_evidence(strength):
+    observations, labels = _boundary_fit([strength], [1.0])
+
+    with pytest.raises(ValueError, match="strengths must be finite"):
+        analyze_fit(observations, labels)
+
+
+def test_fit_threshold_rejects_when_no_finite_boundary_exists():
+    observations, labels = _boundary_fit([sys.float_info.max], [sys.float_info.max])
+
+    with pytest.raises(ValueError, match="no finite threshold exists"):
+        analyze_fit(observations, labels)
 
 
 def test_dataset_split_is_large_predeclared_and_separate_from_e0():
@@ -556,7 +664,15 @@ def test_fts_reproduction_is_deterministic_offline_and_calibratable():
     assert first == second
     assert first["status"] == "calibratable"
     assert first["runtime_policy_shipped"] is False
-    assert first["fit"]["analysis"]["selected_threshold"] == 0.875
+    analysis = first["fit"]["analysis"]
+    assert analysis["selected_threshold"] == math.nextafter(0.75, math.inf)
+    assert analysis["selected_threshold"] > analysis["max_fit_negative_strength"]
+    assert (
+        analysis["selected_threshold_fit_gate_validation"][
+            "gate_100_percent_unanswerable_abstained"
+        ]
+        is True
+    )
     held = first["held_out"]["metrics_at_fit_only_diagnostic_boundary"]
     assert held["pre_abstention_recall_at_5"] == 1.0
     assert held["gate_100_percent_unanswerable_abstained"] is True
