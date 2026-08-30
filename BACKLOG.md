@@ -1526,6 +1526,60 @@ audit does not re-report settled work.
   (None, never 0.0, where there is no denominator or no vector index) and
   `embedding_oldest_pending` — numbers, with no verdict attached.
 
+- **D11 — the SIGBUS is characterized; the fix is deliberately not in the v0.3
+  cleanup (2026-08-30).** Previously carried as "no cause established". It is
+  not ONNX, not sqlite-vec, and not a poison row.
+
+  **Mechanism: a pagein failure on SQLite's memory-mapped WAL index.** The
+  `<db>-shm` mapping is 32 KiB while the backing file is 3 bytes.
+
+  Evidence, all reproducible:
+  - 29 crash reports in `~/Library/Logs/DiagnosticReports/` spanning
+    2026-08-25 onward, every one `EXC_BAD_ACCESS` / `SIGBUS` with subtype
+    `FS pagein error: 22 Invalid argument`.
+  - **100% of faulting frames are SQLite WAL-index functions** — `walFindFrame`
+    via `readDbPage`, `walIndexReadHdr` via `walTryBeginRead`, `walIndexAppend`
+    via `pagerWalFrames`. Zero involve `onnxruntime`, `tokenizers` or `vec0`,
+    though all three were loaded in the drain crash.
+  - Every fault address lands at offset 16384–29368 inside a 32 KiB `rw-`
+    mapped-file region, which is SQLite's wal-index geometry.
+  - On disk during the incident: `haunt.db-shm` was **3 bytes**
+    (`18e22d`, the start of the healthy header — SQLite's own
+    "wal-index needs recovery" marker) while the two idle namespaces were 32768.
+  - The recorded drain death is identifiable: `Python-2026-08-29-211458.000.ips`,
+    1720 s from launch against the record's "1,698 s of progress",
+    `parentProc: zsh`, faulting in `walFindFrame`.
+  - **Reproduced.** Truncating a mapped `-shm` to 3 bytes under a live reader
+    kills the process with signal 10 — shell exit **138**, matching the record.
+
+  Implicated code, in the order it matters: `SQLiteSidecarGuard._acquire_one`
+  pre-creates `<db>-shm` zero-length before SQLite opens the database;
+  `close(clean_unused_claims=True)` unlinks it when it is size 0;
+  `sqlite_storage_snapshot()` opens **and closes** an independent fd on it, and
+  on POSIX closing *any* fd drops *every* `fcntl` lock the process holds on that
+  file — including SQLite's dead-man-switch lock. The zero-write read path is
+  documented as bypassing the configuration flock yet still acquires a sidecar
+  claim. Six Claude Code hook events, each spawning a fresh process opening the
+  database read-write, plus the MCP servers and CLI, with no pooling, supply the
+  concurrency. 20 of 29 crashes have `parentProc: claude`.
+
+  This explains every recorded observation: why only the busy `haunt` namespace
+  crashed, why the drain died mid-run, why the resume ran through the same
+  region cleanly (a race, not data), and why `integrity_check` passed — the
+  main database was never corrupt, only the transient wal-index.
+
+  **Not fixed in the v0.3 cleanup**, on purpose: it changes sidecar lifetime and
+  SQLite locking semantics, which is not cleanup-shaped and deserves its own
+  change with its own review. Note the interaction with D10 — a background
+  drain must not ship while this is open, because a mid-drain crash is exactly
+  the failure mode it would run into.
+
+  *Not proven:* the precise interleaving that puts the truncation under a live
+  mapping is inferred from the four code sites above, not instrumented. To close
+  that: interpose `ftruncate`/`unlink`/`close` on `*-shm` under
+  `DYLD_INSERT_LIBRARIES`, logging pid, path and inode, and correlate against a
+  concurrent hook.
+
 ### Integration state (verified)
 
 - `integration/all-work` `d1aec40` = `main` `ed806b2` + #79 + #81 + #83 +
