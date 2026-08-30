@@ -8,10 +8,20 @@ evaluation harness: importing `haunt.abstention_eval` to reach it pulls in
 `email` stack that only the E6 network-deny harness needs.
 
 This module holds the artifact constants, the canonical JSON hashing the
-manifest identity rests on, and the cache verifier. It imports the standard
-library only, so `haunt.embed` can bind it at module scope without a cycle.
-`haunt.abstention_eval` re-exports every name here, so E6 evidence keeps its
-single source for the manifest it attests.
+manifest identity rests on, the cache verifier, and the small JSON/audit
+helpers the verifier is built from. It imports the standard library only, so
+`haunt.embed` can bind it at module scope without a cycle.
+
+`haunt.abstention_eval` re-exports every name except MANIFEST_SCHEMA_VERSION,
+so E6 evidence keeps one source for the manifest it attests. The traffic is not
+one-way: `_read_json_component` is also the E6 harness's fixture reader, which
+is why its parameter is still named `fixture_dir`. Splitting it in two would
+duplicate a JSON reader to make a boundary look tidier than it is.
+
+This file is listed in abstention_eval.E6_EVIDENCE_PATHS. It has to be: the
+manifest document beside it is E6 evidence, the report's `local_model_cache`
+field is this verifier's return value, and attributing the document without
+its enforcer silently narrows the E6 isolation gate.
 """
 
 from __future__ import annotations

@@ -61,6 +61,10 @@ DEFAULT_E0_CORPUS = ROOT / "tests" / "fixtures" / "retrieval_eval" / "corpus.jso
 E6_EVIDENCE_PATHS = (
     "src/haunt/abstention_eval.py",
     "src/haunt/data/hybrid-model-manifest.json",
+    # The code that enforces the manifest above. Listing the document but not
+    # its enforcer let an E6 commit touching the verifier stop counting as an
+    # E6 commit, so public_runtime_evidence() no longer saw its runtime diff.
+    "src/haunt/model_manifest.py",
     "scripts/reproduce_abstention_eval.py",
     "scripts/benchmark_abstention_evidence.py",
     "tests/fixtures/abstention_eval",
