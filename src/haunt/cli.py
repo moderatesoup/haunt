@@ -1100,14 +1100,31 @@ def trace_cmd(
 
 
 @app.command("install")
-def install_cmd() -> None:
+def install_cmd(
+    allow_alt_home: bool = typer.Option(
+        False,
+        "--allow-alt-home",
+        help=(
+            "Bind hosts even though HAUNT_HOME is not the default ~/.haunt. "
+            "Global editor config will name this home; if it goes away, every "
+            "hook stops capturing silently."
+        ),
+    ),
+) -> None:
     """Bind haunt to all known hosts (Cursor, Claude Code). Idempotent."""
     from haunt.bootstrap import bind_launchers
-    from haunt.hosts import HostConfigError, install_all_hosts
+    from haunt.hosts import AlternateHomeRefused, HostConfigError, install_all_hosts
 
     home, hook_cmd, mcp_cmd = bind_launchers()
     try:
-        reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+        reports = install_all_hosts(
+            str(home), hook_cmd, mcp_cmd, force=allow_alt_home
+        )
+    except AlternateHomeRefused as exc:
+        # Hard error, unlike bootstrap: binding hosts is the entire point of
+        # this command, so doing nothing quietly would be the same silence the
+        # guard exists to prevent.
+        _die(exc, code=2)
     except HostConfigError as exc:
         _die(exc, code=1)
     for r in reports:
@@ -1127,10 +1144,12 @@ def cursor_install_cmd() -> None:
     """Bind haunt to Cursor: hooks.json + mcp.json + haunt.mdc + skill."""
     from haunt.cursor_hook import install_cursor_hooks
 
-    from haunt.hosts import HostConfigError
+    from haunt.hosts import AlternateHomeRefused, HostConfigError
 
     try:
         report = install_cursor_hooks()
+    except AlternateHomeRefused as exc:
+        _die(exc, code=2)
     except HostConfigError as exc:
         _die(exc, code=1)
     typer.echo(f"hooks     {report['hooks_json']}")
@@ -1155,7 +1174,7 @@ def doctor_cmd() -> None:
     """
     from haunt.bootstrap import bind_launchers
     from haunt.doctor import diagnose, format_doctor
-    from haunt.hosts import install_all_hosts
+    from haunt.hosts import host_install_refusal, install_all_hosts
 
     home, hook_cmd, mcp_cmd = bind_launchers()
     from haunt.paths import repair_private_modes
@@ -1165,6 +1184,17 @@ def doctor_cmd() -> None:
     typer.echo(format_doctor(report))
 
     if not report.ok and report.host_file_issues:
+        # doctor's repair step is a host install, so it is guarded exactly like
+        # one -- and it is the likelier of the two to be run by accident from a
+        # smoke-test shell. Decided before the "Re-merging" line so the output
+        # never claims a write that did not happen.
+        refusal = host_install_refusal(str(home))
+        if refusal is not None:
+            typer.echo("")
+            typer.echo("NOT re-merging hosts.")
+            for line in str(refusal).splitlines():
+                typer.echo("  " + line)
+            raise typer.Exit(1)
         typer.echo("")
         typer.echo("Re-merging all hosts...")
         from haunt.hosts import HostConfigError

@@ -36,6 +36,10 @@ jobs:
       - name: "Smoke: haunt --help"
         run: haunt --help
 
+      # No HAUNT_ALLOW_ALT_HOME_HOST_INSTALL here on purpose: a temp-home
+      # smoke test must not bind the runner's global editor config, and this
+      # step asserts nothing about hosts. bootstrap reports the skip and
+      # carries on.
       - name: "Smoke: haunt observe + recall (FTS-only, temp home)"
         env:
           HAUNT_FTS_ONLY: "1"
@@ -46,9 +50,14 @@ jobs:
           haunt recall "ZEPHYR-42" | grep -q "ZEPHYR-42"
           haunt health
 
+      # This step *does* assert a shortcut is written from a temp HAUNT_HOME,
+      # so it opts in explicitly. HOME is a temp dir too, so nothing real is
+      # touched -- which is exactly the deliberate alternate-home install the
+      # escape hatch exists for.
       - name: "Smoke: haunt dash --install-icon writes shortcut"
         env:
           HAUNT_FTS_ONLY: "1"
+          HAUNT_ALLOW_ALT_HOME_HOST_INSTALL: "1"
         run: |
           export HAUNT_HOME="$(mktemp -d)"
           export HOME="$(mktemp -d)"

@@ -8,9 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from haunt.hosts import (
+    DanglingHook,
     HostReport,
     HostStatus,
+    check_host_install_allowed,
     command_leaf,
+    hook_command_defect,
     hook_command_issues,
     mcp_command_issues,
     read_json_object,
@@ -208,11 +211,17 @@ def _expected_claude_hook(haunt_home: str, hook_cmd: str) -> str:
     return _claude_hook_cmd(haunt_home)
 
 
-def install(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostReport:
+def install(
+    haunt_home: str, hook_cmd: str, mcp_cmd: str, *, force: bool = False
+) -> HostReport:
     """Bind Claude Code: settings.json hooks + ~/.claude.json MCP + rule.
 
     hook_cmd is ignored; we use haunt-hook-claude from haunt_home/bin/.
+    Refuses a non-default haunt_home before the first write (see
+    check_host_install_allowed): ~/.claude/settings.json is the real global
+    config, and a temp home planted there stops capture when it is deleted.
     """
+    check_host_install_allowed(haunt_home, force=force)
     config_dir = _claude_config_dir()
     seeded = not config_dir.exists()
 
@@ -272,6 +281,14 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
                     missing_events.append(event)
                     continue
                 for cmd in haunt_cmds:
+                    # Recorded per event, before the per-command dedup below:
+                    # one dead wrapper kills every event it is bound to, and
+                    # the report has to name each one.
+                    defect = hook_command_defect(cmd)
+                    if defect is not None:
+                        status.dangling_hooks.append(
+                            DanglingHook(HOST_NAME, event, cmd, defect)
+                        )
                     if cmd in seen_cmds:
                         continue
                     seen_cmds.add(cmd)

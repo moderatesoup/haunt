@@ -22,15 +22,35 @@ def _find_haunt_cmd() -> str:
     return "haunt"
 
 
-def install_desktop_icon(home: Path | None = None) -> dict[str, Any]:
+def install_desktop_icon(
+    home: Path | None = None, *, force: bool = False
+) -> dict[str, Any]:
     """Write a desktop shortcut for 'haunt dash'.
 
     Linux: writes a .desktop file to ~/.local/share/applications/.
     macOS: best-effort .command wrapper on ~/Desktop.
     Windows: best-effort .bat on Desktop.
 
+    Skipped when `home` is None (so the real user home is the target) and
+    HAUNT_HOME is not the default home: a bootstrap run from a temp home is
+    not entitled to drop files in the operator's actual Desktop. An explicit
+    `home` is already a redirected target, so it is never refused.
+
     Returns dict with 'written' bool, 'path', and 'reason' on skip.
     """
+    if home is None:
+        from haunt.hosts import ALT_HOME_ENV, host_install_refusal
+        from haunt.paths import haunt_home
+
+        refusal = host_install_refusal(haunt_home(), force=force)
+        if refusal is not None:
+            return {
+                "written": False,
+                "reason": (
+                    f"haunt home {refusal.haunt_home} is not the default "
+                    f"{refusal.default_home}; set {ALT_HOME_ENV}=1 to write anyway"
+                ),
+            }
     platform = sys.platform
     haunt_cmd = _find_haunt_cmd()
 
