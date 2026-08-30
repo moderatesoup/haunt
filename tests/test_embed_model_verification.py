@@ -22,12 +22,12 @@ from pathlib import Path
 import pytest
 
 import haunt
-from haunt import abstention_eval, embed
-from haunt.abstention_eval import canonical_hash, verify_local_hybrid_cache
+from haunt import abstention_eval, embed, model_manifest
+from haunt.model_manifest import canonical_hash, verify_local_hybrid_cache
 from haunt.paths import models_dir
 
 PACKAGE_DIR = Path(haunt.__file__).resolve().parent
-HYBRID_MANIFEST = abstention_eval.HYBRID_MANIFEST_DIR / "hybrid-model-manifest.json"
+HYBRID_MANIFEST = model_manifest.HYBRID_MANIFEST_DIR / "hybrid-model-manifest.json"
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
 
@@ -72,7 +72,7 @@ def test_load_verifies_the_cache_before_building_the_session(tmp_path, monkeypat
         calls.append((cache_root, kwargs))
         raise RuntimeError("hybrid cache artifact hash mismatch: planted model")
 
-    monkeypatch.setattr(abstention_eval, "verify_local_hybrid_cache", refuse)
+    monkeypatch.setattr(model_manifest, "verify_local_hybrid_cache", refuse)
     monkeypatch.setattr(
         embed,
         "OnnxEmbedder",
@@ -87,7 +87,7 @@ def test_a_verified_cache_loads(tmp_path, monkeypatch):
     _clean_env(monkeypatch, tmp_path)
     root = _fake_cache(tmp_path)
     monkeypatch.setattr(
-        abstention_eval,
+        model_manifest,
         "verify_local_hybrid_cache",
         lambda *_a, **_k: {"matched_manifest_id": "test", "files": []},
     )
@@ -111,7 +111,7 @@ def test_skipping_verification_takes_an_env_opt_in_and_is_recorded(
     monkeypatch.setenv(flag, "1")
     root = cache(tmp_path)
     monkeypatch.setattr(
-        abstention_eval,
+        model_manifest,
         "verify_local_hybrid_cache",
         _must_not_run("verification ran under an explicit skip"),
     )
@@ -129,7 +129,7 @@ def test_planted_quantized_files_do_not_skip_verification(tmp_path, monkeypatch)
         calls.append(cache_root)
         return {"matched_manifest_id": "test", "files": []}
 
-    monkeypatch.setattr(abstention_eval, "verify_local_hybrid_cache", record)
+    monkeypatch.setattr(model_manifest, "verify_local_hybrid_cache", record)
     embed._verify_bge_m3_cache(root)
     assert calls == [models_dir()]
 
@@ -144,7 +144,7 @@ def test_an_uninstalled_manifest_is_reported_not_assumed(
     def absent(*_a, **_k):
         raise FileNotFoundError("no hybrid-model-manifest.json")
 
-    monkeypatch.setattr(abstention_eval, "verify_local_hybrid_cache", absent)
+    monkeypatch.setattr(model_manifest, "verify_local_hybrid_cache", absent)
     embed._verify_bge_m3_cache(root)
     err = capsys.readouterr().err
     assert "embed_m3_unverified" in err
@@ -188,7 +188,7 @@ CONTENTS = {
 def capped_cache(tmp_path, monkeypatch):
     cache = tmp_path / "cache"
     fixture, digest = _synthetic_fixture(tmp_path, cache, CONTENTS)
-    monkeypatch.setattr(abstention_eval, "HYBRID_ARTIFACT_MANIFEST_SHA256", digest)
+    monkeypatch.setattr(model_manifest, "HYBRID_ARTIFACT_MANIFEST_SHA256", digest)
     return cache, fixture
 
 
@@ -280,3 +280,82 @@ def test_a_built_wheel_actually_contains_the_manifest(tmp_path):
     relative = HYBRID_MANIFEST.resolve().relative_to(PACKAGE_DIR)
     with zipfile.ZipFile(wheel) as archive:
         assert f"haunt/{relative}" in archive.namelist()
+
+
+# --- runtime/evaluation boundary -------------------------------------------
+# The manifest check is a runtime obligation on every model load. It used to
+# live in abstention_eval, so embed reached it through a function-local import
+# that existed purely to dodge a cycle. These four tests pin the boundary.
+
+
+def test_embed_import_does_not_drag_in_the_evaluation_module():
+    """Loading the embedding backend must not import the E6 harness.
+
+    abstention_eval pulls in recall, store, rerank and the whole urllib/ssl/
+    email stack that only its network-deny harness needs. None of that belongs
+    in a hook's import path.
+    """
+    code = (
+        "import sys, haunt.embed; "
+        "print(' '.join(str(int(m in sys.modules)) for m in ("
+        "'haunt.abstention_eval','haunt.recall','haunt.rerank',"
+        "'urllib.request','http.client','ssl')))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.split() == ["0", "0", "0", "0", "0", "0"], out.stdout
+
+
+def test_patching_the_runtime_module_actually_reaches_embed(tmp_path, monkeypatch):
+    """The patch seam must be live, not merely present.
+
+    embed binds the *module* and resolves the attribute per call. Rebinding it
+    as `from haunt.model_manifest import verify_local_hybrid_cache` would freeze
+    the reference, and every test above that patches model_manifest would keep
+    passing while exercising the real verifier. This asserts the seam by using
+    it: if the patch does not reach embed, no SeamReached is raised.
+    """
+
+    class SeamReached(RuntimeError):
+        pass
+
+    _clean_env(monkeypatch, tmp_path)
+    root = _fake_cache(tmp_path)
+
+    def sentinel(*_args, **_kwargs):
+        raise SeamReached("patch reached embed")
+
+    monkeypatch.setattr(model_manifest, "verify_local_hybrid_cache", sentinel)
+    with pytest.raises(SeamReached):
+        embed._verify_bge_m3_cache(root)
+
+
+def test_abstention_eval_re_exports_the_same_objects():
+    """E6 evidence and the runtime check must attest one implementation."""
+    for name in (
+        "verify_local_hybrid_cache",
+        "canonical_bytes",
+        "canonical_hash",
+        "_file_hash",
+        "_emit_audit",
+        "_read_json_component",
+        "AuditHook",
+        "HYBRID_MANIFEST_DIR",
+        "HYBRID_ARTIFACT_MANIFEST_ID",
+        "HYBRID_ARTIFACT_MANIFEST_SHA256",
+    ):
+        assert getattr(abstention_eval, name) is getattr(model_manifest, name), name
+
+
+def test_the_two_schema_versions_are_independent_and_currently_equal():
+    """They version different artifacts and are free to diverge.
+
+    model_manifest.MANIFEST_SCHEMA_VERSION versions hybrid-model-manifest.json.
+    abstention_eval.SCHEMA_VERSION versions the E6 fixture set, and its value is
+    baked into DATASET_MANIFEST_SHA256. Sharing one constant would mean bumping
+    either silently invalidated the other.
+    """
+    assert model_manifest.MANIFEST_SCHEMA_VERSION == 1
+    assert abstention_eval.SCHEMA_VERSION == 1
+    assert "SCHEMA_VERSION" not in vars(model_manifest)
