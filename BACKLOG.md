@@ -1391,6 +1391,61 @@ audit does not re-report settled work.
   from a short-sequence-biased sample and would ship as a hardware-specific
   hardcode.
 
+- **D8 — `store.py` stays one module (2026-08-30).** Audited three candidate
+  extraction boundaries; **none extracted**. The premise did not survive: over
+  `06ebd234..10963523` the file grew 8,456 → 9,406 lines while `class Store`
+  **shrank by 488** and `Store.purge` by 263. `f299353` de-classed the erasure
+  path into module functions taking an explicit `conn` so
+  `_erase_memory_from_backup` could run the *identical* erasure against a loose
+  backup file — the equivalence `tests/test_purge.py` enforces by fault
+  injection. 25 new top-level definitions, 20 of them that one decision. The
+  growth is a coupling reduction plus one new capability, not accumulation.
+  - *Privacy erasure / purge* — best cut metrics in the file (0 inbound edges,
+    contiguous, 2 trivial back-edges) and still wrong.
+    `_erase_memory_content` does not own its transaction: `Store.purge` opens
+    `BEGIN IMMEDIATE`, sets the thread guard, calls it, commits. A SQLite UDF
+    registered on the connection reads that guard to satisfy an append-only
+    trigger created in the schema-init block ~5,000 lines away, and the erasure
+    cluster registers its own always-authorize variant for backup files. The
+    cut falls between the transaction's opener and its body and separates the
+    most permissive authorization from the trigger it defeats.
+    *Unblock:* pass an authorization object into `_erase_memory_content`
+    instead of reading `Store` state through a connection-registered closure,
+    and move `_table_columns` / `_private_backup_root` to a shared helper.
+  - *Reconcile* — genuine bidirectional dependency. The cluster needs the
+    `Store` open-factories; `_retire_namespace`, which stays behind, needs
+    `_plan_namespace_reconciliation`. Transaction ownership here is already
+    clean, so this is the strongest future candidate.
+    *Unblock:* move the four `Store` open-factories to their own module first.
+  - *Namespace label administration* — not cohesive: 7 internal call edges
+    against 30 outbound to 13 registry internals. Extraction here is
+    definitionally the "adds an import layer" outcome.
+    *Unblock:* extract the registry first; never extract this before it.
+  - *Cost any extraction pays regardless:* 84 `monkeypatch.setattr` sites treat
+    `haunt.store` as *the* patch namespace, and several patched helpers have
+    all their callers inside the cluster that would move.
+  - *Enforced by* `tests/test_store_cohesion.py`, which pins the top-level
+    definition names. A line-count ceiling was rejected: it would have fired on
+    the refactor above and stayed silent on unrelated work.
+
+- **D9 — no linter gate for duplicate definitions (2026-08-30).** Closes R21
+  for the shadowing case. `ruff --select F811` is **disqualified on evidence**:
+  its default `dummy-variable-rgx` exempts every underscore-prefixed name,
+  which is every private helper here, so it returns "All checks passed" on the
+  exact historical `_table_columns` mutation. Overriding the regex catches that
+  but still misses duplicate module-level constants entirely — pyflakes has no
+  rule for that shape, and `_TABLE_FIELDS`-style tables are the same hazard.
+  `--select F811,F401,F841` yields 14 findings on the clean tree, 13 of them in
+  `tests/`, none of them the target class.
+  `tests/test_no_duplicate_definitions.py` catches all four probe shapes
+  (historical duplicate, duplicate method 2,000 lines apart in a class,
+  duplicate annotated module constant, def duplicated 9,000 lines apart) with
+  zero findings on the clean tree, zero false positives on `@overload`,
+  property setter/deleter, `try/except ImportError`, `TYPE_CHECKING` and
+  platform branches, in 0.4s, with no new dependency and no new CI step — it
+  rides the existing `pytest tests/`. R21's mypy half is untouched and remains
+  open.
+
 ### Integration state (verified)
 
 - `integration/all-work` `d1aec40` = `main` `ed806b2` + #79 + #81 + #83 +
