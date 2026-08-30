@@ -639,3 +639,31 @@ def test_backfill_pages_instead_of_loading_a_whole_namespace_at_once(
         again = _BatchCountingConn(store.conn)
         assert _backfill_content_hashes(again) == 0
         assert again.batches == []
+
+
+def test_whitespace_only_content_is_not_counted_as_embeddable(dup_env):
+    """The coverage denominator must not count rows observe() will never queue.
+
+    SQLite's one-argument TRIM strips U+0020 only, while observe() gates on
+    Python's str.strip(). A row whose content is "\\n\\t" therefore counted
+    toward memories_embeddable while never producing an embedding_jobs row,
+    capping embedding_coverage below 1.0 forever -- the exact defect the
+    denominator was added to remove.
+    """
+    from haunt.store import Store
+
+    with Store("ws-test", create=True) as store:
+        store.observe("\n\t", defer_embedding=True)
+        store.observe("   ", defer_embedding=True)
+        store.observe("real content", defer_embedding=True)
+        stats = store.stats()
+        queued = store.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs"
+        ).fetchone()[0]
+
+    assert stats["memories"] == 3
+    assert queued == 1, "only the real row should be queued"
+    assert stats["memories_embeddable"] == queued, (
+        "denominator counts a row that can never be enqueued: "
+        f"embeddable={stats['memories_embeddable']} queued={queued}"
+    )

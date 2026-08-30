@@ -179,6 +179,20 @@ def _install_rule(cursor_dir: Path) -> Path:
     return dest
 
 
+def preflight(haunt_home: str, hook_cmd: str, *, force: bool = False) -> None:
+    """Every refusal this adapter can raise, before it writes anything.
+
+    install_all_hosts runs this for all adapters first, so one adapter
+    refusing cannot leave an earlier adapter's config already rewritten.
+    install() still re-checks: a caller can reach it directly.
+    """
+    check_host_install_allowed(haunt_home, force=force)
+    check_hook_command_safe(hook_cmd)
+    check_host_config_target(_hooks_json_path(), force=force)
+    check_host_config_target(_mcp_json_path(), force=force)
+    check_host_config_target(_cursor_dir(), force=force)
+
+
 def install(
     haunt_home: str, hook_cmd: str, mcp_cmd: str, *, force: bool = False
 ) -> HostReport:
@@ -187,16 +201,7 @@ def install(
     Refuses a non-default haunt_home before the first write; ~/.cursor is
     global config the same way ~/.claude is.
     """
-    check_host_install_allowed(haunt_home, force=force)
-    # Hook entries are run through a shell by both editors, and the command
-    # is written as one unquoted string.
-    check_hook_command_safe(hook_cmd)
-    # The home check above judged the path being written INTO the config.
-    # These judge the config files themselves, which resolve through
-    # environment overrides the home check cannot see.
-    check_host_config_target(_hooks_json_path(), force=force)
-    check_host_config_target(_mcp_json_path(), force=force)
-    check_host_config_target(_cursor_dir(), force=force)
+    preflight(haunt_home, hook_cmd, force=force)
     cdir = _cursor_dir()
     seeded = not cdir.exists()
 

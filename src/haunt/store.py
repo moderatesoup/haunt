@@ -4373,8 +4373,8 @@ _RECONCILE_TABLES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
 # content_state_digest, because the operator authorizes a digest and
 # everything the apply writes has to be inside it -- `embedding_jobs` is
 # copied verbatim by _reconcile_requeue_embedding, `attempts`/`last_error`
-# included, and any drain moves both -- all of them operator-invoked or
-    # write-triggered, never background.
+# included, and any drain moves both -- all of them
+# operator-invoked or write-triggered, never background.
 _RECONCILE_DIGEST_ONLY_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("embedding_jobs", ("memory_id",)),
 )
@@ -7568,18 +7568,27 @@ class Store:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    # SQLite's one-argument TRIM strips U+0020 only, while Python's str.strip()
+    # strips all whitespace. Spelling the set out keeps the denominator from
+    # counting a "\n\t" row that observe() will never enqueue -- which would cap
+    # embedding_coverage below 1.0 forever, the exact defect the denominator
+    # exists to remove. Residual: content that is whitespace only under Unicode
+    # but not ASCII (a lone U+00A0) still mismatches. Closing that needs a UDF
+    # on a read path, and no such row has been observed.
+    _ASCII_WHITESPACE_SQL = "char(32)||char(9)||char(10)||char(13)||char(11)||char(12)"
+
     def _embeddable_memories(self) -> int:
         """Rows that are supposed to end up with a vector.
 
         The denominator every coverage question needs, and the reason there was
         never an honest one: memories_embedded / memories lands short of 100%
-        forever on a namespace holding policy-excluded rows. This mirrors the
-        enqueue predicate in observe() exactly -- skip_embedding=0 and
-        non-blank content -- so full coverage really can reach 1.0.
+        forever on a namespace holding policy-excluded rows. Mirrors observe()'s
+        enqueue predicate -- skip_embedding=0 and non-blank content -- over
+        ASCII whitespace, so full coverage really can reach 1.0.
         """
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM memories "
-            "WHERE skip_embedding=0 AND TRIM(COALESCE(content, '')) != ''"
+            "SELECT COUNT(*) FROM memories WHERE skip_embedding=0 "
+            f"AND TRIM(COALESCE(content, ''), {self._ASCII_WHITESPACE_SQL}) != ''"
         ).fetchone()
         return int(row[0] or 0)
 

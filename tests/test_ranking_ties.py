@@ -72,8 +72,14 @@ def test_recall_ties_ignore_candidate_arrival_order(haunt_env, monkeypatch):
     assert [hit.final_rank for hit in forward_hits] == [1, 2]
 
 
-def test_timeline_ties_use_memory_id_without_losing_time_order(haunt_env):
-    """IDs settle exact timestamps only; newer events still appear first."""
+def test_timeline_ties_settle_on_content_without_losing_time_order(haunt_env):
+    """The tie key settles exact timestamps only; newer events still lead.
+
+    Renamed from ..._use_memory_id_...: the key is content_hash then memory id.
+    The property under test is unchanged -- chronology dominates and the tie key
+    only orders rows the clock cannot separate -- but the old name asserted a
+    mechanism that was re-randomized on every ingest.
+    """
     from haunt.planner import run_timeline
     from haunt.temporal import compile
     from tests.test_temporal_planner import NOW
@@ -90,9 +96,21 @@ def test_timeline_ties_use_memory_id_without_losing_time_order(haunt_env):
         )
         hits = run_timeline(compile("what happened two weeks ago", NOW), store)
 
+    import hashlib
+
     ids = [hit.memory_id for hit in hits]
     assert ids[0] == later.memory_id
-    assert ids[1:] == sorted([tied_a.memory_id, tied_b.memory_id])
+    expected = [
+        memory_id
+        for _digest, memory_id in sorted(
+            (hashlib.sha256(text.encode("utf-8")).hexdigest(), memory_id)
+            for text, memory_id in (
+                ("TIMELINE-TIE-A", tied_a.memory_id),
+                ("TIMELINE-TIE-B", tied_b.memory_id),
+            )
+        )
+    ]
+    assert ids[1:] == expected
     assert [hit.final_rank for hit in hits] == [1, 2, 3]
 
 

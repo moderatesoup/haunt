@@ -867,7 +867,8 @@ and is ready for a normal Haunt release.
 the largest single correctness defect the documentation pass found and is
 invisible to any byte-reduction sweep. Verified against the current tree:
 C1 (hooks and MCP pass `repo_path` to `Store`), C2, C3 (`reconcile_namespaces`,
-executed against real namespaces), C4 (`drain_embedding_queue`), C5 (attempts
+exercised as a dry run against *copies* of the real namespace databases --
+not against the originals, which remain split), C4 (`drain_embedding_queue`), C5 (attempts
 cap), C6 (`tests/test_capture_policy.py`), C10 (`idx_memories_current`), C11,
 and C12 are all implemented; C7 phase 1 shipped and phase 2 was dropped under
 D3. **Genuinely open: C8** (folded into E6 as a fixture) **and C9** (FTS
@@ -1412,7 +1413,8 @@ audit does not re-report settled work.
   path into module functions taking an explicit `conn` so
   `_erase_memory_from_backup` could run the *identical* erasure against a loose
   backup file — the equivalence `tests/test_purge.py` enforces by fault
-  injection. 25 new top-level definitions, 20 of them that one decision. The
+  injection. 24 new top-level definitions and one removed, 14 of them that one
+  decision (16 counting two constants it added). The
   growth is a coupling reduction plus one new capability, not accumulation.
   - *Privacy erasure / purge* — best cut metrics in the file (0 inbound edges,
     contiguous, 2 trivial back-edges) and still wrong.
@@ -1435,8 +1437,9 @@ audit does not re-report settled work.
     against 30 outbound to 13 registry internals. Extraction here is
     definitionally the "adds an import layer" outcome.
     *Unblock:* extract the registry first; never extract this before it.
-  - *Cost any extraction pays regardless:* 84 `monkeypatch.setattr` sites treat
-    `haunt.store` as *the* patch namespace, and several patched helpers have
+  - *Cost any extraction pays regardless:* ~69 `monkeypatch.setattr` sites
+    target the `haunt.store` module directly and ~96 counting the `Store`
+    class it exports; tests treat `haunt.store` as *the* patch namespace, and several patched helpers have
     all their callers inside the cluster that would move.
   - *Enforced by* `tests/test_store_cohesion.py`, which pins the top-level
     definition names. A line-count ceiling was rejected: it would have fired on
@@ -1449,8 +1452,8 @@ audit does not re-report settled work.
   exact historical `_table_columns` mutation. Overriding the regex catches that
   but still misses duplicate module-level constants entirely — pyflakes has no
   rule for that shape, and `_TABLE_FIELDS`-style tables are the same hazard.
-  `--select F811,F401,F841` yields 14 findings on the clean tree, 13 of them in
-  `tests/`, none of them the target class.
+  `--select F811,F401,F841` yields 14 findings on the clean tree, **all** of
+  them in `tests/` (`src/` and `scripts/` are clean), none the target class.
   `tests/test_no_duplicate_definitions.py` catches all four probe shapes
   (historical duplicate, duplicate method 2,000 lines apart in a class,
   duplicate annotated module constant, def duplicated 9,000 lines apart) with

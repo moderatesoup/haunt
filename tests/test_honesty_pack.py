@@ -7,6 +7,7 @@ Each test is a mutation check — revert the corresponding fix and this file fai
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import os
 import re
@@ -707,13 +708,13 @@ def test_direct_timeline_limit_clamps_and_refills_past_full_superseded_page(hone
                 idempotency_key=f"direct-timeline-supersede-{memory_id}",
             )
 
-        active = [
-            st.observe(
-                f"active equal-time page {i:03d}",
-                event_time="2026-08-08T12:00:00+00:00",
-            )
-            for i in range(105)
-        ]
+        contents = {}
+        active = []
+        for i in range(105):
+            text = f"active equal-time page {i:03d}"
+            result = st.observe(text, event_time="2026-08-08T12:00:00+00:00")
+            contents[result.memory_id] = text
+            active.append(result)
         tq = TemporalQuery(
             temporal=True,
             cleaned_query="",
@@ -728,10 +729,21 @@ def test_direct_timeline_limit_clamps_and_refills_past_full_superseded_page(hone
 
     # K_MAX applies to direct planner calls too. The selected second page is
     # its first 100 stable event IDs, while display sorts its equal-time
-    # materialized memories by memory ID.
+    # materialized memories deterministically -- on content_hash, then memory
+    # id. The key moved off the bare memory id because that is a fresh uuid4
+    # per write, so the display order was total within a run and re-rolled on
+    # the next ingest of the same corpus.
     selected = sorted(active, key=lambda result: result.event_id)[:100]
     assert len(hits) == 100
-    assert [hit.memory_id for hit in hits] == sorted(
-        result.memory_id for result in selected
-    )
+    expected = [
+        memory_id
+        for _digest, memory_id in sorted(
+            (
+                hashlib.sha256(contents[result.memory_id].encode("utf-8")).hexdigest(),
+                result.memory_id,
+            )
+            for result in selected
+        )
+    ]
+    assert [hit.memory_id for hit in hits] == expected
     assert not {hit.memory_id for hit in hits}.intersection(superseded_ids)

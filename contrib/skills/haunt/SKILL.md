@@ -8,7 +8,7 @@ MCP server name is `haunt`. Store is verbatim. Never summarize. Never distill.
 |---|---|
 | Hooks store prompts, replies, and capped/redacted tool I/O (skip `memory_*` and configured exclusions) | **Recall** — you must call `memory_recall` |
 | `sessionEnd` / `SessionEnd` close the session | `sessionStart` worldview — may or may not inject `[haunt worldview ns=…]` |
-| FTS indexing of every stored row | **Vector embedding of hook writes** — queued, and drained only by `haunt bootstrap` or `haunt maintenance` |
+| FTS indexing of every stored row | **Vector embedding of hook writes** — queued, and drained by `haunt bootstrap`, `haunt maintenance`, or an ordinary non-deferred write |
 
 If no `[haunt ns=…]` block is visible, call `memory_recall` with the user's exact wording before acting. Recall is not automatic.
 Hooks write FTS rows immediately, queue the vectors, and exclude raw tool I/O from automatic context. Nothing drains that queue on a timer or in the background: `haunt bootstrap` drains up to 500 rows per namespace, `haunt maintenance` one batch of 64, and an ordinary non-deferred write up to 32 as a side effect. Recall never drains it. Use `HAUNT_EXCLUDE_TOOLS` when a tool must not be stored.

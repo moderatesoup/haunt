@@ -297,6 +297,21 @@ def classify_recall_residue(
     return raw_tool, classification_source
 
 
+def _tie_key_name(hit: Hit) -> str:
+    """The tie key this hit was actually ordered by.
+
+    Not cosmetic. content_hash arrives with the v10 migration and recall opens
+    read-only by default, so on a database no writer has migrated
+    _stable_tie_key degrades to m.id -- and a row whose hash is still NULL
+    degrades the same way through COALESCE. In both cases the hit's key IS its
+    memory id, and claiming otherwise would put a mechanism the database cannot
+    supply next to score_semantics, which is this module's honesty surface.
+    """
+    if hit.content_hash and hit.content_hash != hit.memory_id:
+        return "content_hash_asc_then_memory_id_asc"
+    return "memory_id_asc"
+
+
 def _ordering_explanation(hit: Hit, *, is_rrf: bool) -> dict[str, str]:
     """Describe only ordering evidence this Hit actually carries.
 
@@ -308,15 +323,12 @@ def _ordering_explanation(hit: Hit, *, is_rrf: bool) -> dict[str, str]:
         method = str(hit.rerank_stage["method"])
         return {
             "primary": f"{method}_desc",
-            "ties": "content_hash_asc_then_memory_id_asc",
+            "ties": _tie_key_name(hit),
             "stage": method,
             "reordered_from": "rrf_score_desc",
         }
     if is_rrf:
-        return {
-            "primary": "rrf_score_desc",
-            "ties": "content_hash_asc_then_memory_id_asc",
-        }
+        return {"primary": "rrf_score_desc", "ties": _tie_key_name(hit)}
     if (
         hit.vector_stage is not None
         and hit.fts_stage is not None

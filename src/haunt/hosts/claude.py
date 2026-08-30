@@ -213,6 +213,20 @@ def _expected_claude_hook(haunt_home: str, hook_cmd: str) -> str:
     return _claude_hook_cmd(haunt_home)
 
 
+def preflight(haunt_home: str, hook_cmd: str, *, force: bool = False) -> None:
+    """Every refusal this adapter can raise, before it writes anything.
+
+    install_all_hosts runs this for all adapters first, so one adapter
+    refusing cannot leave an earlier adapter's config already rewritten.
+    install() still re-checks: a caller can reach it directly.
+    """
+    check_host_install_allowed(haunt_home, force=force)
+    check_hook_command_safe(_claude_hook_cmd(haunt_home))
+    check_host_config_target(_settings_json_path(), force=force)
+    check_host_config_target(_claude_dotfile(), force=force)
+    check_host_config_target(_claude_config_dir(), force=force)
+
+
 def install(
     haunt_home: str, hook_cmd: str, mcp_cmd: str, *, force: bool = False
 ) -> HostReport:
@@ -223,16 +237,7 @@ def install(
     check_host_install_allowed): ~/.claude/settings.json is the real global
     config, and a temp home planted there stops capture when it is deleted.
     """
-    check_host_install_allowed(haunt_home, force=force)
-    # Hook entries are run through a shell by both editors, and the command
-    # is written as one unquoted string.
-    check_hook_command_safe(hook_cmd)
-    # The home check above judged the path being written INTO the config.
-    # These judge the config files themselves, which resolve through
-    # environment overrides the home check cannot see.
-    check_host_config_target(_settings_json_path(), force=force)
-    check_host_config_target(_claude_dotfile(), force=force)
-    check_host_config_target(_claude_config_dir(), force=force)
+    preflight(haunt_home, hook_cmd, force=force)
     config_dir = _claude_config_dir()
     seeded = not config_dir.exists()
 

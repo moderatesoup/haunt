@@ -1,6 +1,6 @@
 """store.py may not grow new top-level definitions without a named decision.
 
-store.py is 9,406 lines. An audit of three candidate extraction boundaries --
+An audit of three candidate extraction boundaries --
 privacy erasure, reconcile, namespace label administration -- rejected all
 three; the blocking coupling for each is recorded in BACKLOG.md under D8. That
 decision only stays honest if the file does not quietly accumulate unrelated
@@ -22,6 +22,10 @@ refactor that reduced coupling, and stayed silent on a genuinely unrelated
 
 Renaming or removing a definition fails this too, which is intended: both are
 decisions worth seeing in a diff.
+
+No line count appears above on purpose. An earlier draft quoted one and it went
+stale two commits later, inside the same PR -- in the file whose whole argument
+is that counts in prose drift while names do not.
 """
 
 from __future__ import annotations

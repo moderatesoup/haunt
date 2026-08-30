@@ -1136,17 +1136,19 @@ def install_cmd(
 ) -> None:
     """Bind haunt to all known hosts (Cursor, Claude Code). Idempotent."""
     from haunt.bootstrap import bind_launchers
-    from haunt.hosts import AlternateHomeRefused, HostConfigError, install_all_hosts
+    from haunt.hosts import HostConfigError, HostInstallRefused, install_all_hosts
 
     home, hook_cmd, mcp_cmd = bind_launchers()
     try:
         reports = install_all_hosts(
             str(home), hook_cmd, mcp_cmd, force=allow_alt_home
         )
-    except AlternateHomeRefused as exc:
+    except HostInstallRefused as exc:
         # Hard error, unlike bootstrap: binding hosts is the entire point of
         # this command, so doing nothing quietly would be the same silence the
-        # guard exists to prevent.
+        # guard exists to prevent. Catches the category, not one class -- the
+        # unsafe-command and foreign-target guards were previously uncaught
+        # here and surfaced as tracebacks.
         _die(exc, code=2)
     except HostConfigError as exc:
         _die(exc, code=1)
@@ -1167,11 +1169,11 @@ def cursor_install_cmd() -> None:
     """Bind haunt to Cursor: hooks.json + mcp.json + haunt.mdc + skill."""
     from haunt.cursor_hook import install_cursor_hooks
 
-    from haunt.hosts import AlternateHomeRefused, HostConfigError
+    from haunt.hosts import HostConfigError, HostInstallRefused
 
     try:
         report = install_cursor_hooks()
-    except AlternateHomeRefused as exc:
+    except HostInstallRefused as exc:
         _die(exc, code=2)
     except HostConfigError as exc:
         _die(exc, code=1)
@@ -1220,10 +1222,12 @@ def doctor_cmd() -> None:
             raise typer.Exit(1)
         typer.echo("")
         typer.echo("Re-merging all hosts...")
-        from haunt.hosts import HostConfigError
+        from haunt.hosts import HostConfigError, HostInstallRefused
 
         try:
             install_all_hosts(str(home), hook_cmd, mcp_cmd)
+        except HostInstallRefused as exc:
+            _die(exc, code=2)
         except HostConfigError as exc:
             _die(exc, code=1)
         report = diagnose(str(home), hook_cmd, mcp_cmd)

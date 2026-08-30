@@ -172,6 +172,15 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
         if embed_state.available:
             st.set_meta("embed_model", embed_state.model_id)
             st.set_meta("embed_dim", str(embed_state.dim))
+    # Immediately after the probe and before the drain loop. The probe is what
+    # gates writing them at all (an interpreter that cannot load sqlite-vec
+    # must not be baked into a wrapper the desktop shortcut then prefers), but
+    # deferring them past the drain meant an interrupted bootstrap left no
+    # canonical wrapper at all -- and _find_haunt_cmd then falls back to
+    # shutil.which, which is the pyenv-shim failure the wrapper exists to
+    # prevent.
+    launcher = write_launcher()
+
     reembed_report: list = []
     if reembed:
         reembed_report = reembed_all_namespaces()
@@ -210,29 +219,50 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                 entry["namespace"] = row["name"]
                 entry["auto"] = True
                 reembed_report.append(entry)
-    launcher = write_launcher()
+    from haunt.hosts import (
+        HostInstallRefused,
+        check_hook_command_safe,
+        host_install_refusal,
+        install_all_hosts,
+    )
 
-    from haunt.hosts import host_install_refusal, install_all_hosts
+    hook_cmd = str(bin_dir() / "haunt-hook")
+    mcp_cmd = str(bin_dir() / "haunt-mcp")
 
     # One decision for both global-config writes below, so the report tells a
-    # single coherent story. bootstrap() skips rather than aborts: every other
-    # step above (layout, launchers, registry, embeddings) is still useful and
-    # still correct for an alternate home. The skip is reported loudly by
-    # format_report() -- silence here is the failure mode this guard exists for.
-    refusal = host_install_refusal(str(home))
+    # single coherent story, and it is made BEFORE either write. bootstrap()
+    # skips rather than aborts: every other step above (layout, launchers,
+    # registry, embeddings) is still useful and still correct. The skip is
+    # reported loudly by format_report() -- silence here is the failure mode
+    # these guards exist for.
+    #
+    # The hook command is checked here rather than only inside the adapters
+    # because install_all_hosts binds Cursor before Claude's adapter runs: a
+    # refusal raised there leaves one host configured and the other not, and
+    # the desktop shortcut already written. Deciding up front keeps the skip
+    # all-or-nothing.
+    refusal: Exception | None = host_install_refusal(str(home))
+    if refusal is None:
+        try:
+            check_hook_command_safe(hook_cmd)
+        except HostInstallRefused as exc:
+            refusal = exc
 
     from haunt.desktop import install_desktop_icon
     icon_result = (
         install_desktop_icon()
         if refusal is None
-        else {"written": False, "reason": "haunt home is not the default home"}
+        else {"written": False, "reason": "host config bind was refused"}
     )
 
-    hook_cmd = str(bin_dir() / "haunt-hook")
-    mcp_cmd = str(bin_dir() / "haunt-mcp")
-    host_reports = (
-        install_all_hosts(str(home), hook_cmd, mcp_cmd) if refusal is None else []
-    )
+    host_reports = []
+    if refusal is None:
+        try:
+            host_reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+        except HostInstallRefused as exc:
+            # Backstop: the adapters re-check, and a target-path refusal can
+            # only be seen there.
+            refusal = exc
 
     hook_launcher = bin_dir() / "haunt-hook"
     report = {

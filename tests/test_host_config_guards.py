@@ -532,7 +532,11 @@ def test_a_symlinked_config_root_cannot_alias_back_inside_the_home(
 def test_the_escape_hatch_still_allows_a_deliberate_foreign_target(
     sandbox, foreign_config, monkeypatch
 ):
-    """One consent variable, exactly 1, covers both guards."""
+    """The alternate-home consent also covers the foreign-target guard.
+
+    It does NOT cover the hook-command guard, which has its own variable --
+    see test_the_override_is_separate_from_the_alternate_home_consent.
+    """
     from haunt.hosts import ALT_HOME_ENV, claude
 
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(foreign_config))
@@ -606,3 +610,78 @@ def test_the_override_is_separate_from_the_alternate_home_consent(
 
     monkeypatch.setenv("HAUNT_ALLOW_UNSAFE_HOOK_COMMAND", "1")
     check_hook_command_safe("/Users/First Last/.haunt/bin/haunt-hook")
+
+    # The other direction: consenting to an unsafe hook command must not
+    # unlock the alternate-home guard.
+    from haunt.hosts import AlternateHomeRefused, check_host_install_allowed
+
+    monkeypatch.delenv(ALT_HOME_ENV, raising=False)
+    with pytest.raises(AlternateHomeRefused):
+        check_host_install_allowed(sandbox["alt_home"])
+
+
+# --- refusals must be caught, not surfaced as tracebacks ---------------------
+# AlternateHomeRefused was wired into a handling contract; the two guards added
+# later inherited from RuntimeError and matched no handler, so an ordinary home
+# containing a space aborted `haunt bootstrap` with a traceback after the
+# launchers and the desktop shortcut had already been written.
+
+
+def test_every_refusal_shares_one_base(sandbox):
+    from haunt.hosts import (
+        AlternateHomeRefused,
+        ForeignHostConfigRefused,
+        HostInstallRefused,
+        UnsafeHookCommandRefused,
+    )
+
+    for cls in (
+        AlternateHomeRefused,
+        ForeignHostConfigRefused,
+        UnsafeHookCommandRefused,
+    ):
+        assert issubclass(cls, HostInstallRefused), cls
+
+
+def test_bootstrap_skips_and_reports_a_home_with_a_space(tmp_path, monkeypatch):
+    """The front-door command must not die on an ordinary macOS home."""
+    from haunt.bootstrap import bootstrap, format_report
+
+    spaced = tmp_path / "First Last"
+    (spaced / ".haunt").mkdir(parents=True)
+    for var, value in (
+        ("HOME", spaced),
+        ("USERPROFILE", spaced),
+        ("HAUNT_HOME", spaced / ".haunt"),
+        ("CURSOR_HOME", spaced / ".cursor"),
+        ("CLAUDE_CONFIG_DIR", spaced / ".claude"),
+    ):
+        monkeypatch.setenv(var, str(value))
+    monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
+    monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
+    monkeypatch.delenv("HAUNT_ALLOW_UNSAFE_HOOK_COMMAND", raising=False)
+    assert Path.home().resolve() == spaced.resolve()
+
+    rendered = format_report(bootstrap("default"))
+    assert "HOST BIND SKIPPED" in rendered, rendered
+    # The shortcut is skipped too: it is the other global-config write, and the
+    # decision is made once, before either happens.
+    assert "desktop icon  skipped" in rendered, rendered
+    assert not (spaced / ".cursor" / "hooks.json").exists()
+    assert not (spaced / ".claude" / "settings.json").exists()
+
+
+def test_install_all_hosts_writes_nothing_when_one_adapter_refuses(
+    sandbox, foreign_config, monkeypatch
+):
+    """A partial bind is worse than none: doctor would call one host healthy."""
+    from haunt.hosts import HostInstallRefused, install_all_hosts
+
+    # Only Claude's target is foreign, so Cursor would otherwise be written
+    # first and Claude's adapter would refuse afterwards.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(foreign_config))
+    cmds = _use_home(monkeypatch, sandbox["default_home"])
+    with pytest.raises(HostInstallRefused):
+        install_all_hosts(cmds["home"], cmds["hook_cmd"], cmds["mcp_cmd"])
+    assert not (sandbox["cursor_home"] / "hooks.json").exists()
+    assert sorted(foreign_config.iterdir()) == []

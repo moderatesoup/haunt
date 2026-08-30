@@ -18,6 +18,7 @@ from typing import Literal
 
 from haunt.recall import (
     Hit,
+    _stable_tie_key,
     RecallResult,
     classify_recall_residue,
     execution_metadata,
@@ -284,6 +285,11 @@ def _hits_from_events(
 ) -> list[Hit]:
     hits: list[Hit] = []
     seen: set[str] = set()
+    # Timeline hits are built here, not by recall(), so they need the tie key
+    # selected explicitly. Without it every timeline Hit carried content_hash
+    # None and the equal-timestamp tie-break below silently degraded back to
+    # the random memory id it was written to replace.
+    tie = _stable_tie_key(store.conn)
     recall_class_select = (
         "e.recall_class AS recall_class"
         if bool(getattr(store, "recall_class_available", False))
@@ -294,7 +300,8 @@ def _hits_from_events(
             f"""
             SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
                    e.role, e.event_time, e.ts, e.tool_name, e.tool_input,
-                   e.tool_output, e.origin, {recall_class_select}
+                   e.tool_output, e.origin, {tie} AS content_hash,
+                   {recall_class_select}
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.event_id=? AND m.valid_to IS NULL
@@ -320,6 +327,7 @@ def _hits_from_events(
                 score=0.0,
                 tier=row["tier"],
                 content=row["content"],
+                content_hash=row["content_hash"],
                 role=row["role"],
                 event_time=row["event_time"],
                 ts=row["ts"],
@@ -347,7 +355,7 @@ def run_timeline(
     session_id: str | None = None,
     limit: int = 50,
     clock: str | None = None,
-) -> list[Hit]:
+) -> RecallResult:
     """A: events in [start, end] on the chosen clock(s).
 
     Direct callers share the public ``clamp_k`` contract, so ``limit`` is

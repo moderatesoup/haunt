@@ -27,7 +27,19 @@ ALT_HOME_ENV = "HAUNT_ALLOW_ALT_HOME_HOST_INSTALL"
 UNSAFE_HOOK_ENV = "HAUNT_ALLOW_UNSAFE_HOOK_COMMAND"
 
 
-class AlternateHomeRefused(RuntimeError):
+class HostInstallRefused(RuntimeError):
+    """Base for every refusal to write global host config.
+
+    Exists so a caller catches the *category*, not a list. The two guards added
+    after AlternateHomeRefused were wired into the same call sites and inherited
+    from RuntimeError, so nothing caught them: `haunt bootstrap` on a home with
+    a space died with a traceback after already writing the launchers, and
+    `install_all_hosts` had written Cursor's config before Claude's adapter
+    raised. A new guard now only has to subclass this.
+    """
+
+
+class AlternateHomeRefused(HostInstallRefused):
     """Host config install refused: this haunt home is not the default one.
 
     Editor host config (Claude Code settings.json, Cursor hooks.json) is
@@ -93,7 +105,7 @@ def check_host_install_allowed(haunt_home: str | Path, *, force: bool = False) -
         raise refusal
 
 
-class ForeignHostConfigRefused(RuntimeError):
+class ForeignHostConfigRefused(HostInstallRefused):
     """The host config about to be written does not belong to this home.
 
     host_install_refusal judges the haunt home that would be *written into*
@@ -153,7 +165,7 @@ def check_host_config_target(target: str | Path, *, force: bool = False) -> None
 _SHELL_SAFE_COMMAND = re.compile(r"\A[A-Za-z0-9._/+@:=-]+\Z")
 
 
-class UnsafeHookCommandRefused(RuntimeError):
+class UnsafeHookCommandRefused(HostInstallRefused):
     """The hook command contains characters the host would hand to a shell.
 
     Hook entries are written into settings.json / hooks.json as a single
@@ -420,6 +432,15 @@ def install_all_hosts(
     an adapter directly (haunt cursor-install does) is guarded too.
     """
     check_host_install_allowed(haunt_home, force=force)
+    # Preflight every adapter before any of them writes. install_all_hosts
+    # iterates Cursor then Claude, so a refusal raised inside Claude's install
+    # used to leave Cursor's hooks.json, mcp.json, rule and skill already
+    # rewritten -- a partial bind is worse than none, because doctor then
+    # reports one host healthy.
+    for adapter in _adapters():
+        preflight = getattr(adapter, "preflight", None)
+        if preflight is not None:
+            preflight(haunt_home, hook_cmd, force=force)
     reports: list[HostReport] = []
     for adapter in _adapters():
         report = adapter.install(haunt_home, hook_cmd, mcp_cmd, force=force)
