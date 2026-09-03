@@ -1415,6 +1415,69 @@ the leg's width without moving the headline numbers. Those numbers were taken
 against spans built before L27 landed, which does not affect them -- the tail
 probe samples at `max_len + 80`, nowhere near the final span L27 repairs.
 
+### Recovery of the hijacked capture, and the stale audit (2026-09-02)
+
+**Recovered capture merged, two of three namespaces.** The scratch tree from
+the L29 incident was preserved to `~/haunt-recovered-20260902` (932 MB, 12,049
+memories), and each side turned out to be a genuine fork: disjoint event IDs
+written to both trees over the same window, because some sessions kept the old
+config and some took the hijacked one.
+
+Merged with `namespace reconcile`, dry-run first on byte copies in a scratch
+home, then applied to the real store behind a full backup at
+`~/haunt-backup-before-merge-20260902` (1.6 GB):
+
+| namespace | before | recovered | after | result |
+|---|---:|---:|---:|---|
+| `default` | 53 | 16 | 69 | applied, verified |
+| `haunt` | 5,046 | 91 | 5,139 | applied, verified |
+| `github.com-memory-protocol-memory-protocol` | 10,702 | 11,941 | — | **blocked** |
+
+Verification on the copies before applying and on the real store after: exact
+expected counts, zero duplicate event IDs, zero orphan memories, FTS row count
+equal to memories, zero dangling corrections, `PRAGMA foreign_key_check`
+empty, `PRAGMA integrity_check` ok, recall answering. The two consumed staging
+labels were retired with `namespace retire --into`, which reported
+`safe: true` and `undrained_rows: {}` -- the registry's own proof that every
+row reached the target -- each behind a verified backup.
+
+The `sessions` `window_conflicts` the dry runs reported (1 for `haunt`, 8 for
+`mp`) do **not** block an apply; they are windows reconcile could not merge
+automatically, and the target's window is kept. Worth knowing because L18 read
+them as a refusal.
+
+**`mp` is blocked, not failed.** Every attempt refused with `SQLite zero-write
+read observed storage drift` on the target: another session is writing that
+namespace continuously, and the zero-write snapshot guard correctly declines
+to plan against a moving file. Nothing was written. To finish it, close the
+session working in `memory-protocol` and run:
+
+```
+haunt namespace reconcile recovered-mp github.com-memory-protocol-memory-protocol
+haunt namespace reconcile recovered-mp github.com-memory-protocol-memory-protocol --apply --plan-digest <digest>
+haunt namespace retire recovered-mp --into github.com-memory-protocol-memory-protocol --apply
+```
+
+`recovered-mp` stays registered and staged for exactly that. The source bytes
+also remain in `~/haunt-recovered-20260902` if the staging label is ever lost.
+
+**PR #19 closed rather than merged.** It is a silent-failure audit written
+against `2e6890a` on 2026-08-21, 110 commits behind. Merging it would add a
+document describing a tree that no longer exists. Its nine findings were
+checked individually against current `main`: F1 (`delete --event-id` needed a
+dummy positional) fixed -- `memory_id` is now `Optional`; F2 (dashboard GET
+created namespaces) fixed -- `create=False` throughout; F3 (`memory_session_end`
+ok for a missing session) fixed -- `create=False`; F4 (`procedure` no-args
+exit 2) fixed -- `no_args_is_help=True`; F5 (hook tool I/O stored as
+`tier=procedural`) fixed -- episodic in both hooks; N1, N3 (CI FTS-only only)
+fixed -- the `test-hybrid` job exists; N4 (retrieval swallowed
+`sqlite3.Error`) fixed -- `RetrievalBackendError`. Only **N2** was still live
+and is fixed in this change.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L31 | `memory_session_end` returned a permanent `"distilled": false`, advertising a distillation step that does not exist and that `docs/MEMORY_CONTRACT.md` section 6 forbids ever existing. Four tests asserted the constant, so the dead field was pinned in place. FIXED: field removed; the tests now assert the key is **absent**, so it cannot be reintroduced silently. Originally PR #19 N2. | LOW (honesty) | `tests/test_session_end.py` | verified |
+
 ### Filtered rows consume the vector KNN budget (2026-09-02)
 
 Found by an independent audit of the correction/supersession subsystem and
