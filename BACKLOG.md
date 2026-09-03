@@ -1488,19 +1488,53 @@ consumes it.
 
 | ID | Item | Severity | Evidence | Checked |
 |---|---|---|---|---|
-| L30 | The validity and residue predicates are a **post-filter on a vec0 KNN**, not a pre-filter. `vec0` returns the `k` nearest rows and the joins then discard some, so every superseded row and every raw tool-I/O row nearer to the query than the live answer spends a candidate slot and is thrown away. Reproduced with a live memory that is relevant but not the single nearest: at 45 hidden rows the raw KNN returns 40 and **0** survive the filter, and recall reports `no_vector_candidates`. The vector half of hybrid retrieval is silently dead and says the index had nothing, when it had 40. In that reproduction FTS still found the row, so the failure is invisible from the outside -- but FTS is exactly what fails on the L1 preference/decision shape, which is the case hybrid exists to cover. Residue matters more than corrections here: a hook-fed store accumulates far more tool I/O than supersessions. | HIGH (silent, pre-existing, worsens monotonically) | `verify2.py` reproduction; `src/haunt/recall.py` head leg `WHERE v.embedding MATCH ? AND k = ? AND {where}`; filter built at `_filters` | verified |
+| L30 | **FIXED.** The validity and residue predicates are a **post-filter on a vec0 KNN**, not a pre-filter. `vec0` returns the `k` nearest rows and the joins then discard some, so every superseded row and every raw tool-I/O row nearer to the query than the live answer spends a candidate slot and is thrown away. Reproduced with a live memory that is relevant but not the single nearest: at 45 hidden rows the raw KNN returns 40 and **0** survive the filter, and recall reports `no_vector_candidates`. The vector half of hybrid retrieval is silently dead and says the index had nothing, when it had 40. In that reproduction FTS still found the row, so the failure is invisible from the outside -- but FTS is exactly what fails on the L1 preference/decision shape, which is the case hybrid exists to cover. Residue matters more than corrections here: a hook-fed store accumulates far more tool I/O than supersessions. | HIGH (silent, pre-existing, worsens monotonically) | `verify2.py` reproduction; `src/haunt/recall.py` head leg `WHERE v.embedding MATCH ? AND k = ? AND {where}`; filter built at `_filters` | verified |
 
 The span leg added in L21 is already partly protected: its over-fetch (L23,
 `limit * max_spans` bounded by `SPAN_KNN_MAX`) widens the KNN for a different
 reason but incidentally leaves room for discards. The head leg has no such
 slack.
 
-**Not fixed in the L21 change.** It is a different subsystem from tail
-coverage, it is pre-existing, and folding a high-severity retrieval fix into
-an already-large span PR would make both harder to review. It also touches
-E6: the harness runs `recall`, so its evidence must be regenerated when this
-lands, and whether `top40` still describes the pool honestly is part of that
-review.
+**Fixed separately from L21**, because it is a different subsystem, it is
+pre-existing, and folding a high-severity retrieval fix into an already-large
+span PR would have made both harder to review.
+
+**The fix.** `_knn_eligible` keeps the filtered query as its first pass, so a
+healthy corpus pays nothing, and only re-asks when that pass comes back short.
+The wider pass projects the predicate as a flag over LEFT JOINs rather than
+applying it as a WHERE, because that is the only shape that reports both
+signals the escalation needs: how many rows the index returned (exhausted?)
+and how many are eligible (enough?). Escalation is ratio-guided -- the first
+pass has already measured how dense eligible rows are near this query -- and
+bounded by `VEC_KNN_MAX`.
+
+Three things that went wrong while building it, all caught by the suite and
+worth recording:
+
+- Routing the head leg through the shared helper made it **swallow backend
+  errors** into an empty result, breaking the `retrieval_backend_error`
+  contract. Only the span leg may tolerate a failure (a namespace
+  mid-migration legitimately lacks the table), and it now catches at its own
+  call site while the helper propagates.
+- Widening the *fast* path's joins to LEFT tripled median recall latency by
+  itself, before any extra query. `frm` must stay byte-identical to the joins
+  that ran before; the outer joins belong only to the probe.
+- An unconditional wider pass also tripled latency, on a corpus where it found
+  nothing extra.
+
+**What it costs, measured on the dogfooded corpus (4,884 memories, 92% raw
+tool residue).** Median hybrid recall at k=8 goes from 53 ms to 123 ms. That
+is not a regression to absorb quietly -- it is the price of a candidate set
+that is actually full. The same five queries before the fix returned 25, 17,
+37, 26 and 20 vector candidates against a nominal 40; after, all five return
+40. The leg was under-filled on every single query on this corpus, which is
+what L30 predicted and is driven by residue, not supersession. Hook-injected
+recall is FTS-only and is unaffected.
+
+**E6.** The harness runs `recall`, so its evidence should be regenerated
+against this behaviour. The pinned `top40` still describes the fused pool
+honestly -- arguably more honestly, since the pool is now actually 40 -- but
+that judgement belongs to an E6 review, not to this change.
 
 ### Operational incident: host config hijacked by a temporary HAUNT_HOME (2026-09-02)
 
