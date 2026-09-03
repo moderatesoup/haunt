@@ -85,7 +85,21 @@
       ],
       "possible_under_feature_definition": true,
       "required_fit_positive_retained_for_95pct": 19,
-      "selected_threshold": 0.875
+      "selected_threshold": 0.7500000000000001,
+      "selected_threshold_fit_gate_validation": {
+        "answerable_cases": 20,
+        "cases": 40,
+        "conditional_answerable_count": 20,
+        "conditional_answerable_retained": 20,
+        "conditional_answerable_retention": 1.0,
+        "gate_100_percent_unanswerable_abstained": true,
+        "gate_95_percent_conditional_answerable_retained": true,
+        "pre_abstention_recall_at_5": 1.0,
+        "unanswerable_abstained": 20,
+        "unanswerable_abstention_rate": 1.0,
+        "unanswerable_cases": 20
+      },
+      "selected_threshold_strategy": "nextafter_max_negative_toward_positive_infinity"
     },
     "cases": [
       {
@@ -3542,7 +3556,7 @@
         }
       }
     ],
-    "diagnostic_boundary_from_fit_only": 0.875,
+    "diagnostic_boundary_from_fit_only": 0.7500000000000001,
     "held_out_labels_available_to_fit": [],
     "labels_available_to_fit": [
       "fts-fit-a01",
@@ -6875,8 +6889,8 @@
       },
       {
         "details": {
-          "boundary": 0.875,
-          "fit_report_canonical_sha256": "6b697530a3dd6f75c491c0d0580c7d0120e6d0538ccef47304440ccd7830724c"
+          "boundary": 0.7500000000000001,
+          "fit_report_canonical_sha256": "8db369d105d91f397d44b30078463d680b95ca745c730702798f7347dda6c32a"
         },
         "event": "fit_boundary_complete"
       },
@@ -6928,9 +6942,16 @@
     "vector_metric": null
   },
   "public_runtime_policy": {
-    "base_revision": "ed806b2",
     "diff": "",
     "diff_empty": true,
+    "e6_commits": [
+      "d5b204c7c7a110c7aa2f6555ca507bebc3ba6798",
+      "b7c557bc6914dbde22c51714ccd0982383404c10",
+      "0a176a49b5e74a7f41c755da5fbb14c46789b19e",
+      "659b852bfd45d37ef6c5f6552d227bad2466ef01",
+      "8170426fca11257af4d846095e5c1cfe74c2137e"
+    ],
+    "history_attributable": true,
     "paths": [
       "pyproject.toml",
       "src/haunt/__init__.py",
@@ -6939,32 +6960,43 @@
       "src/haunt/cli.py",
       "src/haunt/mcp_server.py",
       "src/haunt/dashboard.py"
-    ]
+    ],
+    "uncommitted_paths": [],
+    "uncommitted_unattributed": false
   },
   "report_id": "haunt-abstention-feasibility-fts-v1",
   "runtime_policy_shipped": false,
   "schema_version": 1,
   "sealed_e0": {
-    "base_revision": "ed806b2",
     "byte_mismatches": [],
     "diff": "",
     "diff_empty": true,
+    "e6_commits": [
+      "d5b204c7c7a110c7aa2f6555ca507bebc3ba6798",
+      "b7c557bc6914dbde22c51714ccd0982383404c10",
+      "0a176a49b5e74a7f41c755da5fbb14c46789b19e",
+      "659b852bfd45d37ef6c5f6552d227bad2466ef01",
+      "8170426fca11257af4d846095e5c1cfe74c2137e"
+    ],
+    "history_attributable": true,
     "paths": [
       "src/haunt/frozen_retrieval_eval.py",
       "tests/fixtures/retrieval_eval",
       "tests/test_frozen_retrieval_eval.py"
     ],
     "tracked_file_count": 5,
+    "uncommitted_paths": [],
+    "uncommitted_unattributed": false,
     "working_tree_byte_sha256": {
-      "src/haunt/frozen_retrieval_eval.py": "561d3054138a2c040d7d009e4220794d5a739e01713eb05ef4e0e2a95f3cc7ee",
-      "tests/fixtures/retrieval_eval/README.md": "3b8d0d5950fcd199df6d06949a23b8c774cef6d06b72d8dc34e2a2fbbc2de1ee",
-      "tests/fixtures/retrieval_eval/baseline.json": "edd0a15873e547aec29ac372ad0c57c34811faab28b86bb98149ae221a760f85",
-      "tests/fixtures/retrieval_eval/corpus.json": "50cd13d92d8b85e0e75c9fd3a39c9b520b5b2a7905060ecf033be7d8fb14cbc0",
-      "tests/test_frozen_retrieval_eval.py": "d717506a7c46c4085a281f8dd7f7af9abfd2fbd143e8581e1dbaa8131851df38"
+      "src/haunt/frozen_retrieval_eval.py": "21eb4639c1526920e0621a35204563ff85fa9671e27ff3b4ad40bba4d2c847fd",
+      "tests/fixtures/retrieval_eval/README.md": "9d14bb361a278eaf692239164d04ba542af755d9b5a7ad14da4ddf64d47a5013",
+      "tests/fixtures/retrieval_eval/baseline.json": "38697d85ae324ae055a5a624f7166153d3ad7237a656e83634f423a3c3c7d4e3",
+      "tests/fixtures/retrieval_eval/corpus.json": "906061d5c1cc877c1b5ee9e10a2d38027bb7b0b1d55c34797f77537a33562459",
+      "tests/test_frozen_retrieval_eval.py": "fabec348b2ea7aabd5e22f89e8f9ade096b206434d86c8aecc0f8d2b2a78c4b9"
     }
   },
   "separation_from_e0": {
-    "e0_canonical_dataset_sha256": "838e0efbb4bb63e6dc9b064b71a63307d1a942e14782c1d38f60ac4cc451ea09",
+    "e0_canonical_dataset_sha256": "6a73167821408dfdb40293e5f11fb72d39052de10bb62b9e2fe7314f8676c607",
     "e6_logical_id_count": 40,
     "e6_query_hash_count": 160,
     "e6_record_hash_count": 40,

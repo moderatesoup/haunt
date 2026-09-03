@@ -1042,6 +1042,8 @@ def analyze_fit(
     by_id = {row.case_id: row for row in observations}
     if set(by_id) != set(labels.by_case):
         raise ValueError("fit observations and fit labels must match exactly")
+    if any(not math.isfinite(row.strength) for row in observations):
+        raise ValueError("fit evidence strengths must be finite")
     negatives = [
         by_id[key]
         for key, label in labels.by_case.items()
@@ -1057,21 +1059,36 @@ def analyze_fit(
         raise ValueError("fit requires negative and recalled-positive evidence")
     max_negative = max(row.strength for row in negatives)
     minimum_boundary = math.nextafter(max_negative, math.inf)
+    if not math.isfinite(minimum_boundary):
+        raise ValueError("no finite threshold exists above the strongest negative")
     required = math_ceil_95(len(conditional_positives))
     eligible = [
         row for row in conditional_positives if row.strength >= minimum_boundary
     ]
     possible = len(eligible) >= required
     selected_threshold: float | None = None
+    selected_threshold_strategy: str | None = None
+    fit_gate_validation: dict[str, Any] | None = None
     if possible:
-        retained_strengths = sorted(
-            (row.strength for row in conditional_positives), reverse=True
-        )[:required]
-        selected_threshold = (max_negative + min(retained_strengths)) / 2.0
+        # The smallest representable float strictly above the strongest
+        # negative is the only boundary we need. A midpoint can round back to
+        # max_negative when the positive is exactly one ULP above it, which
+        # would retain the negative because scoring uses strength >= threshold.
+        selected_threshold = minimum_boundary
+        selected_threshold_strategy = "nextafter_max_negative_toward_positive_infinity"
+        fit_gate_validation = _score(observations, labels.by_case, selected_threshold)
+        if not (
+            selected_threshold > max_negative
+            and fit_gate_validation["gate_100_percent_unanswerable_abstained"]
+            and fit_gate_validation["gate_95_percent_conditional_answerable_retained"]
+        ):
+            raise RuntimeError("fit threshold failed its predeclared gates")
     domination = _dominating_pairs(negatives, conditional_positives)
     return {
         "possible_under_feature_definition": possible,
         "selected_threshold": selected_threshold,
+        "selected_threshold_strategy": selected_threshold_strategy,
+        "selected_threshold_fit_gate_validation": fit_gate_validation,
         "minimum_threshold_for_100pct_fit_negative_abstention": minimum_boundary,
         "max_fit_negative_strength": max_negative,
         "conditional_fit_positive_count": len(conditional_positives),

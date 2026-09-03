@@ -22,7 +22,8 @@ retrieval rather than a lexical or stemming shortcut. Both splits also contain
 fifteen close absent-attribute or multi-record unanswerable cases, not only
 far-topic negatives.
 
-The FTS-only cohort is separable at the fit-only `0.875` threshold and passes
+The FTS-only cohort is separable at the strict fit-only
+`nextafter(0.75, +infinity) = 0.7500000000000001` threshold and passes
 both held-out gates. The pinned `BAAI/bge-m3` ONNX, 1024-dimensional,
 native-cosine cohort is not separable: the minimum boundary that abstains on all
 fit negatives retains only 6/20 fit positives, and it retains 6/15 held
