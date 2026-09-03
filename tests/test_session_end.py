@@ -144,7 +144,10 @@ def test_memory_session_end_nonexistent_is_not_ok(fts_env):
     assert data.get("error"), f"failure must include error (payload={data!r})"
     assert data["namespace"] == "default"
     assert data["session_id"] == missing
-    assert data["distilled"] is False
+    # The response never advertises distillation: the contract forbids it
+    # ever existing (docs/MEMORY_CONTRACT.md section 6), so a permanent
+    # `"distilled": false` only implied it might.
+    assert "distilled" not in data
 
     from haunt.store import Store
 
@@ -168,7 +171,10 @@ def test_memory_session_end_already_ended_is_not_ok(fts_env):
     assert data["ok"] is False
     assert data.get("error")
     assert data["session_id"] == sid
-    assert data["distilled"] is False
+    # The response never advertises distillation: the contract forbids it
+    # ever existing (docs/MEMORY_CONTRACT.md section 6), so a permanent
+    # `"distilled": false` only implied it might.
+    assert "distilled" not in data
 
 
 def test_memory_session_end_no_session_is_not_ok(fts_env):
@@ -184,7 +190,10 @@ def test_memory_session_end_no_session_is_not_ok(fts_env):
         f"must not return ok:true (payload={data!r})"
     )
     assert data.get("error")
-    assert data["distilled"] is False
+    # The response never advertises distillation: the contract forbids it
+    # ever existing (docs/MEMORY_CONTRACT.md section 6), so a permanent
+    # `"distilled": false` only implied it might.
+    assert "distilled" not in data
 
 
 def test_memory_session_end_open_session_succeeds(fts_env):
@@ -199,7 +208,10 @@ def test_memory_session_end_open_session_succeeds(fts_env):
     assert data["ok"] is True, f"open session must end: {data!r}"
     assert data["namespace"] == "default"
     assert data["session_id"] == sid
-    assert data["distilled"] is False
+    # The response never advertises distillation: the contract forbids it
+    # ever existing (docs/MEMORY_CONTRACT.md section 6), so a permanent
+    # `"distilled": false` only implied it might.
+    assert "distilled" not in data
     assert "error" not in data
 
     with Store("default") as st:

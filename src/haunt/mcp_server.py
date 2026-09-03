@@ -796,7 +796,6 @@ def memory_session_end(
         "ok": bool(result.get("ok")),
         "namespace": ns,
         "session_id": result.get("session_id"),
-        "distilled": False,
     }
     if not payload["ok"]:
         payload["error"] = result.get("error") or "session was not ended"
