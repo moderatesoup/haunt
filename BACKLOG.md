@@ -1407,13 +1407,37 @@ would silently move E6's pinned profile identity.
 | L25 | The v14 backfill selected its population with `length(content) > embed_max_len()`, reading the live env var, but the migration is one-shot behind the schema version. A single open under `HAUNT_EMBED_MAX_LEN=8192` -- legitimate, BGE-M3 accepts it -- would permanently exclude every memory between 512 and 8192 characters, and `span_backlog` would then report 0 outstanding forever. FIXED: fixed `SPAN_FLOOR_CHARS = 512` constant, `min()`-ed with the window so a smaller configured window stays correct. | MEDIUM | `tests/test_embed_spans.py::test_backfill_floor_is_a_constant_not_the_live_window` | verified |
 | L26 | `HAUNT_EMBED_MAX_SPANS=1` produced zero windows (`_windows` guards on `len(out) < cap - 1`) and `plan()` returned `EMPTY`, which is the "this text fits the window" signal. A 5,000-token memory lost its entire tail with `truncated=False`, contradicting the module's own guarantee, and the drain reported `spans=0 truncated=0` -- a clean-looking pass over nil coverage. FIXED: a cap-blocked plan carries `truncated=True` and the real `total_chars`; `store_memory_spans` counts `plan.spans` rather than the plan's truthiness. | LOW (env-reachable) | `tests/test_embed_spans.py::test_a_cap_that_allows_no_tail_window_says_so` | verified |
 | L27 | Spans overran the embed window. `_offsets` filters zero-width offsets, so windows were cut to `max_len` **content** tokens; the encoder then adds CLS/SEP and truncates at `max_len`. Measured on BGE-M3: widest span 514 content tokens plus 2 specials against a 512 ceiling. Interior spans are absorbed by the 64-token overlap, but the final span has no successor, so the last tokens of every long memory still never reached a vector while `covered_chars` claimed otherwise. Subtracting the overhead alone was **not sufficient** -- re-tokenizing a substring drifts about a token from the parent tokenization -- so the final span is now verified against the real encoder and shrunk from the front (its front is inside the previous window's overlap; its end is not covered by anything). Re-measured: final span 512 against a 512 ceiling. | LOW-MEDIUM | `tests/test_embed_spans.py::test_the_final_span_fits_inside_the_encoder_window` | verified |
-| L28 | **Deferred, not fixed.** Head and span legs each return up to `CANDIDATES` and the merge truncates the union back to `CANDIDATES`, so spans displace head candidates rather than widening a pool sized for one vector leg. This is the mechanism behind the measured head regression (12 of 13 displacements genuine). Widening it is the obvious fix and is **not** taken here: `abstention_eval` pins `fts5-porter-unicode61-top40-k5-v1` and `bge-m3-onnx-1024-native-cosine-fts5-rrf60-top40-k5-v1`, whose `top40` is exactly this number, and the contract makes retrieval configuration part of E6's calibration identity. Changing it needs a profile version bump and E6 re-review, not a quiet edit. See also L4. | MEDIUM (open) | `src/haunt/abstention_eval.py:36-37`; `docs/MEMORY_CONTRACT.md` section 3 | verified |
+| L28 | **Measured, no effect, closed.** Originally deferred as "widen the pool and the head regression goes away". Measured on the drained corpus at k=10 with CANDIDATES=40: keeping the union whole (up to 80) is **bit-identical** to truncating it back to 40 -- head @10 0.560 and tail @10 0.507 under both, against 0.633/0.200 head-only. Pool width was never the mechanism: at k=10 the top ten is already settled long before the 40th candidate, so widening changes nothing a caller sees. The E6 profile bump this would have cost is therefore not worth paying, and the head regression stands as the accepted trade in D8. Original text follows. **Deferred, not fixed.** Head and span legs each return up to `CANDIDATES` and the merge truncates the union back to `CANDIDATES`, so spans displace head candidates rather than widening a pool sized for one vector leg. This is the mechanism behind the measured head regression (12 of 13 displacements genuine). Widening it is the obvious fix and is **not** taken here: `abstention_eval` pins `fts5-porter-unicode61-top40-k5-v1` and `bge-m3-onnx-1024-native-cosine-fts5-rrf60-top40-k5-v1`, whose `top40` is exactly this number, and the contract makes retrieval configuration part of E6's calibration identity. Changing it needs a profile version bump and E6 re-review, not a quiet edit. See also L4. | MEDIUM (open) | `src/haunt/abstention_eval.py:36-37`; `docs/MEMORY_CONTRACT.md` section 3 | verified |
 
 The reachability trade was re-measured after these fixes and is unchanged at
 head @10 0.633 -> 0.560 and tail @10 0.200 -> 0.507; the over-fetch corrected
 the leg's width without moving the headline numbers. Those numbers were taken
 against spans built before L27 landed, which does not affect them -- the tail
 probe samples at `max_len + 80`, nowhere near the final span L27 repairs.
+
+### Filtered rows consume the vector KNN budget (2026-09-02)
+
+Found by an independent audit of the correction/supersession subsystem and
+then reproduced from scratch. **Not caused by the span change** -- the same
+shape is at `06ebd23:src/haunt/recall.py:505`, before spans existed -- and
+distinct from L4 and L28, which both discuss pool *width* rather than what
+consumes it.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L30 | The validity and residue predicates are a **post-filter on a vec0 KNN**, not a pre-filter. `vec0` returns the `k` nearest rows and the joins then discard some, so every superseded row and every raw tool-I/O row nearer to the query than the live answer spends a candidate slot and is thrown away. Reproduced with a live memory that is relevant but not the single nearest: at 45 hidden rows the raw KNN returns 40 and **0** survive the filter, and recall reports `no_vector_candidates`. The vector half of hybrid retrieval is silently dead and says the index had nothing, when it had 40. In that reproduction FTS still found the row, so the failure is invisible from the outside -- but FTS is exactly what fails on the L1 preference/decision shape, which is the case hybrid exists to cover. Residue matters more than corrections here: a hook-fed store accumulates far more tool I/O than supersessions. | HIGH (silent, pre-existing, worsens monotonically) | `verify2.py` reproduction; `src/haunt/recall.py` head leg `WHERE v.embedding MATCH ? AND k = ? AND {where}`; filter built at `_filters` | verified |
+
+The span leg added in L21 is already partly protected: its over-fetch (L23,
+`limit * max_spans` bounded by `SPAN_KNN_MAX`) widens the KNN for a different
+reason but incidentally leaves room for discards. The head leg has no such
+slack.
+
+**Not fixed in the L21 change.** It is a different subsystem from tail
+coverage, it is pre-existing, and folding a high-severity retrieval fix into
+an already-large span PR would make both harder to review. It also touches
+E6: the harness runs `recall`, so its evidence must be regenerated when this
+lands, and whether `top40` still describes the pool honestly is part of that
+review.
 
 ### Operational incident: host config hijacked by a temporary HAUNT_HOME (2026-09-02)
 
