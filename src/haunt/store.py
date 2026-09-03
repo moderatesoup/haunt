@@ -17,12 +17,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import get_ident
-from typing import Any, Callable, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Sequence
 
 import sqlite_vec
 
 from haunt.embed import embed_one
 from haunt.embed import embed_texts
+from haunt.embed import max_len as embed_max_len
+from haunt.embed import special_token_overhead as embed_special_overhead
+from haunt.embed import span_tokenizer as embed_span_tokenizer
 from haunt.embed import state as embed_state
 from haunt.paths import (
     _descriptor_identities as _fd_snapshot,
@@ -74,6 +77,9 @@ from haunt.util import (
     parse_iso,
     utc_iso,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - annotation only
+    from haunt import spans
 
 ROLES = ("user", "assistant", "tool", "system")
 TIERS = ("episodic", "semantic", "procedural", "coordinate")
@@ -127,10 +133,19 @@ _OPEN_SUCCESSOR_SESSIONS = f"""
 #     the vector index. Backfilled from the signature those rows already
 #     carry -- see _backfill_skip_embedding for what that signature cannot
 #     prove.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 SCHEMA_VERSION_KEY = "schema_version"
 PRIVACY_LINEAGE_KEY = "privacy_lineage_head"
 CONTENT_HASH_BACKFILL_BATCH = 1000
+# Character floor for "this memory might exceed the embedding window", used by
+# the v14 span backfill and by the health backlog. Deliberately a constant and
+# NOT HAUNT_EMBED_MAX_LEN: the backfill is one-shot (guarded by the schema
+# version), so reading a live env var means a single open under an unusual
+# value permanently excludes every row below it, with no later pass to notice.
+# One character per token is the hard floor for any text in any script, so 512
+# never under-selects at the shipped window; min() keeps it correct if an
+# operator configures a window smaller than that.
+SPAN_FLOOR_CHARS = 512
 REGISTRY_SCHEMA_VERSION = 5
 REGISTRY_SCHEMA_VERSION_KEY = "schema_version"
 _NAMESPACE_DB_HANDLE_LOCK = SQLITE_OPEN_LOCK
@@ -1446,6 +1461,24 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
             last_error TEXT,
             FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
         );
+        -- Tail windows of a memory too long for one embedding pass (v14).
+        -- `ord` starts at 1: ord 0 is the head window, whose vector has always
+        -- lived in memories.embedding / vec_memories and is not duplicated
+        -- here. start_char/end_char index the stored content verbatim, so a
+        -- span is always a substring and never a rewrite. Derived and
+        -- rebuildable from content alone -- excluded from export for the same
+        -- reason embeddings are (docs/MEMORY_CONTRACT.md section 4).
+        CREATE TABLE IF NOT EXISTS memory_spans (
+            id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            ord INTEGER NOT NULL,
+            start_char INTEGER NOT NULL,
+            end_char INTEGER NOT NULL,
+            embedding BLOB,
+            created_at TEXT NOT NULL,
+            UNIQUE (memory_id, ord),
+            FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+        );
         CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
         CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time);
         CREATE INDEX IF NOT EXISTS idx_events_tier ON events(tier);
@@ -1458,6 +1491,7 @@ def _init_namespace_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_relation_evidence_src ON relation_evidence(src_entity);
         CREATE INDEX IF NOT EXISTS idx_relation_evidence_dst ON relation_evidence(dst_entity);
         CREATE INDEX IF NOT EXISTS idx_embedding_jobs_queued ON embedding_jobs(queued_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_spans_memory ON memory_spans(memory_id);
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             id UNINDEXED,
             content,
@@ -1876,6 +1910,40 @@ def _ensure_namespace_schema(conn: sqlite3.Connection) -> None:
             )
             """
         )
+    if current < 14:
+        # memory_spans is created by _init_namespace_schema above; what the
+        # migration owes is the backlog. Every already-embedded memory longer
+        # than the window has a vector covering only its head, and nothing
+        # would ever revisit it -- observe only enqueues a row whose blob is
+        # NULL. Re-queue them so the tail gets indexed.
+        #
+        # Enqueue only; do not embed. Migration runs on ordinary open, and
+        # recall must not perform maintenance (docs/MEMORY_CONTRACT.md
+        # section 2a). `haunt maintenance` drains this, as it drains every
+        # other queued row.
+        #
+        # The character threshold is deliberately loose. Tokens are what the
+        # window counts, but counting them would mean loading the model during
+        # a schema migration. One character per token is the hard floor for
+        # any text in any script, so a row shorter than the window in
+        # characters cannot be longer than it in tokens. This over-selects and
+        # never under-selects; a re-queued row that turns out to fit produces
+        # no spans and costs one embed. The drain is explicit
+        # (`haunt maintenance`), so the cost is one the operator chooses.
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO embedding_jobs(memory_id, queued_at)
+            SELECT m.id, ?
+              FROM memories m
+             WHERE m.skip_embedding = 0
+               AND m.embedding IS NOT NULL
+               AND length(m.content) > ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_spans s WHERE s.memory_id = m.id
+               )
+            """,
+            (now_iso(), min(SPAN_FLOOR_CHARS, embed_max_len())),
+        )
     _ensure_correction_invariant_triggers(conn)
     _ensure_correction_append_only_triggers(conn)
     _ensure_provenance_type_triggers(conn)
@@ -2081,6 +2149,190 @@ def _claim_fresh_namespace_db_with_configuration_lock(
         raise
 
 
+def ensure_span_vec_table(
+    conn: sqlite3.Connection, dim: int, *, commit: bool = True
+) -> bool:
+    """Create the vec0 table holding tail-span vectors.
+
+    Separate from `vec_memories` rather than sharing it under a composite id:
+    purge has to erase every vector derived from a memory
+    (`docs/MEMORY_CONTRACT.md` section 1), and an explicit `memory_spans` row
+    per vector makes that a keyed delete instead of a prefix scan a vec0
+    virtual table cannot serve.
+    """
+    if dim <= 0 or not _vec_loaded(conn):
+        return False
+    try:
+        conn.execute(
+            f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory_spans USING vec0(
+                id TEXT PRIMARY KEY,
+                embedding FLOAT[{int(dim)}] distance_metric=cosine
+            )
+            """
+        )
+        if commit:
+            conn.commit()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def plan_memory_spans(text: str) -> "spans.SpanPlan":
+    """Tail-span plan for `text` under the live embedder's window.
+
+    Isolated so both write paths ask the same question the same way, and so a
+    tokenizer that cannot be built degrades to character windows here rather
+    than at two call sites.
+    """
+    from haunt import spans as _spans
+
+    # max_len minus what the encoder adds. spans counts content tokens from
+    # an un-truncated tokenizer whose specials are zero-width and invisible in
+    # its offsets; the encoder then adds CLS/SEP and truncates at max_len, so
+    # a window cut to exactly max_len content tokens loses its tail.
+    return _spans.plan(
+        text,
+        max_len=embed_max_len(),
+        tokenizer=embed_span_tokenizer(),
+        special_overhead=embed_special_overhead(),
+    )
+
+
+def store_memory_spans(
+    conn: sqlite3.Connection,
+    rows: Sequence[tuple[str, str]],
+    *,
+    dim: int,
+    ts: str,
+) -> dict[str, Any]:
+    """Embed and store the tail spans for `rows` of (memory_id, content).
+
+    One `embed_texts` call for every span in the batch, because the caller is
+    already paying one model load and a per-span call would dominate ingest.
+    Spans for a memory are replaced wholesale, so re-running is idempotent and
+    a shrinking memory cannot leave an orphan window behind.
+
+    Failure is soft by design: a span is an *additional* index over content
+    that is already stored, already FTS-indexed, and whose head vector was
+    written by the caller. Losing the tail must not fail the memory write that
+    succeeded. Counts come back so the caller can report the shortfall.
+    """
+    out: dict[str, Any] = {"memories": 0, "spans": 0, "truncated": 0, "failed": 0}
+    if not rows or dim <= 0 or not _table_exists(conn, "memory_spans"):
+        return out
+
+    planned: list[tuple[str, str, Any]] = []
+    texts: list[str] = []
+    for memory_id, content in rows:
+        plan = plan_memory_spans(content or "")
+        if plan.truncated:
+            out["truncated"] += 1
+        # `plan.spans` explicitly, not `if not plan`: a plan can carry
+        # truncated=True with no spans at all (HAUNT_EMBED_MAX_SPANS=1), and
+        # that shortfall must still be counted rather than read as "this text
+        # fits in one window".
+        if not plan.spans:
+            # Still clear stale spans: a correction can shorten a memory past
+            # the window, and the old tail must not stay searchable.
+            _drop_memory_spans(conn, memory_id)
+            continue
+        planned.append((memory_id, content, plan))
+        texts.extend(span.slice(content) for span in plan.spans)
+    if not texts:
+        return out
+
+    try:
+        vectors = embed_texts(texts)
+    except Exception:
+        vectors = None
+    if not vectors or len(vectors) != len(texts):
+        out["failed"] = len(planned)
+        return out
+
+    ensure_span_vec_table(conn, dim, commit=False)
+    vec_ready = _table_exists(conn, "vec_memory_spans")
+    cursor = 0
+    for memory_id, _content, plan in planned:
+        take = vectors[cursor : cursor + len(plan.spans)]
+        cursor += len(plan.spans)
+        written = 0
+        try:
+            _drop_memory_spans(conn, memory_id)
+            for span, vec in zip(plan.spans, take):
+                if len(vec) != dim:
+                    raise ValueError(
+                        f"embedding backend returned dimension {len(vec)}; "
+                        f"expected {dim}"
+                    )
+                span_id = f"{memory_id}#{span.ord}"
+                blob = sqlite_vec.serialize_float32(vec)
+                conn.execute(
+                    """
+                    INSERT INTO memory_spans(
+                        id, memory_id, ord, start_char, end_char, embedding,
+                        created_at
+                    ) VALUES (?,?,?,?,?,?,?)
+                    """,
+                    (
+                        span_id,
+                        memory_id,
+                        span.ord,
+                        span.start_char,
+                        span.end_char,
+                        blob,
+                        ts,
+                    ),
+                )
+                if vec_ready:
+                    # Plain INSERT for the same reason: _drop_memory_spans
+                    # above already cleared this memory's rows, and vec0
+                    # would reject the conflict clause rather than honor it.
+                    conn.execute(
+                        "INSERT INTO vec_memory_spans(id, embedding) "
+                        "VALUES (?, ?)",
+                        (span_id, blob),
+                    )
+                written += 1
+            out["spans"] += written
+            out["memories"] += 1
+        except (sqlite3.Error, TypeError, ValueError):
+            # All or nothing per memory. A half-written tail would still make
+            # this memory count as spanned in `haunt health`, which counts
+            # distinct memory_id -- so the gap would read as coverage.
+            # Rolling back to none keeps memories_over_window above
+            # memories_with_spans, which is how an operator sees there is
+            # work left.
+            #
+            # Deliberately not re-queued: the head vector is already correct
+            # and the job row is already gone, so re-queuing would loop the
+            # drain forever on a row it cannot finish. The rebuild is
+            # `haunt bootstrap --reembed`.
+            _drop_memory_spans(conn, memory_id)
+            out["failed"] += 1
+    return out
+
+
+def _drop_memory_spans(conn: sqlite3.Connection, memory_id: str) -> int:
+    """Remove every span row and span vector derived from one memory."""
+    if not _table_exists(conn, "memory_spans"):
+        return 0
+    ids = [
+        str(row["id"])
+        for row in conn.execute(
+            "SELECT id FROM memory_spans WHERE memory_id=?", (memory_id,)
+        ).fetchall()
+    ]
+    if not ids:
+        return 0
+    if _table_exists(conn, "vec_memory_spans"):
+        conn.executemany(
+            "DELETE FROM vec_memory_spans WHERE id=?", [(i,) for i in ids]
+        )
+    conn.execute("DELETE FROM memory_spans WHERE memory_id=?", (memory_id,))
+    return len(ids)
+
+
 def ensure_vec_table(
     conn: sqlite3.Connection, dim: int, *, commit: bool = True
 ) -> bool:
@@ -2089,6 +2341,13 @@ def ensure_vec_table(
     existing = conn.execute("SELECT value FROM meta WHERE key='embed_dim'").fetchone()
     if existing and int(existing["value"]) != dim:
         conn.execute("DROP TABLE IF EXISTS vec_memories")
+        # Span vectors carry the same dimension as memory vectors and are
+        # rebuilt from the same drain, so a dimension change invalidates both.
+        # Dropping only one leaves a namespace whose two vector tables cannot
+        # be searched with one query vector.
+        conn.execute("DROP TABLE IF EXISTS vec_memory_spans")
+        if _table_exists(conn, "memory_spans"):
+            conn.execute("DELETE FROM memory_spans")
     try:
         conn.execute(
             f"""
@@ -5162,6 +5421,10 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
     `vec_memories` is a virtual table: table_info on it needs its module,
     which a backup connection may not have loaded.
+
+    Also guards every span read and write: a namespace opened read-only, or
+    one whose v14 migration has not run, has no `memory_spans`, and a missing
+    derived table must degrade to the pre-v14 behaviour rather than raise.
     """
     return (
         conn.execute(
@@ -5605,6 +5868,14 @@ def _erase_memory_content(
                 """,
                 (tombstone["tombstone_id"], correction["id"]),
             )
+
+    # Before the memories row, not after. memory_spans has ON DELETE CASCADE,
+    # so deleting the memory first silently removes the rows that name the
+    # span vectors -- and vec_memory_spans, a vec0 virtual table, has no
+    # foreign key and would keep every one of them. Erased content would stay
+    # semantically searchable through a vector nothing references. This helper
+    # serves both the live purge and the backup sweep, so one call covers both.
+    report["span_vectors_deleted"] = _drop_memory_spans(conn, memory_id)
 
     conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
 
@@ -7256,6 +7527,16 @@ class Store:
                     embedded = True
                 except sqlite3.Error:
                     pass
+            if vec is not None and not skip_embedding:
+                # The blob above covers only the first HAUNT_EMBED_MAX_LEN
+                # tokens. Index the rest, in the same transaction, so a long
+                # memory is never half-searchable between two commits. Soft
+                # failure: store_memory_spans reports a shortfall rather than
+                # raising, because the memory and its head vector are already
+                # correct and losing the tail must not roll them back.
+                store_memory_spans(
+                    self.conn, [(memory_id, text)], dim=len(vec), ts=ts
+                )
             from haunt.graph import extract_and_store
 
             entity_names = extract_and_store(
@@ -7456,6 +7737,11 @@ class Store:
         ensure_vec_table(self.conn, es.dim, commit=False)
         processed = 0
         failed = 0
+        # Memories whose head vector landed this pass. Their tails are
+        # embedded in one batched call after the loop rather than per row:
+        # the drain already exists to keep model calls batched, and a
+        # long-row backlog is exactly where per-row calls would hurt most.
+        spanned: list[tuple[str, str]] = []
         for row in queued:
             memory_id = row["memory_id"]
             vec = vectors.get(memory_id)
@@ -7484,14 +7770,25 @@ class Store:
                     "UPDATE memories SET embedding=? WHERE id=?",
                     (blob, memory_id),
                 )
+                # Delete-then-insert, not INSERT OR REPLACE: vec0 does not
+                # implement the conflict clause and raises "UNIQUE constraint
+                # failed on vec_memories primary key" instead of replacing.
+                # Nothing re-queued an already-embedded row before schema v14,
+                # so this never fired; the v14 span backfill enqueues exactly
+                # such rows, and without this every one of them would burn its
+                # attempts and the backfill would silently do nothing.
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?, ?)",
+                    "DELETE FROM vec_memories WHERE id=?", (memory_id,)
+                )
+                self.conn.execute(
+                    "INSERT INTO vec_memories(id, embedding) VALUES (?, ?)",
                     (memory_id, blob),
                 )
                 self.conn.execute(
                     "DELETE FROM embedding_jobs WHERE memory_id=?",
                     (memory_id,),
                 )
+                spanned.append((memory_id, row["content"] or ""))
                 processed += 1
             except (sqlite3.Error, TypeError, ValueError) as exc:
                 self.conn.execute(
@@ -7502,6 +7799,9 @@ class Store:
                     (str(exc)[:1000], memory_id),
                 )
                 failed += 1
+        span_stats = store_memory_spans(
+            self.conn, spanned, dim=es.dim, ts=now_iso()
+        )
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_model', ?)",
             (es.model_id,),
@@ -7517,6 +7817,11 @@ class Store:
             "failed": failed,
             "available": True,
             "exhausted": self._exhausted_embedding_jobs(max_attempts),
+            # Additive: how much tail coverage this pass added. `failed` here
+            # counts memories whose head vector landed but whose tail did
+            # not, which is a degraded index rather than a lost write, so it
+            # is reported separately from the job-level `failed` above.
+            "spans": span_stats,
         }
         if batch_error is not None and processed == 0 and failed == len(queued):
             result["error"] = batch_error
@@ -7779,6 +8084,12 @@ class Store:
             ).fetchone()[0]
         )
         self.conn.execute("DROP TABLE IF EXISTS vec_memories")
+        # Spans carry the previous model's vectors and were cut against the
+        # previous window. Both change under a re-embed, so the old plan is
+        # discarded rather than migrated; the drain below rebuilds it.
+        self.conn.execute("DROP TABLE IF EXISTS vec_memory_spans")
+        if _table_exists(self.conn, "memory_spans"):
+            self.conn.execute("DELETE FROM memory_spans")
         if not es.available:
             self.conn.execute("UPDATE memories SET embedding=NULL")
             self.conn.execute(
@@ -7801,12 +8112,17 @@ class Store:
         ids = [r["id"] for r in rows]
         texts = [r["content"] if r["content"] else " " for r in rows]
         updated = 0
+        span_totals = {"memories": 0, "spans": 0, "truncated": 0, "failed": 0}
         chunk = 16
+        now = now_iso()
         for i in range(0, len(texts), chunk):
             vecs = embed_texts(texts[i : i + chunk])
             if not vecs:
                 continue
-            for mid, vec in zip(ids[i : i + chunk], vecs):
+            rebuilt: list[tuple[str, str]] = []
+            for mid, vec, text in zip(
+                ids[i : i + chunk], vecs, texts[i : i + chunk]
+            ):
                 blob = sqlite_vec.serialize_float32(vec)
                 self.conn.execute(
                     "UPDATE memories SET embedding=? WHERE id=?", (blob, mid)
@@ -7822,8 +8138,15 @@ class Store:
                             (mid,),
                         )
                         updated += 1
+                        rebuilt.append((mid, text))
                     except sqlite3.Error:
                         pass
+            # Rebuild the tails of this chunk before moving on, so an
+            # interrupted re-embed leaves whole memories done rather than a
+            # namespace of heads with no tails.
+            stats = store_memory_spans(self.conn, rebuilt, dim=es.dim, ts=now)
+            for key in span_totals:
+                span_totals[key] += int(stats.get(key) or 0)
         self.set_meta("embed_model", es.model_id)
         self.set_meta("embed_dim", str(es.dim))
         self.conn.commit()
@@ -7834,6 +8157,7 @@ class Store:
             "model": es.model_id,
             "dim": es.dim,
             "available": True,
+            "spans": span_totals,
         }
 
     def ensure_current_embeddings(self) -> dict[str, Any] | None:
@@ -7973,6 +8297,53 @@ class Store:
             ).fetchone()
             duplicate_memories = int(dup_row["dup_memories"] or 0)
             duplicate_content_values = int(dup_row["dup_values"] or 0)
+        # L21 tail-span coverage.
+        #
+        # `span_backlog` is the actionable number and is deliberately NOT
+        # "long memories without spans". Whether a memory needs spans is a
+        # question about tokens, and stats() must answer offline and FTS-only,
+        # so it cannot tokenize. The character floor the v14 migration selects
+        # on over-selects heavily -- on the dogfooded corpus 3,059 rows clear
+        # 512 characters while only 1,955 clear 512 tokens -- so a backlog
+        # defined that way reports ~1,100 outstanding rows forever and tells
+        # the operator to run a drain that can never reduce it.
+        #
+        # A row is resolved the moment it drains, whether or not it turned
+        # out to need spans. So the backlog is exactly the long rows still
+        # queued, which converges to zero and stays there.
+        memories_over_window = 0
+        memories_with_spans = 0
+        span_rows = 0
+        span_backlog = 0
+        if _table_exists(self.conn, "memory_spans"):
+            # Characters, not tokens: an upper bound on the population, kept
+            # because it bounds how much work a full rebuild could imply. It
+            # is not a denominator for coverage.
+            memories_over_window = int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM memories "
+                    "WHERE skip_embedding=0 AND length(content) > ?",
+                    (min(SPAN_FLOOR_CHARS, embed_max_len()),),
+                ).fetchone()[0]
+            )
+            memories_with_spans = int(
+                self.conn.execute(
+                    "SELECT COUNT(DISTINCT memory_id) FROM memory_spans"
+                ).fetchone()[0]
+            )
+            span_rows = count("memory_spans")
+            span_backlog = int(
+                self.conn.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM embedding_jobs j
+                      JOIN memories m ON m.id = j.memory_id
+                     WHERE m.skip_embedding = 0
+                       AND length(m.content) > ?
+                    """,
+                    (min(SPAN_FLOOR_CHARS, embed_max_len()),),
+                ).fetchone()[0]
+            )
         return json_safe_sqlite(
             {
                 "namespace": self.name,
@@ -8008,6 +8379,11 @@ class Store:
                 "vector_index_version": self.vec_version(),
                 "duplicate_memories": duplicate_memories,
                 "duplicate_content_values": duplicate_content_values,
+                "memories_over_window": memories_over_window,
+                "memories_with_spans": memories_with_spans,
+                "memory_spans": span_rows,
+                "span_backlog": span_backlog,
+                "embed_max_len": embed_max_len(),
             }
         )
 

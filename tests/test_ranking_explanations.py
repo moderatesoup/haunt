@@ -118,7 +118,10 @@ def test_hybrid_explanation_reports_each_rrf_contribution(haunt_env, monkeypatch
     monkeypatch.setattr(
         recall_module,
         "_vec_hits",
-        lambda store, query_vec, where, params, limit: [
+        # `span_origins` is the out-parameter recall passes so a hit can say
+        # which window produced its distance (schema v14). A stub that reports
+        # no span leaves it untouched, which is the head-match case.
+        lambda store, query_vec, where, params, limit, span_origins=None: [
             (first.memory_id, 1, 0.125, "cosine_distance"),
             (second.memory_id, 2, 0.75, "cosine_distance"),
         ],
@@ -494,6 +497,15 @@ class _Rows:
 
 
 class _NativeVecConnection:
+    """A namespace with head vectors and no tail-span table.
+
+    The sqlite_master probe is answered per requested name, not blanket-true:
+    recall asks separately for `vec_memories` and for `vec_memory_spans`
+    (schema v14), and a fake that claims every table exists would send the
+    span query down this connection and fail the assertions below for the
+    wrong reason.
+    """
+
     def __init__(self):
         self.calls: list[str] = []
 
@@ -504,7 +516,12 @@ class _NativeVecConnection:
             # never migrates, so on a pre-v10 file the column is absent.
             return _Rows([{"name": "id"}, {"name": "content_hash"}])
         if "sqlite_master" in sql:
-            return _Rows([{"name": "vec_memories"}])
+            wanted = (params or [None])[-1]
+            return _Rows(
+                [{"name": "vec_memories"}]
+                if wanted in (None, "vec_memories")
+                else []
+            )
         assert "FROM vec_memories" in sql
         assert "ORDER BY distance" in sql
         assert "ORDER BY distance," not in sql
@@ -519,9 +536,19 @@ class _NativeVecConnection:
 
 
 class _FallbackVecConnection:
+    """A namespace with persisted embeddings, no vec0, and no span table.
+
+    The fallback path probes sqlite_master for `memory_spans` before deciding
+    whether to also scan span vectors (schema v14). Answering that probe with
+    a row would send the span query down this fake and trip the assertion
+    below for the wrong reason.
+    """
+
     def execute(self, sql, params=None):
         if "PRAGMA table_info" in sql:
             return _Rows([{"name": "id"}, {"name": "content_hash"}])
+        if "sqlite_master" in sql:
+            return _Rows([])
         assert "FROM memories" in sql
         return _Rows([
             {"mid": "fallback", "embedding": struct.pack("1f", 1.0), "chash": "aaa"}

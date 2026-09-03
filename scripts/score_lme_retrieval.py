@@ -581,6 +581,72 @@ def _print_set(name: str, block: dict[str, Any], k: int) -> None:
         print(f"  {'':>6} beneath the ranking failure {mech['secondary_counts']}")
 
 
+def _embed_max_len() -> int:
+    """The truncation ceiling the run actually embedded under.
+
+    Recorded in provenance because two reports that differ only by this number
+    are not comparable as the same profile.
+    """
+    from haunt.embed import _max_len
+
+    return _max_len()
+
+
+def _flatten_ids(node: Any) -> list[str]:
+    """Collect the string leaves of a list / dict-of-lists / dict-of-dicts."""
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, list):
+        return [q for item in node for q in _flatten_ids(item)]
+    if isinstance(node, dict):
+        return [q for value in node.values() for q in _flatten_ids(value)]
+    return []
+
+
+def _restrict_ids(
+    spec: str, key: str = "exposed"
+) -> tuple[set[str] | None, dict[str, Any] | None]:
+    """Load a predeclared question-id subgroup, or (None, None) when unset.
+
+    Accepts a JSON list, a JSON object of set name -> list, one id per line,
+    or a `lme_truncation_subgroup.py` fixture, which carries several named
+    groups plus metadata -- `key` selects the group so the same committed file
+    serves the exposed arm and its control. The digest goes into the report so
+    a subgroup cannot be silently redrawn between the two arms of a
+    comparison.
+    """
+    if not spec:
+        return None, None
+    path = Path(spec).expanduser().resolve()
+    raw = path.read_text(encoding="utf-8")
+    selected = key
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        ids = [line.strip() for line in raw.splitlines() if line.strip()]
+        selected = ""
+    else:
+        if isinstance(loaded, dict) and key in loaded:
+            ids = _flatten_ids(loaded[key])
+        elif isinstance(loaded, dict) and "schema_version" in loaded:
+            raise SystemExit(
+                f"--ids-file {path} has no group {key!r}; it holds "
+                f"{sorted(k for k, v in loaded.items() if isinstance(v, (list, dict)))}"
+            )
+        else:
+            ids = _flatten_ids(loaded)
+            selected = ""
+    unique = {q for q in ids if q}
+    if not unique:
+        raise SystemExit(f"--ids-file {path} declared no question ids")
+    return unique, {
+        "path": str(path),
+        "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "group": selected,
+        "ids": len(unique),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--path", default=os.environ.get("HAUNT_LME_PATH", ""))
@@ -591,6 +657,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--set", dest="which", choices=(*SETS, "both"), default="working")
     p.add_argument("--held-out-detail", action="store_true", help="unsuppress detail")
     p.add_argument("--resume", action="store_true", help="skip questions in --out")
+    p.add_argument(
+        "--ids-file",
+        default="",
+        help="restrict the run to the question ids in this file (JSON list, "
+        "JSON object of set -> list, one id per line, or a "
+        "lme_truncation_subgroup.py fixture -- see --ids-key). The subgroup "
+        "must be declared before the run; the report records the file and its "
+        "digest.",
+    )
+    p.add_argument(
+        "--ids-key",
+        default="exposed",
+        help="which group to read from a subgroup fixture that holds several "
+        "(default: exposed). Ignored for a plain list or line-delimited file.",
+    )
     args = p.parse_args(argv)
 
     path = Path(args.path) if args.path else None
@@ -621,9 +702,14 @@ def main(argv: list[str] | None = None) -> int:
     by_id = {str(r.get("question_id") or ""): r for r in rows}
     split = _split(rows)
     wanted = SETS if args.which == "both" else (args.which,)
+    restrict, restrict_meta = _restrict_ids(args.ids_file, args.ids_key)
     queue: list[tuple[str, str]] = []
     for name in wanted:
-        chosen = split[name][: args.limit] if args.limit > 0 else split[name]
+        chosen = split[name]
+        if restrict is not None:
+            chosen = [qid for qid in chosen if qid in restrict]
+        if args.limit > 0:
+            chosen = chosen[: args.limit]
         queue.extend((name, qid) for qid in chosen)
 
     state = embed_state()
@@ -643,6 +729,8 @@ def main(argv: list[str] | None = None) -> int:
         "haunt_home": str(home),
         "sets_run": list(wanted),
         "limit": args.limit,
+        "ids_filter": restrict_meta,
+        "embed_max_len": _embed_max_len(),
         "embedding_coverage": {"memories": 0, "embedded": 0, "queued": 0},
     }
     print(

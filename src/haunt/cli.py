@@ -779,6 +779,22 @@ def health_cmd(
             # Depth alone cannot distinguish "a drain just ran" from "this
             # queue has been stalled for days"; the age of the oldest job can.
             typer.echo(f"              oldest queued {oldest}")
+        # Tail-span coverage sits next to the embedding line because it is
+        # the other half of the same question: `embedded` says how many
+        # memories have a vector, this says how many have one for the part
+        # past the window. `backlog` is long rows still queued -- see stats()
+        # for why coverage is not reported as a fraction of a character-based
+        # population count.
+        typer.echo(
+            f"tail spans    covered={s['memories_with_spans']} "
+            f"spans={s['memory_spans']} backlog={s['span_backlog']} "
+            f"max_len={s['embed_max_len']}"
+        )
+        if s["span_backlog"]:
+            typer.echo(
+                f"              run: haunt maintenance -n {s['namespace']} "
+                "--limit 500"
+            )
         typer.echo(
             f"duplicates    memories={s['duplicate_memories']} "
             f"content={s['duplicate_content_values']}"

@@ -141,6 +141,16 @@ def test_persistent_process_drains_embedding_queue(trust_env, monkeypatch):
             # the attempts cap (see tests/test_embedding_isolation.py) — none
             # here, so exhausted stays 0.
             "exhausted": 0,
+            # L21: tail-span coverage added by this pass. The row here is
+            # short enough to fit one embedding window, so it plans no spans
+            # and every counter stays 0 — the key is present regardless, so a
+            # caller can tell "no spans needed" from "spans not reported".
+            "spans": {
+                "memories": 0,
+                "spans": 0,
+                "truncated": 0,
+                "failed": 0,
+            },
         }
         row = store.conn.execute(
             "SELECT embedding FROM memories WHERE id=?", (result.memory_id,)

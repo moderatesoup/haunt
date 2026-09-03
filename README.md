@@ -112,6 +112,33 @@ Default is **`BAAI/bge-m3`** dense (1024-d, ~2.28 GB ONNX). haunt loads it local
 
 Namespaces lock to the embed model/dimension they were written with. Switching models later requires a full re-embed (`haunt bootstrap --reembed`). A namespace switch = full re-embed of that namespace.
 
+### Long memories and the embedding window
+
+Each text is truncated at `HAUNT_EMBED_MAX_LEN` tokens (default 512) before it
+is embedded. FTS5 indexes the full content regardless, so a long memory has
+always been keyword-searchable whole — but before schema v14 only its first
+window ever reached a vector. Measured against the dogfooded corpora that was
+51–66% of embedded memories partly unrepresented and 66–75% of all tokens
+missing from vector search.
+
+Haunt now also embeds the remainder as overlapping tail windows
+(`haunt.spans`). Spans are verbatim character ranges of the stored content —
+no rewriting, no summarizing — and they are derived state: excluded from
+export, rebuilt on import, dropped and rebuilt by `--reembed`, and erased by
+purge along with the memory.
+
+Upgrading an existing namespace does **not** re-embed anything it already has.
+The v14 migration queues the long rows and stops; the explicit drain does the
+work:
+
+```bash
+haunt maintenance -n NAME --limit 500
+```
+
+`haunt health` reports `memories_over_window` against `memories_with_spans`, so
+a namespace that has migrated but not yet drained is visible rather than
+looking fully indexed.
+
 For machines that cannot spare 2 GB, use the small model as an explicit opt-in:
 
 ```bash
@@ -314,6 +341,10 @@ The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
 | `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
 | `HAUNT_OFFLINE` | unset | set to `1` to prohibit embedding backend initialization/download; FTS recall remains available |
+| `HAUNT_EMBED_MAX_LEN` | `512` | tokens embedded per text before truncation (clamped 8–8192). BGE-M3 itself accepts 8192; the lower default keeps ingest fast, and `HAUNT_EMBED_SPANS` below is what stops the remainder from falling out of the vector index. Changing it changes what every future vector represents — it does **not** re-embed existing rows, so mixing values within a namespace mixes windows. Use `haunt bootstrap --reembed` after a change |
+| `HAUNT_EMBED_SPANS` | on | set to `0` to stop indexing anything past `HAUNT_EMBED_MAX_LEN`. On, a memory longer than the window is additionally embedded as overlapping tail windows, so a phrase late in a long memory is vector-searchable; off is the pre-v14 behavior, where only the first window ever reached a vector. FTS indexes the whole memory either way |
+| `HAUNT_EMBED_SPAN_OVERLAP` | `64` | tokens of overlap between neighbouring tail windows (clamped 0 to half the window). Overlap is what keeps a sentence that straddles a window boundary whole inside at least one vector |
+| `HAUNT_EMBED_MAX_SPANS` | `32` | maximum windows per memory including the head (clamped 1–512), bounding the model calls one pathological row can cost. At the defaults this reaches roughly 14,400 tokens; past it, coverage stops and `haunt health` reports the shortfall rather than hiding it |
 | `HAUNT_EMBED_QUANT_FALLBACK` | unset | set to `1` to allow falling back to the third-party `onnx-community/bge-m3-ONNX` quantized build when `BAAI/bge-m3` itself is unreachable. Off by default: the two repos are different publishers, and both are pinned to a fixed revision |
 | `HAUNT_EMBED_SKIP_MODEL_VERIFY` | unset | set to `1` to load the cached `BAAI/bge-m3` ONNX files without checking them against the committed artifact manifest. Only for a deliberately hand-placed model: without it, anything that can write the model cache can choose the graph onnxruntime executes |
 | `HAUNT_EMBED_MAX_ATTEMPTS` | `5` | maximum embedding attempts for a queued row before it stops being retried (clamped 1–1000) |

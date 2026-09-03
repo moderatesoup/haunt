@@ -37,6 +37,12 @@ STORE = Path(__file__).resolve().parents[1] / "src" / "haunt" / "store.py"
 
 # Top-level def/class names in store.py, as of the D8 cohesion decision.
 PINNED: frozenset[str] = frozenset({
+    # v14 tail spans (L21). One cluster: plan the windows, embed and
+    # store them, drop them, and create the vec0 table they live in.
+    # Every one is called from the embedding write paths only.
+    "_drop_memory_spans",
+    "plan_memory_spans",
+    "store_memory_spans",
     "AliasRetirementError",
     "NamespaceCollisionError",
     "NamespaceMigrationError",
@@ -171,6 +177,7 @@ PINNED: frozenset[str] = frozenset({
     "_verify_private_backup_root",
     "_window_instant",
     "change_namespace_label",
+    "ensure_span_vec_table",
     "ensure_vec_table",
     "get_store",
     "init_registry",
