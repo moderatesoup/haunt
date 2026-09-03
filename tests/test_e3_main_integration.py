@@ -21,16 +21,16 @@ from haunt.store import (
 
 
 @pytest.fixture
-def integrated_home(tmp_path, monkeypatch):
-    home = tmp_path / "haunt-home"
+def integrated_home(tmp_path, monkeypatch, fake_home):
+    home = fake_home / ".haunt"
     monkeypatch.setenv("HAUNT_HOME", str(home))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
     monkeypatch.delenv("HAUNT_MCP_ADMIN", raising=False)
     monkeypatch.delenv("HAUNT_MCP_ALLOW_PURGE", raising=False)
-    monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "cursor"))
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CURSOR_HOME", str(fake_home / ".cursor"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake_home / ".claude"))
     from haunt import embed
 
     embed.reset()

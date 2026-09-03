@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -7,6 +8,9 @@ from pathlib import Path
 import pytest
 
 from tests.dashutil import TEST_DASH_TOKEN
+
+# Captured before any redirect, so the sentinel below watches the real home.
+_REAL_HOME = Path.home()
 
 
 @lru_cache(maxsize=1)
@@ -29,6 +33,11 @@ def _host_model_cache() -> Path | None:
     return None
 
 
+# Pinned now, while HOME and HAUNT_HOME are still the host's own: the autouse
+# fixture below redirects HOME, and models_dir() follows it.
+_host_model_cache()
+
+
 @pytest.fixture(autouse=True)
 def _dashboard_security_defaults():
     """Every test starts with a configured launch token and loopback bind host."""
@@ -41,15 +50,109 @@ def _dashboard_security_defaults():
 
 @pytest.fixture(autouse=True)
 def isolate_host_homes(tmp_path, monkeypatch):
-    """Never write Cursor/Claude configs into the real (or cloud-agent) home.
+    """Redirect every host root a haunt write can reach, unconditionally.
 
-    Tests that need a specific layout set CURSOR_HOME / CLAUDE_CONFIG_DIR
-    themselves; those override this fixture.
+    Conditional redirection was the hole: honouring an ambient CURSOR_HOME or
+    CLAUDE_CONFIG_DIR let a suite run with HOME redirected still write the real
+    global editor config, which is how a smoke home ended up in
+    ~/.claude/settings.json. Nothing here consults the ambient value.
+
+    The config roots live INSIDE the fake home rather than beside it, so the
+    haunt home under test is genuinely ~/.haunt for the redirected HOME. The
+    alternate-home guard then passes on its own merits instead of being
+    switched off suite-wide, which kept the branch's headline protection live
+    exactly where the historical damage came from.
+
+    The model cache was pinned at import, above, while HAUNT_HOME was still
+    the host's own.
     """
-    if not os.environ.get("CURSOR_HOME"):
-        monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "cursor-home"))
-    if not os.environ.get("CLAUDE_CONFIG_DIR"):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    fake_home = tmp_path / "user-home"
+    (fake_home / ".haunt").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("CURSOR_HOME", str(fake_home / ".cursor"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake_home / ".claude"))
+    # Overrides _cursor_dir() on its own, so redirecting CURSOR_HOME is not
+    # enough to contain it.
+    monkeypatch.delenv("CURSOR_HOOKS_JSON", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(fake_home / ".local" / "share"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(fake_home / ".cache"))
+    # Assert the redirect took before any test body can write through it. A
+    # silently ineffective redirect is worse than none: the suite would look
+    # isolated while writing to the operator's real home.
+    assert Path.home().resolve() == fake_home.resolve(), Path.home()
+
+
+# Files haunt itself writes into a real host. Hashed, not stat'd: ~/Desktop is
+# symlinked into iCloud Drive on the maintainer's machine and sync advances
+# mtime on files nothing wrote. ~/.haunt is deliberately absent -- live
+# haunt-mcp servers write to it continuously, so it can never be proven quiet.
+_HOST_SENTINEL_PATHS = (
+    ".cursor/hooks.json",
+    ".cursor/mcp.json",
+    ".claude/settings.json",
+    ".claude.json",
+    "Desktop/Haunt Memories.command",
+    ".local/share/applications/haunt-memories.desktop",
+)
+
+
+def _host_sentinel() -> dict[str, str]:
+    """Current contents of every real host file a haunt install would touch."""
+    snapshot: dict[str, str] = {}
+    for relative in _HOST_SENTINEL_PATHS:
+        try:
+            snapshot[relative] = (_REAL_HOME / relative).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            snapshot[relative] = ""
+    return snapshot
+
+
+@pytest.fixture(autouse=True)
+def _no_real_host_writes(tmp_path, isolate_host_homes):
+    """Fail the test that wrote outside its allocated roots.
+
+    Backstop, not the primary defence: isolate_host_homes is what prevents the
+    write, and this is what notices when prevention was incomplete -- an
+    absolute path read from somewhere other than an env var, or a subprocess
+    that rebuilt its own environment. Depending on isolate_host_homes puts this
+    fixture inside it, so the redirects are still in force at teardown and a
+    failure here cannot leave a test running against the real home.
+    """
+    before = _host_sentinel()
+    yield
+    after = _host_sentinel()
+    # Attribute the change rather than merely detect it. A bare
+    # changed/unchanged check is flaky wherever anything else on the machine
+    # legitimately writes these files, and it is not what went wrong: the
+    # incident was a sandbox path landing inside a real host file. Look for
+    # exactly that.
+    sandbox = str(tmp_path)
+    leaked = sorted(
+        relative
+        for relative, content in after.items()
+        if content != before[relative] and sandbox in content
+    )
+    assert not leaked, (
+        "this test's sandbox path leaked into real host files: "
+        + ", ".join(leaked)
+        + f"\n  sandbox: {sandbox}"
+    )
+
+
+@pytest.fixture
+def fake_home() -> Path:
+    """The redirected HOME for this test.
+
+    Host config roots and the haunt home under test belong UNDER this, not
+    beside it: that is the real-world shape (~/.haunt, ~/.cursor, ~/.claude),
+    it keeps the alternate-home guard satisfied on its own merits rather than
+    switched off, and it is what the host-config target guard checks.
+    """
+    return Path(os.environ["HOME"])
 
 
 @pytest.fixture
@@ -62,7 +165,9 @@ def haunt_env(tmp_path, monkeypatch):
     set the run is still correct, only slower.
     """
     model_cache = _host_model_cache()
-    home = tmp_path / "haunthome"
+    # Under the redirected HOME, so this IS ~/.haunt and the alternate-home
+    # guard has nothing to refuse.
+    home = Path(os.environ["HOME"]) / ".haunt"
     monkeypatch.setenv("HAUNT_HOME", str(home))
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)
     if model_cache is not None:

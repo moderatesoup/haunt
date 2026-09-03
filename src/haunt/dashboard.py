@@ -1000,13 +1000,21 @@ def _validate_recall_request(
     compile_temporal(query)
 
 
-def _local_recall_order(hit: Hit) -> tuple[int, int, float, str]:
-    """Order only within one namespace; never compare RRF across namespaces."""
+def _local_recall_order(hit: Hit) -> tuple[int, int, float, str, str]:
+    """Order only within one namespace; never compare RRF across namespaces.
+
+    The tie term is dead whenever final_rank is set, since recall assigns
+    1..n uniquely. It matches recall's own key anyway: this function re-sorts
+    hits whose explanation payload advertises content-hash ties, and the two
+    disagreeing is the kind of drift that only shows up once someone feeds it
+    merged hits from more than one recall run.
+    """
+    stable = hit.content_hash or hit.memory_id
     if hit.final_rank is not None:
-        return (0, hit.final_rank, 0.0, hit.memory_id)
+        return (0, hit.final_rank, 0.0, stable, hit.memory_id)
     # Defensive ordering for synthetic/custom callers that did not set a rank.
     # It stays local to the namespace and does not rewrite that hit's rank.
-    return (1, 0, -hit.score, hit.memory_id)
+    return (1, 0, -hit.score, stable, hit.memory_id)
 
 
 def _rank_interleaved(groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:

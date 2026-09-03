@@ -17,12 +17,7 @@ from haunt.paths import (
     repair_private_modes,
 )
 from haunt.store import Store, init_registry, register_namespace, list_namespace_rows, reembed_all_namespaces
-from haunt.util import diag, dumps
-
-
-def _sh_single_quote(value: str) -> str:
-    """Quote a string for /bin/sh so command substitution cannot run."""
-    return "'" + str(value).replace("'", "'\\''") + "'"
+from haunt.util import diag, dumps, sh_single_quote
 
 
 def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
@@ -30,7 +25,7 @@ def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     python = str(Path(sys.executable).absolute())
     sibling = Path(python).parent / sibling_name
-    home = _sh_single_quote(str(haunt_home()))
+    home = sh_single_quote(str(haunt_home()))
     # Do not use export HAUNT_HOME="${HAUNT_HOME:-...}". The default word
     # inside double quotes still runs command substitution.
     prefix = (
@@ -41,9 +36,9 @@ def _write_sh_wrapper(dest: Path, sibling_name: str, module: str) -> Path:
         "fi\n"
     )
     if sibling.is_file():
-        body = prefix + f"exec {_sh_single_quote(str(sibling))} \"$@\"\n"
+        body = prefix + f"exec {sh_single_quote(str(sibling))} \"$@\"\n"
     else:
-        body = prefix + f"exec {_sh_single_quote(python)} -m {module} \"$@\"\n"
+        body = prefix + f"exec {sh_single_quote(python)} -m {module} \"$@\"\n"
     dest.write_text(body, encoding="utf-8")
     dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return dest
@@ -61,11 +56,24 @@ def write_claude_hook_launcher() -> Path:
     )
 
 
+def write_cli_launcher() -> Path:
+    """Space-free launcher at ~/.haunt/bin/haunt.
+
+    Without this the desktop shortcut has no canonical target and falls back to
+    `shutil.which("haunt")`, which resolves at icon-write time and freezes. On a
+    machine with a pyenv shim ahead of the haunt venv on PATH that pins the
+    launcher to an interpreter whose sqlite3 was built without extension
+    loading, so the icon opens a console that cannot do vector work.
+    """
+    return _write_sh_wrapper(bin_dir() / "haunt", "haunt", "haunt.cli")
+
+
 def write_launcher() -> Path:
-    """Space-free absolute launchers at ~/.haunt/bin/haunt-{mcp,hook,hook-claude}."""
+    """Space-free absolute launchers at ~/.haunt/bin/haunt{,-mcp,-hook,-hook-claude}."""
     dest = _write_sh_wrapper(bin_dir() / "haunt-mcp", "haunt-mcp", "haunt.mcp_server")
     write_hook_launcher()
     write_claude_hook_launcher()
+    write_cli_launcher()
     return dest
 
 
@@ -131,7 +139,11 @@ def _drain_worth_reporting(drained: dict, *, deliberately_off: bool) -> bool:
 def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict:
     home = ensure_layout()
     repair_private_modes(home)
-    launcher = write_launcher()
+    # Probe BEFORE planting wrappers. write_launcher() embeds sys.executable,
+    # so an abort below used to leave ~/.haunt/bin/* naming the very
+    # interpreter that just failed the probe -- and the desktop shortcut now
+    # prefers that wrapper over PATH. Failing before writing keeps a broken
+    # interpreter out of the artifacts that outlive this call.
     vec = probe_sqlite_vec()
     if not vec.get("ok") and not fts_only():
         hint = (
@@ -160,6 +172,15 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
         if embed_state.available:
             st.set_meta("embed_model", embed_state.model_id)
             st.set_meta("embed_dim", str(embed_state.dim))
+    # Immediately after the probe and before the drain loop. The probe is what
+    # gates writing them at all (an interpreter that cannot load sqlite-vec
+    # must not be baked into a wrapper the desktop shortcut then prefers), but
+    # deferring them past the drain meant an interrupted bootstrap left no
+    # canonical wrapper at all -- and _find_haunt_cmd then falls back to
+    # shutil.which, which is the pyenv-shim failure the wrapper exists to
+    # prevent.
+    launcher = write_launcher()
+
     reembed_report: list = []
     if reembed:
         reembed_report = reembed_all_namespaces()
@@ -198,14 +219,50 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
                 entry["namespace"] = row["name"]
                 entry["auto"] = True
                 reembed_report.append(entry)
-    from haunt.desktop import install_desktop_icon
-    icon_result = install_desktop_icon()
-
-    from haunt.hosts import install_all_hosts
+    from haunt.hosts import (
+        HostInstallRefused,
+        check_hook_command_safe,
+        host_install_refusal,
+        install_all_hosts,
+    )
 
     hook_cmd = str(bin_dir() / "haunt-hook")
     mcp_cmd = str(bin_dir() / "haunt-mcp")
-    host_reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+
+    # One decision for both global-config writes below, so the report tells a
+    # single coherent story, and it is made BEFORE either write. bootstrap()
+    # skips rather than aborts: every other step above (layout, launchers,
+    # registry, embeddings) is still useful and still correct. The skip is
+    # reported loudly by format_report() -- silence here is the failure mode
+    # these guards exist for.
+    #
+    # The hook command is checked here rather than only inside the adapters
+    # because install_all_hosts binds Cursor before Claude's adapter runs: a
+    # refusal raised there leaves one host configured and the other not, and
+    # the desktop shortcut already written. Deciding up front keeps the skip
+    # all-or-nothing.
+    refusal: Exception | None = host_install_refusal(str(home))
+    if refusal is None:
+        try:
+            check_hook_command_safe(hook_cmd)
+        except HostInstallRefused as exc:
+            refusal = exc
+
+    from haunt.desktop import install_desktop_icon
+    icon_result = (
+        install_desktop_icon()
+        if refusal is None
+        else {"written": False, "reason": "host config bind was refused"}
+    )
+
+    host_reports = []
+    if refusal is None:
+        try:
+            host_reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+        except HostInstallRefused as exc:
+            # Backstop: the adapters re-check, and a target-path refusal can
+            # only be seen there.
+            refusal = exc
 
     hook_launcher = bin_dir() / "haunt-hook"
     report = {
@@ -214,6 +271,9 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
         "hook_launcher": str(hook_launcher.resolve()),
         "models_dir": str(models_dir()),
         "desktop_icon": icon_result.get("path") if icon_result.get("written") else None,
+        "desktop_icon_reason": (
+            None if icon_result.get("written") else icon_result.get("reason")
+        ),
         "sqlite_vec": vec,
         "embed": {
             "requested": embed_state.requested,
@@ -225,6 +285,7 @@ def bootstrap(default_namespace: str = "default", reembed: bool = False) -> dict
             # None for a non-ONNX backend, or a cache predating the marker.
             "source": bge_m3_source() if embed_state.backend == "onnx" else None,
         },
+        "hosts_skipped": str(refusal) if refusal is not None else None,
         "default_namespace": default_namespace,
         "default_db": str(db),
         "python": sys.executable,
@@ -263,11 +324,15 @@ def _format_sqlite_vec_line(report: dict) -> str:
 def format_report(report: dict) -> str:
     home = report.get('haunt_home', '')
     icon = report.get('desktop_icon')
+    # Never claim "unsupported platform" for a skip that had another cause.
+    icon_line = icon or (
+        "skipped (" + str(report.get("desktop_icon_reason") or "unsupported platform") + ")"
+    )
     lines = [
         f"haunt home    {home}",
         f"launcher      {report['launcher']}",
         f"hook          {report.get('hook_launcher', '')}",
-        f"desktop icon  {icon or 'skipped (unsupported platform)'}",
+        f"desktop icon  {icon_line}",
         f"python        {report['python']}",
         f"sqlite-vec    {_format_sqlite_vec_line(report)}",
         f"embed         loaded={report['embed']['loaded']} dim={report['embed']['dim']} requested={report['embed']['requested']}"
@@ -339,6 +404,12 @@ def format_report(report: dict) -> str:
         lines.append(
             "            BAAI/bge-m3 can download (~2.28 GB)."
         )
+    skipped = report.get("hosts_skipped")
+    if skipped:
+        lines.append("")
+        lines.append("HOST BIND SKIPPED — editor hooks were NOT installed or updated.")
+        for line in str(skipped).splitlines():
+            lines.append("  " + line)
     for h in report.get("hosts") or []:
         status = "seeded" if h.get("seeded") else "merged"
         lines.append(

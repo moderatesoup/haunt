@@ -1241,14 +1241,14 @@ def test_namespace_registration_retries_only_recognized_registry_handoff(
     original = store_mod._register_namespace_once
     attempts = 0
 
-    def transient(name, repo_path=None):
+    def transient(name, repo_path=None, *, explicit_label=False):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise NamespacePathError(
                 "SQLite sidecar disappeared during safe open: registry.db-wal"
             )
-        return original(name, repo_path)
+        return original(name, repo_path, explicit_label=explicit_label)
 
     monkeypatch.setattr(store_mod, "_register_namespace_once", transient)
     db = store_mod.register_namespace("registered-retry")
@@ -1258,7 +1258,7 @@ def test_namespace_registration_retries_only_recognized_registry_handoff(
     unsafe = NamespacePathError("namespace database physical identity changed")
     unsafe_attempts = 0
 
-    def unsafe_once(name, repo_path=None):
+    def unsafe_once(name, repo_path=None, *, explicit_label=False):
         nonlocal unsafe_attempts
         unsafe_attempts += 1
         raise unsafe
@@ -1274,7 +1274,7 @@ def test_namespace_registration_retries_only_recognized_registry_handoff(
     )
     exhausted_attempts = 0
 
-    def always_transient(name, repo_path=None):
+    def always_transient(name, repo_path=None, *, explicit_label=False):
         nonlocal exhausted_attempts
         exhausted_attempts += 1
         raise exhausted
@@ -1369,7 +1369,7 @@ def test_store_create_retries_post_registration_transient_absence(
     """A fresh creator waits out only a stale read after its own commit."""
     import haunt.store as store_mod
 
-    real_register = store_mod.register_namespace
+    real_register = store_mod.register_namespace_context
     real_resolve = store_mod.resolve_namespace_identity
     registration_returned = False
     resolution_calls = 0
@@ -1389,7 +1389,7 @@ def test_store_create_retries_post_registration_transient_absence(
                 return None
         return real_resolve(name)
 
-    monkeypatch.setattr(store_mod, "register_namespace", registered)
+    monkeypatch.setattr(store_mod, "register_namespace_context", registered)
     monkeypatch.setattr(store_mod, "resolve_namespace_identity", stale_once)
     with Store("post-register-stale") as store:
         assert store.name == "post-register-stale"

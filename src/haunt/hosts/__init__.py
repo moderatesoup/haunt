@@ -12,6 +12,8 @@ A later host (Codex, …) is another module added to _adapters().
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,206 @@ from typing import Any
 
 class HostConfigError(ValueError):
     """Existing host JSON is malformed. Refuse to overwrite it."""
+
+
+ALT_HOME_ENV = "HAUNT_ALLOW_ALT_HOME_HOST_INSTALL"
+UNSAFE_HOOK_ENV = "HAUNT_ALLOW_UNSAFE_HOOK_COMMAND"
+
+
+class HostInstallRefused(RuntimeError):
+    """Base for every refusal to write global host config.
+
+    Exists so a caller catches the *category*, not a list. The two guards added
+    after AlternateHomeRefused were wired into the same call sites and inherited
+    from RuntimeError, so nothing caught them: `haunt bootstrap` on a home with
+    a space died with a traceback after already writing the launchers, and
+    `install_all_hosts` had written Cursor's config before Claude's adapter
+    raised. A new guard now only has to subclass this.
+    """
+
+
+class AlternateHomeRefused(HostInstallRefused):
+    """Host config install refused: this haunt home is not the default one.
+
+    Editor host config (Claude Code settings.json, Cursor hooks.json) is
+    global and shared by every session on the machine. Binding it to a
+    HAUNT_HOME that is not ~/.haunt plants that path in the user's real
+    editor config; when the alternate home goes away -- a smoke test's
+    temp dir, a deleted worktree -- every hook command points at nothing
+    and memory capture stops with no error anywhere.
+    """
+
+    def __init__(self, haunt_home: str, default_home: str) -> None:
+        self.haunt_home = haunt_home
+        self.default_home = default_home
+        super().__init__(
+            "refusing to write global host config for a non-default haunt home\n"
+            f"  haunt home    {haunt_home}\n"
+            f"  default home  {default_home}\n"
+            "  Host config is global: this path would replace the hook command in\n"
+            "  the real Claude Code / Cursor config. If it later disappears, every\n"
+            "  hook silently stops capturing.\n"
+            f"  To install anyway, set {ALT_HOME_ENV}=1 (exactly 1)."
+        )
+
+
+def default_haunt_home() -> Path:
+    """The one haunt home that may be written into global host config."""
+    return (Path.home() / ".haunt").resolve()
+
+
+def _resolved(path: str | Path) -> Path:
+    """Absolute, symlink-free, ~-expanded. `.smoke-home` cannot alias past this."""
+    return Path(path).expanduser().resolve()
+
+
+def alt_home_install_allowed() -> bool:
+    """True only for an exact ALT_HOME_ENV=1. Nothing else counts as consent."""
+    return os.environ.get(ALT_HOME_ENV, "").strip() == "1"
+
+
+def host_install_refusal(
+    haunt_home: str | Path, *, force: bool = False
+) -> AlternateHomeRefused | None:
+    """The refusal for binding global host config to `haunt_home`, or None.
+
+    Checks the home about to be *written*, not the ambient HAUNT_HOME: the
+    argument is what lands in settings.json, so it is the thing to judge.
+    Both sides are fully resolved, so a symlink pointing at a temp dir is
+    refused and a symlink pointing at ~/.haunt is allowed.
+    """
+    if force or alt_home_install_allowed():
+        return None
+    resolved = _resolved(haunt_home)
+    default = default_haunt_home()
+    if resolved == default:
+        return None
+    return AlternateHomeRefused(str(resolved), str(default))
+
+
+def check_host_install_allowed(haunt_home: str | Path, *, force: bool = False) -> None:
+    """Raise AlternateHomeRefused unless this home may touch global host config."""
+    refusal = host_install_refusal(haunt_home, force=force)
+    if refusal is not None:
+        raise refusal
+
+
+class ForeignHostConfigRefused(HostInstallRefused):
+    """The host config about to be written does not belong to this home.
+
+    host_install_refusal judges the haunt home that would be *written into*
+    the config. It cannot see *which* config, because the target comes from
+    CLAUDE_CONFIG_DIR, CURSOR_HOME or CURSOR_HOOKS_JSON. With HOME redirected
+    to a temp dir and one of those still pointing at the operator's real
+    config, the home check passes -- resolved HAUNT_HOME does equal
+    resolved ~/.haunt for the redirected HOME -- and the temp path is written
+    into the real global settings.json anyway. That is the original incident
+    reproduced with the guard enabled and reporting success.
+    """
+
+    def __init__(self, target: str, home: str) -> None:
+        self.target = target
+        self.home = home
+        super().__init__(
+            "refusing to write host config outside the current home\n"
+            f"  config target {target}\n"
+            f"  current home  {home}\n"
+            "  This path is not under the home whose haunt install was approved,\n"
+            "  so the check that approved it did not judge this file. Unset\n"
+            "  CLAUDE_CONFIG_DIR / CURSOR_HOME / CURSOR_HOOKS_JSON, or point them\n"
+            "  inside the current home.\n"
+            f"  To write it anyway, set {ALT_HOME_ENV}=1 (exactly 1)."
+        )
+
+
+def host_config_target_refusal(
+    target: str | Path, *, force: bool = False
+) -> ForeignHostConfigRefused | None:
+    """The refusal for writing host config at `target`, or None.
+
+    Judges the file about to be written, which host_install_refusal cannot
+    reach. Both sides resolve, so a symlink cannot alias out of the home.
+    """
+    if force or alt_home_install_allowed():
+        return None
+    resolved = _resolved(target)
+    home = Path.home().resolve()
+    try:
+        resolved.relative_to(home)
+    except ValueError:
+        return ForeignHostConfigRefused(str(resolved), str(home))
+    return None
+
+
+def check_host_config_target(target: str | Path, *, force: bool = False) -> None:
+    """Raise ForeignHostConfigRefused unless `target` belongs to this home."""
+    refusal = host_config_target_refusal(target, force=force)
+    if refusal is not None:
+        raise refusal
+
+
+# Conservative: every character a POSIX shell and a Windows .bat both treat as
+# ordinary. Anything else -- space, $, backtick, quote, semicolon, newline --
+# is refused rather than escaped.
+_SHELL_SAFE_COMMAND = re.compile(r"\A[A-Za-z0-9._/+@:=-]+\Z")
+
+
+class UnsafeHookCommandRefused(HostInstallRefused):
+    """The hook command contains characters the host would hand to a shell.
+
+    Hook entries are written into settings.json / hooks.json as a single
+    `command` string, and the editors run them through a shell. A haunt home
+    containing a space therefore yields "no such file or directory" and capture
+    stops with no error; one containing $(...) or a backtick executes on every
+    hook event.
+
+    This refuses rather than quotes on purpose. MCP server entries in the same
+    files are spawned argv-style, where added quotes would become part of the
+    path, and nothing in the config distinguishes the two at read time. A path
+    that cannot work should fail at install, loudly, instead of being written
+    and silently never running.
+    """
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+        offending = sorted({c for c in command if not _SHELL_SAFE_COMMAND.match(c)})
+        printable = ", ".join(repr(c) for c in offending)
+        super().__init__(
+            "refusing to write a hook command a shell would not run verbatim\n"
+            f"  command   {command}\n"
+            f"  offending {printable}\n"
+            "  Editor hook commands are executed through a shell. This path would\n"
+            "  either fail to start (capture stops with no error) or execute the\n"
+            "  embedded expression on every hook event.\n"
+            "  Usually this is a home directory containing a space. Point\n"
+            "  HAUNT_HOME at a path without these characters and re-run, e.g.\n"
+            "    HAUNT_HOME=/opt/haunt haunt install --allow-alt-home\n"
+            f"  If your editor execs hooks directly rather than through a shell,\n"
+            f"  set {UNSAFE_HOOK_ENV}=1 (exactly 1) to write it anyway."
+        )
+
+
+def unsafe_hook_command_allowed() -> bool:
+    """True only for an exact UNSAFE_HOOK_ENV=1. Nothing else counts as consent."""
+    return os.environ.get(UNSAFE_HOOK_ENV, "").strip() == "1"
+
+
+def check_hook_command_safe(command: str) -> None:
+    """Raise UnsafeHookCommandRefused unless a shell would run `command` verbatim.
+
+    Overridable, deliberately. The common trigger is a home directory holding a
+    space -- `/Users/First Last/.haunt/bin/haunt-hook` -- which the operator
+    cannot simply rename, and which some hosts may exec directly rather than
+    hand to a shell. Refusing by default keeps the silent-capture-loss case
+    loud; a separate, narrowly named variable lets someone who knows their host
+    proceed. It is deliberately NOT the alternate-home variable: these are
+    different risks and consenting to one is not consenting to the other.
+    """
+    if unsafe_hook_command_allowed():
+        return
+    if not _SHELL_SAFE_COMMAND.match(command):
+        raise UnsafeHookCommandRefused(command)
+
 
 HAUNT_MCP_LEAVES = frozenset({"haunt-mcp"})
 HAUNT_HOOK_LEAVES = frozenset({"haunt-hook"})
@@ -52,6 +254,46 @@ def mcp_command_issues(command: str, expected: str | None = None) -> list[str]:
     return issues
 
 
+def hook_command_defect(command: str) -> str | None:
+    """Why a planted hook command cannot run, or None when it can.
+
+    Existence *and* executability, because both fail the same way: the host
+    fires the hook, nothing runs, nothing is reported, capture is off. Only
+    absolute commands are judged -- a bare name is resolved by the host's own
+    PATH and is a different (already reported) kind of wrong.
+    """
+    path = Path(command)
+    if not path.is_absolute():
+        return None
+    try:
+        if not path.exists():
+            return "not found"
+        if not path.is_file():
+            return "not a regular file"
+        if not os.access(path, os.X_OK):
+            return "not executable"
+    except OSError as exc:
+        return f"cannot be checked: {exc}"
+    return None
+
+
+@dataclass(frozen=True)
+class DanglingHook:
+    """One host event whose haunt hook command cannot run.
+
+    This is the shape of the silent failure: the host config still lists the
+    hook, so nothing looks missing, but the command behind it is gone.
+    """
+
+    host: str
+    event: str
+    command: str
+    reason: str
+
+    def __str__(self) -> str:
+        return f"{self.host}  {self.event}  {self.command}  ({self.reason})"
+
+
 def hook_command_issues(
     command: str,
     expected: str | None = None,
@@ -79,8 +321,9 @@ def hook_command_issues(
     if not path.is_absolute():
         issues.append(f"hook command is not an absolute haunt-hook wrapper: {command}")
         return issues
-    if not path.is_file():
-        issues.append(f"hook command not found: {command}")
+    defect = hook_command_defect(command)
+    if defect is not None:
+        issues.append(f"hook command {defect}: {command}")
         return issues
     if expected and command != expected:
         try:
@@ -130,6 +373,10 @@ class HostStatus:
     rule_path: str | None = None
     skill_path: str | None = None
     issues: list[str] = field(default_factory=list)
+    # Every (event, command) whose hook cannot run -- one entry per event,
+    # never deduplicated by command: the operator needs to see that all six
+    # Claude Code events are dead, not that one path is bad.
+    dangling_hooks: list[DanglingHook] = field(default_factory=list)
 
 
 def read_json_object(path: Path) -> dict[str, Any] | None:
@@ -170,16 +417,33 @@ def _adapters() -> list:
     return [cursor, claude]
 
 
-def install_all_hosts(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> list[HostReport]:
+def install_all_hosts(
+    haunt_home: str, hook_cmd: str, mcp_cmd: str, *, force: bool = False
+) -> list[HostReport]:
     """Bind every known host. Returns a report per host.
 
     Each adapter may compute host-specific launchers from haunt_home/bin/.
     hook_cmd is the default (Cursor) hook; adapters that need a different
     launcher (e.g. haunt-hook-claude) derive it from haunt_home.
+
+    Raises AlternateHomeRefused before touching anything when haunt_home is
+    not the default home and neither `force` nor ALT_HOME_ENV says otherwise.
+    Checked here *and* inside each adapter.install(), so a caller that reaches
+    an adapter directly (haunt cursor-install does) is guarded too.
     """
+    check_host_install_allowed(haunt_home, force=force)
+    # Preflight every adapter before any of them writes. install_all_hosts
+    # iterates Cursor then Claude, so a refusal raised inside Claude's install
+    # used to leave Cursor's hooks.json, mcp.json, rule and skill already
+    # rewritten -- a partial bind is worse than none, because doctor then
+    # reports one host healthy.
+    for adapter in _adapters():
+        preflight = getattr(adapter, "preflight", None)
+        if preflight is not None:
+            preflight(haunt_home, hook_cmd, force=force)
     reports: list[HostReport] = []
     for adapter in _adapters():
-        report = adapter.install(haunt_home, hook_cmd, mcp_cmd)
+        report = adapter.install(haunt_home, hook_cmd, mcp_cmd, force=force)
         reports.append(report)
     return reports
 

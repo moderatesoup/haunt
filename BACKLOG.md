@@ -537,9 +537,12 @@ state). Four gaps stand between here and merge.
   (`src/haunt/portability.py:86`) consumes about 13 s of the default 30 s
   `timeout_seconds` (`:92`). Raising `input_bytes` toward the 256 MiB clamp
   (`:95`) without raising `timeout_seconds` yields an opaque timeout. (R24)
-- `FORMAT_MINOR = 0` (`src/haunt/portability.py:61`) leaves "Accept known older
-  minor versions through explicit migrations" with no exercised path. Recorded
-  as an accepted caveat on that criterion, not as scheduled work. (R25)
+- ~~`FORMAT_MINOR = 0` leaves "Accept known older minor versions through
+  explicit migrations" with no exercised path.~~ **Obsolete 2026-08-30:**
+  `FORMAT_MINOR` is `1` (`portability.py`), `_fields_by_minor()` implements the
+  per-minor field table, and `tests/fixtures/export/v1/legacy-v1.0.json` and
+  `golden-v1.1.json` both exist. The criterion is exercised; the caveat no
+  longer applies. (R25)
 - Import validates `recall_class` against `RECALL_CLASSES`
   (`src/haunt/portability.py:38`, `:1344`) but never validates `tier`, which it
   carries as a plain field (`:146`, `:154`) into columns with no CHECK
@@ -859,7 +862,17 @@ and is ready for a normal Haunt release.
 
 ## Corpus health and capture policy (C-series)
 
-**Status:** Ready
+**Status:** Mostly shipped — corrected 2026-08-30. This section read "Ready"
+(no implementation active) while most of it was already in the tree, which is
+the largest single correctness defect the documentation pass found and is
+invisible to any byte-reduction sweep. Verified against the current tree:
+C1 (hooks and MCP pass `repo_path` to `Store`), C2, C3 (`reconcile_namespaces`,
+exercised as a dry run against *copies* of the real namespace databases --
+not against the originals, which remain split), C4 (`drain_embedding_queue`), C5 (attempts
+cap), C6 (`tests/test_capture_policy.py`), C10 (`idx_memories_current`), C11,
+and C12 are all implemented; C7 phase 1 shipped and phase 2 was dropped under
+D3. **Genuinely open: C8** (folded into E6 as a fixture) **and C9** (FTS
+tokenizer, whose camelCase half is already recorded as dropped under R30).
 
 The E-series above adopts new capabilities. The C-series repairs what Haunt
 already does to a live store. These items were found on 2026-08-26 by measuring
@@ -1119,8 +1132,10 @@ evidence below. A third pass at `integration/followups` `3c4bb1e` records the
 PR #85 review (14 findings fixed, 1 refuted), closes R8 and L12, and adds the
 real-namespace reconcile proof with its four findings (L17-L20). This register
 supersedes every prior audit of this repository. **Audits written against
-`88f607f` are 15 commits stale** — that revision is 15 commits behind
-`main`, and most of what those audits report was fixed in between. The closed
+`88f607f` are badly stale** — that revision is 87 commits behind `main` as of
+2026-08-30 (it read 15 when written; the number was never updated, which is
+itself the argument for not putting counts in prose), and most of what those
+audits report was fixed in between. The closed
 table below is the list; do not re-open anything in it without new evidence.
 
 `Checked` reads: `verified` — citation re-checked during this reconciliation, at
@@ -1315,7 +1330,7 @@ audit does not re-report settled work.
 | Entity resolution not attempted (C3) | NOT A DEFECT | deliberate scope decision, documented in `src/haunt/store.py` |
 | Trigram tokenizer rejected (C9) | WELL-FOUNDED | FTS5 trigram cannot be wrapped by porter; losing stemming on a prose corpus is a net loss |
 | C7 phase 2 (reference-not-copy) dropped | WELL-FOUNDED, restated | see the C7 phase 2 decision above — the grounds changed, the decision did not |
-| R25 — `FORMAT_MINOR = 0` leaves the older-minor path unexercised | NOT SCHEDULED | true but not work; recorded as an accepted E4 caveat (`src/haunt/portability.py:61`) |
+| R25 — `FORMAT_MINOR = 0` leaves the older-minor path unexercised | OBSOLETE | premise false as of 2026-08-30: `FORMAT_MINOR` is `1`, `_fields_by_minor()` walks every minor, and both v1.0 and v1.1 golden fixtures exist |
 | R26 — `_backfill_content_hashes` runs on every store open, inside R5's unprotected loop | REFUTED | it is called once inside `if current < 10:` (`src/haunt/store.py:1703-1717`) and `_ensure_namespace_schema` early-returns when `current >= SCHEMA_VERSION` (`:1610-1615`). One-shot migration. It is unbounded within that single pass; cheap batching is welcome, heavy machinery is not |
 | R27 — `idx_memories_content_hash` costs a write per INSERT to serve one diagnostic | REFUTED twice | `EXPLAIN QUERY PLAN` shows `SEARCH memories USING COVERING INDEX idx_memories_content_hash`, so the index is used. The residual worry that a fresh v11 database never gets the C7/C10 indexes is false: a fresh database stamps at `SCHEMA_VERSION` 11 and receives both `idx_memories_content_hash` (`src/haunt/store.py:1709-1711`) and `idx_memories_current` (`:1723-1726`), 20 `idx_` indexes total |
 | R29 — missing `UNIQUE(norm_name, type)` on the entities index | DROPPED | latent invariant gap; the race is unreachable today via `observe` |
@@ -1391,6 +1406,185 @@ audit does not re-report settled work.
   from a short-sequence-biased sample and would ship as a hardware-specific
   hardcode.
 
+- **D8 — `store.py` stays one module (2026-08-30).** Audited three candidate
+  extraction boundaries; **none extracted**. The premise did not survive: over
+  `06ebd234..10963523` the file grew 8,456 → 9,406 lines while `class Store`
+  **shrank by 488** and `Store.purge` by 263. `f299353` de-classed the erasure
+  path into module functions taking an explicit `conn` so
+  `_erase_memory_from_backup` could run the *identical* erasure against a loose
+  backup file — the equivalence `tests/test_purge.py` enforces by fault
+  injection. 24 new top-level definitions and one removed, 14 of them that one
+  decision (16 counting two constants it added). The
+  growth is a coupling reduction plus one new capability, not accumulation.
+  - *Privacy erasure / purge* — best cut metrics in the file (0 inbound edges,
+    contiguous, 2 trivial back-edges) and still wrong.
+    `_erase_memory_content` does not own its transaction: `Store.purge` opens
+    `BEGIN IMMEDIATE`, sets the thread guard, calls it, commits. A SQLite UDF
+    registered on the connection reads that guard to satisfy an append-only
+    trigger created in the schema-init block ~5,000 lines away, and the erasure
+    cluster registers its own always-authorize variant for backup files. The
+    cut falls between the transaction's opener and its body and separates the
+    most permissive authorization from the trigger it defeats.
+    *Unblock:* pass an authorization object into `_erase_memory_content`
+    instead of reading `Store` state through a connection-registered closure,
+    and move `_table_columns` / `_private_backup_root` to a shared helper.
+  - *Reconcile* — genuine bidirectional dependency. The cluster needs the
+    `Store` open-factories; `_retire_namespace`, which stays behind, needs
+    `_plan_namespace_reconciliation`. Transaction ownership here is already
+    clean, so this is the strongest future candidate.
+    *Unblock:* move the four `Store` open-factories to their own module first.
+  - *Namespace label administration* — not cohesive: 7 internal call edges
+    against 30 outbound to 13 registry internals. Extraction here is
+    definitionally the "adds an import layer" outcome.
+    *Unblock:* extract the registry first; never extract this before it.
+  - *Cost any extraction pays regardless:* ~69 `monkeypatch.setattr` sites
+    target the `haunt.store` module directly and ~96 counting the `Store`
+    class it exports; tests treat `haunt.store` as *the* patch namespace, and several patched helpers have
+    all their callers inside the cluster that would move.
+  - *Enforced by* `tests/test_store_cohesion.py`, which pins the top-level
+    definition names. A line-count ceiling was rejected: it would have fired on
+    the refactor above and stayed silent on unrelated work.
+
+- **D9 — no linter gate for duplicate definitions (2026-08-30).** Closes R21
+  for the shadowing case. `ruff --select F811` is **disqualified on evidence**:
+  its default `dummy-variable-rgx` exempts every underscore-prefixed name,
+  which is every private helper here, so it returns "All checks passed" on the
+  exact historical `_table_columns` mutation. Overriding the regex catches that
+  but still misses duplicate module-level constants entirely — pyflakes has no
+  rule for that shape, and `_TABLE_FIELDS`-style tables are the same hazard.
+  `--select F811,F401,F841` yields 14 findings on the clean tree, **all** of
+  them in `tests/` (`src/` and `scripts/` are clean), none the target class.
+  `tests/test_no_duplicate_definitions.py` catches all four probe shapes
+  (historical duplicate, duplicate method 2,000 lines apart in a class,
+  duplicate annotated module constant, def duplicated 9,000 lines apart) with
+  zero findings on the clean tree, zero false positives on `@overload`,
+  property setter/deleter, `try/except ImportError`, `TYPE_CHECKING` and
+  platform branches, in 0.4s, with no new dependency and no new CI step — it
+  rides the existing `pytest tests/`. R21's mypy half is untouched and remains
+  open.
+
+- **D10 — explicit maintenance vs. a singleton background drain: OPEN, and not
+  yet decidable (2026-08-30).** Do not implement either until the measurements
+  below exist. Recorded so the question is not settled by whichever option
+  someone reaches for first.
+
+  *Not in dispute, established from call sites.* No timer, daemon, thread,
+  plist or scheduled job drains the queue — the only `threading.Thread` in
+  `src/` is the dashboard's browser-opener. Three product drains exist:
+  `haunt bootstrap` (≤500/namespace/run), `haunt maintenance` (one batch,
+  default 64, ceiling 100), and `observe()` on the non-deferred path (≤32).
+  Hooks always defer and never drain; `recall()` reports
+  `observed_not_drained`. Draining from a hook's synchronous path is already
+  ruled out by design.
+
+  *Option A* — keep draining human-invoked; improve discoverability and make
+  `haunt maintenance` loop rather than run a single batch.
+  *Option B* — drain on the MCP server's idle time. No new process, but it
+  introduces concurrency against a SQLite writer lock that today has exactly
+  one writer at a time.
+
+  *Required before choosing:*
+  - **M1 arrival rate** over a normal 24–72h window, sampled hourly from
+    **copies**, never the live store. If a day's arrivals fit inside one
+    operator command, A suffices; if they exceed any single command's bound,
+    no cadence of A can catch up and B is required.
+  - **M2 queue-age slope** — `MIN(queued_at)` among pending rows across the
+    same window, including a weekend. Flat or sawtooth favours A; monotonically
+    rising is direct evidence human invocation does not happen often enough.
+    Age is the discriminator, not depth: a shallow queue that never empties is
+    still a coverage failure.
+  - **M3 idle catch-up rate** — sustained rows/second at batch 16/32/64/100,
+    *and* the contended figure with a second process holding the writer lock,
+    against measured MCP idle time. B is viable only if idle seconds ×
+    contended rate exceeds M1 with margin.
+  - **M4 resource use per row** — wall, peak RSS, CPU-seconds. If a batch is
+    noticeable inside the MCP process, which also serves interactive recall, B
+    must be rejected in-process.
+  - **M5 crash behaviour mid-drain** — this is a gate, not a preference. Kill
+    between batches, mid-batch after partial commit, and during vec-table
+    creation; then `integrity_check`, `foreign_key_check`, and re-read the
+    counters. If a kill can inflate `attempts` toward the cap, a crash-looping
+    background drain would silently exhaust the whole queue, since exhaustion
+    is permanent and `reembed()` is the only reset. **A background drain must
+    not ship while the SIGBUS is unfixed** — D11 characterizes the mechanism but
+    deliberately does not fix it, and knowing the cause does not remove the
+    hazard. A crash-looping background drain meets exactly that failure mode,
+    and exhaustion at the attempts cap is permanent.
+  - **M6 coverage-vs-quality curve** — replicate the existing synthetic
+    experiment with more queries (the SE ≈ 0.08 floor is what stops it
+    separating 75% from 0%), sample the unmeasured 6–75% region, and run once
+    on a real transcript corpus. This sets the target, not the mechanism.
+
+  *Required caveat.* One manual drain does not prove the queue stays caught up.
+  The 2026-08-29 repair took four namespaces to full coverage in a single
+  operator loop; that demonstrates the drain works and says nothing about
+  whether coverage *stays* high, because it measured one point immediately
+  after a human intervened. This is a rate question, not a capacity question.
+  Only M1 and M2, observed over days **without** an intervening manual drain,
+  can answer it. A second manual drain would add no evidence. Any claim of the
+  form "the queue is fine now" must cite an age slope, not a coverage snapshot.
+
+  *Do not invent a threshold.* No "healthy coverage" cutoff exists in any
+  product path and none should be added: until D10's M6 lands, the only
+  measurement available is non-monotonic in coverage, so no single cutoff is
+  honest. `stats()` now reports `memories_embeddable`, `embedding_coverage`
+  (None, never 0.0, where there is no denominator or no vector index) and
+  `embedding_oldest_pending` — numbers, with no verdict attached.
+
+- **D11 — the SIGBUS is characterized; the fix is deliberately not in the v0.3
+  cleanup (2026-08-30).** Previously carried as "no cause established". It is
+  not ONNX, not sqlite-vec, and not a poison row.
+
+  **Mechanism: a pagein failure on SQLite's memory-mapped WAL index.** The
+  `<db>-shm` mapping is 32 KiB while the backing file is 3 bytes.
+
+  Evidence, all reproducible:
+  - 29 crash reports in `~/Library/Logs/DiagnosticReports/` spanning
+    2026-08-25 onward, every one `EXC_BAD_ACCESS` / `SIGBUS` with subtype
+    `FS pagein error: 22 Invalid argument`.
+  - **100% of faulting frames are SQLite WAL-index functions** — `walFindFrame`
+    via `readDbPage`, `walIndexReadHdr` via `walTryBeginRead`, `walIndexAppend`
+    via `pagerWalFrames`. Zero involve `onnxruntime`, `tokenizers` or `vec0`,
+    though all three were loaded in the drain crash.
+  - Every fault address lands at offset 16384–29368 inside a 32 KiB `rw-`
+    mapped-file region, which is SQLite's wal-index geometry.
+  - On disk during the incident: `haunt.db-shm` was **3 bytes**
+    (`18e22d`, the start of the healthy header — SQLite's own
+    "wal-index needs recovery" marker) while the two idle namespaces were 32768.
+  - The recorded drain death is identifiable: `Python-2026-08-29-211458.000.ips`,
+    1720 s from launch against the record's "1,698 s of progress",
+    `parentProc: zsh`, faulting in `walFindFrame`.
+  - **Reproduced.** Truncating a mapped `-shm` to 3 bytes under a live reader
+    kills the process with signal 10 — shell exit **138**, matching the record.
+
+  Implicated code, in the order it matters: `SQLiteSidecarGuard._acquire_one`
+  pre-creates `<db>-shm` zero-length before SQLite opens the database;
+  `close(clean_unused_claims=True)` unlinks it when it is size 0;
+  `sqlite_storage_snapshot()` opens **and closes** an independent fd on it, and
+  on POSIX closing *any* fd drops *every* `fcntl` lock the process holds on that
+  file — including SQLite's dead-man-switch lock. The zero-write read path is
+  documented as bypassing the configuration flock yet still acquires a sidecar
+  claim. Six Claude Code hook events, each spawning a fresh process opening the
+  database read-write, plus the MCP servers and CLI, with no pooling, supply the
+  concurrency. 20 of 29 crashes have `parentProc: claude`.
+
+  This explains every recorded observation: why only the busy `haunt` namespace
+  crashed, why the drain died mid-run, why the resume ran through the same
+  region cleanly (a race, not data), and why `integrity_check` passed — the
+  main database was never corrupt, only the transient wal-index.
+
+  **Not fixed in the v0.3 cleanup**, on purpose: it changes sidecar lifetime and
+  SQLite locking semantics, which is not cleanup-shaped and deserves its own
+  change with its own review. Note the interaction with D10 — a background
+  drain must not ship while this is open, because a mid-drain crash is exactly
+  the failure mode it would run into.
+
+  *Not proven:* the precise interleaving that puts the truncation under a live
+  mapping is inferred from the four code sites above, not instrumented. To close
+  that: interpose `ftruncate`/`unlink`/`close` on `*-shm` under
+  `DYLD_INSERT_LIBRARIES`, logging pid, path and inode, and correlate against a
+  concurrent hook.
+
 ### Integration state (verified)
 
 - `integration/all-work` `d1aec40` = `main` `ed806b2` + #79 + #81 + #83 +
@@ -1399,7 +1593,10 @@ audit does not re-report settled work.
 - The schema ladder merged sequentially and correctly: v9 `recall_class` (main)
   to v10 `content_hash` plus index plus backfill (C7) to v11
   `idx_memories_current` partial index (C10). No duplicate version numbers;
-  `SCHEMA_VERSION = 11` (`src/haunt/store.py:101`).
+  `SCHEMA_VERSION` is `13` in `src/haunt/store.py` as of 2026-08-30 — the
+  ladder continued past v11 to v12 (`succeeds_session`) and v13
+  (`skip_embedding`), both described elsewhere in this document. This line read
+  `11` with a line-number citation that had drifted by 29 lines.
 - `portability`, `rerank`, and `abstention_eval` all co-import.
 - `integration/all-work` `413f8b9` adds the E6 guard, store-correctness,
   dashboard-XSS, surface-polish, resilience, embed-batching, E0-gate,

@@ -40,7 +40,7 @@ from haunt.store import (
     open_existing,
     open_existing_readonly,
     reconcile_namespaces,
-    register_namespace,
+    register_namespace_context,
     retire_namespace,
     retire_namespace_alias,
     undo_namespace_migration,
@@ -222,7 +222,16 @@ def init_cmd(
         ns, inferred_repo_path = infer_namespace_context(repo)
         repo_path = str(repo) if repo else inferred_repo_path
     try:
-        db = register_namespace(ns, repo_path=repo_path)
+        # Registration reports the label it published: an inferred name can
+        # fork when another repository already owns it. A name the user typed
+        # cannot -- `haunt init team --repo A` then `--repo B` is a request to
+        # share `team`, and typing a name must produce that name. Without this
+        # flag `--repo` would silently reroute the second one to
+        # `team-<digest>`, because it is the only path that hands registration
+        # a chosen label together with a repository to assert ownership with.
+        ns, db = register_namespace_context(
+            ns, repo_path=repo_path, explicit_label=name is not None
+        )
         with Store(ns) as st:
             stats = st.stats()
     except (NamespaceCollisionError, NamespacePathError) as exc:
@@ -640,7 +649,13 @@ def namespace_reconcile_cmd(
     SOURCE is never written to. Both databases are backed up before TARGET is
     touched. Refuses -- writing nothing -- if any row's id collides with
     different content, if idempotency keys collide, or if either namespace is
-    not at the current schema version. Embeddings are dropped and re-queued
+    not at the current schema version. The single exception to "verbatim" is
+    a session window: a session either side has a row or an event for is
+    widened to hold every event either side has for it -- never narrowed,
+    and never closed while TARGET still holds it open. The dry-run's
+    `window_merges` lists every such window with the values it will take,
+    and `unresolvable_windows` names any left untouched because a stored
+    timestamp in them cannot be ordered. Embeddings are dropped and re-queued
     rather than copied; run this again to pick up rows added since. This does
     not touch the registry: both labels remain independently resolvable.
     """
@@ -751,11 +766,19 @@ def health_cmd(
             f"sessions={s['sessions']} entities={s['entities']} relations={s['relations']}"
         )
         typer.echo(f"tiers         {s['tiers']}")
+        coverage = s.get("embedding_coverage")
         typer.echo(
-            f"embedding     embedded={s['memories_embedded']} "
+            f"embedding     embedded={s['memories_embedded']}"
+            f"/{s.get('memories_embeddable', 0)} "
+            f"coverage={'n/a' if coverage is None else f'{coverage:.1%}'} "
             f"pending={s['embedding_pending']} exhausted={s['embedding_exhausted']} "
             f"index={s['vector_index']}"
         )
+        oldest = s.get("embedding_oldest_pending")
+        if oldest:
+            # Depth alone cannot distinguish "a drain just ran" from "this
+            # queue has been stalled for days"; the age of the oldest job can.
+            typer.echo(f"              oldest queued {oldest}")
         typer.echo(
             f"duplicates    memories={s['duplicate_memories']} "
             f"content={s['duplicate_content_values']}"
@@ -1100,14 +1123,33 @@ def trace_cmd(
 
 
 @app.command("install")
-def install_cmd() -> None:
+def install_cmd(
+    allow_alt_home: bool = typer.Option(
+        False,
+        "--allow-alt-home",
+        help=(
+            "Bind hosts even though HAUNT_HOME is not the default ~/.haunt. "
+            "Global editor config will name this home; if it goes away, every "
+            "hook stops capturing silently."
+        ),
+    ),
+) -> None:
     """Bind haunt to all known hosts (Cursor, Claude Code). Idempotent."""
     from haunt.bootstrap import bind_launchers
-    from haunt.hosts import HostConfigError, install_all_hosts
+    from haunt.hosts import HostConfigError, HostInstallRefused, install_all_hosts
 
     home, hook_cmd, mcp_cmd = bind_launchers()
     try:
-        reports = install_all_hosts(str(home), hook_cmd, mcp_cmd)
+        reports = install_all_hosts(
+            str(home), hook_cmd, mcp_cmd, force=allow_alt_home
+        )
+    except HostInstallRefused as exc:
+        # Hard error, unlike bootstrap: binding hosts is the entire point of
+        # this command, so doing nothing quietly would be the same silence the
+        # guard exists to prevent. Catches the category, not one class -- the
+        # unsafe-command and foreign-target guards were previously uncaught
+        # here and surfaced as tracebacks.
+        _die(exc, code=2)
     except HostConfigError as exc:
         _die(exc, code=1)
     for r in reports:
@@ -1127,10 +1169,12 @@ def cursor_install_cmd() -> None:
     """Bind haunt to Cursor: hooks.json + mcp.json + haunt.mdc + skill."""
     from haunt.cursor_hook import install_cursor_hooks
 
-    from haunt.hosts import HostConfigError
+    from haunt.hosts import HostConfigError, HostInstallRefused
 
     try:
         report = install_cursor_hooks()
+    except HostInstallRefused as exc:
+        _die(exc, code=2)
     except HostConfigError as exc:
         _die(exc, code=1)
     typer.echo(f"hooks     {report['hooks_json']}")
@@ -1155,7 +1199,7 @@ def doctor_cmd() -> None:
     """
     from haunt.bootstrap import bind_launchers
     from haunt.doctor import diagnose, format_doctor
-    from haunt.hosts import install_all_hosts
+    from haunt.hosts import host_install_refusal, install_all_hosts
 
     home, hook_cmd, mcp_cmd = bind_launchers()
     from haunt.paths import repair_private_modes
@@ -1165,12 +1209,25 @@ def doctor_cmd() -> None:
     typer.echo(format_doctor(report))
 
     if not report.ok and report.host_file_issues:
+        # doctor's repair step is a host install, so it is guarded exactly like
+        # one -- and it is the likelier of the two to be run by accident from a
+        # smoke-test shell. Decided before the "Re-merging" line so the output
+        # never claims a write that did not happen.
+        refusal = host_install_refusal(str(home))
+        if refusal is not None:
+            typer.echo("")
+            typer.echo("NOT re-merging hosts.")
+            for line in str(refusal).splitlines():
+                typer.echo("  " + line)
+            raise typer.Exit(1)
         typer.echo("")
         typer.echo("Re-merging all hosts...")
-        from haunt.hosts import HostConfigError
+        from haunt.hosts import HostConfigError, HostInstallRefused
 
         try:
             install_all_hosts(str(home), hook_cmd, mcp_cmd)
+        except HostInstallRefused as exc:
+            _die(exc, code=2)
         except HostConfigError as exc:
             _die(exc, code=1)
         report = diagnose(str(home), hook_cmd, mcp_cmd)

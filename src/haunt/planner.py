@@ -18,6 +18,7 @@ from typing import Literal
 
 from haunt.recall import (
     Hit,
+    _stable_tie_key,
     RecallResult,
     classify_recall_residue,
     execution_metadata,
@@ -176,19 +177,25 @@ def _clocks(clock: str) -> tuple[str, ...]:
     return (c,)
 
 
-def _recall_order(hit: Hit) -> tuple[int, float, str]:
+def _recall_order(hit: Hit) -> tuple[int, float, str, str]:
     """Sort key preserving the order recall() returned a hit in.
 
     recall() owns ranking and an enabled rerank stage replaces RRF order
     with its own, so re-deriving order from ``score`` here would silently
     undo it. With no such stage final_rank is assigned in exactly
-    ``(-score, memory_id)`` order, so this key reproduces it. A Hit built
-    by hand rather than by recall() carries no final_rank and falls back to
-    that score order.
+    ``(-score, content_hash, memory_id)`` order, so this key reproduces it. A
+    Hit built by hand rather than by recall() carries no final_rank and falls
+    back to that score order.
+
+    run_ranked merges hits from several recall runs, so two hits routinely
+    share a final_rank and the tie is decided here rather than inside recall.
+    content_hash leads memory_id for the same reason it does there: the id is
+    a fresh uuid4 per write and would re-roll this order on every ingest.
     """
     return (
         hit.final_rank if hit.final_rank is not None else 0,
         -hit.score,
+        hit.content_hash or hit.memory_id,
         hit.memory_id,
     )
 
@@ -278,6 +285,11 @@ def _hits_from_events(
 ) -> list[Hit]:
     hits: list[Hit] = []
     seen: set[str] = set()
+    # Timeline hits are built here, not by recall(), so they need the tie key
+    # selected explicitly. Without it every timeline Hit carried content_hash
+    # None and the equal-timestamp tie-break below silently degraded back to
+    # the random memory id it was written to replace.
+    tie = _stable_tie_key(store.conn)
     recall_class_select = (
         "e.recall_class AS recall_class"
         if bool(getattr(store, "recall_class_available", False))
@@ -288,7 +300,8 @@ def _hits_from_events(
             f"""
             SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
                    e.role, e.event_time, e.ts, e.tool_name, e.tool_input,
-                   e.tool_output, e.origin, {recall_class_select}
+                   e.tool_output, e.origin, {tie} AS content_hash,
+                   {recall_class_select}
             FROM memories m
             JOIN events e ON e.id = m.event_id
             WHERE m.event_id=? AND m.valid_to IS NULL
@@ -314,6 +327,7 @@ def _hits_from_events(
                 score=0.0,
                 tier=row["tier"],
                 content=row["content"],
+                content_hash=row["content_hash"],
                 role=row["role"],
                 event_time=row["event_time"],
                 ts=row["ts"],
@@ -341,7 +355,7 @@ def run_timeline(
     session_id: str | None = None,
     limit: int = 50,
     clock: str | None = None,
-) -> list[Hit]:
+) -> RecallResult:
     """A: events in [start, end] on the chosen clock(s).
 
     Direct callers share the public ``clamp_k`` contract, so ``limit`` is
@@ -395,9 +409,11 @@ def run_timeline(
                 break
             offset = nxt
     # Preserve chronological order. Only exact values on the selected clock
-    # fall back to the stable memory ID; never sort timeline hits by ID alone.
+    # fall back to the content key; never sort timeline hits by it alone. The
+    # memory id is NOT stable across ingests -- it is a fresh uuid4 per write
+    # -- so content_hash leads and the id only settles byte-identical content.
     hits = list(merged.values())
-    hits.sort(key=lambda hit: hit.memory_id)
+    hits.sort(key=lambda hit: (hit.content_hash or hit.memory_id, hit.memory_id))
     time_attr = "ts" if _clocks(chosen)[0] == "storage_time" else "event_time"
     hits.sort(key=lambda hit: getattr(hit, time_attr) or "", reverse=True)
     hits = hits[:limit]

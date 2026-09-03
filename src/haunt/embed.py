@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from haunt import model_manifest
 from haunt.paths import models_dir
 from haunt.util import diag, dumps, env_flag, env_int, loads
 
@@ -40,7 +41,7 @@ BGE_M3_PATTERNS = [
 ]
 # The revision whose onnx/ file sizes and SHA-256s are the ones in
 # src/haunt/data/hybrid-model-manifest.json, which ships in the wheel and which
-# abstention_eval.verify_local_hybrid_cache enforces byte for byte.
+# model_manifest.verify_local_hybrid_cache enforces byte for byte.
 BGE_M3_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 BGE_M3_QUANT_REPO = "onnx-community/bge-m3-ONNX"
 # No committed manifest covers this variant -- the hybrid manifest's
@@ -237,11 +238,8 @@ def _verify_bge_m3_cache(root: Path) -> None:
     if quantized and _quant_fallback_enabled():
         diag("embed_m3_unverified", reason="quantized variant has no manifest")
         return
-    # abstention_eval imports this module, so the import has to be deferred.
-    from haunt.abstention_eval import verify_local_hybrid_cache
-
     try:
-        evidence = verify_local_hybrid_cache(
+        evidence = model_manifest.verify_local_hybrid_cache(
             root.parent, hash_max_bytes=VERIFY_HASH_MAX_BYTES
         )
     except FileNotFoundError as exc:

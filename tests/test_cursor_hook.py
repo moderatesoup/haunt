@@ -12,9 +12,9 @@ from haunt.store import Store
 
 
 @pytest.fixture
-def fts_hook_env(tmp_path, monkeypatch):
+def fts_hook_env(tmp_path, monkeypatch, fake_home):
     """Isolated HAUNT_HOME, FTS-only — never download BGE-M3."""
-    home = tmp_path / "haunthome"
+    home = fake_home / ".haunt"
     project = tmp_path / "myproj"
     project.mkdir()
     monkeypatch.setenv("HAUNT_HOME", str(home))
@@ -148,8 +148,10 @@ def test_fail_open_invalid_json(fts_hook_env, capsys, monkeypatch):
     assert json.loads(capsys.readouterr().out) == {}
 
 
-def test_cursor_install_merges_without_clobber(fts_hook_env, tmp_path, monkeypatch):
-    cursor_home = tmp_path / "cursor"
+def test_cursor_install_merges_without_clobber(
+    fts_hook_env, tmp_path, monkeypatch, fake_home
+):
+    cursor_home = fake_home / ".cursor"
     cursor_home.mkdir()
     hooks_path = cursor_home / "hooks.json"
     hooks_path.write_text(
@@ -186,9 +188,9 @@ def test_cursor_install_merges_without_clobber(fts_hook_env, tmp_path, monkeypat
         assert any("haunt-hook" in c["command"] for c in data["hooks"][event])
 
 
-def test_cursor_install_writes_rule_file(fts_hook_env, tmp_path, monkeypatch):
+def test_cursor_install_writes_rule_file(fts_hook_env, tmp_path, monkeypatch, fake_home):
     """cursor-install must write haunt.mdc to ~/.cursor/rules/ even without contrib/ on disk."""
-    cursor_home = tmp_path / "cursor"
+    cursor_home = fake_home / ".cursor"
     cursor_home.mkdir()
     monkeypatch.setenv("CURSOR_HOME", str(cursor_home))
     from haunt.cursor_hook import install_cursor_hooks

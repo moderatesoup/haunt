@@ -17,12 +17,12 @@ import pytest
 
 
 @pytest.fixture
-def fanout_env(tmp_path, monkeypatch):
+def fanout_env(tmp_path, monkeypatch, fake_home):
     """Isolated HAUNT_HOME, FTS-only -- same pattern as
     tests/test_reembed_counts.py::_fts_only_home. Per-namespace isolation
     is orthogonal to which backend embeds, so no real model is loaded.
     """
-    monkeypatch.setenv("HAUNT_HOME", str(tmp_path / "haunthome"))
+    monkeypatch.setenv("HAUNT_HOME", str(fake_home / ".haunt"))
     monkeypatch.setenv("HAUNT_FTS_ONLY", "1")
     monkeypatch.setenv("HAUNT_EMBED_MODEL", "off")
     monkeypatch.delenv("HAUNT_NAMESPACE", raising=False)

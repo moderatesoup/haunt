@@ -10,9 +10,27 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from haunt.paths import bin_dir
+from haunt.util import desktop_exec_quote, sh_single_quote
+
 
 def _find_haunt_cmd() -> str:
-    """Find the haunt CLI command path."""
+    """Resolve the haunt CLI for a shortcut, preferring the canonical wrapper.
+
+    ~/.haunt/bin/haunt is written by bootstrap and re-exec's the interpreter
+    haunt is actually installed into, so it keeps working across PATH changes
+    and venv rebuilds. shutil.which resolves once, at icon-write time, and then
+    freezes -- on a machine with a pyenv shim ahead of the haunt venv that
+    pinned the shortcut to an interpreter whose sqlite3 cannot load extensions,
+    so the console opened but no vector search worked. Keep which() as the
+    fallback for installs that never ran bootstrap.
+    """
+    canonical = bin_dir() / "haunt"
+    # Executable, not merely present: a wrapper left behind by a rebuilt venv
+    # names an interpreter that no longer exists (exit 126), and preferring it
+    # over a working PATH haunt would trade one broken shortcut for another.
+    if canonical.is_file() and os.access(canonical, os.X_OK):
+        return str(canonical)
     which = shutil.which("haunt")
     if which:
         return which
@@ -22,15 +40,35 @@ def _find_haunt_cmd() -> str:
     return "haunt"
 
 
-def install_desktop_icon(home: Path | None = None) -> dict[str, Any]:
+def install_desktop_icon(
+    home: Path | None = None, *, force: bool = False
+) -> dict[str, Any]:
     """Write a desktop shortcut for 'haunt dash'.
 
     Linux: writes a .desktop file to ~/.local/share/applications/.
     macOS: best-effort .command wrapper on ~/Desktop.
     Windows: best-effort .bat on Desktop.
 
+    Skipped when `home` is None (so the real user home is the target) and
+    HAUNT_HOME is not the default home: a bootstrap run from a temp home is
+    not entitled to drop files in the operator's actual Desktop. An explicit
+    `home` is already a redirected target, so it is never refused.
+
     Returns dict with 'written' bool, 'path', and 'reason' on skip.
     """
+    if home is None:
+        from haunt.hosts import ALT_HOME_ENV, host_install_refusal
+        from haunt.paths import haunt_home
+
+        refusal = host_install_refusal(haunt_home(), force=force)
+        if refusal is not None:
+            return {
+                "written": False,
+                "reason": (
+                    f"haunt home {refusal.haunt_home} is not the default "
+                    f"{refusal.default_home}; set {ALT_HOME_ENV}=1 to write anyway"
+                ),
+            }
     platform = sys.platform
     haunt_cmd = _find_haunt_cmd()
 
@@ -54,7 +92,7 @@ def _install_linux(haunt_cmd: str, home: Path | None = None) -> dict[str, Any]:
         "Type=Application\n"
         "Name=Haunt Memories\n"
         "Comment=Local memory console for AI agents\n"
-        f"Exec={haunt_cmd} dash\n"
+        f"Exec={desktop_exec_quote(haunt_cmd)} dash\n"
         "Terminal=true\n"
         "Categories=Development;Utility;\n"
         "StartupNotify=false\n"
@@ -85,7 +123,7 @@ def _install_macos(haunt_cmd: str, home: Path | None = None) -> dict[str, Any]:
     script_path = desktop / "Haunt Memories.command"
     script_path.write_text(
         f"#!/bin/bash\n"
-        f'exec "{haunt_cmd}" dash\n',
+        f"exec {sh_single_quote(haunt_cmd)} dash\n",
         encoding="utf-8",
     )
     script_path.chmod(
@@ -102,7 +140,7 @@ def _install_windows(haunt_cmd: str, home: Path | None = None) -> dict[str, Any]
 
     bat_path = desktop / "Haunt Memories.bat"
     bat_path.write_text(
-        f'@echo off\n"{haunt_cmd}" dash\n',
+        '@echo off\n"' + haunt_cmd.replace("%", "%%") + '" dash\n',
         encoding="utf-8",
     )
     return {"written": True, "path": str(bat_path), "platform": "windows"}

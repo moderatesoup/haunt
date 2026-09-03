@@ -1725,6 +1725,17 @@ def infer_namespace_context(cwd: Path | None = None) -> tuple[str, str | None]:
         # The label is another repository's already. Fork: two namespaces are
         # a visible, reversible split, while commingled memory has no clean
         # undo and no signal that it happened.
+        #
+        # This read cannot be the ownership decision: two repositories that
+        # infer before either registers both see the label free here. It is
+        # the fast path, and register_namespace() repeats the test inside the
+        # transaction that publishes and binds, forking to this same label
+        # because the digest depends only on *discriminator*.
+        #
+        # The two paths agree only while this fork target is free. If a third
+        # repository already owns it, arriving here (sequentially) forks again
+        # off the already-forked label, whereas losing the race there has no
+        # candidate left and fails closed. See register_namespace_context().
         mint_label = disambiguate_namespace_label(mint_label, discriminator)
     registered = match.namespace
     if registered:

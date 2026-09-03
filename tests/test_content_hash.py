@@ -275,8 +275,17 @@ def test_haunt_health_shows_the_duplicate_and_coverage_counts(dup_env):
     result = CliRunner().invoke(cli.app, ["health", "-n", "dup-test"])
     assert result.exit_code == 0, result.output
     assert "duplicates    memories=2 content=1" in result.output
-    assert "embedding     embedded=0 pending=" in result.output
+    # Every embedding number stats() computes has to reach this surface,
+    # including the denominator and the queue age added for the drain
+    # decision -- the whole point of this test.
+    assert "embedding     embedded=0/3" in result.output
+    assert "pending=" in result.output
+    assert "exhausted=" in result.output
     assert "index=False" in result.output
+    # None, not 0.0: this namespace is FTS-only, and "0% coverage" would read
+    # as unhealthy when there is simply no vector index to be covered.
+    assert "coverage=n/a" in result.output
+    assert "oldest queued " in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -630,3 +639,31 @@ def test_backfill_pages_instead_of_loading_a_whole_namespace_at_once(
         again = _BatchCountingConn(store.conn)
         assert _backfill_content_hashes(again) == 0
         assert again.batches == []
+
+
+def test_whitespace_only_content_is_not_counted_as_embeddable(dup_env):
+    """The coverage denominator must not count rows observe() will never queue.
+
+    SQLite's one-argument TRIM strips U+0020 only, while observe() gates on
+    Python's str.strip(). A row whose content is "\\n\\t" therefore counted
+    toward memories_embeddable while never producing an embedding_jobs row,
+    capping embedding_coverage below 1.0 forever -- the exact defect the
+    denominator was added to remove.
+    """
+    from haunt.store import Store
+
+    with Store("ws-test", create=True) as store:
+        store.observe("\n\t", defer_embedding=True)
+        store.observe("   ", defer_embedding=True)
+        store.observe("real content", defer_embedding=True)
+        stats = store.stats()
+        queued = store.conn.execute(
+            "SELECT COUNT(*) FROM embedding_jobs"
+        ).fetchone()[0]
+
+    assert stats["memories"] == 3
+    assert queued == 1, "only the real row should be queued"
+    assert stats["memories_embeddable"] == queued, (
+        "denominator counts a row that can never be enqueued: "
+        f"embeddable={stats['memories_embeddable']} queued={queued}"
+    )

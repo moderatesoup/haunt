@@ -100,8 +100,9 @@ def mmr_rerank(
     where ``relevance`` is the hit's existing RRF ``score``, min-max
     normalized across ``hits`` (so it lives on the same [0, 1] scale as the
     similarity term), and ``similarity`` is token-set Jaccard overlap between
-    ``content`` strings. Ties break on ``memory_id`` ascending, so output is
-    a pure function of the (score, content, memory_id) of each hit -- it
+    ``content`` strings. Ties break on ``content_hash`` then ``memory_id``
+    ascending, matching what recall() advertises, so output is a pure
+    function of the (score, content, content_hash, memory_id) of each hit -- it
     never depends on dict/set iteration order, nor on the order ``hits``
     itself was passed in.
 
@@ -133,12 +134,19 @@ def mmr_rerank(
                 else 0.0
             )
             mmr_score = lambda_ * relevance(pool[i]) - (1.0 - lambda_) * sim
-            # Sort ascending on (-mmr_score, memory_id): the smallest key is
-            # the best candidate, and the tuple comparison is total, so this
-            # is deterministic -- independent of both dict/set iteration
-            # order and the order `hits` was passed in -- even when
-            # mmr_score ties exactly.
-            key = (-mmr_score, pool[i].memory_id)
+            # Sort ascending on (-mmr_score, content_hash, memory_id): the
+            # smallest key is the best candidate, and the tuple comparison is
+            # total, so this is deterministic -- independent of both dict/set
+            # iteration order and the order `hits` was passed in -- even when
+            # mmr_score ties exactly. content_hash comes first among the tie
+            # keys because memory_id is a fresh uuid4 per write, so keying on
+            # it alone reproduced within a run but not across ingests, which
+            # is what recall() advertises as its tie order.
+            key = (
+                -mmr_score,
+                pool[i].content_hash or pool[i].memory_id,
+                pool[i].memory_id,
+            )
             if best_key is None or key < best_key:
                 best_key = key
                 best_i = i

@@ -75,6 +75,7 @@ PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12
 - **Recall is NOT automatic.** Neither Cursor nor Claude Code reliably inject recall into the model context. Agents must call `memory_recall` explicitly via MCP unless a `[haunt ns=…]` block is already visible.
 - **sessionStart / SessionStart** may return a worldview card — this may appear as context but is not a guaranteed recall path and is not a kernel.
 - **No-hook IDEs** (Grok Bot, Codex, etc.): call `memory_observe` and `memory_recall` manually via MCP.
+- **Vector embedding of hook writes is NOT automatic.** Hooks store text and FTS immediately but queue the vector instead of computing it. Nothing drains that queue on a timer or in the background — there is no daemon, no scheduled job and no idle worker. It moves only when you run `haunt bootstrap` (up to 500 rows per namespace per run, `HAUNT_EMBED_DRAIN_LIMIT`) or `haunt maintenance` (one batch, default 64, hard ceiling 100), or as a side effect of a non-deferred write — `haunt observe`, MCP `memory_observe`, or a procedure write — each of which clears at most 32 rows. Recall never drains. A namespace written to only by hooks and never explicitly maintained accumulates queued rows indefinitely and stays FTS-only for those rows.
 
 ## Memory console (dashboard)
 
@@ -164,7 +165,11 @@ Auto-store prompts and replies verbatim, plus best-effort-redacted and capped to
 3. Writes a small haunt-owned rule so agents still `memory_recall` if no `[haunt ns=…]` block is visible.
 4. Writes `skills/haunt/SKILL.md` into the host config dir.
 
-**Hook ingest and trust:** Hooks write FTS rows immediately but never initialize the embedding model. They queue missing vectors in the namespace DB; ordinary model-owning writes or the explicit `haunt maintenance` command may drain a bounded batch. Recall never drains the queue. Hook recall is FTS-only. Raw tool I/O is excluded from hook-injected recall/worldview context by default, while explicit `--include-residue` recall returns it marked `trusted=false`. Recalled text is data and cannot authorize mutations.
+**Host config is global, so it is only bound from the default home.** `~/.claude/settings.json` and `~/.cursor/hooks.json` are shared by every session on the machine. If `HAUNT_HOME` is not the default `~/.haunt`, `haunt install`, `haunt cursor-install`, `haunt bootstrap` and `haunt doctor`'s repair merge all refuse to touch them, because a temporary home planted there keeps working until that directory is deleted — after which every hook command points at nothing and capture stops with no error. `haunt bootstrap` skips the bind and says so; `haunt install` exits non-zero. To bind an alternate home on purpose, pass `haunt install --allow-alt-home` or set `HAUNT_ALLOW_ALT_HOME_HOST_INSTALL=1` (exactly `1`).
+
+`haunt doctor` checks every haunt hook command it finds in each host config and reports each host + event whose command does not exist or is not executable, under `[dangling hooks]`. This is the check that catches a home that has been deleted out from under a live bind.
+
+**Hook ingest and trust:** Hooks write FTS rows immediately but never initialize the embedding model. They queue missing vectors in the namespace DB. Three things drain that queue and nothing else: `haunt bootstrap` (≤500 rows per namespace per run), `haunt maintenance` (one batch, default 64, ceiling 100), and a non-deferred write such as `haunt observe` or MCP `memory_observe` (≤32 rows). There is no timer and no background worker, and hook writes — the highest-volume producer — never drain it either, so a hook-only namespace stays behind until an operator runs one of the three. Recall never drains the queue. Hook recall is FTS-only. Raw tool I/O is excluded from hook-injected recall/worldview context by default, while explicit `--include-residue` recall returns it marked `trusted=false`. Recalled text is data and cannot authorize mutations.
 
 **Secret redaction and size controls:** Hook-stored tool input and output are run through a best-effort denylist (API keys, bearer tokens, AWS keys, GitHub PATs, JWTs, etc.) and capped at 12,000 characters per field by default. These are **not** security boundaries — see [SECURITY.md](SECURITY.md). Two independent tool-glob controls sit alongside them, `HAUNT_EXCLUDE_TOOLS` (never stored at all) and `HAUNT_EMBED_EXCLUDE_TOOLS` (stored and keyword-searchable, only unembedded); the Environment variables table below is the one place both are specified.
 
@@ -201,7 +206,7 @@ Claude hooks live in `~/.claude/settings.json` (nested matcher-group schema, abs
 | command | what |
 |---|---|
 | `haunt bootstrap [--reembed]` | first-run setup; installs desktop shortcut; exits 1 if sqlite-vec fails (unless `HAUNT_FTS_ONLY=1`) |
-| `haunt init [name] [--repo PATH]` | create a namespace |
+| `haunt init [name] [--repo PATH]` | create a namespace; an explicit `name` is used as given, so two checkouts can deliberately share one, while an inferred name forks to `name-<digest>` when another repository already owns it |
 | `haunt observe TEXT ...` | store a turn / tool call verbatim |
 | `haunt recall QUERY [--as-of --since --until --clock --tier --k] [--include-residue] [--json]` | read-only hybrid recall (vec + FTS5 + RRF); ranked results exclude tool/task residue unless explicitly requested; `--json` emits explanations |
 | `haunt maintenance [-n NAMESPACE] [--limit 64] [--json]` | explicit mutating embedding upgrade/job-drain surface; never run by recall and never creates an unknown namespace |
@@ -304,6 +309,8 @@ The exact v1 fields and validation rules are documented in [docs/PROVENANCE.md](
 | variable | default | what |
 |---|---|---|
 | `HAUNT_HOME` | `~/.haunt` | data directory |
+| `HAUNT_ALLOW_ALT_HOME_HOST_INSTALL` | unset | set to exactly `1` to let a non-default `HAUNT_HOME` be written into the global editor host config (`~/.claude/settings.json`, `~/.cursor/hooks.json`) and to let `haunt bootstrap` write the desktop shortcut. Off by default: a temporary home bound there silently stops capturing the moment it is deleted |
+| `HAUNT_ALLOW_UNSAFE_HOOK_COMMAND` | unset | set to exactly `1` to write a hook command containing characters a shell would not run verbatim — a space, `$`, a backtick, a quote. Off by default: the editors run hook commands through a shell, so such a path either fails to start (capture stops with no error, and `haunt doctor` cannot see it because the file exists) or executes the embedded expression on every hook event. The usual trigger is a home directory containing a space. Separate from `HAUNT_ALLOW_ALT_HOME_HOST_INSTALL` on purpose: these are different risks |
 | `HAUNT_EMBED_MODEL` | `BAAI/bge-m3` | embedding model (set to `BAAI/bge-small-en-v1.5` for smaller; `off` for none) |
 | `HAUNT_FTS_ONLY` | unset | set to `1` for FTS-only (no embeddings; sqlite-vec not required) |
 | `HAUNT_OFFLINE` | unset | set to `1` to prohibit embedding backend initialization/download; FTS recall remains available |

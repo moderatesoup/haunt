@@ -124,7 +124,7 @@ def test_execution_metadata_survives_zero_and_nonzero_recall_surfaces(fts_recall
         if query == "PRESENT-EXECUTION-CANARY":
             assert all(
                 payload["hits"][0]["explanation"]["ordering"]
-                == {"primary": "rrf_score_desc", "ties": "memory_id_asc"}
+                == {"primary": "rrf_score_desc", "ties": "content_hash_asc_then_memory_id_asc"}
                 for payload in payloads
             )
 
@@ -211,14 +211,17 @@ def test_timeline_bounded_ties_select_events_then_order_materialized_memories(
     from haunt.temporal import compile as compile_temporal
 
     with Store("default") as store:
-        tied = [
-            store.observe(
-                f"bounded tie {index}",
+        tie_text = {}
+        tied = []
+        for index in range(5):
+            text = f"bounded tie {index}"
+            result = store.observe(
+                text,
                 event_time="2026-08-08T12:00:00+00:00",
                 defer_embedding=True,
             )
-            for index in range(5)
-        ]
+            tie_text[result.memory_id] = text
+            tied.append(result)
         later = store.observe(
             "bounded later",
             event_time="2026-08-08T13:00:00+00:00",
@@ -230,12 +233,23 @@ def test_timeline_bounded_ties_select_events_then_order_materialized_memories(
 
     # The SQL event page contains the later event plus the first two event IDs
     # among the five equal-time events. Only that selected set is subsequently
-    # sorted by memory ID after materialization.
+    # ordered after materialization -- on content_hash, then memory id. The key
+    # is no longer the bare memory id, which was a fresh uuid4 per write and so
+    # re-rolled this order on every ingest of the same corpus.
+    import hashlib
+
     selected_ties = sorted(tied, key=lambda result: result.event_id)[:2]
-    assert [hit.memory_id for hit in hits] == [
-        later.memory_id,
-        *sorted(result.memory_id for result in selected_ties),
+    ordered_ties = [
+        memory_id
+        for _digest, memory_id in sorted(
+            (
+                hashlib.sha256(tie_text[result.memory_id].encode("utf-8")).hexdigest(),
+                result.memory_id,
+            )
+            for result in selected_ties
+        )
     ]
+    assert [hit.memory_id for hit in hits] == [later.memory_id, *ordered_ties]
     ordering = hits[1].as_dict()["explanation"]["ordering"]
     assert ordering == {
         "primary": "selected_clock_desc",

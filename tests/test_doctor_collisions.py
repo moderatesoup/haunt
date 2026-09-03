@@ -1,22 +1,29 @@
 """doctor reports namespaces that two repositories already share.
 
-The collision guard in paths.py forks only at mint time, deliberately:
-re-deriving an existing namespace would re-route it and make the memory
-stored under it invisible, which is the harm C1/C2 exists to prevent. So a
+The collision guard forks only the registration in front of it -- at mint
+time in paths.py, and again inside register_namespace()'s publishing
+transaction, which is what settles ownership when two repositories infer
+one label before either registers. It never re-derives an existing
+namespace: that would re-route it and make the memory stored under it
+invisible, which is the harm C1/C2 exists to prevent. So a
 pair that collided before the guard landed is still colliding, and nothing
 reported it. These tests pin that doctor now does -- as an advisory that
 leaves the exit code alone, because healing a pair is `haunt namespace
 reconcile`'s operator-invoked, reversible job.
 
-Both real collision shapes are built through register_namespace() rather
-than hand-written SQL, so they are the states a pre-guard haunt actually
+Both real collision shapes are the states a pre-guard haunt actually
 produced: separator collapse (github.com/acme/foo-bar against
 github.com/acme-foo/bar, both minting github.com-acme-foo-bar) and
-remote-less basename (any two checkouts named app).
+remote-less basename (any two checkouts named app). The first repository
+registers normally; the second's binding is written directly, because
+register_namespace() now settles ownership inside its publishing
+transaction and forks rather than adding a second repository to an owned
+namespace -- so it can no longer produce the state under test.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -30,7 +37,9 @@ from haunt.doctor import (
     _check_namespace_collisions,
     format_doctor,
 )
+from haunt.paths import normalize_namespace_label, registry_path
 from haunt.store import init_registry, register_namespace
+from haunt.util import new_id, now_iso
 
 
 @pytest.fixture
@@ -62,6 +71,34 @@ def _patch_remotes(monkeypatch, remotes: dict[str, str | None]) -> None:
     monkeypatch.setattr(store, "_git_repo_context", fake)
 
 
+def _record_second_repository(label: str, *, identity: str | None, root: Path) -> None:
+    """Bind a second repository to *label* the way a pre-guard haunt did.
+
+    Written directly rather than through register_namespace(), which now
+    refuses this state -- see the module docstring. doctor still has to
+    report registries that already contain it.
+    """
+    conn = sqlite3.connect(registry_path())
+    conn.row_factory = sqlite3.Row
+    try:
+        norm = normalize_namespace_label(label)
+        namespace_id = conn.execute(
+            "SELECT namespace_id FROM namespace_aliases WHERE normalized_label=?",
+            (norm,),
+        ).fetchone()["namespace_id"]
+        now = now_iso()
+        conn.execute(
+            """INSERT INTO repository_bindings(
+                   binding_id,namespace_id,repository_identity,repo_path,label_norm,
+                   created_at,updated_at
+               ) VALUES (?,?,?,?,?,?,?)""",
+            (new_id(), namespace_id, identity, str(root.resolve()), norm, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _report(check: Check, collisions) -> DoctorReport:
     """A report whose only non-passing check is the one under test."""
     checks = [
@@ -83,7 +120,9 @@ def test_collision_from_separator_collapse_is_reported(registry_env, monkeypatch
         },
     )
     register_namespace("github.com-acme-foo-bar", str(foo_bar))
-    register_namespace("github.com-acme-foo-bar", str(bar))
+    _record_second_repository(
+        "github.com-acme-foo-bar", identity="github.com/acme-foo/bar", root=bar
+    )
 
     check, collisions = _check_namespace_collisions()
 
@@ -103,7 +142,7 @@ def test_collision_from_remote_less_basename_is_reported(registry_env, monkeypat
     second.mkdir(parents=True)
     _patch_remotes(monkeypatch, {str(first): None, str(second): None})
     register_namespace("app", str(first))
-    register_namespace("app", str(second))
+    _record_second_repository("app", identity=None, root=second)
 
     check, collisions = _check_namespace_collisions()
 
@@ -119,7 +158,7 @@ def test_collision_is_advisory_and_never_fails_doctor(registry_env, monkeypatch)
     second.mkdir(parents=True)
     _patch_remotes(monkeypatch, {str(first): None, str(second): None})
     register_namespace("app", str(first))
-    register_namespace("app", str(second))
+    _record_second_repository("app", identity=None, root=second)
 
     report = _report(*_check_namespace_collisions())
 

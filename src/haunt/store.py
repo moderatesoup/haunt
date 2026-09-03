@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import get_ident
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import sqlite_vec
 
@@ -28,6 +28,7 @@ from haunt.paths import (
     _descriptor_identities as _fd_snapshot,
     _forget_registered_alias,
     _git_repo_context,
+    disambiguate_namespace_label,
     ensure_layout,
     haunt_home,
     materialize_sqlite_shadow,
@@ -145,16 +146,8 @@ def privacy_lineage_genesis(namespace_id: str) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
-def namespace_privacy_lineage_head(
-    conn: sqlite3.Connection, namespace_id: str
-) -> str:
-    """Read the opaque purge lineage head without creating legacy metadata."""
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key=?", (PRIVACY_LINEAGE_KEY,)
-    ).fetchone()
-    if row is None:
-        return privacy_lineage_genesis(namespace_id)
-    value = row["value"]
+def _validated_privacy_lineage_head(value: object) -> str:
+    """Accept only a stored head this module could itself have written."""
     if (
         not isinstance(value, str)
         or len(value) != 71
@@ -165,11 +158,47 @@ def namespace_privacy_lineage_head(
     return value
 
 
-def _rotate_privacy_lineage_head(
+def _stored_privacy_lineage_head(conn: sqlite3.Connection) -> str | None:
+    """The validated head this database holds, or None when it holds none."""
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (PRIVACY_LINEAGE_KEY,)
+    ).fetchone()
+    if row is None:
+        return None
+    return _validated_privacy_lineage_head(row["value"])
+
+
+def namespace_privacy_lineage_head(
     conn: sqlite3.Connection, namespace_id: str
 ) -> str:
-    """Atomically make every pre-purge bundle stale without retaining erased data."""
-    previous = namespace_privacy_lineage_head(conn, namespace_id)
+    """Read the opaque purge lineage head without creating legacy metadata."""
+    stored = _stored_privacy_lineage_head(conn)
+    if stored is None:
+        return privacy_lineage_genesis(namespace_id)
+    return stored
+
+
+def _rotate_privacy_lineage_head(
+    conn: sqlite3.Connection, namespace_id: str | None
+) -> str:
+    """Atomically make every pre-purge bundle stale without retaining erased data.
+
+    `namespace_id` is None for a backup file, which carries no registry
+    identity and so cannot derive its own genesis head. The rotation then
+    chains from whatever head the file already holds, or from fresh random
+    material when it holds none. Only unpredictability is load-bearing: the
+    new head has to differ from the one every pre-purge bundle carries, not
+    continue any particular chain.
+    """
+    if namespace_id is None:
+        stored = _stored_privacy_lineage_head(conn)
+        previous = (
+            "sha256:" + hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+            if stored is None
+            else stored
+        )
+    else:
+        previous = namespace_privacy_lineage_head(conn, namespace_id)
     material = (
         b"haunt-privacy-lineage-rotate-v1\0"
         + previous.encode("ascii")
@@ -317,6 +346,17 @@ CORRECTION_KEY_MAX = 512
 TOMBSTONE_SCHEMA_VERSION = 1
 PURGE_SAFE_ORIGIN = "privacy-sanitized"
 PURGE_SAFE_SESSION_SOURCE = "privacy-sanitized"
+# Shortest erasure marker treated as a substring match. Below it a marker is
+# an origin, a tier or an empty JSON object: text ordinary surviving rows
+# carry, which would make every taint check and every sweep look positive.
+ERASURE_MARKER_MIN_LEN = 8
+# How many json.loads layers session metadata is unwrapped through when
+# deciding whether it still carries erased context. Callers nest encoded
+# documents inside metadata (a serialized prompt, a captured payload), and an
+# escaped marker is not a substring of the value that holds it. Bounded only
+# as a guard: each decoded layer is strictly shorter than its encoding, so
+# real nesting terminates well inside this.
+SESSION_META_DECODE_DEPTH = 8
 PURGE_SAFE_PROVENANCE = provenance_json(
     {
         "schema_version": 1,
@@ -335,10 +375,14 @@ PURGE_SAFE_PROVENANCE = provenance_json(
 EMBED_MAX_ATTEMPTS_DEFAULT = 5
 
 # C4: rows-per-namespace bound on Store.drain_embedding_queue() (see
-# _embed_drain_limit). Hook writes always queue with defer_embedding=True
-# and nothing upstream of `haunt bootstrap` drains that queue except read
-# traffic hitting recall() -- a namespace that is written to but rarely
-# searched can grow an unbounded backlog. 500 is enough to clear a normal
+# _embed_drain_limit). Hook writes always queue with defer_embedding=True.
+# Nothing drains that queue on a timer or in the background. The only
+# production drains are `haunt bootstrap` (this bound), `haunt maintenance`
+# (one process_embedding_jobs batch, default 64, ceiling 100), and the 32-row
+# opportunistic drain inside observe() on the `commit and not
+# defer_embedding` path. recall() explicitly does not drain -- it reports
+# observed_not_drained -- so a namespace written to only by hooks and never
+# explicitly maintained grows an unbounded backlog. 500 is enough to clear a normal
 # session's worth of deferred writes in one `haunt bootstrap` call without
 # risking an operator's terminal hanging on a pathological backlog (real
 # dogfooded example: 1363 queued rows in one namespace).
@@ -355,6 +399,22 @@ class UnknownNamespaceError(ValueError):
 
 class NamespaceCollisionError(ValueError):
     """Raised when a label, repository, or target file belongs elsewhere."""
+
+
+class _NamespaceOwnedElsewhere(Exception):
+    """Internal signal: the label being published belongs to another repository.
+
+    Raised inside the publishing transaction so its rollback path runs, and
+    always handled by _register_namespace_once_with_configuration_lock(). It
+    never reaches a caller.
+    """
+
+    def __init__(self, label: str, owner: str) -> None:
+        self.label = label
+        self.owner = owner
+        super().__init__(
+            f"namespace {label!r} is already bound to repository {owner!r}"
+        )
 
 
 class AliasRetirementError(ValueError):
@@ -2190,6 +2250,86 @@ def resolve_namespace_id(namespace_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _foreign_repository_owner(
+    conn: sqlite3.Connection,
+    *,
+    namespace_id: str,
+    db_path: str,
+    repo_identity: str | None,
+    repo_path: str | None,
+    explicit_label: bool,
+) -> str | None:
+    """Name the repository already owning this namespace, if it is not the caller.
+
+    Returns ``None`` when the namespace is unowned, when the caller owns it,
+    when the caller names no repository at all, or when *explicit_label* says
+    a human chose this label rather than deriving it from a repository.
+
+    Ownership is only ever contested between *derived* labels. Inference mints
+    a label from a repository, so two repositories whose lossy labels collide
+    each believe they are minting a private namespace, and handing them one is
+    a silent commingling neither asked for. A label a human typed carries the
+    opposite intent: ``haunt init team --repo A`` followed by
+    ``haunt init team --repo B`` is a request to share ``team`` across two
+    checkouts, which is a supported workflow, so it binds both rather than
+    forking the second to ``team-<digest>``. That is not a reopened race --
+    the raced and sequential outcomes are identical, because both callers
+    named the same namespace on purpose.
+
+    ``HAUNT_NAMESPACE`` reaches registration with ``repo_path=None`` at every
+    entry point (see infer_namespace_context() and the hooks' namespace
+    context helpers), so the "names no repository" rule already covers it;
+    *explicit_label* covers the one remaining case, ``haunt init NAME
+    --repo PATH``, where a chosen label does arrive with a repository.
+
+    A blank ``repo_path`` names no repository, so it is never evidence of
+    another owner: that is the rule _registered_namespace_for_repo() applies
+    in paths.py, for the same reason. Must be called inside the publishing
+    transaction -- read outside it, the answer is a snapshot another writer
+    can invalidate before the binding lands.
+    """
+    if explicit_label:
+        return None
+    if not repo_identity and not repo_path:
+        return None
+    bindings = conn.execute(
+        "SELECT repository_identity,repo_path FROM repository_bindings WHERE namespace_id=?",
+        (namespace_id,),
+    ).fetchall()
+    bound: list[str] = []
+    for binding in bindings:
+        bound_identity = str(binding["repository_identity"] or "").strip() or None
+        bound_path = str(binding["repo_path"] or "").strip() or None
+        if repo_identity and bound_identity == repo_identity:
+            return None
+        if repo_path and bound_path == repo_path:
+            return None
+        if bound_identity or bound_path:
+            bound.append(str(bound_identity or bound_path))
+    if bound:
+        return bound[0]
+    # Registrations that predate repository_bindings recorded the repository
+    # only on `namespaces`, and those rows are still an ownership claim.
+    owner: str | None = None
+    for row in conn.execute(
+        "SELECT repo_path FROM namespaces WHERE db_path=?", (db_path,)
+    ).fetchall():
+        stored = str(row["repo_path"] or "").strip()
+        if not stored:
+            continue
+        stored_identity = repository_identity(stored)
+        if repo_identity and stored_identity == repo_identity:
+            return None
+        if repo_path and stored_identity is None:
+            try:
+                if str(Path(stored).expanduser().resolve()) == repo_path:
+                    return None
+            except OSError:
+                pass
+        owner = owner or stored
+    return owner
+
+
 def _bind_repository(
     conn: sqlite3.Connection,
     *,
@@ -2243,19 +2383,82 @@ def _bind_repository(
     )
 
 
-def _register_namespace_once(name: str, repo_path: str | None = None) -> Path:
+def _register_namespace_once(
+    name: str, repo_path: str | None = None, *, explicit_label: bool = False
+) -> tuple[str, Path]:
     """Run one complete registry/namespace publication under one writer lock."""
     with _sqlite_configuration_lock():
-        return _register_namespace_once_with_configuration_lock(name, repo_path)
+        return _register_namespace_once_with_configuration_lock(
+            name, repo_path, explicit_label=explicit_label
+        )
+
+
+def _registration_candidates(label: str, discriminator: str | None) -> list[str]:
+    """The labels to publish under, in order: the requested one, then its fork.
+
+    Never empty, which is what makes the caller's loop total.
+
+    The list is one entry when there is nothing to fork on (no discriminator),
+    and also when the fork is a fixed point: *label* is already this
+    discriminator's fork and is long enough that appending the digest again
+    truncates back to *label* itself. Retrying an identical candidate could
+    only fail identically, so such a label gets one attempt, not two.
+    """
+    if not discriminator:
+        return [label]
+    forked = disambiguate_namespace_label(label, discriminator)
+    return [label] if forked == label else [label, forked]
 
 
 def _register_namespace_once_with_configuration_lock(
-    name: str, repo_path: str | None = None
-) -> Path:
+    name: str, repo_path: str | None = None, *, explicit_label: bool = False
+) -> tuple[str, Path]:
+    """Publish *name*, forking when another repository already owns it.
+
+    Returns the label actually published with its database path. That label
+    differs from *name* only on a fork, so a caller that resolves *name*
+    afterwards instead of the returned label opens the other repository's
+    namespace -- the outcome this exists to prevent.
+
+    Raises NamespaceCollisionError when every candidate is owned elsewhere.
+    """
     label = safe_name(name)
+    repo_identity, repo = _repository_context(repo_path)
+    # The fork digest depends on nothing but this repository's own strongest
+    # identifier, so a registration that loses a race lands on the same label
+    # paths.py would have inferred for it had it simply run second -- as long
+    # as that fork target is itself free. See register_namespace_context() for
+    # the one case where raced and sequential losers diverge.
+    candidates = _registration_candidates(label, repo_identity or repo)
+    for candidate in candidates[:-1]:
+        try:
+            return _publish_namespace_with_configuration_lock(
+                candidate, repo_identity, repo, explicit_label=explicit_label
+            )
+        except _NamespaceOwnedElsewhere:
+            continue
+    # The last candidate has nothing left to fall back to, so its refusal is
+    # the caller's. Splitting it out this way is what makes the loop total:
+    # _registration_candidates() never returns an empty list, so this
+    # statement always runs unless an earlier candidate already returned.
+    try:
+        return _publish_namespace_with_configuration_lock(
+            candidates[-1], repo_identity, repo, explicit_label=explicit_label
+        )
+    except _NamespaceOwnedElsewhere as owned:
+        raise NamespaceCollisionError(str(owned)) from owned
+
+
+def _publish_namespace_with_configuration_lock(
+    label: str,
+    repo_identity: str | None,
+    repo: str | None,
+    *,
+    explicit_label: bool = False,
+) -> tuple[str, Path]:
+    """Publish and bind *label* in one transaction, or raise if it is owned."""
     norm = normalize_namespace_label(label)
     now = now_iso()
-    repo_identity, repo = _repository_context(repo_path)
     conn = _registry()
     claim: _FreshNamespaceClaim | None = None
     row: sqlite3.Row | None = None
@@ -2293,6 +2496,21 @@ def _register_namespace_once_with_configuration_lock(
             namespace_id = str(row["namespace_id"])
             canonical = str(row["canonical_label"])
             if repo_identity or repo:
+                # Inference's mint-time guard read the registry before any of
+                # today's racers had published, so every one of them saw this
+                # label free. This transaction is the first point that can see
+                # the winner's binding, and so the only place the decision can
+                # be made without a window between checking and binding.
+                owner = _foreign_repository_owner(
+                    conn,
+                    namespace_id=namespace_id,
+                    db_path=str(db),
+                    repo_identity=repo_identity,
+                    repo_path=repo,
+                    explicit_label=explicit_label,
+                )
+                if owner is not None:
+                    raise _NamespaceOwnedElsewhere(canonical, owner)
                 conn.execute(
                     "UPDATE namespace_identities SET updated_at=? WHERE namespace_id=?",
                     (now, namespace_id),
@@ -2383,11 +2601,42 @@ def _register_namespace_once_with_configuration_lock(
             claim.close(remove_target=False)
         else:
             ns.close()
-    return db
+    return label, db
 
 
-def register_namespace(name: str, repo_path: str | None = None) -> Path:
+def register_namespace_context(
+    name: str, repo_path: str | None = None, *, explicit_label: bool = False
+) -> tuple[str, Path]:
     """Register a namespace, retrying only recognized registry handoffs.
+
+    Returns the label actually published with its database path. When
+    *repo_path* names a repository and *name* is already owned by a different
+    one, registration forks to a disambiguated label rather than binding a
+    second repository to one namespace, so the returned label is what the
+    caller must resolve afterwards -- resolving *name* would open the other
+    repository's namespace.
+
+    Pass ``explicit_label=True`` when a human chose *name* rather than
+    inference deriving it from *repo_path*. Such a label is never forked and
+    never refused: see _foreign_repository_owner() for why sharing one
+    deliberately named namespace across checkouts is a request to honour, not
+    a collision to break up. The only caller that needs it is
+    ``haunt init NAME --repo PATH``; every other explicit-selection path
+    already arrives with ``repo_path=None``.
+
+    Determinism, stated exactly. A derived label that loses the race for a
+    bare label forks to ``disambiguate_namespace_label(label, discriminator)``
+    over its own strongest identifier, which is precisely what inference would
+    have minted for it had it run second -- *provided that fork target is
+    itself free*. It is not universal. When a third repository already owns the
+    fork target, the raced loser has no candidate left and fails closed with
+    NamespaceCollisionError, while a sequential loser would have inferred the
+    fork label first, arrived here asking for *it*, and forked once more to
+    ``label-digest-digest``. Both outcomes are safe -- nothing is commingled
+    either way -- but they are not the same outcome, and re-running the failed
+    caller does not converge on the sequential one: it fails closed again,
+    identically, until an operator intervenes with
+    ``haunt namespace reconcile``.
 
     A failed attempt may have committed the identity before a subsequent
     mapped-DB validation sees a changing WAL sidecar.  Re-entering the
@@ -2397,12 +2646,28 @@ def register_namespace(name: str, repo_path: str | None = None) -> Path:
     """
     for attempt in range(8):
         try:
-            return _register_namespace_once(name, repo_path)
+            return _register_namespace_once(
+                name, repo_path, explicit_label=explicit_label
+            )
         except (NamespacePathError, sqlite3.Error) as exc:
             if not is_concurrent_registry_change(exc) or attempt == 7:
                 raise
             threading.Event().wait(0.002 * (attempt + 1))
     raise AssertionError("unreachable namespace registration retry exhaustion")
+
+
+def register_namespace(
+    name: str, repo_path: str | None = None, *, explicit_label: bool = False
+) -> Path:
+    """Register a namespace and return its database path.
+
+    Callers that resolve the namespace by label afterwards want
+    register_namespace_context() instead: this signature cannot report the
+    disambiguated label a fork publishes.
+    """
+    return register_namespace_context(
+        name, repo_path, explicit_label=explicit_label
+    )[1]
 
 
 def namespace_exists(name: str) -> bool:
@@ -4080,7 +4345,10 @@ def retire_namespace_alias(label: str, *, apply: bool = False) -> dict[str, Any]
 #     present on both sides with byte-identical content (ignoring
 #     `embedding`) is a no-op; present on both sides with *different*
 #     content is a hard, whole-operation refusal -- never a guess, never a
-#     partial merge. Graph rows (entities/relations/mentions/evidence) are
+#     partial merge -- with exactly one exception, `sessions.started_at`
+#     and `sessions.ended_at`, described under
+#     `_RECONCILE_WINDOW_COLUMNS` below. Graph rows
+#     (entities/relations/mentions/evidence) are
 #     copied by the same id-preserving rule; this does not attempt to
 #     resolve two differently-`id`'d entities that merely share a name --
 #     that is entity resolution, a different and harder problem this does
@@ -4105,10 +4373,45 @@ _RECONCILE_TABLES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
 # content_state_digest, because the operator authorizes a digest and
 # everything the apply writes has to be inside it -- `embedding_jobs` is
 # copied verbatim by _reconcile_requeue_embedding, `attempts`/`last_error`
-# included, and a background drain moves both.
+# included, and any drain moves both -- all of them
+# operator-invoked or write-triggered, never background.
 _RECONCILE_DIGEST_ONLY_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("embedding_jobs", ("memory_id",)),
 )
+
+# The one place reconcile merges instead of copying or refusing: a
+# session's window.
+#
+# A session that was still live when the namespace changed over exists in
+# both databases, and each recorded when *it* first saw that session, so the
+# two rows differ on `started_at`/`ended_at` and on nothing else -- `id`,
+# `source`, `meta` and `succeeds_session` are identical. Refusing the whole
+# reconcile over that is wrong (the two rows describe one session), and so
+# is keeping either side's window, which would leave the merged database
+# holding events outside the window that contains them.
+#
+# The merged window is the union of everything either database can attest
+# to: the earliest `started_at` and the latest `ended_at` recorded on either
+# side, clamped outward to the first and last event the merged database will
+# hold for that session. It never narrows -- a recorded `ended_at` later
+# than the last event is kept, because `end_session`'s sweep is a real end
+# signal and the quiet gap after the last event is real too.
+#
+# NULL is unknown, never epoch and never now: a NULL end is ignored as a
+# candidate rather than treated as a bound, and an `ended_at` NULL on both
+# sides stays NULL -- an unrecorded end is an open session, not a session
+# that ended at its last event. A NULL end on TARGET's row is stronger
+# still: it is live control state that `end_session` and `ensure_session`
+# read, so an end recorded only by SOURCE is not adopted over it. See
+# `_merged_window` for why the mirror shape is deliberately not symmetric.
+#
+# The clock is the durable write/audit clock -- `events.ts`, the column
+# `_default_temporal_cut` (portability.py) groups with these two -- and not
+# `event_time`, which an import may legitimately backdate years behind the
+# session that recorded it.
+_RECONCILE_WINDOW_COLUMNS: dict[str, tuple[str, ...]] = {
+    "sessions": ("started_at", "ended_at"),
+}
 
 # Columns outside the primary key that are also required to be globally
 # unique (enforced by a partial UNIQUE index). A SOURCE row queued for
@@ -4128,6 +4431,21 @@ _RECONCILE_SECONDARY_UNIQUE_KEYS: dict[str, tuple[str, ...]] = {
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """Column names of one ordinary table, in the order the table declares them.
+
+    The order is load-bearing for `_execute_reconciliation_writes`, which
+    builds an INSERT's column list and its value tuple from two separate
+    walks of this result: a set would make the pair agree with each other and
+    with nothing else, so the same reconcile would emit a different column
+    order in every process. It is also the only definition -- a second one
+    returning a set once shadowed this and silently took those four callers
+    with it.
+
+    A missing table yields `[]` rather than raising, which callers rely on:
+    a backup is never migrated, so one can predate a column the erasure reads,
+    and degrading to what a file actually holds keeps an old backup erasable
+    instead of failing its whole sweep.
+    """
     return [
         str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
     ]
@@ -4197,6 +4515,17 @@ class _TableDiff:
     already_present: int
     colliding_pks: list[tuple[Any, ...]]
     secondary_collisions: list[tuple[str, Any]]
+    # Primary keys present on both sides differing *only* on this table's
+    # window columns: not a collision, and not already consistent either.
+    window_conflicts: list[tuple[Any, ...]] = field(default_factory=list)
+    # One record per window the apply will actually change, resolved against
+    # both databases' events. Empty for every table without window columns,
+    # and empty when every window already holds.
+    window_merges: list[dict[str, Any]] = field(default_factory=list)
+    # Primary keys whose own recorded window holds a timestamp that cannot
+    # be ordered. Named, never guessed at, and never written -- and never a
+    # reason to refuse the rest of the operation.
+    unresolvable_windows: list[tuple[Any, ...]] = field(default_factory=list)
 
 
 def _diff_reconcile_table(
@@ -4205,10 +4534,12 @@ def _diff_reconcile_table(
     secondary_keys: tuple[str, ...],
     source_rows: dict[tuple[Any, ...], dict[str, Any]],
     target_rows: dict[tuple[Any, ...], dict[str, Any]],
+    window_columns: tuple[str, ...] = (),
 ) -> _TableDiff:
     to_insert: list[dict[str, Any]] = []
     already_present = 0
     colliding: list[tuple[Any, ...]] = []
+    window_conflicts: list[tuple[Any, ...]] = []
     for pk in sorted(source_rows, key=_reconcile_sort_key):
         row = source_rows[pk]
         existing = target_rows.get(pk)
@@ -4216,6 +4547,12 @@ def _diff_reconcile_table(
             to_insert.append(row)
         elif _rows_equal(row, existing, ignore_columns):
             already_present += 1
+        elif window_columns and _rows_equal(
+            row, existing, ignore_columns | frozenset(window_columns)
+        ):
+            # Same session, two observers, two answers about when it began
+            # or ended. Everything else about the row already agrees.
+            window_conflicts.append(pk)
         else:
             colliding.append(pk)
     secondary_collisions: list[tuple[str, Any]] = []
@@ -4227,7 +4564,290 @@ def _diff_reconcile_table(
             value = row.get(column)
             if value is not None and value in target_values:
                 secondary_collisions.append((column, value))
-    return _TableDiff(table, to_insert, already_present, colliding, secondary_collisions)
+    return _TableDiff(
+        table,
+        to_insert,
+        already_present,
+        colliding,
+        secondary_collisions,
+        window_conflicts,
+    )
+
+
+def _orderable_instant(value: Any) -> tuple[Any, Any] | None:
+    """Chronological sort key for one stored timestamp, or None.
+
+    Parsed, never compared as raw text: two databases that reached the same
+    instant by different routes can spell it differently, and a window
+    merged on a lexical comparison would then clamp the wrong way. Mirrors
+    `portability._at_or_before`'s parse, but not its refusal: a value that
+    cannot be parsed has no place on a timeline, and the callers here drop
+    it rather than guess one for it or refuse the whole operation over it.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return (parse_iso(value), value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _window_instant(value: Any, what: str) -> tuple[Any, Any]:
+    """`_orderable_instant` for a value the caller has already vetted.
+
+    Every `min`/`max` below is fed a list filtered through
+    `_orderable_instant` first, so this is a guard against that filtering
+    being dropped later, not a path a corrupt database can reach.
+    """
+    instant = _orderable_instant(value)
+    if instant is None:
+        raise NamespaceMigrationError(
+            f"cannot order timestamp {what} ({value!r}); refusing to guess a "
+            "session window"
+        )
+    return instant
+
+
+def _session_event_extents(
+    conn: sqlite3.Connection, session_ids: set[Any]
+) -> dict[Any, tuple[str, str]]:
+    """First and last *orderable* `events.ts` per named session.
+
+    A `ts` that cannot be parsed contributes no extent instead of refusing
+    the operation. This is the only code that parses `events.ts`, and it is
+    reached by both reconcile and retire, so a hard refusal here would let a
+    single corrupt row strand a whole namespace -- unable to be drained and
+    unable to be retired -- where before this existed the same namespace
+    reconciled fine. An unorderable timestamp cannot be placed on the
+    timeline at all, so it neither widens a window nor narrows one; a
+    session whose every `ts` is unorderable ends up in the same state as a
+    session with no events. Refusing is still right for the two window
+    columns themselves (see `_resolve_window_merges`), because those are
+    values this has to *write*, not evidence it is reading.
+    """
+    buckets: dict[Any, list[str]] = {}
+    if not session_ids:
+        return {}
+    for row in conn.execute("SELECT session_id, ts FROM events").fetchall():
+        if row["session_id"] not in session_ids:
+            continue
+        if _orderable_instant(row["ts"]) is not None:
+            buckets.setdefault(row["session_id"], []).append(row["ts"])
+    return {
+        session_id: (
+            min(values, key=lambda ts: _window_instant(ts, "events.ts")),
+            max(values, key=lambda ts: _window_instant(ts, "events.ts")),
+        )
+        for session_id, values in buckets.items()
+    }
+
+
+def _merged_window(
+    window_columns: tuple[str, ...],
+    source_row: dict[str, Any] | None,
+    target_row: dict[str, Any] | None,
+    extents: tuple[tuple[str, str] | None, ...],
+) -> tuple[Any, ...]:
+    """Union window: earliest of every start, latest of every end.
+
+    Candidates are the values recorded on either side, each bound outward to
+    the real first and last event the merged session will hold. NULL is
+    unknown and contributes no candidate: it never acts as epoch, as now, or
+    as a bound of any kind.
+
+    An end nobody recorded stays NULL even when the session has events. The
+    invariant is that a window contains every event inside it, and an open
+    end is unbounded above, so it already does -- while writing the last
+    event's timestamp there would assert something nothing observed. The
+    event clamp widens a boundary that was recorded; it never invents one
+    that was not.
+
+    A NULL end on TARGET's row means more than "unknown", and this is the
+    one place the merge is deliberately asymmetric. TARGET is the surviving
+    namespace, and there `ended_at IS NULL` is live control state:
+    `end_session`'s sweep selects on it and `ensure_session` reads it to
+    decide whether the session id can be continued. Writing an end into it
+    closes a session that is still open and sends the next write off to mint
+    a successor. So an end SOURCE recorded for a session TARGET still holds
+    open is not adopted -- unbounded-above is the wider of the two ends, and
+    this merge only ever widens.
+
+    The mirror shape is not symmetric and must not be: SOURCE's NULL over an
+    end TARGET already swept would *reopen* a session TARGET closed, and
+    discard a real end signal, so there the recorded end still wins. That
+    mirror is the common cutover shape (SOURCE abandoned mid-session, TARGET
+    swept it closed later) and it is unaffected by any of this.
+    """
+    start_column, end_column = window_columns
+    rows = (source_row, target_row)
+    starts = [
+        row[start_column]
+        for row in rows
+        if row is not None and row.get(start_column) is not None
+    ]
+    if target_row is not None and target_row.get(end_column) is None:
+        # TARGET holds this session open. Unbounded above is already the
+        # widest end there is, and closing it is the one move forbidden here.
+        ends: list[Any] = []
+    else:
+        ends = [
+            row[end_column]
+            for row in rows
+            if row is not None and row.get(end_column) is not None
+        ]
+    recorded_end = bool(ends)
+    for extent in extents:
+        if extent is not None:
+            starts.append(extent[0])
+            if recorded_end:
+                ends.append(extent[1])
+    started_at = (
+        min(
+            starts,
+            key=lambda value: _window_instant(value, f"sessions.{start_column}"),
+        )
+        if starts
+        else None
+    )
+    ended_at = (
+        max(ends, key=lambda value: _window_instant(value, f"sessions.{end_column}"))
+        if ends
+        else None
+    )
+    return (started_at, ended_at)
+
+
+def _resolve_window_merges(
+    source_conn: sqlite3.Connection,
+    target_conn: sqlite3.Connection,
+    diff: _TableDiff,
+    window_columns: tuple[str, ...],
+    pk_columns: tuple[str, ...],
+    source_rows: dict[tuple[Any, ...], dict[str, Any]],
+    target_rows: dict[tuple[Any, ...], dict[str, Any]],
+) -> None:
+    """Resolve every window either database can name, and record real changes.
+
+    The candidate set is the union of three things, not SOURCE's sessions
+    table alone: SOURCE's session primary keys, TARGET's session primary
+    keys, and the `session_id` of every event either side holds. Deriving it
+    from SOURCE's rows made the containment invariant depend on SOURCE's own
+    `events -> sessions` foreign key having held: an event whose session had
+    no SOURCE row was copied into TARGET without widening the TARGET window
+    that then had to contain it, and a session only TARGET had was never
+    looked at. The invariant has to hold structurally, not by luck.
+
+    Every candidate is considered, not only the ones whose rows differ:
+    merging SOURCE's events into a session whose row TARGET already holds
+    byte-identically can put an event outside the window that contains it,
+    and that is the same defect as a disagreeing pair. Rows already refused
+    as collisions are skipped -- the whole operation is about to refuse --
+    as is a session id that no row on either side declares, which has no row
+    to widen and is itself a symptom of that broken foreign key.
+
+    A record is emitted only when the merged window differs from what TARGET
+    would otherwise end up holding, which is what makes this idempotent: the
+    second cycle recomputes the same union, finds it already written, and
+    reports (and writes) nothing. `to_insert` rows are replaced by clamped
+    *copies*; the fetched rows themselves stay untouched because the caller
+    hashes them into the content digest after this returns.
+
+    A session whose own recorded window cannot be ordered is named in
+    `unresolvable_windows` and left exactly as it is -- not guessed at, and
+    not allowed to refuse an operation the rest of which is fine. That
+    matters more now the candidate set includes rows only TARGET has: a
+    corrupt row TARGET has held for months must not brick a drain of SOURCE.
+    """
+    colliding = set(diff.colliding_pks)
+    pks = set(source_rows) | set(target_rows)
+    if pk_columns == ("id",):
+        for conn in (source_conn, target_conn):
+            pks |= {
+                (row["session_id"],)
+                for row in conn.execute(
+                    "SELECT DISTINCT session_id FROM events"
+                ).fetchall()
+            }
+    candidates = [
+        pk
+        for pk in sorted(pks, key=_reconcile_sort_key)
+        if pk not in colliding and (pk in source_rows or pk in target_rows)
+    ]
+    if not candidates:
+        return
+    session_ids = {pk[0] for pk in candidates}
+    source_extents = _session_event_extents(source_conn, session_ids)
+    target_extents = _session_event_extents(target_conn, session_ids)
+    start_column, end_column = window_columns
+    records: list[dict[str, Any]] = []
+    unresolvable: list[tuple[Any, ...]] = []
+    clamped_by_pk: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for pk in candidates:
+        source_row = source_rows.get(pk)
+        target_row = target_rows.get(pk)
+        if any(
+            value is not None and _orderable_instant(value) is None
+            for row in (source_row, target_row)
+            if row is not None
+            for value in (row[start_column], row[end_column])
+        ):
+            unresolvable.append(pk)
+            continue
+        session_id = pk[0]
+        source_extent = source_extents.get(session_id)
+        target_extent = target_extents.get(session_id)
+        merged = _merged_window(
+            window_columns, source_row, target_row, (source_extent, target_extent)
+        )
+        baseline = target_row if target_row is not None else source_row
+        if merged == tuple(baseline[column] for column in window_columns):
+            continue
+        if target_row is None:
+            clamped = dict(source_row)
+            for column, value in zip(window_columns, merged):
+                clamped[column] = value
+            clamped_by_pk[pk] = clamped
+        present = [e for e in (source_extent, target_extent) if e is not None]
+        events = None
+        if present:
+            events = {
+                "first": min(
+                    (e[0] for e in present),
+                    key=lambda ts: _window_instant(ts, "events.ts"),
+                ),
+                "last": max(
+                    (e[1] for e in present),
+                    key=lambda ts: _window_instant(ts, "events.ts"),
+                ),
+            }
+        records.append(
+            {
+                "pk": [json_safe_sqlite(value) for value in pk],
+                "id": json_safe_sqlite(session_id),
+                "in_target": target_row is not None,
+                "source": None
+                if source_row is None
+                else {
+                    start_column: source_row[start_column],
+                    end_column: source_row[end_column],
+                },
+                "target": None
+                if target_row is None
+                else {
+                    start_column: target_row[start_column],
+                    end_column: target_row[end_column],
+                },
+                "events": events,
+                "merged": {start_column: merged[0], end_column: merged[1]},
+            }
+        )
+    if clamped_by_pk:
+        diff.to_insert = [
+            clamped_by_pk.get(tuple(row[column] for column in pk_columns), row)
+            for row in diff.to_insert
+        ]
+    diff.window_merges = records
+    diff.unresolvable_windows = unresolvable
 
 
 def _reconcile_content_state_digest(
@@ -4275,13 +4895,25 @@ def _reconcile_content_state_digest(
             )
         source_rows = _fetch_rows_by_pk(source_conn, table, pk_columns)
         target_rows = _fetch_rows_by_pk(target_conn, table, pk_columns)
+        window_columns = _RECONCILE_WINDOW_COLUMNS.get(table, ())
         diffs[table] = _diff_reconcile_table(
             table,
             ignore_columns,
             _RECONCILE_SECONDARY_UNIQUE_KEYS.get(table, ()),
             source_rows,
             target_rows,
+            window_columns,
         )
+        if window_columns:
+            _resolve_window_merges(
+                source_conn,
+                target_conn,
+                diffs[table],
+                window_columns,
+                pk_columns,
+                source_rows,
+                target_rows,
+            )
         per_table_digest[table] = {
             "source": sorted(
                 _canonical_json({"pk": list(pk), "row": _json_safe_row(row)})
@@ -4380,11 +5012,30 @@ def _plan_namespace_reconciliation(source_label: str, target_label: str) -> dict
                             {"column": column, "value": json_safe_sqlite(value)}
                             for column, value in diff.secondary_collisions
                         ],
+                        # The rows that would have been refused before:
+                        # present on both sides, differing only on their
+                        # window. Reported like `colliding_ids` because it
+                        # is the same population, no longer fatal.
+                        "window_conflicts": [
+                            list(pk) for pk in diff.window_conflicts
+                        ],
+                        # Every window this will change, with the values it
+                        # will change to -- a count alone would leave the
+                        # operator authorizing a boundary move sight unseen.
+                        "window_merges": diff.window_merges,
+                        # Windows left exactly as they are because a stored
+                        # timestamp in them cannot be ordered.
+                        "unresolvable_windows": [
+                            list(pk) for pk in diff.unresolvable_windows
+                        ],
                     }
                     for table, diff in diffs.items()
                 },
                 "total_rows_to_insert": sum(
                     len(diff.to_insert) for diff in diffs.values()
+                ),
+                "total_window_merges": sum(
+                    len(diff.window_merges) for diff in diffs.values()
                 ),
             }
             report["content_state_digest"] = content_digest
@@ -4506,6 +5157,653 @@ def _backup_namespace_database(store: "ReadOnlyStore", *, purpose: str) -> _Veri
         os.close(backup_root_fd)
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Table presence read from the catalog, never from PRAGMA table_info.
+
+    `vec_memories` is a virtual table: table_info on it needs its module,
+    which a backup connection may not have loaded.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _sanitize_correction_replacement_event(
+    conn: sqlite3.Connection,
+    correction: sqlite3.Row,
+    *,
+    erased_memory_id: str,
+) -> None:
+    """Remove purged correction context from its surviving replacement event.
+
+    Only the direct replacement created by this correction is eligible.
+    Content and unrelated event origins are never changed. Session rekeying
+    is handled once for every target and adjacent correction session.
+    """
+    replacement_id = correction["replacement_memory_id"]
+    if replacement_id is None or replacement_id == erased_memory_id:
+        return
+    has_provenance = "provenance" in _table_columns(conn, "events")
+    event = conn.execute(
+        f"""
+        SELECT e.id, e.origin{", e.provenance" if has_provenance else ""}
+        FROM memories m JOIN events e ON e.id=m.event_id
+        WHERE m.id=?
+        """,
+        (replacement_id,),
+    ).fetchone()
+    if event is None:
+        return
+
+    correction_origin = correction["origin"]
+    origin_matches = (
+        correction_origin is not None and event["origin"] == correction_origin
+    )
+    parsed_provenance = (
+        loads(event["provenance"], default={}) if has_provenance else {}
+    )
+    provenance_matches = bool(
+        isinstance(parsed_provenance, dict)
+        and correction_origin is not None
+        and parsed_provenance.get("origin") == correction_origin
+    )
+    if not origin_matches and not provenance_matches:
+        return
+
+    updates: list[str] = []
+    params: list[Any] = []
+    if origin_matches:
+        updates.append("origin=?")
+        params.append(PURGE_SAFE_ORIGIN)
+    if provenance_matches:
+        updates.append("provenance=?")
+        params.append(PURGE_SAFE_PROVENANCE)
+    params.append(event["id"])
+    conn.execute(
+        f"UPDATE events SET {', '.join(updates)} WHERE id=?",
+        params,
+    )
+
+
+def _create_purge_safe_session(
+    conn: sqlite3.Connection,
+    *,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    source: Any,
+    meta: Any,
+    succeeds: str | None = None,
+) -> str:
+    safe_session = new_id()
+    columns = _table_columns(conn, "sessions")
+    names = ["id", "started_at", "ended_at", "source", "meta"]
+    values: list[Any] = [
+        safe_session,
+        now_iso() if started_at is None else started_at,
+        ended_at,
+        source,
+        meta,
+    ]
+    if SESSION_SUCCEEDS_KEY in columns:
+        names.append(SESSION_SUCCEEDS_KEY)
+        values.append(succeeds)
+    conn.execute(
+        f"INSERT INTO sessions({', '.join(names)}) "
+        f"VALUES ({', '.join('?' * len(names))})",
+        values,
+    )
+    return safe_session
+
+
+def _purge_safe_session_context(
+    conn: sqlite3.Connection, session_id: str, sensitive_values: set[str]
+) -> tuple[str | None, str | None, Any, Any]:
+    """Preserve clean session fields and remove only erased context."""
+    row = conn.execute(
+        "SELECT started_at, ended_at, source, meta FROM sessions WHERE id=?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None, None, PURGE_SAFE_SESSION_SOURCE, dumps({})
+    source = row["source"]
+    original_meta = row["meta"]
+    dropped = object()
+
+    def tainted(value: Any) -> bool:
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, (bytes, bytearray)):
+            raw = bytes(value)
+            return any(
+                raw == token.encode("utf-8")
+                or (len(token) >= ERASURE_MARKER_MIN_LEN and token.encode("utf-8") in raw)
+                for token in sensitive_values
+            )
+        if not isinstance(value, str):
+            return False
+        return any(
+            value == token
+            or (len(token) >= ERASURE_MARKER_MIN_LEN and token in value)
+            for token in sensitive_values
+        )
+
+    safe_source = PURGE_SAFE_SESSION_SOURCE if tainted(source) else source
+    if isinstance(original_meta, memoryview):
+        original_meta = original_meta.tobytes()
+    if isinstance(original_meta, (bytes, bytearray)):
+        try:
+            meta_text = bytes(original_meta).decode("utf-8")
+        except UnicodeDecodeError:
+            # Opaque metadata on an affected session cannot be proven free
+            # of erased context. Privacy purge therefore drops it even when
+            # no plaintext marker can be found in the raw bytes.
+            return row["started_at"], row["ended_at"], safe_source, dumps({})
+    else:
+        meta_text = original_meta
+    not_json = object()
+    original = loads(meta_text, default=not_json)
+
+    def contains_tainted(value: Any, depth: int = 0) -> bool:
+        if tainted(value):
+            return True
+        if isinstance(value, dict):
+            return any(
+                contains_tainted(key, depth) or contains_tainted(child, depth)
+                for key, child in value.items()
+            )
+        if isinstance(value, list):
+            return any(contains_tainted(child, depth) for child in value)
+        if isinstance(value, str) and depth < SESSION_META_DECODE_DEPTH:
+            # A caller that stored `json.dumps({"prompt": secret})` stored a
+            # string whose bytes are the *escaped* form of the secret, so the
+            # substring comparison above misses it while one json.loads gets
+            # it straight back. Decode what decodes and compare that too.
+            # Each layer is strictly shorter than the one that encoded it, so
+            # the depth cap is a guard, not the terminating condition.
+            child = loads(value, default=not_json)
+            if child is not not_json and child != value:
+                return contains_tainted(child, depth + 1)
+        return False
+
+    if not tainted(original_meta) and (
+        original is not_json or not contains_tainted(original)
+    ):
+        return row["started_at"], row["ended_at"], safe_source, original_meta
+    if original is not_json:
+        return row["started_at"], row["ended_at"], safe_source, dumps({})
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, str):
+            # contains_tainted, not tainted: a string that is itself an
+            # encoded document has to be judged on what it decodes to. The
+            # whole string is dropped rather than re-encoded clean, because
+            # a caller's encoding is theirs and privacy is not the place to
+            # guess at round-tripping it.
+            return dropped if contains_tainted(value) else value
+        if isinstance(value, dict):
+            clean: dict[Any, Any] = {}
+            for key, child in value.items():
+                if isinstance(key, str) and contains_tainted(key):
+                    continue
+                sanitized = sanitize(child)
+                if sanitized is not dropped:
+                    clean[key] = sanitized
+            return clean
+        if isinstance(value, list):
+            return [
+                sanitized
+                for child in value
+                if (sanitized := sanitize(child)) is not dropped
+            ]
+        return value
+
+    sanitized_meta = dumps(sanitize(original))
+    if tainted(sanitized_meta):
+        sanitized_meta = dumps({})
+    return row["started_at"], row["ended_at"], safe_source, sanitized_meta
+
+
+def _prune_erased_only_lineage(conn: sqlite3.Connection) -> None:
+    """During purge, discard components that no surviving memory can trace."""
+    rows = conn.execute(
+        """
+        SELECT id, target_memory_id, target_tombstone_id,
+               replacement_memory_id, replacement_tombstone_id
+        FROM corrections
+        """
+    ).fetchall()
+
+    def nodes(row: sqlite3.Row) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        for prefix in ("target", "replacement"):
+            if row[f"{prefix}_memory_id"] is not None:
+                found.append(("memory", str(row[f"{prefix}_memory_id"])))
+            elif row[f"{prefix}_tombstone_id"] is not None:
+                found.append(("tombstone", str(row[f"{prefix}_tombstone_id"])))
+        return found
+
+    by_node: dict[tuple[str, str], set[str]] = {}
+    row_nodes: dict[str, list[tuple[str, str]]] = {}
+    for row in rows:
+        correction_nodes = nodes(row)
+        row_nodes[str(row["id"])] = correction_nodes
+        for item in correction_nodes:
+            by_node.setdefault(item, set()).add(str(row["id"]))
+
+    pending = set(row_nodes)
+    while pending:
+        seed = pending.pop()
+        component = {seed}
+        frontier = [seed]
+        component_nodes: set[tuple[str, str]] = set()
+        while frontier:
+            correction_id = frontier.pop()
+            for item in row_nodes[correction_id]:
+                component_nodes.add(item)
+                for neighbor in by_node[item]:
+                    if neighbor in pending:
+                        pending.remove(neighbor)
+                        component.add(neighbor)
+                        frontier.append(neighbor)
+        if any(kind == "memory" for kind, _ in component_nodes):
+            continue
+        conn.executemany(
+            "DELETE FROM corrections WHERE id=?", [(item,) for item in component]
+        )
+
+    if not _table_exists(conn, "lineage_tombstones"):
+        return
+    conn.execute(
+        """
+        DELETE FROM lineage_tombstones
+        WHERE tombstone_id NOT IN (
+            SELECT target_tombstone_id FROM corrections
+            WHERE target_tombstone_id IS NOT NULL
+            UNION
+            SELECT replacement_tombstone_id FROM corrections
+            WHERE replacement_tombstone_id IS NOT NULL
+        )
+        """
+    )
+
+
+def _erase_memory_content(
+    conn: sqlite3.Connection,
+    memory_id: str,
+    *,
+    namespace_id: str | None,
+    report: dict[str, Any],
+) -> set[str] | None:
+    """Erase one memory and every surface reachable from it, in the open transaction.
+
+    Returns the erasure markers -- every textual form of the erased context,
+    which a caller may scan a rewritten file for -- or None when the memory
+    is already absent. The caller owns the transaction, any byte-level
+    rebuild, and the report keys this does not set.
+
+    Rows that are not the target's are rewritten: a shared event is re-minted
+    under a fresh id, a session holding erased context is replaced by an
+    opaque one with every reference rekeyed, and an adjacent correction is
+    scrubbed down to a tombstone. Whatever else those rows carried survives.
+    `namespace_id` is None only for a database with no registry identity;
+    see `_rotate_privacy_lineage_head`.
+    """
+    has_provenance = "provenance" in _table_columns(conn, "events")
+    has_succeeds = SESSION_SUCCEEDS_KEY in _table_columns(conn, "sessions")
+    row = conn.execute(
+        f"""
+        SELECT m.id, m.event_id, m.content,
+               e.origin, e.session_id,
+               e.ts AS event_ts, e.event_time, e.role AS event_role,
+               e.tier AS event_tier,
+               e.idempotency_key AS event_idempotency_key,
+               e.content AS event_content,
+               e.tool_name, e.tool_input, e.tool_output,
+               e.meta AS event_meta
+               {", e.provenance AS event_provenance" if has_provenance else ""}
+        FROM memories m JOIN events e ON e.id=m.event_id
+        WHERE m.id=?
+        """,
+        (memory_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    event_id = row["event_id"]
+
+    # Privacy erasure is the sole exception to correction immutability.
+    # Replace an erased chain member with a fresh opaque tombstone and
+    # scrub correction request/context fields that could retain it.
+    has_corrections = _table_exists(conn, "corrections")
+    lineage_rows = (
+        conn.execute(
+            """
+            SELECT * FROM corrections
+            WHERE target_memory_id=? OR replacement_memory_id=?
+            """,
+            (memory_id, memory_id),
+        ).fetchall()
+        if has_corrections
+        else []
+    )
+    needs_tombstone = any(
+        r["replacement_memory_id"] is not None
+        or r["replacement_tombstone_id"] is not None
+        for r in lineage_rows
+        if r["target_memory_id"] == memory_id
+    ) or any(r["replacement_memory_id"] == memory_id for r in lineage_rows)
+    tombstone: dict[str, Any] | None = None
+    sessions_to_cleanup: dict[str, dict[str, Any]] = {}
+    erased_values = _erasure_context_values(
+        memory_id,
+        event_id,
+        row["content"],
+        row["origin"],
+        row["session_id"],
+        row["event_idempotency_key"],
+        row["event_content"],
+        row["tool_name"],
+        row["tool_input"],
+        row["tool_output"],
+        row["event_meta"],
+        *_provenance_erasure_values(
+            row["event_provenance"] if has_provenance else None
+        ),
+    )
+    markers = set(erased_values)
+
+    def track_erased_session(session_id: object, *context_values: object) -> None:
+        if session_id is None:
+            return
+        info = sessions_to_cleanup.setdefault(
+            str(session_id), {"sensitive_values": set(erased_values)}
+        )
+        info["sensitive_values"].update(_erasure_context_values(*context_values))
+
+    # A target session ID is erased context even when that session
+    # predates the target and still contains unrelated events.
+    track_erased_session(row["session_id"], *erased_values)
+    if needs_tombstone:
+        tombstone = {
+            "schema_version": TOMBSTONE_SCHEMA_VERSION,
+            "tombstone_id": new_id(),
+            "status": "erased",
+            "erased_at": now_iso(),
+        }
+        conn.execute(
+            """
+            INSERT INTO lineage_tombstones(
+                schema_version, tombstone_id, status, erased_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            tuple(tombstone.values()),
+        )
+    for correction in lineage_rows:
+        correction_session = correction["session_id"]
+        track_erased_session(
+            correction_session,
+            correction["origin"],
+            correction["session_id"],
+            correction["reason"],
+            correction["idempotency_key"],
+            correction["request_identity"],
+            correction["target_tombstone_id"],
+            correction["replacement_tombstone_id"],
+        )
+        # Session taint may over-reach harmlessly; a residue scan may not.
+        # Tombstone ids are Haunt's own and can outlive this purge on a longer
+        # chain, so they stay out of the marker set.
+        markers.update(
+            _erasure_context_values(
+                correction["origin"],
+                correction["session_id"],
+                correction["reason"],
+                correction["idempotency_key"],
+                correction["request_identity"],
+            )
+        )
+        markers.update(
+            _opaque_erasure_values(
+                correction["request_payload"], correction["response_json"]
+            )
+        )
+        if correction["target_memory_id"] == memory_id:
+            _sanitize_correction_replacement_event(
+                conn, correction, erased_memory_id=memory_id
+            )
+            has_successor = (
+                correction["replacement_memory_id"] is not None
+                or correction["replacement_tombstone_id"] is not None
+            )
+            if not has_successor:
+                conn.execute(
+                    "DELETE FROM corrections WHERE id=?", (correction["id"],)
+                )
+                continue
+            conn.execute(
+                """
+                UPDATE corrections
+                SET target_memory_id=NULL, target_tombstone_id=?,
+                    origin=NULL, session_id=NULL, reason=NULL,
+                    idempotency_key=NULL, request_identity=NULL,
+                    request_payload=NULL, response_json=NULL
+                WHERE id=?
+                """,
+                (tombstone["tombstone_id"], correction["id"]),
+            )
+        if correction["replacement_memory_id"] == memory_id:
+            conn.execute(
+                """
+                UPDATE corrections
+                SET replacement_memory_id=NULL, replacement_tombstone_id=?,
+                    origin=NULL, session_id=NULL, reason=NULL,
+                    idempotency_key=NULL, request_identity=NULL,
+                    request_payload=NULL, response_json=NULL
+                WHERE id=?
+                """,
+                (tombstone["tombstone_id"], correction["id"]),
+            )
+
+    conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+
+    if _table_exists(conn, "memories_fts"):
+        conn.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
+        # Deleting an FTS5 row drops its content but only writes a
+        # delete marker into the index; the erased terms stay legible in
+        # the existing segments. Merging every segment applies the
+        # markers, which is what frees those pages for secure_delete.
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES ('optimize')")
+        report["fts_deleted"] = True
+    if _table_exists(conn, "vec_memories"):
+        conn.execute("DELETE FROM vec_memories WHERE id=?", (memory_id,))
+        report["vec_deleted"] = True
+
+    other_memories = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
+    ).fetchone()[0]
+    from haunt.graph import remove_event_evidence
+
+    rel_count, entity_count = remove_event_evidence(conn, event_id)
+    report["relations_deleted"] = rel_count
+    report["entities_deleted"] = entity_count
+    if other_memories == 0:
+        conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+        report["event_deleted"] = True
+    else:
+        # One event may have more than one materialized memory. The
+        # survivors remain, but neither the shared event's identifier
+        # nor its target-owned context may survive privacy erasure.
+        safe_event_id = new_id()
+        names = [
+            "id", "idempotency_key", "session_id", "ts", "event_time", "role",
+            "content", "tool_name", "tool_input", "tool_output", "origin",
+            "tier", "meta",
+        ]
+        values: list[Any] = [
+            safe_event_id,
+            None,
+            row["session_id"],
+            row["event_ts"],
+            row["event_time"],
+            row["event_role"],
+            "",
+            None,
+            None,
+            None,
+            PURGE_SAFE_ORIGIN,
+            row["event_tier"],
+            dumps({}),
+        ]
+        if has_provenance:
+            names.append("provenance")
+            values.append(PURGE_SAFE_PROVENANCE)
+        conn.execute(
+            f"INSERT INTO events({', '.join(names)}) "
+            f"VALUES ({', '.join('?' * len(names))})",
+            values,
+        )
+        conn.execute(
+            "UPDATE memories SET event_id=? WHERE event_id=?",
+            (safe_event_id, event_id),
+        )
+        conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+        report["event_deleted"] = True
+
+    for session_id, session_info in sessions_to_cleanup.items():
+        session_refs = conn.execute(
+            f"""
+            SELECT
+              (SELECT COUNT(*) FROM events WHERE session_id=?) +
+              {"(SELECT COUNT(*) FROM corrections WHERE session_id=?)"
+               if has_corrections else "0"}
+            """,
+            (session_id, session_id) if has_corrections else (session_id,),
+        ).fetchone()[0]
+        started_at, ended_at, safe_source, safe_meta = _purge_safe_session_context(
+            conn, session_id, session_info["sensitive_values"]
+        )
+        if session_refs > 0:
+            # The replacement stands in for the erased session, so
+            # it keeps that session's own place in a succession
+            # chain unless the predecessor is erased context too.
+            predecessor = None
+            if has_succeeds:
+                predecessor = conn.execute(
+                    f"SELECT {SESSION_SUCCEEDS_KEY} AS predecessor "
+                    "FROM sessions WHERE id=?",
+                    (session_id,),
+                ).fetchone()["predecessor"]
+                if predecessor in session_info["sensitive_values"]:
+                    predecessor = None
+            safe_session = _create_purge_safe_session(
+                conn,
+                started_at=started_at,
+                ended_at=ended_at,
+                source=safe_source,
+                meta=safe_meta,
+                succeeds=predecessor,
+            )
+            # Session IDs attached to the target or adjacent correction
+            # are erased context. Rekey every remaining reference while
+            # preserving unrelated event content and origins. A
+            # successor names its predecessor too, and that row is not
+            # the purged session's own -- an unrekeyed link republishes
+            # the erased id, including into every export bundle.
+            conn.execute(
+                "UPDATE events SET session_id=? WHERE session_id=?",
+                (safe_session, session_id),
+            )
+            if has_corrections:
+                conn.execute(
+                    "UPDATE corrections SET session_id=? WHERE session_id=?",
+                    (safe_session, session_id),
+                )
+            if has_succeeds:
+                conn.execute(
+                    f"UPDATE sessions SET {SESSION_SUCCEEDS_KEY}=? "
+                    f"WHERE {SESSION_SUCCEEDS_KEY}=?",
+                    (safe_session, session_id),
+                )
+            conn.execute(
+                "UPDATE meta SET value=? WHERE key='current_session' AND value=?",
+                (safe_session, session_id),
+            )
+            conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            report["session_deleted"] = True
+        else:
+            conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            # Nothing replaces a session with no surviving references,
+            # so a successor of it is left with no predecessor rather
+            # than a dangling erased id.
+            if has_succeeds:
+                conn.execute(
+                    f"UPDATE sessions SET {SESSION_SUCCEEDS_KEY}=NULL "
+                    f"WHERE {SESSION_SUCCEEDS_KEY}=?",
+                    (session_id,),
+                )
+            conn.execute(
+                "DELETE FROM meta WHERE key='current_session' AND value=?",
+                (session_id,),
+            )
+            report["session_deleted"] = True
+
+    if tombstone is not None:
+        report["lineage_tombstone"] = tombstone
+
+    if has_corrections:
+        _prune_erased_only_lineage(conn)
+
+    # A hard purge invalidates every bundle made from the preceding
+    # privacy history. The opaque head retains neither erased IDs nor
+    # erased bytes and rotates in the same transaction as deletion.
+    _rotate_privacy_lineage_head(conn, namespace_id)
+    return markers
+
+
+def _opaque_erasure_values(*raw_values: object) -> set[str]:
+    """Textual forms of stored values, with no structural decomposition.
+
+    Haunt's own correction request and response envelopes are erased bytes,
+    but their fields name rows that survive the purge and their keys are fixed
+    schema. A residue scan for those parts would report data that is
+    legitimately still there.
+    """
+    values: set[str] = set()
+    for value in raw_values:
+        if value is None:
+            continue
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, (bytes, bytearray)):
+            values.add(bytes(value).decode("utf-8", "surrogateescape"))
+            continue
+        values.add(str(value))
+    return values
+
+
+def _residual_erasure_markers(data: bytes, markers: Iterable[str]) -> list[str]:
+    """Erasure markers still legible in raw file bytes, shortest first.
+
+    Short markers are skipped and the purge-safe sentinels excluded: a
+    three-character origin, an empty JSON object and the replacement values
+    purge itself writes all match surviving rows, so scanning for them would
+    report every sweep as failed. The length threshold is the one session
+    sanitization already uses to decide substring taint.
+    """
+    safe = _erasure_context_values(
+        PURGE_SAFE_ORIGIN, PURGE_SAFE_SESSION_SOURCE, PURGE_SAFE_PROVENANCE
+    )
+    found: set[str] = set()
+    for marker in markers:
+        if len(marker) < ERASURE_MARKER_MIN_LEN or marker in safe:
+            continue
+        if marker.encode("utf-8", "surrogateescape") in data:
+            found.add(marker)
+    return sorted(found, key=len)
+
+
 def _open_backup_copy(path: Path) -> sqlite3.Connection:
     """Open one backup database as its own authorized privacy purge.
 
@@ -4537,81 +5835,65 @@ def _open_backup_copy(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _backup_table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    """Table presence read from the catalog, never from PRAGMA table_info.
+def _erase_memory_from_backup(
+    conn: sqlite3.Connection, memory_id: str
+) -> set[str] | None:
+    """Erase one memory from an opened backup, or report absence with None.
 
-    `vec_memories` is a virtual table: table_info on it needs its module,
-    which a backup connection may not have loaded.
+    Runs the erasure `Store.purge` runs, on a loose file rather than a
+    registered namespace: the same content deletion, the same correction
+    lineage scrubbing, the same session rekeying, and the same privacy
+    lineage rotation. Restoring a swept backup therefore restores a database
+    that already refuses every bundle exported before the purge, instead of
+    one that still answers with the pre-purge head.
+
+    A backup that never held the row still gets the rotation, and `None` is
+    still returned for it. The head is not a property of the erased row; it
+    is the namespace's answer to "has anything been purged since you took
+    this bundle", and a backup restored still holding the pre-purge answer
+    accepts every bundle exported before the purge -- including one carrying
+    the row just erased. Rotating only the backups that held it would leave
+    exactly the file the purge did nothing to as the way back in.
+
+    Returns the erasure markers so the caller can prove the rewritten file
+    no longer holds them, or None when there was no row here to erase.
     """
-    return (
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        ).fetchone()
-        is not None
-    )
-
-
-def _erase_memory_from_backup(conn: sqlite3.Connection, memory_id: str) -> bool:
-    """Erase one memory's content from an opened backup, or report absence.
-
-    Mirrors the content-bearing half of `Store.purge`: the memory row, its
-    FTS and vector entries, the graph evidence of its event, and the event
-    itself. Corrections naming it are deleted outright rather than
-    tombstoned -- a backup is a restore artifact, not a lineage the store
-    reads, and a tombstone would only add a row to a file being discarded.
-
-    Deliberately not mirrored: the identifier rekeying purge does in the
-    live namespace (purge-safe sessions, correction request scrubbing).
-    Restoring a swept backup restores a pre-purge database whose erased
-    row's content is gone but whose session and event identifiers are the
-    original ones.
-    """
-    row = conn.execute(
-        "SELECT event_id FROM memories WHERE id=?", (memory_id,)
-    ).fetchone()
-    if row is None:
-        return False
-    event_id = row["event_id"]
+    report: dict[str, Any] = {}
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-        if _backup_table_exists(conn, "memories_fts"):
-            conn.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
-            conn.execute("INSERT INTO memories_fts(memories_fts) VALUES ('optimize')")
-        if _backup_table_exists(conn, "vec_memories"):
-            conn.execute("DELETE FROM vec_memories WHERE id=?", (memory_id,))
-        if _backup_table_exists(conn, "corrections"):
-            conn.execute(
-                "DELETE FROM corrections WHERE target_memory_id=? "
-                "OR replacement_memory_id=?",
-                (memory_id, memory_id),
-            )
-        from haunt.graph import remove_event_evidence
-
-        remove_event_evidence(conn, event_id)
-        survivors = conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
-        ).fetchone()[0]
-        if survivors == 0:
-            conn.execute("DELETE FROM events WHERE id=?", (event_id,))
-        else:
-            # Another memory still needs this event row to satisfy its
-            # foreign key, but every content-bearing column on it belongs
-            # to the erased memory.
-            conn.execute(
-                """
-                UPDATE events
-                SET content='', tool_name=NULL, tool_input=NULL,
-                    tool_output=NULL, meta=?
-                WHERE id=?
-                """,
-                (dumps({}), event_id),
-            )
+        markers = _erase_memory_content(
+            conn, memory_id, namespace_id=None, report=report
+        )
+        if markers is None:
+            _rotate_privacy_lineage_head(conn, None)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    return True
+    return markers
+
+
+def _verify_backup_erasure(
+    conn: sqlite3.Connection, memory_id: str, previous_head: str | None
+) -> None:
+    """Raise unless the rewritten backup is sound and no longer pre-purge.
+
+    Checked inside the sweep rather than left to a caller, so an empty
+    `backups_unerased` cannot cover a file that is corrupt, still holds the
+    row, or still answers with the head every stale bundle carries. Applied
+    to every backup the sweep rewrites, including one that never held the
+    row and so was rewritten for the rotation alone.
+    """
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    if str(integrity) != "ok":
+        raise NamespaceMigrationError(f"swept backup is not intact: {integrity}")
+    if conn.execute("PRAGMA foreign_key_check").fetchall():
+        raise NamespaceMigrationError("swept backup has dangling references")
+    if conn.execute("SELECT 1 FROM memories WHERE id=?", (memory_id,)).fetchone():
+        raise NamespaceMigrationError("swept backup still holds the erased memory")
+    head = _stored_privacy_lineage_head(conn)
+    if head is None or head == previous_head:
+        raise NamespaceMigrationError("swept backup privacy lineage did not rotate")
 
 
 def _purge_backup_copies(memory_id: str) -> dict[str, Any]:
@@ -4628,9 +5910,33 @@ def _purge_backup_copies(memory_id: str) -> dict[str, Any]:
     also hold, so a backup cannot be published from a pre-purge snapshot
     while the sweep is deciding what exists.
 
-    Returns `scanned`, `erased`, and `unerased` -- the names of backups that
-    could not be swept (locked, corrupt, or a vec table whose module would
-    not load). A non-empty `unerased` means the erasure did not complete.
+    Returns `scanned`, `erased`, and `unerased`.
+
+    `scanned` counts every candidate the sweep examined -- every file under
+    the backup root named the way `_backup_namespace_database` names one --
+    including the ones it could not stat, could not open, or declined to
+    rewrite. It is deliberately not "files successfully processed": a count
+    that dropped whatever went wrong could not be compared against the
+    directory listing to notice a file the sweep passed over in silence.
+
+    `erased` counts only backups that held the row and that the sweep then
+    re-read and found consistent, rowless, rotated off their pre-purge
+    privacy head, and free of the erased bytes.
+
+    `unerased` describes every candidate the sweep could not prove is free of
+    the row: one it could not stat or open (locked, corrupt, or a vec table
+    whose module would not load), one it declined to rewrite (not a regular
+    file, hard-linked elsewhere, or no longer at the private mode haunt wrote
+    it with), and one it rewrote that then failed a check. Each entry is
+    `"<name> (<reason>)"`, and the one entry that names no file says so in
+    place of a name: a backup root this process cannot verify is reported
+    against the directory itself. A non-empty `unerased` means the erasure
+    did not complete.
+
+    A candidate that is scanned and appears in neither counter held no copy
+    of the row -- it was rewritten for the privacy rotation alone, or it is
+    not a namespace database at all.
+
     Sweeping rewrites the file, so the sha256 an earlier migration report
     recorded for that backup no longer matches it.
     """
@@ -4639,20 +5945,59 @@ def _purge_backup_copies(memory_id: str) -> dict[str, Any]:
         if not (haunt_home() / "backups").is_dir():
             return result
         backup_root, backup_root_fd = _private_backup_root()
-    except Exception:
+    except Exception as exc:
         # The live erasure is already committed, so a directory this
         # process cannot verify must be reported, not raised: the caller
         # would otherwise see a failure for work that succeeded.
-        result["unerased"].append("backups")
+        _record_unerased_backup(result, None, f"could not be verified: {exc}")
         return result
     try:
         _sweep_backup_copies(backup_root, backup_root_fd, memory_id, result)
-    except Exception:
+    except Exception as exc:
         # Same reason as the root failure above: the purge itself is done.
-        result["unerased"].append("backups")
+        _record_unerased_backup(result, None, f"could not be swept: {exc}")
     finally:
         os.close(backup_root_fd)
     return result
+
+
+def _record_unerased_backup(
+    result: dict[str, Any], name: str | None, reason: str
+) -> None:
+    """Name one backup the sweep could not prove erased, and why.
+
+    Every entry is a string so the CLI, MCP and console can keep joining the
+    list for a human. `name` is None only for the backup directory itself,
+    which is not a file the sweep chose to skip but the place it could not
+    read at all; the entry says that rather than silently reading as a
+    filename.
+    """
+    subject = "the HAUNT_HOME/backups directory" if name is None else name
+    result["unerased"].append(f"{subject} ({reason})")
+
+
+def _backup_rewrite_refusal(info: os.stat_result) -> str | None:
+    """Why this directory entry must not be rewritten in place, or None.
+
+    Each condition is a reason the file is not the private, single-named
+    copy `_backup_namespace_database` created, and rewriting it either would
+    not erase every path to those bytes or would be writing to something
+    this process cannot account for. None of them is a reason to believe the
+    row is not in there, which is why the caller reports rather than skips.
+    """
+    if not stat.S_ISREG(info.st_mode):
+        return "is not a regular file"
+    if int(info.st_nlink) != 1:
+        return (
+            f"has {int(info.st_nlink)} hard links, so rewriting this name "
+            "would leave the other names holding the same bytes"
+        )
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        return (
+            f"has mode {stat.S_IMODE(info.st_mode):04o}, not the private 0600 "
+            "haunt wrote it with"
+        )
+    return None
 
 
 def _sweep_backup_copies(
@@ -4670,40 +6015,54 @@ def _sweep_backup_copies(
         and (name.startswith("namespace-") or name.startswith(".namespace-backup-"))
     )
     for name in names:
+        # Counted before anything can go wrong with it. A candidate dropped
+        # from the count on its way to being skipped is a file the report
+        # cannot be checked against the directory listing to find.
+        result["scanned"] += 1
         try:
             info = os.stat(name, dir_fd=backup_root_fd, follow_symlinks=False)
-        except OSError:
+        except OSError as exc:
+            _record_unerased_backup(result, name, f"could not be examined: {exc}")
             continue
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or int(info.st_nlink) != 1
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
+        refusal = _backup_rewrite_refusal(info)
+        if refusal is not None:
+            # Declining to rewrite is not evidence the row is absent, and the
+            # sweep has no way to acquire that evidence without opening the
+            # file it just refused. Reporting is the only honest outcome:
+            # silence here is a report claiming success over a backup the
+            # sweep knows it left exactly as it found it.
+            _record_unerased_backup(result, name, refusal)
             continue
         try:
             conn = _open_backup_copy(backup_root / name)
-        except Exception:
-            result["unerased"].append(name)
+        except Exception as exc:
+            _record_unerased_backup(result, name, f"could not be opened: {exc}")
             continue
+        markers: set[str] | None = None
+        failure: str | None = None
         try:
-            if not _backup_table_exists(conn, "memories"):
+            if not _table_exists(conn, "memories"):
                 # Belt and braces behind the name filter: a file named like a
                 # namespace backup but holding no memories is not one, and is
                 # left alone rather than rebuilt.
                 continue
-            result["scanned"] += 1
-            if not _erase_memory_from_backup(conn, memory_id):
-                continue
-            # The copy is byte-for-byte, so it carries the source file's free
-            # pages too -- pages that can hold an older copy of the row this
-            # sweep just unlinked. Only the rebuild removes those, and it must
-            # not spill the surviving plaintext to a temp directory doing it.
-            conn.execute("PRAGMA temp_store=MEMORY")
-            conn.execute("VACUUM")
+            previous_head = _stored_privacy_lineage_head(conn)
+            markers = _erase_memory_from_backup(conn, memory_id)
+            if markers is not None:
+                # The copy is byte-for-byte, so it carries the source file's
+                # free pages too -- pages that can hold an older copy of the
+                # row this sweep just unlinked. Only the rebuild removes
+                # those, and it must not spill the surviving plaintext to a
+                # temp directory doing it. A backup that never held the row
+                # freed no page holding it, so it is not rebuilt: it was
+                # opened only to move its privacy head.
+                conn.execute("PRAGMA temp_store=MEMORY")
+                conn.execute("VACUUM")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            result["erased"] += 1
-        except Exception:
-            result["unerased"].append(name)
+            _verify_backup_erasure(conn, memory_id, previous_head)
+        except Exception as exc:
+            markers = None
+            failure = f"was rewritten but not proven erased: {exc}"
         finally:
             conn.close()
             for suffix in ("-wal", "-shm"):
@@ -4711,7 +6070,50 @@ def _sweep_backup_copies(
                     os.unlink(f"{name}{suffix}", dir_fd=backup_root_fd)
                 except OSError:
                     pass
+        if failure is not None:
+            _record_unerased_backup(result, name, failure)
+            continue
+        if markers is None:
+            # Nothing of this row was here to erase, so nothing counts as
+            # erased. The rotation above still happened, and was verified.
+            continue
+        # Every logical check above passed on a connection; this one reads the
+        # bytes on disk, because the leak this sweep exists for is exactly a
+        # copy no query looks at.
+        try:
+            residue = _residual_erasure_markers(
+                _read_relative_file(backup_root_fd, name), markers
+            )
+        except OSError as exc:
+            _record_unerased_backup(result, name, f"could not be re-read: {exc}")
+            continue
+        if residue:
+            _record_unerased_backup(
+                result,
+                name,
+                f"still holds {len(residue)} erased value(s) after the rewrite",
+            )
+        else:
+            result["erased"] += 1
     os.fsync(backup_root_fd)
+
+
+def _read_relative_file(dir_fd: int, name: str) -> bytes:
+    """Read one file by name within an already-verified directory descriptor."""
+    fd = os.open(
+        name,
+        os.O_RDONLY | required_o_nofollow() | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=dir_fd,
+    )
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
 
 
 def _reconcile_requeue_embedding(
@@ -4830,7 +6232,7 @@ def _execute_reconciliation_writes(
     # `[]` rather than raising).
     source_has_embedding_jobs = bool(_table_columns(source_conn, "embedding_jobs"))
     table_results: dict[str, dict[str, int]] = {}
-    for table, _pk_columns, _ignore in _RECONCILE_TABLES:
+    for table, pk_columns, _ignore in _RECONCILE_TABLES:
         diff = diffs[table]
         columns = _table_columns(target_conn, table)
         placeholders = ",".join("?" for _ in columns)
@@ -4859,9 +6261,29 @@ def _execute_reconciliation_writes(
                     source_embedded=source_embedded,
                     source_has_embedding_jobs=source_has_embedding_jobs,
                 )
+        # Windows resolved against rows this transaction has just inserted:
+        # the UPDATE only ever widens, and only rows the plan named.
+        window_columns = _RECONCILE_WINDOW_COLUMNS.get(table, ())
+        merged_windows = 0
+        if window_columns:
+            assignments = ",".join(f"{column}=?" for column in window_columns)
+            where = " AND ".join(f"{column}=?" for column in pk_columns)
+            for record in diff.window_merges:
+                if not record["in_target"]:
+                    continue  # already carried by the row inserted above
+                target_conn.execute(
+                    f"UPDATE {table} SET {assignments} WHERE {where}",
+                    (
+                        *(record["merged"][column] for column in window_columns),
+                        *record["pk"],
+                    ),
+                )
+                merged_windows += 1
         table_results[table] = {
             "inserted": inserted,
             "already_consistent": diff.already_present,
+            "windows_merged": len(diff.window_merges),
+            "windows_updated_in_place": merged_windows,
         }
     return table_results
 
@@ -4957,6 +6379,13 @@ def reconcile_namespaces(
     dry-run-then-apply cycle is repeated, but literally replaying one
     already-applied digest is refused rather than silently treated as a
     no-op, consistent with `change_namespace_label`'s digest contract.
+
+    Rows are copied verbatim with one exception the plan always names in
+    full: a session present on both sides with a different `started_at` /
+    `ended_at` is merged into the window that contains every event either
+    database holds for it, rather than refused. The merge only ever widens,
+    and a session TARGET still holds open is never closed by it. See
+    `_RECONCILE_WINDOW_COLUMNS`.
     """
     if not apply:
         return _plan_namespace_reconciliation(source, target)
@@ -5021,6 +6450,18 @@ def _retire_namespace(label: str, *, into: str, apply: bool) -> dict[str, Any]:
                 "reference": (
                     f"{plan['total_rows_to_insert']} row(s) absent from "
                     f"{plan['target']}"
+                ),
+            }
+        )
+    # A window this namespace still holds evidence for is undrained content
+    # too: removing the file would strand the boundary, not just a row.
+    if plan["total_window_merges"]:
+        blockers.append(
+            {
+                "kind": "unmerged-session-windows",
+                "reference": (
+                    f"{plan['total_window_merges']} session window(s) not yet "
+                    f"merged into {plan['target']}"
                 ),
             }
         )
@@ -5121,9 +6562,11 @@ def _retire_namespace(label: str, *, into: str, apply: bool) -> dict[str, Any]:
         finally:
             target_ro.close()
         stranded = {
-            table: len(diff.to_insert) + len(diff.colliding_pks)
+            table: len(diff.to_insert)
+            + len(diff.colliding_pks)
+            + len(diff.window_merges)
             for table, diff in diffs.items()
-            if diff.to_insert or diff.colliding_pks
+            if diff.to_insert or diff.colliding_pks or diff.window_merges
         }
         report["backup"] = dict(backup)
         report["stranded_rows"] = stranded
@@ -5307,7 +6750,11 @@ class Store:
         requested = safe_name(name)
         registered = False
         if create:
-            register_namespace(requested, repo_path)
+            # Registration forks this label when another repository already
+            # owns it, so resolve what was published rather than what was
+            # asked for -- otherwise this opens that other repository's
+            # database, which is exactly what the fork exists to avoid.
+            requested, _ = register_namespace_context(requested, repo_path)
             registered = True
         attempts = 8 if registered else 1
         last_error: BaseException | None = None
@@ -5921,7 +7368,13 @@ class Store:
         )
 
     def process_embedding_jobs(self, *, limit: int = 64) -> dict[str, Any]:
-        """Embed queued hook writes in a persistent, model-owning process.
+        """Embed queued hook writes from a model-owning caller.
+
+        There is no daemon and no timer behind this. Every call is either an
+        explicit operator command (`haunt maintenance`, and `haunt bootstrap`
+        via drain_embedding_queue) or opportunistic inside a caller that
+        already owns the model -- observe() on the `commit and not
+        defer_embedding` path, and the evaluation harnesses.
 
         C5: two failure-isolation guarantees on top of the historical
         behavior, both required because this queue is unattended -- nothing
@@ -6115,6 +7568,49 @@ class Store:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    # SQLite's one-argument TRIM strips U+0020 only, while Python's str.strip()
+    # strips all whitespace. Spelling the set out keeps the denominator from
+    # counting a "\n\t" row that observe() will never enqueue -- which would cap
+    # embedding_coverage below 1.0 forever, the exact defect the denominator
+    # exists to remove. Residual: content that is whitespace only under Unicode
+    # but not ASCII (a lone U+00A0) still mismatches. Closing that needs a UDF
+    # on a read path, and no such row has been observed.
+    _ASCII_WHITESPACE_SQL = "char(32)||char(9)||char(10)||char(13)||char(11)||char(12)"
+
+    def _embeddable_memories(self) -> int:
+        """Rows that are supposed to end up with a vector.
+
+        The denominator every coverage question needs, and the reason there was
+        never an honest one: memories_embedded / memories lands short of 100%
+        forever on a namespace holding policy-excluded rows. Mirrors observe()'s
+        enqueue predicate -- skip_embedding=0 and non-blank content -- over
+        ASCII whitespace, so full coverage really can reach 1.0.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE skip_embedding=0 "
+            f"AND TRIM(COALESCE(content, ''), {self._ASCII_WHITESPACE_SQL}) != ''"
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def _oldest_pending_embedding(self, max_attempts: int) -> str | None:
+        """queued_at of the oldest still-drainable job, or None.
+
+        The only one of these numbers that separates "a drain just ran" from
+        "this queue has been stalled for a week": depth alone cannot, because a
+        shallow queue that never empties looks healthy. Index-only via
+        idx_embedding_jobs_queued. Returns the raw timestamp rather than an age
+        so the value is stable across readers.
+        """
+        row = self.conn.execute(
+            """
+            SELECT MIN(j.queued_at) AS oldest FROM embedding_jobs j
+            JOIN memories m ON m.id=j.memory_id
+            WHERE j.attempts < ? AND m.skip_embedding=0
+            """,
+            (max_attempts,),
+        ).fetchone()
+        return row["oldest"] if row and row["oldest"] else None
+
     def _pending_embedding_jobs(self, max_attempts: int) -> int:
         """Count rows still eligible for process_embedding_jobs's SELECT
         (attempts < max_attempts) -- the complement of
@@ -6176,9 +7672,11 @@ class Store:
         per namespace from `haunt bootstrap`, independent of any recall.
 
         HARD CONSTRAINT: never call this from a hook's synchronous path.
-        Hooks run under a watchdog with a short timeout and embedding is
-        slow; this loop can legitimately run for a while against a real
-        backlog. It exists to be invoked from an explicit, out-of-band
+        Embedding is slow and this loop can legitimately run for a while
+        against a real backlog, while a hook must return promptly or the turn
+        stalls. haunt itself imposes no watchdog -- an earlier version of this
+        sentence claimed one and there is none in this repository; any timeout
+        is the host editor's, outside our control. It exists to be invoked from an explicit, out-of-band
         operator command only.
 
         Bounded by HAUNT_EMBED_DRAIN_LIMIT rows per call (see
@@ -6449,6 +7947,14 @@ class Store:
             str(row["name"])
             for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()
         }
+        embeddable = (
+            self._embeddable_memories() if "skip_embedding" in memory_columns else 0
+        )
+        coverage = (
+            round(min(1.0, (vec_count or 0) / embeddable), 4)
+            if vec_count is not None and embeddable > 0
+            else None
+        )
         duplicate_memories = 0
         duplicate_content_values = 0
         if "content_hash" in memory_columns:
@@ -6485,8 +7991,19 @@ class Store:
                 "last_event_time": last["event_time"] if last else None,
                 "wal": True,
                 "memories_embedded": vec_count if vec_count is not None else 0,
+                "memories_embeddable": embeddable,
+                # None, never 0.0, when there is no denominator or no vector
+                # index: an FTS-only namespace and a namespace whose embedding
+                # has never run would both read as "0% coverage, unhealthy",
+                # which is the opposite of true. No threshold is attached to
+                # this on purpose -- the only measurement that exists is
+                # non-monotonic in coverage, so no single cutoff is honest.
+                "embedding_coverage": coverage,
                 "embedding_pending": self._pending_embedding_jobs(max_attempts),
                 "embedding_exhausted": self._exhausted_embedding_jobs(max_attempts),
+                "embedding_oldest_pending": self._oldest_pending_embedding(
+                    max_attempts
+                ),
                 "vector_index": vec_count is not None,
                 "vector_index_version": self.vec_version(),
                 "duplicate_memories": duplicate_memories,
@@ -6658,30 +8175,18 @@ class Store:
         `overwrite_erased_pages()` itself. Nothing else does it for them.
 
         Every purge also erases the row from the namespace backups Haunt
-        wrote under `<HAUNT_HOME>/backups`, rebuilding each one it touches.
-        `backups_unerased` names the backups that still hold it; a
+        wrote under `<HAUNT_HOME>/backups`, running the same erasure there
+        that it runs here, and verifying each rewritten file before counting
+        it. `backups_unerased` names the backups that still hold it; a
         surprising cost here is that a namespace with backups pays a rebuild
         per backup, and `rebuild=False` does not defer it.
         """
-        row = self.conn.execute(
-            """
-            SELECT m.id, m.event_id, m.content,
-                   e.origin, e.session_id,
-                   e.ts AS event_ts, e.event_time, e.role AS event_role,
-                   e.tier AS event_tier,
-                   e.idempotency_key AS event_idempotency_key,
-                   e.content AS event_content,
-                   e.tool_name, e.tool_input, e.tool_output,
-                   e.meta AS event_meta, e.provenance AS event_provenance
-            FROM memories m JOIN events e ON e.id=m.event_id
-            WHERE m.id=?
-            """,
-            (memory_id,),
+        exists = self.conn.execute(
+            "SELECT 1 FROM memories WHERE id=?", (memory_id,)
         ).fetchone()
-        if not row:
+        if not exists:
             return {"ok": False, "error": "memory not found"}
 
-        event_id = row["event_id"]
         deleted: dict[str, Any] = {
             "ok": True,
             "fts_deleted": False,
@@ -6705,266 +8210,15 @@ class Store:
             try:
                 self.conn.execute("BEGIN IMMEDIATE")
                 self._privacy_purge_thread_id = get_ident()
-                # Privacy erasure is the sole exception to correction immutability.
-                # Replace an erased chain member with a fresh opaque tombstone and
-                # scrub correction request/context fields that could retain it.
-                lineage_rows = self.conn.execute(
-                    """
-                    SELECT * FROM corrections
-                    WHERE target_memory_id=? OR replacement_memory_id=?
-                    """,
-                    (memory_id, memory_id),
-                ).fetchall()
-                needs_tombstone = any(
-                    r["replacement_memory_id"] is not None
-                    or r["replacement_tombstone_id"] is not None
-                    for r in lineage_rows
-                    if r["target_memory_id"] == memory_id
-                ) or any(r["replacement_memory_id"] == memory_id for r in lineage_rows)
-                tombstone: dict[str, Any] | None = None
-                sessions_to_cleanup: dict[str, dict[str, Any]] = {}
-                erased_values = _erasure_context_values(
+                erased = _erase_memory_content(
+                    self.conn,
                     memory_id,
-                    event_id,
-                    row["content"],
-                    row["origin"],
-                    row["session_id"],
-                    row["event_idempotency_key"],
-                    row["event_content"],
-                    row["tool_name"],
-                    row["tool_input"],
-                    row["tool_output"],
-                    row["event_meta"],
-                    *_provenance_erasure_values(row["event_provenance"]),
+                    namespace_id=self.namespace_id,
+                    report=deleted,
                 )
-
-                def track_erased_session(
-                    session_id: object, *context_values: object
-                ) -> None:
-                    if session_id is None:
-                        return
-                    info = sessions_to_cleanup.setdefault(
-                        str(session_id), {"sensitive_values": set(erased_values)}
-                    )
-                    info["sensitive_values"].update(
-                        _erasure_context_values(*context_values)
-                    )
-
-                # A target session ID is erased context even when that session
-                # predates the target and still contains unrelated events.
-                track_erased_session(row["session_id"], *erased_values)
-                if needs_tombstone:
-                    tombstone = {
-                        "schema_version": TOMBSTONE_SCHEMA_VERSION,
-                        "tombstone_id": new_id(),
-                        "status": "erased",
-                        "erased_at": now_iso(),
-                    }
-                    self.conn.execute(
-                        """
-                        INSERT INTO lineage_tombstones(
-                            schema_version, tombstone_id, status, erased_at
-                        ) VALUES (?, ?, ?, ?)
-                        """,
-                        tuple(tombstone.values()),
-                    )
-                for correction in lineage_rows:
-                    correction_session = correction["session_id"]
-                    track_erased_session(
-                        correction_session,
-                        correction["origin"],
-                        correction["session_id"],
-                        correction["reason"],
-                        correction["idempotency_key"],
-                        correction["request_identity"],
-                        correction["target_tombstone_id"],
-                        correction["replacement_tombstone_id"],
-                    )
-                    if correction["target_memory_id"] == memory_id:
-                        self._sanitize_correction_replacement_event(
-                            correction, erased_memory_id=memory_id
-                        )
-                        has_successor = (
-                            correction["replacement_memory_id"] is not None
-                            or correction["replacement_tombstone_id"] is not None
-                        )
-                        if not has_successor:
-                            self.conn.execute(
-                                "DELETE FROM corrections WHERE id=?", (correction["id"],)
-                            )
-                            continue
-                        self.conn.execute(
-                            """
-                            UPDATE corrections
-                            SET target_memory_id=NULL, target_tombstone_id=?,
-                                origin=NULL, session_id=NULL, reason=NULL,
-                                idempotency_key=NULL, request_identity=NULL,
-                                request_payload=NULL, response_json=NULL
-                            WHERE id=?
-                            """,
-                            (tombstone["tombstone_id"], correction["id"]),
-                        )
-                    if correction["replacement_memory_id"] == memory_id:
-                        self.conn.execute(
-                            """
-                            UPDATE corrections
-                            SET replacement_memory_id=NULL, replacement_tombstone_id=?,
-                                origin=NULL, session_id=NULL, reason=NULL,
-                                idempotency_key=NULL, request_identity=NULL,
-                                request_payload=NULL, response_json=NULL
-                            WHERE id=?
-                            """,
-                            (tombstone["tombstone_id"], correction["id"]),
-                        )
-
-                self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-
-                has_fts = self.conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'"
-                ).fetchone()
-                if has_fts:
-                    self.conn.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
-                    # Deleting an FTS5 row drops its content but only writes a
-                    # delete marker into the index; the erased terms stay legible in
-                    # the existing segments. Merging every segment applies the
-                    # markers, which is what frees those pages for secure_delete.
-                    self.conn.execute(
-                        "INSERT INTO memories_fts(memories_fts) VALUES ('optimize')"
-                    )
-                    deleted["fts_deleted"] = True
-                has_vec = self.conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_memories'"
-                ).fetchone()
-                if has_vec:
-                    self.conn.execute("DELETE FROM vec_memories WHERE id=?", (memory_id,))
-                    deleted["vec_deleted"] = True
-
-                other_memories = self.conn.execute(
-                    "SELECT COUNT(*) FROM memories WHERE event_id=?", (event_id,)
-                ).fetchone()[0]
-                from haunt.graph import remove_event_evidence
-
-                rel_count, entity_count = remove_event_evidence(self.conn, event_id)
-                deleted["relations_deleted"] = rel_count
-                deleted["entities_deleted"] = entity_count
-                if other_memories == 0:
-                    self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
-                    deleted["event_deleted"] = True
-                else:
-                    # One event may have more than one materialized memory. The
-                    # survivors remain, but neither the shared event's identifier
-                    # nor its target-owned context may survive privacy erasure.
-                    safe_event_id = new_id()
-                    self.conn.execute(
-                        """
-                        INSERT INTO events(
-                            id, idempotency_key, session_id, ts, event_time, role,
-                            content, tool_name, tool_input, tool_output, origin,
-                            tier, meta, provenance
-                        ) VALUES (?, NULL, ?, ?, ?, ?, '', NULL, NULL, NULL, ?, ?, ?, ?)
-                        """,
-                        (
-                            safe_event_id,
-                            row["session_id"],
-                            row["event_ts"],
-                            row["event_time"],
-                            row["event_role"],
-                            PURGE_SAFE_ORIGIN,
-                            row["event_tier"],
-                            dumps({}),
-                            PURGE_SAFE_PROVENANCE,
-                        ),
-                    )
-                    self.conn.execute(
-                        "UPDATE memories SET event_id=? WHERE event_id=?",
-                        (safe_event_id, event_id),
-                    )
-                    self.conn.execute("DELETE FROM events WHERE id=?", (event_id,))
-                    deleted["event_deleted"] = True
-
-                for session_id, session_info in sessions_to_cleanup.items():
-                    session_refs = self.conn.execute(
-                        """
-                        SELECT
-                          (SELECT COUNT(*) FROM events WHERE session_id=?) +
-                          (SELECT COUNT(*) FROM corrections WHERE session_id=?)
-                        """,
-                        (session_id, session_id),
-                    ).fetchone()[0]
-                    started_at, ended_at, safe_source, safe_meta = (
-                        self._purge_safe_session_context(
-                            session_id, session_info["sensitive_values"]
-                        )
-                    )
-                    if session_refs > 0:
-                        # The replacement stands in for the erased session, so
-                        # it keeps that session's own place in a succession
-                        # chain unless the predecessor is erased context too.
-                        predecessor = self.conn.execute(
-                            f"SELECT {SESSION_SUCCEEDS_KEY} AS predecessor "
-                            "FROM sessions WHERE id=?",
-                            (session_id,),
-                        ).fetchone()["predecessor"]
-                        if predecessor in session_info["sensitive_values"]:
-                            predecessor = None
-                        safe_session = self._create_purge_safe_session(
-                            started_at=started_at,
-                            ended_at=ended_at,
-                            source=safe_source,
-                            meta=safe_meta,
-                            succeeds=predecessor,
-                        )
-                        # Session IDs attached to the target or adjacent correction
-                        # are erased context. Rekey every remaining reference while
-                        # preserving unrelated event content and origins. A
-                        # successor names its predecessor too, and that row is not
-                        # the purged session's own -- an unrekeyed link republishes
-                        # the erased id, including into every export bundle.
-                        self.conn.execute(
-                            "UPDATE events SET session_id=? WHERE session_id=?",
-                            (safe_session, session_id),
-                        )
-                        self.conn.execute(
-                            "UPDATE corrections SET session_id=? WHERE session_id=?",
-                            (safe_session, session_id),
-                        )
-                        self.conn.execute(
-                            f"UPDATE sessions SET {SESSION_SUCCEEDS_KEY}=? "
-                            f"WHERE {SESSION_SUCCEEDS_KEY}=?",
-                            (safe_session, session_id),
-                        )
-                        self.conn.execute(
-                            "UPDATE meta SET value=? WHERE key='current_session' AND value=?",
-                            (safe_session, session_id),
-                        )
-                        self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-                        deleted["session_deleted"] = True
-                    else:
-                        self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-                        # Nothing replaces a session with no surviving references,
-                        # so a successor of it is left with no predecessor rather
-                        # than a dangling erased id.
-                        self.conn.execute(
-                            f"UPDATE sessions SET {SESSION_SUCCEEDS_KEY}=NULL "
-                            f"WHERE {SESSION_SUCCEEDS_KEY}=?",
-                            (session_id,),
-                        )
-                        self.conn.execute(
-                            "DELETE FROM meta WHERE key='current_session' AND value=?",
-                            (session_id,),
-                        )
-                        deleted["session_deleted"] = True
-
-                if tombstone is not None:
-                    deleted["lineage_tombstone"] = tombstone
-
-                self._prune_erased_only_lineage()
-
-                # A hard purge invalidates every bundle made from the preceding
-                # privacy history. The opaque head retains neither erased IDs nor
-                # erased bytes and rotates in the same transaction as deletion.
-                _rotate_privacy_lineage_head(self.conn, self.namespace_id)
-
+                if erased is None:
+                    self.conn.rollback()
+                    return {"ok": False, "error": "memory not found"}
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
@@ -7049,235 +8303,6 @@ class Store:
                 self.conn.execute(f"PRAGMA temp_store={previous_temp_store:d}")
             row = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         return rebuilt and row is not None and int(row[0]) == 0
-
-    def _sanitize_correction_replacement_event(
-        self,
-        correction: sqlite3.Row,
-        *,
-        erased_memory_id: str,
-    ) -> None:
-        """Remove purged correction context from its surviving replacement event.
-
-        Only the direct replacement created by this correction is eligible.
-        Content and unrelated event origins are never changed. Session rekeying
-        is handled once for every target and adjacent correction session.
-        """
-        replacement_id = correction["replacement_memory_id"]
-        if replacement_id is None or replacement_id == erased_memory_id:
-            return
-        event = self.conn.execute(
-            """
-            SELECT e.id, e.origin, e.provenance
-            FROM memories m JOIN events e ON e.id=m.event_id
-            WHERE m.id=?
-            """,
-            (replacement_id,),
-        ).fetchone()
-        if event is None:
-            return
-
-        correction_origin = correction["origin"]
-        origin_matches = (
-            correction_origin is not None and event["origin"] == correction_origin
-        )
-        parsed_provenance = loads(event["provenance"], default={})
-        provenance_matches = bool(
-            isinstance(parsed_provenance, dict)
-            and correction_origin is not None
-            and parsed_provenance.get("origin") == correction_origin
-        )
-        if not origin_matches and not provenance_matches:
-            return
-
-        updates: list[str] = []
-        params: list[Any] = []
-        if origin_matches:
-            updates.append("origin=?")
-            params.append(PURGE_SAFE_ORIGIN)
-        if provenance_matches:
-            updates.append("provenance=?")
-            params.append(PURGE_SAFE_PROVENANCE)
-        params.append(event["id"])
-        self.conn.execute(
-            f"UPDATE events SET {', '.join(updates)} WHERE id=?",
-            params,
-        )
-
-    def _create_purge_safe_session(
-        self,
-        *,
-        started_at: str | None = None,
-        ended_at: str | None = None,
-        source: Any,
-        meta: Any,
-        succeeds: str | None = None,
-    ) -> str:
-        safe_session = new_id()
-        self.conn.execute(
-            "INSERT INTO sessions(id, started_at, ended_at, source, meta, "
-            f"{SESSION_SUCCEEDS_KEY}) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                safe_session,
-                now_iso() if started_at is None else started_at,
-                ended_at,
-                source,
-                meta,
-                succeeds,
-            ),
-        )
-        return safe_session
-
-    def _purge_safe_session_context(
-        self, session_id: str, sensitive_values: set[str]
-    ) -> tuple[str | None, str | None, Any, Any]:
-        """Preserve clean session fields and remove only erased context."""
-        row = self.conn.execute(
-            "SELECT started_at, ended_at, source, meta FROM sessions WHERE id=?",
-            (session_id,),
-        ).fetchone()
-        if row is None:
-            return None, None, PURGE_SAFE_SESSION_SOURCE, dumps({})
-        source = row["source"]
-        original_meta = row["meta"]
-        dropped = object()
-
-        def tainted(value: Any) -> bool:
-            if isinstance(value, memoryview):
-                value = value.tobytes()
-            if isinstance(value, (bytes, bytearray)):
-                raw = bytes(value)
-                return any(
-                    raw == token.encode("utf-8")
-                    or (len(token) >= 8 and token.encode("utf-8") in raw)
-                    for token in sensitive_values
-                )
-            if not isinstance(value, str):
-                return False
-            return any(
-                value == token or (len(token) >= 8 and token in value)
-                for token in sensitive_values
-            )
-
-        safe_source = PURGE_SAFE_SESSION_SOURCE if tainted(source) else source
-        if isinstance(original_meta, memoryview):
-            original_meta = original_meta.tobytes()
-        if isinstance(original_meta, (bytes, bytearray)):
-            try:
-                meta_text = bytes(original_meta).decode("utf-8")
-            except UnicodeDecodeError:
-                # Opaque metadata on an affected session cannot be proven free
-                # of erased context. Privacy purge therefore drops it even when
-                # no plaintext marker can be found in the raw bytes.
-                return row["started_at"], row["ended_at"], safe_source, dumps({})
-        else:
-            meta_text = original_meta
-        not_json = object()
-        original = loads(meta_text, default=not_json)
-
-        def contains_tainted(value: Any) -> bool:
-            if tainted(value):
-                return True
-            if isinstance(value, dict):
-                return any(
-                    contains_tainted(key) or contains_tainted(child)
-                    for key, child in value.items()
-                )
-            if isinstance(value, list):
-                return any(contains_tainted(child) for child in value)
-            return False
-
-        if not tainted(original_meta) and (
-            original is not_json or not contains_tainted(original)
-        ):
-            return row["started_at"], row["ended_at"], safe_source, original_meta
-        if original is not_json:
-            return row["started_at"], row["ended_at"], safe_source, dumps({})
-
-        def sanitize(value: Any) -> Any:
-            if isinstance(value, str):
-                return dropped if tainted(value) else value
-            if isinstance(value, dict):
-                clean: dict[Any, Any] = {}
-                for key, child in value.items():
-                    if isinstance(key, str) and tainted(key):
-                        continue
-                    sanitized = sanitize(child)
-                    if sanitized is not dropped:
-                        clean[key] = sanitized
-                return clean
-            if isinstance(value, list):
-                return [
-                    sanitized
-                    for child in value
-                    if (sanitized := sanitize(child)) is not dropped
-                ]
-            return value
-
-        sanitized_meta = dumps(sanitize(original))
-        if tainted(sanitized_meta):
-            sanitized_meta = dumps({})
-        return row["started_at"], row["ended_at"], safe_source, sanitized_meta
-
-    def _prune_erased_only_lineage(self) -> None:
-        """During purge, discard components that no surviving memory can trace."""
-        rows = self.conn.execute(
-            """
-            SELECT id, target_memory_id, target_tombstone_id,
-                   replacement_memory_id, replacement_tombstone_id
-            FROM corrections
-            """
-        ).fetchall()
-
-        def nodes(row: sqlite3.Row) -> list[tuple[str, str]]:
-            found: list[tuple[str, str]] = []
-            for prefix in ("target", "replacement"):
-                if row[f"{prefix}_memory_id"] is not None:
-                    found.append(("memory", str(row[f"{prefix}_memory_id"])))
-                elif row[f"{prefix}_tombstone_id"] is not None:
-                    found.append(("tombstone", str(row[f"{prefix}_tombstone_id"])))
-            return found
-
-        by_node: dict[tuple[str, str], set[str]] = {}
-        row_nodes: dict[str, list[tuple[str, str]]] = {}
-        for row in rows:
-            correction_nodes = nodes(row)
-            row_nodes[str(row["id"])] = correction_nodes
-            for item in correction_nodes:
-                by_node.setdefault(item, set()).add(str(row["id"]))
-
-        pending = set(row_nodes)
-        while pending:
-            seed = pending.pop()
-            component = {seed}
-            frontier = [seed]
-            component_nodes: set[tuple[str, str]] = set()
-            while frontier:
-                correction_id = frontier.pop()
-                for item in row_nodes[correction_id]:
-                    component_nodes.add(item)
-                    for neighbor in by_node[item]:
-                        if neighbor in pending:
-                            pending.remove(neighbor)
-                            component.add(neighbor)
-                            frontier.append(neighbor)
-            if any(kind == "memory" for kind, _ in component_nodes):
-                continue
-            self.conn.executemany(
-                "DELETE FROM corrections WHERE id=?", [(item,) for item in component]
-            )
-
-        self.conn.execute(
-            """
-            DELETE FROM lineage_tombstones
-            WHERE tombstone_id NOT IN (
-                SELECT target_tombstone_id FROM corrections
-                WHERE target_tombstone_id IS NOT NULL
-                UNION
-                SELECT replacement_tombstone_id FROM corrections
-                WHERE replacement_tombstone_id IS NOT NULL
-            )
-            """
-        )
 
     def trace(self, memory_id: str) -> dict[str, Any]:
         """Return the ordered correction chain containing a surviving memory.

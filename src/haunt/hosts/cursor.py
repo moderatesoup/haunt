@@ -8,9 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from haunt.hosts import (
+    DanglingHook,
     HostReport,
     HostStatus,
+    check_hook_command_safe,
+    check_host_config_target,
+    check_host_install_allowed,
     command_leaf,
+    hook_command_defect,
     hook_command_issues,
     mcp_command_issues,
     read_json_object,
@@ -174,8 +179,29 @@ def _install_rule(cursor_dir: Path) -> Path:
     return dest
 
 
-def install(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostReport:
-    """Bind Cursor: hooks.json + mcp.json + haunt.mdc."""
+def preflight(haunt_home: str, hook_cmd: str, *, force: bool = False) -> None:
+    """Every refusal this adapter can raise, before it writes anything.
+
+    install_all_hosts runs this for all adapters first, so one adapter
+    refusing cannot leave an earlier adapter's config already rewritten.
+    install() still re-checks: a caller can reach it directly.
+    """
+    check_host_install_allowed(haunt_home, force=force)
+    check_hook_command_safe(hook_cmd)
+    check_host_config_target(_hooks_json_path(), force=force)
+    check_host_config_target(_mcp_json_path(), force=force)
+    check_host_config_target(_cursor_dir(), force=force)
+
+
+def install(
+    haunt_home: str, hook_cmd: str, mcp_cmd: str, *, force: bool = False
+) -> HostReport:
+    """Bind Cursor: hooks.json + mcp.json + haunt.mdc.
+
+    Refuses a non-default haunt_home before the first write; ~/.cursor is
+    global config the same way ~/.claude is.
+    """
+    preflight(haunt_home, hook_cmd, force=force)
     cdir = _cursor_dir()
     seeded = not cdir.exists()
 
@@ -226,6 +252,12 @@ def doctor(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> HostStatus:
                     missing_events.append(event)
                     continue
                 for cmd in haunt_cmds:
+                    # Per event, before the per-command dedup: see claude.py.
+                    defect = hook_command_defect(cmd)
+                    if defect is not None:
+                        status.dangling_hooks.append(
+                            DanglingHook(HOST_NAME, event, cmd, defect)
+                        )
                     if cmd in seen_cmds:
                         continue
                     seen_cmds.add(cmd)

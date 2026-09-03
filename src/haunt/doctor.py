@@ -11,7 +11,7 @@ from pathlib import Path
 
 from haunt.bootstrap import probe_sqlite_vec
 from haunt.embed import _env_model, _local_bge_m3_ready, _wants_bge_m3, fts_only
-from haunt.hosts import HostStatus, doctor_all_hosts
+from haunt.hosts import DanglingHook, HostStatus, doctor_all_hosts
 from haunt.paths import (
     NamespacePathError,
     _registered_namespace_for_repo,
@@ -68,6 +68,10 @@ class DoctorReport:
     checks: list[Check] = field(default_factory=list)
     hosts: list[HostStatus] = field(default_factory=list)
     collisions: list[NamespaceCollision] = field(default_factory=list)
+    # Every (host, event, command) whose hook cannot run. Flattened from the
+    # host statuses so the operator sees one list instead of hunting through
+    # per-host blocks. Empty when every planted hook command resolves.
+    dangling_hooks: list[DanglingHook] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -496,6 +500,8 @@ def diagnose(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> DoctorReport:
     report.checks.append(namespaces)
 
     report.hosts = doctor_all_hosts(haunt_home, hook_cmd, mcp_cmd)
+    for status in report.hosts:
+        report.dangling_hooks.extend(status.dangling_hooks)
     seen_hosts = {s.host for s in report.hosts}
     for required_host in ("cursor", "claude-code"):
         if required_host not in seen_hosts:
@@ -519,6 +525,47 @@ def diagnose(haunt_home: str, hook_cmd: str, mcp_cmd: str) -> DoctorReport:
         if name not in present:
             report.checks.append(Check(name, False, "check was not run"))
     return report
+
+
+def format_dangling_hooks(dangling: list[DanglingHook]) -> list[str]:
+    """Render the dangling-hook block, or nothing when every command resolves.
+
+    This is the detector for the failure that reports itself nowhere else:
+    the host config still lists the hook, so nothing reads as missing, but
+    the command behind it cannot run and capture is simply off.
+    """
+    if not dangling:
+        return []
+    host_width = max(len(d.host) for d in dangling)
+    event_width = max(len(d.event) for d in dangling)
+    lines = [
+        "",
+        "[dangling hooks]  these host events CANNOT capture — the command does not run",
+    ]
+    for d in dangling:
+        lines.append(
+            f"  {d.host:<{host_width}}  {d.event:<{event_width}}  {d.command}  ({d.reason})"
+        )
+    lines.append(
+        "  Fix: `unset HAUNT_HOME && haunt install` repoints every host hook at"
+    )
+    lines.append(
+        "  the default home. The unset matters: these entries usually dangle"
+    )
+    lines.append(
+        "  precisely because a non-default HAUNT_HOME was bound once, and a plain"
+    )
+    lines.append(
+        "  `haunt install` from that same shell is refused and changes nothing."
+    )
+    lines.append(
+        "  `haunt doctor` also re-merges hosts on its own when a host check fails,"
+    )
+    lines.append(
+        "  which repoints these — unless it printed a refusal (HAUNT_HOME is not the"
+    )
+    lines.append("  default home), in which case nothing was rewritten.")
+    return lines
 
 
 def _flag(check: Check) -> str:
@@ -560,6 +607,8 @@ def format_doctor(report: DoctorReport) -> str:
 
     for check in extras:
         lines.append(f"  {check.name:<12} {_flag(check)}  {check.detail}")
+
+    lines.extend(format_dangling_hooks(report.dangling_hooks))
 
     if not report.ok:
         lines.append("")

@@ -52,9 +52,14 @@ Canonical export digests detect corruption and make exact import replay
 identifiable. They are unkeyed hashes, not signatures or authenticity claims.
 Export excludes local paths, embeddings, indexes, and previously purged bytes,
 but anyone who can read a bundle can read its surviving plaintext content.
-An opaque namespace history head rotates in the hard-purge transaction, so an
-older or independently diverged bundle cannot be replayed into that namespace
-to restore erased rows. The head is not a secret, signature, or defense against
+An opaque namespace history head rotates in the hard-purge transaction, and in
+every namespace backup the purge sweeps — including the backups that never held
+the purged row, since the head is what a restored file answers with and not a
+property of the row. So an older or independently diverged bundle cannot be
+replayed into that namespace, or into a database restored from one of the
+backups the sweep rewrote, to restore erased rows. A backup the sweep could not
+rewrite keeps its old head and is named in `backups_unerased`. The head is not a
+secret, signature, or defense against
 a same-user attacker who can directly rewrite Haunt's files. Interrupted fresh
 imports recover only files still matching the fsynced intent's exact token,
 digest, device, and inode ownership; replacement links fail closed.
@@ -76,23 +81,65 @@ way; the older copies stay readable until a later purge rebuilds the file.
 
 Haunt writes full plaintext copies of a namespace database itself, under
 `<HAUNT_HOME>/backups`, whenever `haunt namespaces reconcile --apply` or
-`haunt namespaces retire --apply` runs. Purge sweeps those: it erases the row
-from every namespace backup holding it and rebuilds each one it touches,
-matching on the memory id, which reconcile preserves when it copies rows, so a
-backup of a different namespace is covered as well. The registry backups that
-share the directory are left alone; they record labels and migration audit
-state, never memory content. `backups_erased` counts the
-backups rewritten and `backups_unerased` names the ones that could not be —
-locked, corrupt, or holding a vector table whose extension would not load.
-A non-empty `backups_unerased` means the erasure did not complete. Sweeping
+`haunt namespaces retire --apply` runs. Purge sweeps those, running the erasure
+it runs in the live namespace: the same content deletion, the same correction
+lineage scrubbing, the same purge-safe session rekeying and metadata
+sanitization, and the same privacy head rotation. It matches on the memory id,
+which reconcile preserves when it copies rows, so a backup of a different
+namespace is covered as well, and it rebuilds each file it touches. Restoring a
+swept backup therefore restores a database that has already had the purge, down
+to refusing every bundle exported before it. The registry backups that share the
+directory are left alone; they record labels and migration audit state, never
+memory content.
+
+A rewritten backup counts as erased only after the sweep re-reads it: integrity
+and foreign-key checks pass, the row is gone, the privacy head has moved, and a
+raw scan of the file's bytes finds none of the erased values.
+
+That last scan is a transcription check, not an independent proof. It looks for
+the erased values as they were stored, which is the same comparison the
+sanitizer made when it decided what to remove, so it catches a copy of those
+bytes the rewrite missed — a stale page, an index entry, a field the erasure did
+not know to visit — and it does not catch a value some other row re-encoded.
+Base64, compression, an escaped copy nested inside another document: none of
+those contain the erased bytes to find. The sanitizer decodes JSON-encoded
+session metadata before it decides, so a value one `json.loads` deep is removed
+rather than merely unfound; nothing generalises that to every possible encoding,
+and the scan cannot be read as saying the value is gone in every form. It says
+the values it erased are not sitting in the file verbatim.
+
+The sweep is namespace-wide, and so is the rotation. Reconcile copies rows
+keeping their primary keys, so one memory id names the same row in every
+namespace and in every backup of one — a backup of one namespace really does
+hold another's rows once they have been reconciled. Nothing identifies which
+namespace a backup belongs to: the database stores no namespace id or label
+(the identity lives in the registry, keyed by the live file's path), `retire`
+deletes the identity row outright, and the filename is a lossy `safe_name` that
+two different labels can share. So a purge in one namespace rewrites and rotates
+every namespace backup on the machine, not only that namespace's. The cost is
+that restoring an unrelated namespace's backup afterwards refuses bundles
+exported before a purge that never touched it; re-export from the live namespace
+is the remedy. Purge cost scales with the total number of backups, not with the
+purged namespace.
+
+`backups_scanned` counts every candidate file the sweep examined, so it can be
+compared against the directory listing. `backups_erased` counts backups that
+held the row and then passed every check above. `backups_unerased` describes
+every candidate the sweep could not prove free of the row, with the reason: one
+it could not open (locked, corrupt, or holding a vector table whose extension
+would not load), one it declined to rewrite (not a regular file, hard-linked
+under another name, or no longer at the private 0600 mode Haunt wrote it with —
+each of which leaves the file exactly as it was found), and one it rewrote that
+then failed a check. A candidate in neither counter held no copy of the row. A
+non-empty `backups_unerased` means the erasure did not complete. Sweeping
 rewrites the file, so the sha256 the migration report recorded for that backup
-no longer matches it, and a swept backup restores a namespace whose erased
-content is gone but whose session and event identifiers were never rekeyed.
+no longer matches it.
 
 Everything else is out of reach and is not covered: export bundles, an
 operator's own `cp` of a namespace file, Time Machine or other filesystem
 snapshots, a backup on removable or network storage, and anything already
-copied elsewhere. Purge one namespace and its bundles remain. Nor does it
+copied elsewhere. Purge one namespace and its bundles remain readable; the head
+rotation only stops them being imported back, it does not erase them. Nor does it
 reach blocks the filesystem has already released: truncation, copy-on-write
 snapshots, and SSD wear-levelling can leave the original blocks intact on the
 physical device. Full-disk encryption, not purge, is the answer to an attacker

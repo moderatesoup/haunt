@@ -118,6 +118,11 @@ class Hit:
     # the default -- means final_rank IS the fusion rank.
     rerank_stage: dict[str, Any] | None = None
     references: dict[str, Any] | None = None
+    # The reproducible tie key this hit was ordered by. Falls back to the
+    # memory id on a database whose content_hash column predates v10, so it is
+    # always a usable sort key. Deliberately absent from as_dict(): it is
+    # ordering machinery, not part of the public response.
+    content_hash: str | None = None
     recall_class: str | None = None
     classification_source: str = "legacy_unknown"
     # Keep structured tool detection internal: callers still receive only the
@@ -292,6 +297,21 @@ def classify_recall_residue(
     return raw_tool, classification_source
 
 
+def _tie_key_name(hit: Hit) -> str:
+    """The tie key this hit was actually ordered by.
+
+    Not cosmetic. content_hash arrives with the v10 migration and recall opens
+    read-only by default, so on a database no writer has migrated
+    _stable_tie_key degrades to m.id -- and a row whose hash is still NULL
+    degrades the same way through COALESCE. In both cases the hit's key IS its
+    memory id, and claiming otherwise would put a mechanism the database cannot
+    supply next to score_semantics, which is this module's honesty surface.
+    """
+    if hit.content_hash and hit.content_hash != hit.memory_id:
+        return "content_hash_asc_then_memory_id_asc"
+    return "memory_id_asc"
+
+
 def _ordering_explanation(hit: Hit, *, is_rrf: bool) -> dict[str, str]:
     """Describe only ordering evidence this Hit actually carries.
 
@@ -303,12 +323,12 @@ def _ordering_explanation(hit: Hit, *, is_rrf: bool) -> dict[str, str]:
         method = str(hit.rerank_stage["method"])
         return {
             "primary": f"{method}_desc",
-            "ties": "memory_id_asc",
+            "ties": _tie_key_name(hit),
             "stage": method,
             "reordered_from": "rrf_score_desc",
         }
     if is_rrf:
-        return {"primary": "rrf_score_desc", "ties": "memory_id_asc"}
+        return {"primary": "rrf_score_desc", "ties": _tie_key_name(hit)}
     if (
         hit.vector_stage is not None
         and hit.fts_stage is not None
@@ -458,6 +478,54 @@ def _l2(a: list[float], b: list[float]) -> float:
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
+def _stable_tie_key(conn: sqlite3.Connection) -> str:
+    """SQL for the reproducible tie key, degrading where the column is absent.
+
+    content_hash arrives with the v10 migration, which only a writer performs;
+    ReadOnlyStore never migrates (see its class docstring) and recall opens
+    read-only by default. On a database no writer has opened at this code
+    version the column does not exist, and naming it would turn every recall
+    into "no such column". Store.stats() already guards the same way.
+
+    The fallback is m.id, not a constant: falling back to '' would sort every
+    unhashed row ahead of every hashed one, which is a systematic reordering
+    rather than a settled tie. m.id reduces exactly to the previous
+    (rank, id) behaviour for rows the key cannot cover.
+    """
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+    }
+    return "COALESCE(m.content_hash, m.id)" if "content_hash" in columns else "m.id"
+
+
+def _content_keys(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
+    """Stable per-row sort keys for a fused candidate set.
+
+    memory_id is a fresh uuid4 per write, so ordering tied rows by it is total
+    but re-randomized on every ingest: the same corpus scored twice put the
+    same two exactly-tied documents in either order. content_hash is a pure
+    function of the stored text, so it settles the tie the same way every time.
+    Rows written before schema v10 and not yet backfilled hold NULL and fall
+    back to the id (register item R7).
+    """
+    if not ids:
+        return {}
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+    }
+    if "content_hash" not in columns:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, COALESCE(content_hash, id) AS chash "
+        f"FROM memories WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return {str(row["id"]): str(row["chash"]) for row in rows}
+
+
 def _fts_hits(
     conn: sqlite3.Connection,
     query: str,
@@ -468,6 +536,7 @@ def _fts_hits(
     match = _fts_match_query(query)
     if not match:
         return []
+    tie = _stable_tie_key(conn)
     sql = f"""
         SELECT f.id AS mid, f.rank AS rnk
         FROM memories_fts f
@@ -475,7 +544,7 @@ def _fts_hits(
         JOIN events e ON e.id = m.event_id
         WHERE memories_fts MATCH ?
           AND {where}
-        ORDER BY f.rank, f.id
+        ORDER BY f.rank, {tie}, f.id
         LIMIT ?
     """
     rows = conn.execute(sql, [match, *params, limit]).fetchall()
@@ -491,13 +560,15 @@ def _vec_hits(
 ) -> list[tuple[str, int, float, str]]:
     blob = sqlite_vec.serialize_float32(query_vec)
     conn = store.conn
+    tie = _stable_tie_key(conn)
     if store.vec_ok():
         has = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memories'"
         ).fetchone()
         if has:
             sql = f"""
-                SELECT v.id AS mid, v.distance AS dist
+                SELECT v.id AS mid, v.distance AS dist,
+                       {tie} AS chash
                 FROM vec_memories v
                 JOIN memories m ON m.id = v.id
                 JOIN events e ON e.id = m.event_id
@@ -511,29 +582,30 @@ def _vec_hits(
             # do not treat a malformed native KNN query as an L2 fallback.
             rows = conn.execute(sql, [blob, limit, *params]).fetchall()
             candidates = sorted(
-                ((r["mid"], float(r["dist"])) for r in rows),
-                key=lambda item: (item[1], item[0]),
+                ((r["mid"], float(r["dist"]), str(r["chash"])) for r in rows),
+                key=lambda item: (item[1], item[2], item[0]),
             )
             return [
                 (mid, i + 1, distance, "cosine_distance")
-                for i, (mid, distance) in enumerate(candidates)
+                for i, (mid, distance, _chash) in enumerate(candidates)
             ]
     sql = f"""
-        SELECT m.id AS mid, m.embedding
+        SELECT m.id AS mid, m.embedding,
+               {tie} AS chash
         FROM memories m
         JOIN events e ON e.id = m.event_id
         WHERE m.embedding IS NOT NULL AND {where}
     """
-    scored: list[tuple[str, float]] = []
+    scored: list[tuple[str, float, str]] = []
     for r in conn.execute(sql, params):
         vec = _deserialize(r["embedding"])
         if len(vec) != len(query_vec):
             continue
-        scored.append((r["mid"], _l2(query_vec, vec)))
-    scored.sort(key=lambda x: (x[1], x[0]))
+        scored.append((r["mid"], _l2(query_vec, vec), str(r["chash"])))
+    scored.sort(key=lambda x: (x[1], x[2], x[0]))
     return [
         (mid, i + 1, dist, "l2_distance")
-        for i, (mid, dist) in enumerate(scored[:limit])
+        for i, (mid, dist, _chash) in enumerate(scored[:limit])
     ]
 
 
@@ -650,10 +722,20 @@ def recall(
         # promote from while enabled.
         from haunt import rerank
 
-        ranked = sorted(rrf.items(), key=lambda kv: (-kv[1], kv[0]))[
-            : rerank.candidate_pool(k)
-        ]
+        # Only exactly-equal fused scores can consult the stable key, so pay
+        # for the lookup only when two of them collide. FTS-only recall feeds
+        # fusion a dense 1..N rank, which cannot produce equal sums, so that
+        # path never pays at all.
+        ordered_scores = sorted(rrf.values(), reverse=True)
+        fused_tie = any(
+            left == right for left, right in zip(ordered_scores, ordered_scores[1:])
+        )
+        stable = _content_keys(store.conn, list(rrf)) if fused_tie else {}
+        ranked = sorted(
+            rrf.items(), key=lambda kv: (-kv[1], stable.get(kv[0], kv[0]), kv[0])
+        )[: rerank.candidate_pool(k)]
         hits: list[Hit] = []
+        materialize_tie = _stable_tie_key(store.conn)
         recall_class_select = (
             "e.recall_class AS recall_class"
             if recall_class_available
@@ -665,6 +747,7 @@ def recall(
                 SELECT m.id, m.event_id, m.tier, m.content, m.valid_from, m.valid_to,
                        e.role, e.event_time, e.ts, e.tool_name, e.tool_input,
                        e.tool_output, e.origin,
+                       {materialize_tie} AS content_hash,
                        {recall_class_select}
                 FROM memories m
                 JOIN events e ON e.id = m.event_id
@@ -690,6 +773,7 @@ def recall(
                     score=score,
                     tier=row["tier"],
                     content=row["content"],
+                    content_hash=row["content_hash"],
                     role=row["role"],
                     event_time=row["event_time"],
                     ts=row["ts"],
