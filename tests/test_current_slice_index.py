@@ -48,9 +48,9 @@ def current_index_env(tmp_path, monkeypatch):
 def test_fresh_database_has_current_index_at_v11(current_index_env):
     from haunt.store import SCHEMA_VERSION, Store
 
-    assert SCHEMA_VERSION == 13
+    assert SCHEMA_VERSION == 14
     with Store("default") as store:
-        assert store.get_meta("schema_version") == "13"
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
         index = store.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' "
             "AND name='idx_memories_current'"

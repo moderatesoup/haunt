@@ -1208,6 +1208,266 @@ IDs continue the L-series. None is a merge blocker.
 
 5 late findings.
 
+### Embedding window and tail coverage (2026-09-01)
+
+Found by tokenizing the live corpora rather than by reading the code. IDs
+continue the L-series; L21 is a **defect**, and the rest of this section is
+its evidence and its fix.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L21 | Only the first `HAUNT_EMBED_MAX_LEN` tokens of a memory were ever embedded, and the setting was documented nowhere. BGE-M3 accepts 8192; the default is 512, applied as hard truncation (`src/haunt/embed.py:_max_len`, `enable_truncation` in `OnnxEmbedder.__init__`). FTS5 indexes the full `content`, so the loss was invisible from every surface. Measured with the cached BGE-M3 tokenizer over `memories` rows with `skip_embedding=0`: `haunt` 1941/3782 rows over the window (51.3%), 66.2% of tokens dropped; `memory-protocol` 2929/4471 (65.5%), 67.8%; `ironscope` 1992/3329 (59.8%), 75.2%. Longest single row 12,436 tokens, of which 512 were indexed. FIXED: schema v14 tail spans, see below. | MEDIUM-HIGH (retrieval coverage, all users) -- graded on measured index coverage and on the reachability probe, **not** on a demonstrated end-to-end benchmark gain: the LongMemEval arm below is a complete null and that instrument cannot see this defect | `scripts/lme_truncation_subgroup.py`; the reachability probe below; `tests/test_embed_spans.py` | verified |
+| L22 | `process_embedding_jobs` could not re-embed a memory that already had a vector. It wrote with `INSERT OR REPLACE INTO vec_memories`, and vec0 does not implement the conflict clause -- it raises `UNIQUE constraint failed on vec_memories primary key`. Latent until now because nothing ever re-queued an embedded row: `observe` enqueues only when the blob is NULL, and `reembed()` drops the table first. The L21 backfill enqueues exactly such rows, so without the fix every backfilled row burns its attempts and the migration silently does nothing. FIXED: delete-then-insert. | MEDIUM (latent, blocking L21) | reproduced as `attempts=1, last_error='UNIQUE constraint failed on vec_memories primary key'`; regression coverage in `tests/test_embed_spans.py` | verified |
+
+**Reachability probe (real corpus, label-free)**
+
+Whether truncation costs retrieval is answerable without a benchmark. For 150
+memories over the window in the `haunt` namespace (median 1,961 tokens),
+a verbatim ~40-token phrase was lifted from inside the head window and another
+from past it, each embedded and run as a vector-only query against
+`vec_memories`. A phrase the memory literally contains should retrieve that
+memory.
+
+| probe | self-retrieval @1 | @10 |
+|---|---:|---:|
+| head (inside the window) | 0.420 | 0.673 |
+| tail (past the window) | 0.067 | 0.227 |
+
+Both arms share the corpus's near-duplicate confound, which is what holds the
+head arm to 0.673; the contrast is the measurement. Run against a copy, never
+the live store.
+
+**What was NOT concluded**
+
+- Not "hybrid retrieval is broken". FTS was unaffected throughout, and L2's
+  finding stands unchanged.
+- Not a fix for L1. `single-session-preference` is a vocabulary-disjunction
+  failure, and 0 of the 21 working-set preference questions have an
+  answer-bearing gold turn over the window -- the two problems do not overlap.
+- L9 measured the same signal in 2026-08-27 ("almost always padded to 512")
+  and read it purely as ingest throughput. That reading was correct and
+  incomplete; the padding ceiling is also a truncation ceiling.
+
+**Fix (schema v14)**
+
+`haunt.spans` plans overlapping tail windows over the content past the head,
+cut on real token offsets and stored as verbatim character ranges in
+`memory_spans` with vectors in `vec_memory_spans`. Recall searches both vector
+tables and keeps each memory's nearest window, so a long memory cannot take
+several candidate slots. The metric label stays `cosine_distance` -- same
+model, same vec0 configuration -- so E6's pinned profile identity does not
+move; which window matched is reported separately as
+`explanation.vector.matched_span_ord`.
+
+Spans are derived state and are treated as such: excluded from export and from
+reconcile's copy set, rebuilt on import, dropped and rebuilt by `--reembed`,
+and erased by purge **before** the `memories` row, because `ON DELETE CASCADE`
+would otherwise remove the rows that name the span vectors and strand the
+vectors in a virtual table that has no foreign key.
+
+Upgrading re-embeds nothing that already has a vector: the migration enqueues
+the long rows and stops, and `haunt maintenance` drains them. `haunt health`
+reports `memories_over_window` against `memories_with_spans` so a
+migrated-but-undrained namespace does not look finished. `HAUNT_EMBED_SPANS=0`
+restores the previous behaviour exactly.
+
+**LongMemEval arm**
+
+Predeclared before either run: the cap can only change a vector rank for a
+question whose answer-bearing gold turn exceeds it, so
+`scripts/lme_truncation_subgroup.py` draws that subgroup from the dataset and
+the tokenizer alone -- no retrieval, no scores -- and commits it with a digest
+(`tests/fixtures/lme_truncation/exposed_ids.json`). Working 83/350 exposed,
+held-out 29/150, longest answer-bearing turn 994 tokens, which is why the
+comparator is 1024 rather than 2048: 1024 covers every exposed case in the
+dataset and 2048 would cost twice the compute for no additional coverage.
+
+LongMemEval is a **weak instrument for this defect** and the result must be
+read that way. Its unit of ingest is a conversational turn, not an agent turn:
+17.1% of turns exceed 512 tokens against 51-66% of real memories, and 10.8% of
+tokens are dropped against 66-75%. Credit is also scored per gold *session*,
+so a truncated answer-bearing turn can still be scored a hit via a sibling
+turn. A positive result here is therefore meaningful; a null result is not
+evidence that the defect does not matter in production, which the reachability
+probe above measures directly.
+
+**Result: a complete null.** Both arms, 83 exposed working questions, hybrid,
+k=10, bge-m3, embedding coverage 0.9999, run against clean `main` `06ebd23`
+(the harness resolves `haunt` through the installed editable, so this measures
+the *pre-fix* tree, which is what a cap comparison should measure).
+
+| cutoff | 512 | 1024 | delta | discordant |
+|---|---:|---:|---:|---|
+| R@1 | 0.916 | 0.916 | +0.000 | 0 / 0 |
+| R@3 | 0.964 | 0.964 | +0.000 | 0 / 0 |
+| R@5 | 0.964 | 0.964 | +0.000 | 0 / 0 |
+| R@10 | 0.988 | 0.988 | +0.000 | 0 / 0 |
+| MRR | 0.943 | 0.943 | +0.000 | |
+
+Not "no significant difference" -- the gold rank of every one of the 83
+questions was **identical** between arms. The arms did differ: same 40,822
+turns and same coverage, but 8,530s of embedding at 1024 against 7,825s at 512
+(+9%), and the reports record `embed_max_len` 512 and 1024 respectively
+against one subgroup digest.
+
+Read it as what it is. On this dataset there is almost no headroom to move --
+R@1 is already 0.916 and R@10 0.988, so 1 question misses at R@10 and 7 at
+R@1 -- and the median answer-bearing turn is 487 tokens, exceeding the window
+by tens of tokens rather than thousands. Combined with session-level credit, a
+truncated answer-bearing turn is still scored a hit through a sibling turn in
+the same gold session. The instrument cannot see this defect, and the null is
+consistent with that rather than evidence against L21.
+
+**Do not** record this as "the embedding window does not affect retrieval."
+The accurate statement is: *at LongMemEval's exposure (17.1% of turns, 10.8%
+of tokens) and under session-level credit at a 0.988 R@10 ceiling, raising the
+cap from 512 to 1024 changed nothing.* What the cap costs on an agent-turn
+corpus with memory-level retrieval is measured by the reachability probe
+above, not here.
+
+**Regression arm on the fixed tree (the check that mattered most).**
+
+Once the null landed, the open risk was no longer "does the fix help" but
+"does it make anything worse": spans widen the candidate pool, so a long
+memory can displace a short one. The same 83 questions were re-run on the
+fixed tree at max_len 512, spans on.
+
+| cutoff | pre-fix | spans | delta | lost / gained |
+|---|---:|---:|---:|---|
+| R@1 | 0.916 | 0.916 | +0.000 | 0 / 0 |
+| R@5 | 0.964 | 0.964 | +0.000 | 0 / 0 |
+| R@10 | 0.988 | **1.000** | +0.012 | **0 / 1** |
+| MRR | 0.943 | 0.945 | +0.002 | |
+
+Zero questions lost at any cutoff, and the single remaining R@10 miss
+(`6d550036`) was recovered at rank 6. Small, but it is a labeled result and it
+is in the right direction.
+
+The report's `tree.sha` does **not** identify the code that ran here -- the
+harness resolves the repository root, while the arm selected the fixed tree
+through `PYTHONPATH`. Proven directly instead, from the namespaces each arm
+left behind: the baseline home is schema 13 with no `memory_spans` table, the
+fixed home is schema 14 with 102 span rows in the same question's namespace.
+
+**Reachability after the fix, and the cost it carries**
+
+The real-corpus copy was drained to completion (3,085 jobs, 32 batches, ~48
+minutes, 0 failures, 7,647 span rows over 1,955 memories) and the head/tail
+probe re-run against it. Paired: one corpus, one sample of 150, one code-path
+difference -- the "before" arm queries `vec_memories` alone, which *is* the
+pre-fix index, since the drain rewrote each head vector with the same model at
+the same window.
+
+| probe | head-only (pre-fix) | head + spans | delta |
+|---|---:|---:|---:|
+| head phrase @10 | 0.633 | 0.560 | **-0.073** |
+| tail phrase @10 | 0.200 | 0.507 | **+0.307** |
+
+Tail reachability rose by half again as much as head reachability fell, but
+the head cost is real and is **not** a counting artifact: of the 13 head
+probes displaced out of the top ten, only 1 was displaced by a memory that
+also contains the exact phrase (a near-duplicate, benign). The other 12 were
+displaced by memories that do not contain it. Roughly 46 memories gain tail
+reachability for every 11-12 that lose head reachability.
+
+**A refuted hypothesis, recorded because it was wrong.** The suspected
+mechanism was a distance-scale mismatch: a span vector summarizes a narrow
+window and a head vector the widest 512 tokens, so for any phrase a span
+contains its cosine distance should be systematically smaller regardless of
+relevance -- two scales in one ordering, the exact problem RRF exists to
+avoid. Fusing the two vector legs by RRF instead was measured and is **worse
+on both arms** (head @10 0.533, tail @10 0.433, against 0.560 / 0.507 for the
+shipped min-distance merge). Rank-only fusion discards the distance signal
+that makes a near-verbatim span match obvious. The shipped merge is the better
+of the two designs measured; the theory did not survive contact.
+
+No labeled instrument can currently adjudicate whether those 12 displacing
+span matches are useful or noise. LongMemEval cannot see it -- its regression
+arm above shows zero losses precisely because only 17.1% of its turns clear
+the window, so there are few spans to displace anything. The two results are
+consistent, not contradictory.
+
+**Control arms not run.** The design called for 30 non-exposed working
+questions per cap, to show any effect was specific to the exposed subgroup.
+With zero effect to localize they would cost roughly three machine-hours to
+confirm zero equals zero, and they were stopped deliberately rather than
+quietly dropped.
+
+
+### Adversarial review of the span change (2026-09-02)
+
+Six findings against the L21 implementation, all reproduced before being
+fixed. Five are fixed in the same change; one is deferred because fixing it
+would silently move E6's pinned profile identity.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L23 | The span leg asked `vec_memory_spans` for the `k` nearest **spans** and collapsed per memory, so it offered far fewer distinct candidates than the head leg -- measured 21, 31, 32, 35, 38 against the head leg's 40 on five real queries over the drained corpus (7,647 spans, up to 23 on one memory). The shortfall landed entirely on the tail-only memories the feature exists to surface. FIXED: over-fetch `limit * max_spans` bounded by `SPAN_KNN_MAX`, which makes the worst case exact, then trim to the nearest `limit` distinct memories. Re-measured 40/40 on all five, 33-60ms warm. | MEDIUM | `tests/test_embed_spans.py::test_the_span_leg_offers_as_many_memories_as_the_head_leg` | verified |
+| L24 | `memory_spans.embedding` was written and never read: ~4 KB per span, about 30 MB on the dogfooded namespace, and -- the real defect -- the persisted-embedding L2 fallback in `_vec_hits` scanned only `memories.embedding`. A namespace whose sqlite-vec failed to load was silently back to head-only retrieval while `haunt health` still reported `covered=1955`. FIXED: the fallback now merges span vectors, nearest per memory, the same rule the native path uses. | MEDIUM | `tests/test_embed_spans.py::test_tail_is_reachable_on_the_persisted_embedding_fallback` | verified |
+| L25 | The v14 backfill selected its population with `length(content) > embed_max_len()`, reading the live env var, but the migration is one-shot behind the schema version. A single open under `HAUNT_EMBED_MAX_LEN=8192` -- legitimate, BGE-M3 accepts it -- would permanently exclude every memory between 512 and 8192 characters, and `span_backlog` would then report 0 outstanding forever. FIXED: fixed `SPAN_FLOOR_CHARS = 512` constant, `min()`-ed with the window so a smaller configured window stays correct. | MEDIUM | `tests/test_embed_spans.py::test_backfill_floor_is_a_constant_not_the_live_window` | verified |
+| L26 | `HAUNT_EMBED_MAX_SPANS=1` produced zero windows (`_windows` guards on `len(out) < cap - 1`) and `plan()` returned `EMPTY`, which is the "this text fits the window" signal. A 5,000-token memory lost its entire tail with `truncated=False`, contradicting the module's own guarantee, and the drain reported `spans=0 truncated=0` -- a clean-looking pass over nil coverage. FIXED: a cap-blocked plan carries `truncated=True` and the real `total_chars`; `store_memory_spans` counts `plan.spans` rather than the plan's truthiness. | LOW (env-reachable) | `tests/test_embed_spans.py::test_a_cap_that_allows_no_tail_window_says_so` | verified |
+| L27 | Spans overran the embed window. `_offsets` filters zero-width offsets, so windows were cut to `max_len` **content** tokens; the encoder then adds CLS/SEP and truncates at `max_len`. Measured on BGE-M3: widest span 514 content tokens plus 2 specials against a 512 ceiling. Interior spans are absorbed by the 64-token overlap, but the final span has no successor, so the last tokens of every long memory still never reached a vector while `covered_chars` claimed otherwise. Subtracting the overhead alone was **not sufficient** -- re-tokenizing a substring drifts about a token from the parent tokenization -- so the final span is now verified against the real encoder and shrunk from the front (its front is inside the previous window's overlap; its end is not covered by anything). Re-measured: final span 512 against a 512 ceiling. | LOW-MEDIUM | `tests/test_embed_spans.py::test_the_final_span_fits_inside_the_encoder_window` | verified |
+| L28 | **Measured, no effect, closed.** Originally deferred as "widen the pool and the head regression goes away". Measured on the drained corpus at k=10 with CANDIDATES=40: keeping the union whole (up to 80) is **bit-identical** to truncating it back to 40 -- head @10 0.560 and tail @10 0.507 under both, against 0.633/0.200 head-only. Pool width was never the mechanism: at k=10 the top ten is already settled long before the 40th candidate, so widening changes nothing a caller sees. The E6 profile bump this would have cost is therefore not worth paying, and the head regression stands as the accepted trade in D8. Original text follows. **Deferred, not fixed.** Head and span legs each return up to `CANDIDATES` and the merge truncates the union back to `CANDIDATES`, so spans displace head candidates rather than widening a pool sized for one vector leg. This is the mechanism behind the measured head regression (12 of 13 displacements genuine). Widening it is the obvious fix and is **not** taken here: `abstention_eval` pins `fts5-porter-unicode61-top40-k5-v1` and `bge-m3-onnx-1024-native-cosine-fts5-rrf60-top40-k5-v1`, whose `top40` is exactly this number, and the contract makes retrieval configuration part of E6's calibration identity. Changing it needs a profile version bump and E6 re-review, not a quiet edit. See also L4. | MEDIUM (open) | `src/haunt/abstention_eval.py:36-37`; `docs/MEMORY_CONTRACT.md` section 3 | verified |
+
+The reachability trade was re-measured after these fixes and is unchanged at
+head @10 0.633 -> 0.560 and tail @10 0.200 -> 0.507; the over-fetch corrected
+the leg's width without moving the headline numbers. Those numbers were taken
+against spans built before L27 landed, which does not affect them -- the tail
+probe samples at `max_len + 80`, nowhere near the final span L27 repairs.
+
+### Filtered rows consume the vector KNN budget (2026-09-02)
+
+Found by an independent audit of the correction/supersession subsystem and
+then reproduced from scratch. **Not caused by the span change** -- the same
+shape is at `06ebd23:src/haunt/recall.py:505`, before spans existed -- and
+distinct from L4 and L28, which both discuss pool *width* rather than what
+consumes it.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L30 | The validity and residue predicates are a **post-filter on a vec0 KNN**, not a pre-filter. `vec0` returns the `k` nearest rows and the joins then discard some, so every superseded row and every raw tool-I/O row nearer to the query than the live answer spends a candidate slot and is thrown away. Reproduced with a live memory that is relevant but not the single nearest: at 45 hidden rows the raw KNN returns 40 and **0** survive the filter, and recall reports `no_vector_candidates`. The vector half of hybrid retrieval is silently dead and says the index had nothing, when it had 40. In that reproduction FTS still found the row, so the failure is invisible from the outside -- but FTS is exactly what fails on the L1 preference/decision shape, which is the case hybrid exists to cover. Residue matters more than corrections here: a hook-fed store accumulates far more tool I/O than supersessions. | HIGH (silent, pre-existing, worsens monotonically) | `verify2.py` reproduction; `src/haunt/recall.py` head leg `WHERE v.embedding MATCH ? AND k = ? AND {where}`; filter built at `_filters` | verified |
+
+The span leg added in L21 is already partly protected: its over-fetch (L23,
+`limit * max_spans` bounded by `SPAN_KNN_MAX`) widens the KNN for a different
+reason but incidentally leaves room for discards. The head leg has no such
+slack.
+
+**Not fixed in the L21 change.** It is a different subsystem from tail
+coverage, it is pre-existing, and folding a high-severity retrieval fix into
+an already-large span PR would make both harder to review. It also touches
+E6: the harness runs `recall`, so its evidence must be regenerated when this
+lands, and whether `top40` still describes the pool honestly is part of that
+review.
+
+### Operational incident: host config hijacked by a temporary HAUNT_HOME (2026-09-02)
+
+Not a finding against this change, but it happened during it and cost real
+data placement, so it is recorded rather than tidied away.
+
+Ad-hoc diagnostic scripts called `bootstrap()` with `HAUNT_HOME` pointed at a
+scratch directory and nothing else set. `bootstrap()` installs host
+integration unconditionally, so it rewrote `~/.claude.json`,
+`~/.cursor/mcp.json`, `~/.cursor/hooks.json` and `~/.claude/settings.json` to
+wrappers under that scratch directory. Every hook write from both editors --
+across all of the operator's projects, not only this one -- then landed in the
+scratch tree for roughly two days: 11,941 memories and 966 MB in
+`github.com-memory-protocol-memory-protocol` alone, while the real
+`~/.haunt/namespaces/haunt.db` recorded nothing after 2026-09-01T06:22.
+
+Recovered: the tree was copied to `~/haunt-recovered-20260902` (932 MB, 12,049
+memories) before anything else, `haunt install` repointed all four files at
+`~/.haunt/bin/*`, `haunt doctor` returns ok, and a canary driven through the
+real `haunt-hook-claude` wrapper landed in `~/.haunt/namespaces/haunt.db` with
+nothing leaking to the scratch tree. The canary was then purged
+(`bytes_overwritten=True`). **Merging the recovered namespaces back is an
+operator decision and was deliberately not performed** -- the scratch tree
+holds `github.com-moderatesoup-haunt` where the real store holds `haunt`, two
+labels for one repository, which is the L18 fork case.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L29 | `bootstrap()` writes global editor configuration as a side effect of creating a namespace. The test suite is safe only because `tests/conftest.py::isolate_host_homes` is autouse and repoints `CURSOR_HOME`/`CLAUDE_CONFIG_DIR`; the library function itself has no guard, so any script, notebook, or downstream embedder that sets a temporary `HAUNT_HOME` silently repoints the user's editors at it. That the project already ships a fixture specifically to contain this is evidence the hazard is known. Suggested fix: host install becomes an explicit argument that the CLI passes and library callers do not, or `bootstrap()` refuses to write host config when `HAUNT_HOME` is not the resolved default. NOT fixed here -- unrelated to L21 and deserves its own change. | MEDIUM (footgun, real incident) | this incident; `src/haunt/bootstrap.py`; `tests/conftest.py:42-52` | verified |
+
 ### Reconcile against real namespaces (2026-08-28)
 
 D2 executed. Run against **copies** of the owner's namespaces -- `ironscope`
@@ -1403,6 +1663,13 @@ audit does not re-report settled work.
   but `embed.py` hardcodes `CPUExecutionProvider`
   (`src/haunt/embed.py:218`). Deliberately deferred pending a vector-agreement
   measurement, and to land as a change separate from L9.
+- **D8 — tail spans on by default.** `HAUNT_EMBED_SPANS` defaults on. Taken by
+  the owner on the measured trade above -- roughly 4:1 coverage gain against
+  precision cost, zero labeled regression, and the alternative leaves two
+  thirds of the corpus outside the vector index. The precision cost is real
+  and unadjudicated; `HAUNT_EMBED_SPANS=0` is the escape hatch and restores
+  the pre-v14 behaviour exactly. Revisit if a labeled decision-impact or
+  answer-quality eval ever adjudicates the displacing matches.
 - **D7 — ONNX thread tuning.** Not adopted. The `intra=8` 1.32x result came
   from a short-sequence-biased sample and would ship as a hardware-specific
   hardcode.

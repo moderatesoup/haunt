@@ -31,6 +31,15 @@ _FTS_TOKEN = re.compile(r"[\w./+-]+", re.UNICODE)
 
 RRF_K = 60
 CANDIDATES = 40
+# Ceiling on the span KNN width. The span table is keyed by span, not by
+# memory, so asking it for `limit` rows can come back as far fewer distinct
+# memories -- measured at 21 of a possible 40 on the dogfooded corpus, where
+# one memory holds up to 23 spans. Asking for `limit * max_spans` makes the
+# worst case exact (a memory cannot contribute more rows than it has spans);
+# this bounds that product so a large HAUNT_EMBED_MAX_SPANS cannot turn one
+# recall into an unbounded scan. Above the ceiling the leg is best-effort
+# again, which is the pre-existing behavior rather than a new failure.
+SPAN_KNN_MAX = 2048
 BACKEND_ERROR_CODE = "retrieval_backend_error"
 
 
@@ -108,6 +117,12 @@ class Hit:
     fts_rank: int | None = None
     vec_distance: float | None = None
     vec_metric: str | None = None
+    # Set only when the reported vector distance came from a tail span rather
+    # than the memory's head window (schema v14, `haunt.spans`). None means
+    # the head vector matched, which is every memory short enough to fit one
+    # embedding pass. Provenance, not metric: vec_metric is cosine distance
+    # either way.
+    vec_span_ord: int | None = None
     fts_rank_raw: float | None = None
     filter_context: dict[str, Any] | None = None
     final_rank: int | None = None
@@ -164,6 +179,15 @@ class Hit:
                 "distance": self.vec_distance,
                 "metric": self.vec_metric,
                 "lower_is_better": True if self.vec_rank is not None else None,
+                # Present only when a tail window produced this distance.
+                # Omitted rather than set to null on a head match, so the
+                # serialized vector explanation is byte-identical to the
+                # pre-v14 one for every memory that fits a single pass.
+                **(
+                    {"matched_span_ord": self.vec_span_ord}
+                    if self.vec_span_ord is not None
+                    else {}
+                ),
             },
         )
         fts = _modality_explanation(
@@ -551,13 +575,104 @@ def _fts_hits(
     return [(r["mid"], i + 1, float(r["rnk"])) for i, r in enumerate(rows)]
 
 
+def _span_hits(
+    conn: sqlite3.Connection,
+    blob: bytes,
+    where: str,
+    params: list[Any],
+    limit: int,
+    tie: str = "m.id",
+) -> dict[str, tuple[float, int, str]]:
+    """Nearest tail spans, collapsed to `memory_id -> (distance, ord, tie)`.
+
+    `tie` is the stable tie-break expression the caller sorts by, carried
+    through so a span-matched memory settles an exact distance tie by the same
+    rule as a head-matched one.
+
+    A memory longer than the embedding window has its head in `vec_memories`
+    and the rest in `vec_memory_spans` (schema v14, see `haunt.spans`).
+    Searching only the first table makes everything past the window
+    unreachable by vector search -- on the live corpora that was around two
+    thirds of all tokens.
+
+    A memory can match on several spans at once. Only its best one is kept:
+    the fused rank is a rank of memories, and letting one long memory occupy
+    several candidate slots would crowd out short ones purely for being long.
+    """
+    if not _table_exists(conn, "vec_memory_spans"):
+        return {}
+    from haunt import spans as _spans
+
+    # See SPAN_KNN_MAX: `limit` nearest *spans* is not `limit` nearest
+    # memories, and the shortfall lands entirely on tail-only memories.
+    knn = min(max(limit, limit * _spans.max_spans()), SPAN_KNN_MAX)
+    sql = f"""
+        SELECT s.memory_id AS mid, s.ord AS ord, v.distance AS dist,
+               {tie} AS chash
+        FROM vec_memory_spans v
+        JOIN memory_spans s ON s.id = v.id
+        JOIN memories m ON m.id = s.memory_id
+        JOIN events e ON e.id = m.event_id
+        WHERE v.embedding MATCH ?
+          AND k = ?
+          AND {where}
+        ORDER BY distance
+    """
+    try:
+        rows = conn.execute(sql, [blob, knn, *params]).fetchall()
+    except sqlite3.Error:
+        # A namespace mid-migration can have the span table without its
+        # vector table, or vice versa. The head vectors still answer; a
+        # missing tail index degrades coverage, not correctness.
+        return {}
+    best: dict[str, tuple[float, int, str]] = {}
+    for row in rows:
+        mid = row["mid"]
+        entry = (float(row["dist"]), int(row["ord"]), str(row["chash"]))
+        current = best.get(mid)
+        if current is None or entry[:2] < current[:2]:
+            best[mid] = entry
+    # Rows arrive ordered by distance, so the first `limit` distinct memories
+    # are the nearest `limit`; trimming here keeps the leg the same width as
+    # the head leg it is merged with.
+    if len(best) <= limit:
+        return best
+    ordered = sorted(
+        best.items(), key=lambda kv: (kv[1][0], kv[1][2], kv[0])
+    )[:limit]
+    return dict(ordered)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return row is not None
+
+
 def _vec_hits(
     store: Store,
     query_vec: list[float],
     where: str,
     params: list[Any],
     limit: int,
+    span_origins: dict[str, int] | None = None,
 ) -> list[tuple[str, int, float, str]]:
+    """Nearest memories by vector, over head vectors and tail spans alike.
+
+    The returned tuple shape and its metric label are deliberately unchanged.
+    A span vector is produced by the same model, in the same vec0 table
+    configuration, under the same `distance_metric=cosine`: it is the same
+    metric measured against a different window of the same memory, so calling
+    it anything else would misreport the metric and would move E6's pinned
+    profile identity (`haunt.abstention_eval`) for a reason that is not a
+    profile change.
+
+    Which window matched is provenance, not metric. When `span_origins` is
+    supplied it is filled with `memory_id -> span ord` for every memory whose
+    best distance came from a tail span, and the caller attaches that to the
+    hit's explanation.
+    """
     blob = sqlite_vec.serialize_float32(query_vec)
     conn = store.conn
     tie = _stable_tie_key(conn)
@@ -581,10 +696,41 @@ def _vec_hits(
             # returned candidate set in Python to settle exact distance ties;
             # do not treat a malformed native KNN query as an L2 fallback.
             rows = conn.execute(sql, [blob, limit, *params]).fetchall()
+            # (distance, tie key). The tie key is #87's content hash, not
+            # the metric name -- sorting on a constant would silently collapse
+            # that tie-break back to memory id.
+            merged: dict[str, tuple[float, str]] = {}
+            for r in rows:
+                merged[r["mid"]] = (float(r["dist"]), str(r["chash"]))
+            # Both legs are asked for `limit` candidates and then merged, so a
+            # memory reachable only by its tail competes on equal terms with
+            # one reachable by its head. Nearest wins when both legs return
+            # the same memory: the head and a tail window are two views of one
+            # row, not two pieces of evidence.
+            for mid, (distance, ord_, chash) in _span_hits(
+                conn, blob, where, params, limit, tie
+            ).items():
+                current = merged.get(mid)
+                if current is None or distance < current[0]:
+                    merged[mid] = (distance, chash)
+                    if span_origins is not None:
+                        span_origins[mid] = ord_
+                elif span_origins is not None:
+                    # The head was at least as close. Drop any earlier span
+                    # claim so the explanation never names a window that did
+                    # not produce the reported distance.
+                    span_origins.pop(mid, None)
             candidates = sorted(
-                ((r["mid"], float(r["dist"]), str(r["chash"])) for r in rows),
+                (
+                    (mid, dist, chash)
+                    for mid, (dist, chash) in merged.items()
+                ),
                 key=lambda item: (item[1], item[2], item[0]),
-            )
+            )[:limit]
+            if span_origins is not None:
+                kept = {mid for mid, _, _ in candidates}
+                for mid in [m for m in span_origins if m not in kept]:
+                    del span_origins[mid]
             return [
                 (mid, i + 1, distance, "cosine_distance")
                 for i, (mid, distance, _chash) in enumerate(candidates)
@@ -596,13 +742,41 @@ def _vec_hits(
         JOIN events e ON e.id = m.event_id
         WHERE m.embedding IS NOT NULL AND {where}
     """
-    scored: list[tuple[str, float, str]] = []
+    best_l2: dict[str, tuple[float, str]] = {}
     for r in conn.execute(sql, params):
         vec = _deserialize(r["embedding"])
         if len(vec) != len(query_vec):
             continue
-        scored.append((r["mid"], _l2(query_vec, vec), str(r["chash"])))
-    scored.sort(key=lambda x: (x[1], x[2], x[0]))
+        best_l2[r["mid"]] = (_l2(query_vec, vec), str(r["chash"]))
+    # The native path searches head and tail vectors; this one has to as well,
+    # or a namespace whose sqlite-vec extension failed to load is quietly back
+    # to head-only retrieval while `haunt health` still reports tail coverage.
+    # memory_spans.embedding exists for exactly this path.
+    if _table_exists(conn, "memory_spans"):
+        span_sql = f"""
+            SELECT s.memory_id AS mid, s.embedding AS embedding,
+                   {tie} AS chash
+            FROM memory_spans s
+            JOIN memories m ON m.id = s.memory_id
+            JOIN events e ON e.id = m.event_id
+            WHERE s.embedding IS NOT NULL AND {where}
+        """
+        try:
+            span_rows = conn.execute(span_sql, params).fetchall()
+        except sqlite3.Error:
+            span_rows = []
+        for r in span_rows:
+            vec = _deserialize(r["embedding"])
+            if len(vec) != len(query_vec):
+                continue
+            distance = _l2(query_vec, vec)
+            current = best_l2.get(r["mid"])
+            if current is None or distance < current[0]:
+                best_l2[r["mid"]] = (distance, str(r["chash"]))
+    scored = sorted(
+        ((mid, dist, chash) for mid, (dist, chash) in best_l2.items()),
+        key=lambda x: (x[1], x[2], x[0]),
+    )
     return [
         (mid, i + 1, dist, "l2_distance")
         for i, (mid, dist, _chash) in enumerate(scored[:limit])
@@ -678,6 +852,9 @@ def recall(
                 "no_fts_candidates" if not fts else "returned_fts_candidates",
             )
         vec: list[tuple[str, int, float, str]] = []
+        # memory_id -> tail span ord, for hits whose reported distance came
+        # from a window past the embedding head. Empty on every other path.
+        span_origins: dict[str, int] = {}
         if not use_vectors:
             vector_execution = _stage("not_run", "disabled_by_caller")
         elif embed_offline():
@@ -687,7 +864,9 @@ def recall(
         else:
             qv = embed_one(query)
             if qv:
-                vec = _vec_hits(store, qv, where, params, CANDIDATES)
+                vec = _vec_hits(
+                    store, qv, where, params, CANDIDATES, span_origins
+                )
                 vec_reason = (
                     "no_vector_candidates"
                     if not vec
@@ -785,6 +964,7 @@ def recall(
                     fts_rank=fr[0] if fr else None,
                     vec_distance=vr[1] if vr else None,
                     vec_metric=vr[2] if vr else None,
+                    vec_span_ord=span_origins.get(mid) if vr else None,
                     fts_rank_raw=fr[1] if fr else None,
                     filter_context=filter_context,
                     final_rank=final_rank,

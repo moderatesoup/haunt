@@ -606,18 +606,22 @@ def test_alias_and_old_schema_read_only_recall_never_repairs_source(recall_gate_
 
     # A normal writer may upgrade on its explicit lifecycle, but does not
     # guess/backfill classes for historical v8 events. Restart remains at
-    # the current SCHEMA_VERSION (v13 as of the skip_embedding column).
+    # whatever the current SCHEMA_VERSION is -- asserted against the constant
+    # rather than the literal of the day, because the property under test is
+    # "the writer settled and stays settled", not any particular number.
+    from haunt.store import SCHEMA_VERSION
+
     with Store("renamed-gate", create=False) as store:
         assert store.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()[0] == "13"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
         assert store.conn.execute(
             "SELECT COUNT(*) FROM events WHERE recall_class IS NOT NULL"
         ).fetchone()[0] == 0
     with Store("renamed-gate", create=False) as restarted:
         assert restarted.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()[0] == "13"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
 
 
 def test_stable_id_readonly_open_survives_label_change(recall_gate_home):

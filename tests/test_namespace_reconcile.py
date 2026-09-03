@@ -1677,12 +1677,21 @@ def test_every_content_table_is_in_the_reconcile_copy_set(reconcile_home):
     #                   of being blindly re-queued in TARGET.
     #   memories_fts* - FTS5 shadow tables, rebuilt from copied memories.
     #   vec_memories* - vec0 shadow tables; embeddings are re-derived.
+    #   memory_spans  - tail windows cut from memories.content and embedded
+    #                   under TARGET's own model/window (schema v14). Copying
+    #                   them would carry SOURCE's vectors and SOURCE's cut
+    #                   points into a database that may have neither; the
+    #                   embedding re-queue above rebuilds them, exactly as it
+    #                   rebuilds the head vector.
+    #   vec_memory_spans* - vec0 shadow table for the above.
     #   sqlite_*      - SQLite internals.
-    excluded = {"meta", "embedding_jobs"}
+    excluded = {"meta", "embedding_jobs", "memory_spans"}
     unclassified = {
         t
         for t in live - copied - excluded
-        if not t.startswith(("memories_fts", "vec_memories", "sqlite_"))
+        if not t.startswith(
+            ("memories_fts", "vec_memories", "vec_memory_spans", "sqlite_")
+        )
     }
     assert unclassified == set(), (
         f"table(s) {sorted(unclassified)} are neither copied by reconcile nor "

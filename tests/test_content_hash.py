@@ -296,9 +296,9 @@ def test_haunt_health_shows_the_duplicate_and_coverage_counts(dup_env):
 def test_fresh_database_has_content_hash_column_and_index_at_v10(dup_env):
     from haunt.store import SCHEMA_VERSION, Store
 
-    assert SCHEMA_VERSION == 13
+    assert SCHEMA_VERSION == 14
     with Store("dup-test") as store:
-        assert store.get_meta("schema_version") == "13"
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
         columns = {
             row["name"]
             for row in store.conn.execute("PRAGMA table_info(memories)").fetchall()

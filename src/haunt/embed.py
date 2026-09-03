@@ -561,6 +561,16 @@ def reset() -> None:
         _state = None
         if hasattr(_load, "_model"):
             delattr(_load, "_model")
+        # The span tokenizer is keyed to a model id, but a reset may swap the
+        # model under the same id (a test pointing HAUNT_MODEL_CACHE
+        # elsewhere), so drop it outright rather than trusting the key.
+        for holder, attrs in (
+            (span_tokenizer, ("_tok", "_for")),
+            (special_token_overhead, ("_n", "_for")),
+        ):
+            for attr in attrs:
+                if hasattr(holder, attr):
+                    delattr(holder, attr)
 
 
 def available() -> bool:
@@ -569,6 +579,128 @@ def available() -> bool:
 
 def dimension() -> int:
     return state().dim
+
+
+# CLS + SEP on the BERT-family encoders Haunt ships. Used only when the
+# live tokenizer cannot be asked.
+_DEFAULT_SPECIAL_OVERHEAD = 2
+
+
+def max_len() -> int:
+    """The token ceiling every embedded text is truncated at.
+
+    Public because it is not only an embedder detail: `haunt.spans` needs the
+    same number to plan the windows that cover what truncation drops, and the
+    LongMemEval harness records it, since two reports that differ only by this
+    value are not the same profile.
+    """
+    return _max_len()
+
+
+def special_token_overhead() -> int:
+    """Tokens the encoder adds to every input on top of the text itself.
+
+    `haunt.spans` counts content tokens from an un-truncated tokenizer whose
+    special tokens are zero-width and therefore invisible in its offset list.
+    The encoder then prepends CLS and appends SEP before truncating at
+    `max_len`, so a window cut to exactly `max_len` content tokens arrives
+    `max_len + overhead` wide and loses its tail. Subtracting this keeps every
+    planned span inside the window it was planned for.
+
+    Measured against the live tokenizer rather than assumed to be 2: a model
+    with a different post-processor would silently reintroduce the loss.
+    """
+    tok = span_tokenizer()
+    if tok is None:
+        return _DEFAULT_SPECIAL_OVERHEAD
+    cached = getattr(special_token_overhead, "_n", None)
+    if cached is not None and getattr(special_token_overhead, "_for", None) == state().model_id:
+        return cached
+    try:
+        with_special = len(tok.encode("x", add_special_tokens=True).ids)
+        without = len(tok.encode("x", add_special_tokens=False).ids)
+        overhead = max(0, with_special - without)
+    except Exception:
+        overhead = _DEFAULT_SPECIAL_OVERHEAD
+    special_token_overhead._n = overhead  # type: ignore[attr-defined]
+    special_token_overhead._for = state().model_id  # type: ignore[attr-defined]
+    return overhead
+
+
+def span_tokenizer() -> Any:
+    """An un-truncated tokenizer for span planning, or None.
+
+    Deliberately not the encoder `embed_texts` uses: that one has
+    `enable_truncation(max_length=_max_len())` set on it, so it can never
+    report a character offset past the window -- asking it where to cut the
+    tail would return the head every time. This builds a second, independent
+    Tokenizer over the same vocabulary file with no truncation and no padding.
+
+    Two backends, two routes to the same vocabulary: the ONNX embedder knows
+    the directory it loaded from, and fastembed keeps a `tokenizers.Tokenizer`
+    on its inner model. The fastembed one is cloned through its own
+    serialization rather than reused, because turning truncation off on the
+    live object would change what `embed_texts` encodes.
+
+    Returns None when neither route works; `haunt.spans.plan` then falls back
+    to character-estimated windows, which cover less per span but still cover.
+    """
+    st = state()
+    if not st.available:
+        return None
+    cached = getattr(span_tokenizer, "_tok", None)
+    if cached is not None and getattr(span_tokenizer, "_for", None) == st.model_id:
+        return cached
+    model = getattr(_load, "_model", None)
+    if model is None:
+        return None
+    tok = _untruncated_from_file(model) or _untruncated_clone(model)
+    if tok is None:
+        return None
+    span_tokenizer._tok = tok  # type: ignore[attr-defined]
+    span_tokenizer._for = st.model_id  # type: ignore[attr-defined]
+    return tok
+
+
+def _untruncated_from_file(model: Any) -> Any:
+    """OnnxEmbedder route: re-read tokenizer.json from the model directory."""
+    root = getattr(model, "root", None)
+    if root is None:
+        return None
+    tok_path = _find_tokenizer(Path(root))
+    if tok_path is None:
+        return None
+    try:
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_file(str(tok_path))
+        tok.no_truncation()
+        tok.no_padding()
+        return tok
+    except Exception:
+        return None
+
+
+def _untruncated_clone(model: Any) -> Any:
+    """fastembed route: copy its live tokenizer, then drop the truncation."""
+    inner = getattr(getattr(model, "model", None), "tokenizer", None)
+    if inner is None:
+        return None
+    try:
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_str(inner.to_str())
+        tok.no_truncation()
+        tok.no_padding()
+        # Prove it actually reports beyond the window before trusting it: a
+        # clone that kept truncation would silently cap every span plan at
+        # the head and look like a text that needs no tail.
+        probe = tok.encode("word " * 4096)
+        if len(getattr(probe, "offsets", ()) or ()) < 2048:
+            return None
+        return tok
+    except Exception:
+        return None
 
 
 def l2_normalize(vec: list[float]) -> list[float]:
