@@ -13,7 +13,7 @@ import sqlite3
 import struct
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import sqlite_vec
 
@@ -40,6 +40,17 @@ CANDIDATES = 40
 # recall into an unbounded scan. Above the ceiling the leg is best-effort
 # again, which is the pre-existing behavior rather than a new failure.
 SPAN_KNN_MAX = 2048
+# Ceiling on how wide a vector KNN may be re-asked when the eligibility filter
+# eats the budget. See `_knn_eligible`: vec0 returns the k nearest rows and the
+# validity / residue predicates discard some afterwards, so a corpus with many
+# superseded or raw-tool rows nearer to the query than the live answer can
+# leave nothing. Escalating is bounded here so one recall cannot turn into a
+# full scan of a large index.
+VEC_KNN_MAX = 4096
+# Multiplier per escalation. Four keeps the number of round trips small (40 ->
+# 160 -> 640 -> 2560) while not over-fetching hugely on the common case, which
+# is satisfied by the very first pass.
+VEC_KNN_GROWTH = 4
 BACKEND_ERROR_CODE = "retrieval_backend_error"
 
 
@@ -575,6 +586,93 @@ def _fts_hits(
     return [(r["mid"], i + 1, float(r["rnk"])) for i, r in enumerate(rows)]
 
 
+def _knn_eligible(
+    conn: sqlite3.Connection,
+    body: str,
+    frm: str,
+    frm_wide: str,
+    blob: bytes,
+    where: str,
+    params: list[Any],
+    fetch: int,
+    ceiling: int,
+    satisfied: "Callable[[list[sqlite3.Row]], bool]",
+) -> list[sqlite3.Row]:
+    """Nearest eligible rows, re-asking wider only when the filter bites.
+
+    vec0 answers a KNN by returning the `k` nearest rows; Haunt's validity and
+    residue predicates are then applied in the join. Rows the filter will throw
+    away therefore spend candidate slots. On a corpus where superseded rows or
+    raw tool I/O sit nearer to the query than the live answer, a `k` of 40 can
+    come back with **nothing** eligible -- measured at 45 hidden rows -- and
+    recall then reports `no_vector_candidates` when the index in fact returned
+    a full 40. That is L30, and it predates tail spans.
+
+    Two shapes, deliberately, and `frm` must be byte-identical to the joins
+    this always used -- inner, not outer. The first pass is exactly the query
+    that ran before, so a healthy corpus (nearly every recall) pays nothing for
+    this fix. Measured on a 4,884-memory namespace: an unconditional wider pass
+    tripled median recall latency, and so did merely widening the fast path's
+    joins to LEFT, which changes the plan SQLite picks.
+    Only when that pass comes back short does it re-ask with the predicate
+    projected as a flag over LEFT JOINs, which is the shape that can report
+    both signals the escalation needs: how many rows the index actually
+    returned (is it exhausted?) and how many are eligible (is that enough?).
+
+    Backend errors propagate. A dimension mismatch or a corrupt index is a
+    `retrieval_backend_error` the caller must surface, not an empty result --
+    only the span leg tolerates a failure here, and it catches at its own call
+    site because a namespace mid-migration legitimately lacks the table.
+    """
+    fast = f"""
+        SELECT {body}
+        {frm}
+        WHERE v.embedding MATCH ?
+          AND k = ?
+          AND {where}
+        ORDER BY distance
+    """
+    rows = conn.execute(fast, [blob, fetch, *params]).fetchall()
+    if satisfied(rows) or fetch >= ceiling:
+        return rows
+
+    k = fetch
+    seen_eligible = len(rows)
+    while k < ceiling:
+        # Ratio-guided, not blindly geometric. The first pass already measured
+        # how dense eligible rows are near this query, so aim straight at the
+        # width that density implies and double it for headroom, instead of
+        # creeping up by a fixed factor. On the dogfooded corpus -- 92% raw
+        # tool residue -- this converges in one extra query where a fixed x4
+        # took several. Falls back to the fixed factor when the first pass
+        # found nothing, because then there is no density to extrapolate from.
+        if seen_eligible > 0:
+            implied = -(-fetch * k // max(1, seen_eligible)) * 2
+            k = min(max(k * 2, implied), ceiling)
+        else:
+            k = min(k * VEC_KNN_GROWTH, ceiling)
+        wide = f"""
+            SELECT * FROM (
+                SELECT {body},
+                       CASE WHEN {where} THEN 1 ELSE 0 END AS eligible
+                {frm_wide}
+                WHERE v.embedding MATCH ?
+                  AND k = ?
+                ORDER BY distance
+            )
+        """
+        probed = conn.execute(wide, [*params, blob, k]).fetchall()
+        rows = [r for r in probed if r["eligible"]]
+        seen_eligible = len(rows)
+        if satisfied(rows):
+            return rows
+        if len(probed) < k:
+            # The index handed back fewer rows than asked: it is exhausted,
+            # and no wider request can find more.
+            return rows
+    return rows
+
+
 def _span_hits(
     conn: sqlite3.Connection,
     blob: bytes,
@@ -603,27 +701,38 @@ def _span_hits(
         return {}
     from haunt import spans as _spans
 
-    # See SPAN_KNN_MAX: `limit` nearest *spans* is not `limit` nearest
-    # memories, and the shortfall lands entirely on tail-only memories.
-    knn = min(max(limit, limit * _spans.max_spans()), SPAN_KNN_MAX)
-    sql = f"""
-        SELECT s.memory_id AS mid, s.ord AS ord, v.distance AS dist,
-               {tie} AS chash
-        FROM vec_memory_spans v
-        JOIN memory_spans s ON s.id = v.id
-        JOIN memories m ON m.id = s.memory_id
-        JOIN events e ON e.id = m.event_id
-        WHERE v.embedding MATCH ?
-          AND k = ?
-          AND {where}
-        ORDER BY distance
-    """
+    # Two separate reasons to ask wider than `limit`, multiplied together.
+    # `limit` nearest *spans* is not `limit` nearest memories (L23), and rows
+    # the eligibility filter discards still spend slots (L30).
+    want = min(max(limit, limit * _spans.max_spans()), SPAN_KNN_MAX)
     try:
-        rows = conn.execute(sql, [blob, knn, *params]).fetchall()
+        rows = _knn_eligible(
+            conn,
+            f"s.memory_id AS mid, s.ord AS ord, v.distance AS dist, {tie} AS chash",
+            """
+            FROM vec_memory_spans v
+            JOIN memory_spans s ON s.id = v.id
+            JOIN memories m ON m.id = s.memory_id
+            JOIN events e ON e.id = m.event_id
+            """,
+            """
+            FROM vec_memory_spans v
+            LEFT JOIN memory_spans s ON s.id = v.id
+            LEFT JOIN memories m ON m.id = s.memory_id
+            LEFT JOIN events e ON e.id = m.event_id
+            """,
+            blob,
+            where,
+            params,
+            want,
+            max(SPAN_KNN_MAX, VEC_KNN_MAX),
+            lambda rs: len({r["mid"] for r in rs}) >= limit,
+        )
     except sqlite3.Error:
         # A namespace mid-migration can have the span table without its
         # vector table, or vice versa. The head vectors still answer; a
-        # missing tail index degrades coverage, not correctness.
+        # missing tail index degrades coverage, not correctness. The head leg
+        # deliberately does not do this -- there, a backend error is real.
         return {}
     best: dict[str, tuple[float, int, str]] = {}
     for row in rows:
@@ -681,21 +790,31 @@ def _vec_hits(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memories'"
         ).fetchone()
         if has:
-            sql = f"""
-                SELECT v.id AS mid, v.distance AS dist,
-                       {tie} AS chash
-                FROM vec_memories v
-                JOIN memories m ON m.id = v.id
-                JOIN events e ON e.id = m.event_id
-                WHERE v.embedding MATCH ?
-                  AND k = ?
-                  AND {where}
-                ORDER BY distance
-            """
             # vec0 accepts KNN queries ordered by distance alone. Sort the
             # returned candidate set in Python to settle exact distance ties;
             # do not treat a malformed native KNN query as an L2 fallback.
-            rows = conn.execute(sql, [blob, limit, *params]).fetchall()
+            # Asked through _knn_eligible so superseded rows and raw tool I/O
+            # nearer than the live answer cannot spend the whole budget (L30).
+            rows = _knn_eligible(
+                conn,
+                f"v.id AS mid, v.distance AS dist, {tie} AS chash",
+                """
+                FROM vec_memories v
+                JOIN memories m ON m.id = v.id
+                JOIN events e ON e.id = m.event_id
+                """,
+                """
+                FROM vec_memories v
+                LEFT JOIN memories m ON m.id = v.id
+                LEFT JOIN events e ON e.id = m.event_id
+                """,
+                blob,
+                where,
+                params,
+                limit,
+                VEC_KNN_MAX,
+                lambda rs: len(rs) >= limit,
+            )
             # (distance, tie key). The tie key is #87's content hash, not
             # the metric name -- sorting on a constant would silently collapse
             # that tie-break back to memory id.

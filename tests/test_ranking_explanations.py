@@ -529,9 +529,13 @@ class _NativeVecConnection:
         # caller settles that returned candidate set deterministically. The
         # content hashes here deliberately contradict the memory-id order, so
         # this asserts the tie breaks on content and not on the id.
+        # `eligible` is the projected filter flag the adaptive KNN reads
+        # (L30): the predicate is a CASE column now, not a WHERE, so one
+        # statement reports both how many rows the index returned and how
+        # many survive. Both rows here are eligible.
         return _Rows([
-            {"mid": "native-z", "dist": 0.25, "chash": "aaa"},
-            {"mid": "native-a", "dist": 0.25, "chash": "bbb"},
+            {"mid": "native-z", "dist": 0.25, "chash": "aaa", "eligible": 1},
+            {"mid": "native-a", "dist": 0.25, "chash": "bbb", "eligible": 1},
         ])
 
 
