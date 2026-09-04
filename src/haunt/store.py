@@ -2199,63 +2199,117 @@ def plan_memory_spans(text: str) -> "spans.SpanPlan":
     )
 
 
-def store_memory_spans(
-    conn: sqlite3.Connection,
-    rows: Sequence[tuple[str, str]],
-    *,
-    dim: int,
-    ts: str,
-) -> dict[str, Any]:
-    """Embed and store the tail spans for `rows` of (memory_id, content).
+@dataclass
+class PreparedSpans:
+    """Span vectors computed but not yet written. Holds no database handle.
 
-    One `embed_texts` call for every span in the batch, because the caller is
-    already paying one model load and a per-span call would dominate ingest.
-    Spans for a memory are replaced wholesale, so re-running is idempotent and
-    a shrinking memory cannot leave an orphan window behind.
-
-    Failure is soft by design: a span is an *additional* index over content
-    that is already stored, already FTS-indexed, and whose head vector was
-    written by the caller. Losing the tail must not fail the memory write that
-    succeeded. Counts come back so the caller can report the shortfall.
+    The split exists because embedding is slow and SQLite transactions must
+    not be. See `prepare_memory_spans`.
     """
-    out: dict[str, Any] = {"memories": 0, "spans": 0, "truncated": 0, "failed": 0}
-    if not rows or dim <= 0 or not _table_exists(conn, "memory_spans"):
-        return out
+
+    rows: list[tuple[str, str, Any, list[list[float]]]] = field(default_factory=list)
+    truncated: int = 0
+    failed: int = 0
+    attempted: int = 0
+
+    def __bool__(self) -> bool:
+        return bool(self.rows) or self.truncated > 0 or self.failed > 0
+
+
+def prepare_memory_spans(
+    rows: Sequence[tuple[str, str]], *, dim: int
+) -> PreparedSpans:
+    """Plan and embed tail spans. Touches no database, on purpose.
+
+    L32: `process_embedding_jobs` used to call the embedding model from inside
+    an already-open write transaction, because the head-vector writes had
+    begun one before the span work started. A 100-row batch takes minutes to
+    embed, so the transaction stayed open for minutes -- and on a namespace
+    with a live concurrent writer, every commit then failed with
+    `sqlite3.OperationalError: locking protocol`. Zero of 400 batches landed
+    on a 1.08 GB namespace; the same code drained four quieter ones without a
+    retry, which is why it looked namespace-specific rather than structural.
+
+    Keeping this function free of a connection is the guarantee: the slow part
+    cannot hold a lock it never takes. `persist_memory_spans` does the writes,
+    and they are fast.
+
+    One `embed_texts` call for the whole batch, because the caller is already
+    paying one model load and a per-span call would dominate ingest.
+    """
+    prepared = PreparedSpans()
+    if not rows or dim <= 0:
+        return prepared
 
     planned: list[tuple[str, str, Any]] = []
     texts: list[str] = []
     for memory_id, content in rows:
         plan = plan_memory_spans(content or "")
         if plan.truncated:
-            out["truncated"] += 1
+            prepared.truncated += 1
         # `plan.spans` explicitly, not `if not plan`: a plan can carry
         # truncated=True with no spans at all (HAUNT_EMBED_MAX_SPANS=1), and
         # that shortfall must still be counted rather than read as "this text
-        # fits in one window".
-        if not plan.spans:
-            # Still clear stale spans: a correction can shorten a memory past
-            # the window, and the old tail must not stay searchable.
-            _drop_memory_spans(conn, memory_id)
-            continue
+        # fits in one window". A memory with no spans is still carried through
+        # so persist can clear any stale ones -- a correction can shorten a
+        # memory past the window, and the old tail must not stay searchable.
         planned.append((memory_id, content, plan))
         texts.extend(span.slice(content) for span in plan.spans)
+    prepared.attempted = sum(1 for _m, _c, pl in planned if pl.spans)
     if not texts:
-        return out
+        prepared.rows = [(m, c, pl, []) for m, c, pl in planned]
+        return prepared
 
     try:
         vectors = embed_texts(texts)
     except Exception:
         vectors = None
     if not vectors or len(vectors) != len(texts):
-        out["failed"] = len(planned)
+        prepared.failed = prepared.attempted
+        # Still return the no-span rows so persist can clear stale spans.
+        prepared.rows = [(m, c, pl, []) for m, c, pl in planned if not pl.spans]
+        return prepared
+
+    cursor = 0
+    for memory_id, content, plan in planned:
+        take = vectors[cursor : cursor + len(plan.spans)]
+        cursor += len(plan.spans)
+        prepared.rows.append((memory_id, content, plan, take))
+    return prepared
+
+
+def persist_memory_spans(
+    conn: sqlite3.Connection,
+    prepared: PreparedSpans,
+    *,
+    dim: int,
+    ts: str,
+) -> dict[str, Any]:
+    """Write already-embedded spans. Database only -- no model call.
+
+    Fast by construction, so the write transaction this runs in stays short.
+    See `prepare_memory_spans` for why that matters (L32).
+
+    Failure is soft by design: a span is an *additional* index over content
+    that is already stored, already FTS-indexed, and whose head vector the
+    caller wrote. Losing the tail must not fail the memory write that
+    succeeded. Counts come back so the caller can report the shortfall.
+    """
+    out: dict[str, Any] = {
+        "memories": 0,
+        "spans": 0,
+        "truncated": prepared.truncated,
+        "failed": prepared.failed,
+    }
+    if not prepared.rows or dim <= 0 or not _table_exists(conn, "memory_spans"):
         return out
 
     ensure_span_vec_table(conn, dim, commit=False)
     vec_ready = _table_exists(conn, "vec_memory_spans")
-    cursor = 0
-    for memory_id, _content, plan in planned:
-        take = vectors[cursor : cursor + len(plan.spans)]
-        cursor += len(plan.spans)
+    for memory_id, _content, plan, take in prepared.rows:
+        if not plan.spans:
+            _drop_memory_spans(conn, memory_id)
+            continue
         written = 0
         try:
             _drop_memory_spans(conn, memory_id)
@@ -2285,9 +2339,9 @@ def store_memory_spans(
                     ),
                 )
                 if vec_ready:
-                    # Plain INSERT for the same reason: _drop_memory_spans
-                    # above already cleared this memory's rows, and vec0
-                    # would reject the conflict clause rather than honor it.
+                    # Plain INSERT: _drop_memory_spans above already cleared
+                    # this memory's rows, and vec0 rejects the conflict clause
+                    # rather than honoring it.
                     conn.execute(
                         "INSERT INTO vec_memory_spans(id, embedding) "
                         "VALUES (?, ?)",
@@ -2300,17 +2354,34 @@ def store_memory_spans(
             # All or nothing per memory. A half-written tail would still make
             # this memory count as spanned in `haunt health`, which counts
             # distinct memory_id -- so the gap would read as coverage.
-            # Rolling back to none keeps memories_over_window above
-            # memories_with_spans, which is how an operator sees there is
-            # work left.
-            #
-            # Deliberately not re-queued: the head vector is already correct
-            # and the job row is already gone, so re-queuing would loop the
-            # drain forever on a row it cannot finish. The rebuild is
-            # `haunt bootstrap --reembed`.
+            # Rolling back to none keeps the backlog honest. Not re-queued:
+            # the head vector is already correct and the job row is gone, so
+            # a re-queue would loop the drain forever on a row it cannot
+            # finish. The rebuild is `haunt bootstrap --reembed`.
             _drop_memory_spans(conn, memory_id)
             out["failed"] += 1
     return out
+
+
+def store_memory_spans(
+    conn: sqlite3.Connection,
+    rows: Sequence[tuple[str, str]],
+    *,
+    dim: int,
+    ts: str,
+) -> dict[str, Any]:
+    """Prepare and persist in one call.
+
+    Convenience for callers that are NOT inside an open write transaction.
+    Anything holding one must call `prepare_memory_spans` before it opens the
+    transaction and `persist_memory_spans` inside it -- this helper embeds,
+    which is far too slow to do under a lock (L32).
+    """
+    if not _table_exists(conn, "memory_spans"):
+        return {"memories": 0, "spans": 0, "truncated": 0, "failed": 0}
+    return persist_memory_spans(
+        conn, prepare_memory_spans(rows, dim=dim), dim=dim, ts=ts
+    )
 
 
 def _drop_memory_spans(conn: sqlite3.Connection, memory_id: str) -> int:
@@ -7799,9 +7870,6 @@ class Store:
                     (str(exc)[:1000], memory_id),
                 )
                 failed += 1
-        span_stats = store_memory_spans(
-            self.conn, spanned, dim=es.dim, ts=now_iso()
-        )
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_model', ?)",
             (es.model_id,),
@@ -7810,7 +7878,24 @@ class Store:
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_dim', ?)",
             (str(es.dim),),
         )
+        # Commit the head vectors BEFORE embedding any tail spans (L32). The
+        # loop above has had a write transaction open since its first UPDATE;
+        # embedding a 100-row batch of spans takes minutes, and holding the
+        # transaction across that made every commit on a concurrently-written
+        # namespace fail with "locking protocol" -- 0 of 400 batches landed.
+        # Committing here also makes the head work durable on its own, which
+        # it should be: a span is an additional index over content whose
+        # vector is already correct.
         self.conn.commit()
+
+        span_stats = {"memories": 0, "spans": 0, "truncated": 0, "failed": 0}
+        if spanned and _table_exists(self.conn, "memory_spans"):
+            # No transaction is open across this call. That is the whole fix.
+            prepared = prepare_memory_spans(spanned, dim=es.dim)
+            span_stats = persist_memory_spans(
+                self.conn, prepared, dim=es.dim, ts=now_iso()
+            )
+            self.conn.commit()
         result: dict[str, Any] = {
             "queued": len(queued),
             "processed": processed,
@@ -8143,8 +8228,16 @@ class Store:
                         pass
             # Rebuild the tails of this chunk before moving on, so an
             # interrupted re-embed leaves whole memories done rather than a
-            # namespace of heads with no tails.
-            stats = store_memory_spans(self.conn, rebuilt, dim=es.dim, ts=now)
+            # namespace of heads with no tails. Head work is committed first
+            # so the span embedding does not run under a write lock (L32).
+            self.conn.commit()
+            stats = persist_memory_spans(
+                self.conn,
+                prepare_memory_spans(rebuilt, dim=es.dim),
+                dim=es.dim,
+                ts=now,
+            )
+            self.conn.commit()
             for key in span_totals:
                 span_totals[key] += int(stats.get(key) or 0)
         self.set_meta("embed_model", es.model_id)

@@ -1423,7 +1423,7 @@ cannot be drained at all.
 
 | ID | Item | Severity | Evidence | Checked |
 |---|---|---|---|---|
-| L32 | `process_embedding_jobs` raises `sqlite3.OperationalError: locking protocol` (SQLITE_PROTOCOL) from `self.conn.commit()` on `github.com-memory-protocol-memory-protocol`. The embedding work itself completes; only the commit fails, so the batch is lost and the backlog never moves -- 0 of 400 attempted batches succeeded across two runs, ~90 minutes apart. **A plain `sqlite3` connection to the same file commits a write transaction without complaint**, and `PRAGMA quick_check` returns `ok`, so the database is healthy and this is haunt's connection configuration rather than file corruption. Not contention: `lsof` shows no other process holding the file at the time of failure. The namespace is the largest in the store (1.08 GB, 12,681 events) and is the only one that fails; the other four drained without a single retry. | HIGH (a namespace cannot build span coverage at all) | traceback below; `PRAGMA journal_mode=wal`, `locking_mode=normal` | verified |
+| L32 | **FIXED.** `process_embedding_jobs` raises `sqlite3.OperationalError: locking protocol` (SQLITE_PROTOCOL) from `self.conn.commit()` on `github.com-memory-protocol-memory-protocol`. The embedding work itself completes; only the commit fails, so the batch is lost and the backlog never moves -- 0 of 400 attempted batches succeeded across two runs, ~90 minutes apart. **A plain `sqlite3` connection to the same file commits a write transaction without complaint**, and `PRAGMA quick_check` returns `ok`, so the database is healthy and this is haunt's connection configuration rather than file corruption. Not contention: `lsof` shows no other process holding the file at the time of failure. The namespace is the largest in the store (1.08 GB, 12,681 events) and is the only one that fails; the other four drained without a single retry. | HIGH (a namespace cannot build span coverage at all) | traceback below; `PRAGMA journal_mode=wal`, `locking_mode=normal` | verified |
 
 Reproduction:
 
@@ -1450,16 +1450,65 @@ immediately), and journal mode (`wal`, as everywhere else). A stale zero-byte
 `-journal` sidecar dated 2026-08-26 sits beside it, but several namespaces
 that drain fine have one too, so it is a suspect rather than a cause.
 
-**Not investigated further here.** Diagnosing it means going into
-`haunt.paths`'s SQLite open path -- `SQLITE_OPEN_LOCK`, `SQLitePrimaryGuard`,
-`SQLiteSidecarGuard` -- which is a change to the storage safety machinery and
-should not be started as a side effect of running a backfill. Filed with the
-reproduction so it can be picked up deliberately.
+**Root cause: the embedding model was called with a write transaction open.**
+Not the guard machinery, and not the file. `process_embedding_jobs` writes its
+head vectors first, which opens an implicit deferred transaction at the first
+`UPDATE` and takes the WAL write lock. It then called `store_memory_spans`,
+which embeds every tail span in the batch -- up to ~1,900 sequences of 512
+tokens through a CPU ONNX pass, minutes of work -- and only then committed.
+The write lock was held for the entire model call.
 
-**Consequence today.** That namespace holds 12,681 events and roughly 4,650
-memories that need tail spans; none can be built until this is fixed. Its
-vector search is still correct, just head-only for long rows -- the pre-v14
-behaviour. Every other namespace is fully covered.
+Why `SQLITE_PROTOCOL` and not the `SQLITE_BUSY` that `busy_timeout=5000` would
+have retried: SQLite raises it from `walTryBeginRead()` once an internal
+~100-attempt budget is exhausted, which a *writer* reaches through
+`sqlite3WalFrames()` -> `walRestartLog()` during the commit flush. That budget
+only runs out when the wal-index header keeps changing underneath -- other
+processes starting and aborting WAL transactions continuously. The busy
+handler is never consulted on that path, which is precisely why raising the
+timeout would have done nothing.
+
+Where the contention came from is the sharp part: **haunt itself**.
+`Store.observe` runs `self.process_embedding_jobs(limit=32)` on every
+non-deferred write, so every hook write on a namespace with a backlog ran this
+same minutes-long transaction. The processes fighting for the lock were
+haunt's own hooks, each holding it for minutes. That also explains the
+apparent namespace-selectivity: the failing namespace was the largest and
+busiest, so it had the longest span batches and the most hook writers piling
+in, while four quiet namespaces drained without a single retry.
+
+**The fix.** `store_memory_spans` is split into `prepare_memory_spans`, which
+embeds and deliberately takes **no connection**, and `persist_memory_spans`,
+which writes and makes **no model call**. `process_embedding_jobs` commits its
+head vectors before preparing spans, so the model call runs with nothing open;
+`reembed` does the same per chunk. Committing first also makes the durability
+boundary honest -- a tail is an additional index over content whose vector is
+already correct, and a span failure should not roll it back.
+
+Verified on the namespace that failed 0 of 400 batches: 4 of 4 immediately,
+then a full drain landing 100/100 per batch with hundreds of spans and zero
+span failures.
+
+The regression tests assert the invariant rather than the symptom, because the
+symptom needs a concurrent writer and a gigabyte of corpus to appear at all:
+`tests/test_l32_no_model_under_lock.py` watches `embed_texts` and fails if
+`conn.in_transaction` is ever true when it is called. Three of its four fail
+on the pre-fix tree; the fourth guards the new commit ordering.
+
+Two further defects surfaced while diagnosing this and are **not** fixed here:
+neither can fail a commit minutes after the connection opened, and both are
+changes to the storage safety machinery that deserve their own review.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L33 | POSIX advisory locks are per (process, inode): closing *any* descriptor for an inode drops every `fcntl` lock the process holds on it. SQLite defends against this for descriptors it opened but cannot see one Python opened. `SQLiteSidecarGuard` opens and closes raw fds on `-wal`, `-shm` and `-journal` (`paths.py:325`, `paths.py:424`), and `_connect` runs `PRAGMA journal_mode=WAL` immediately followed by `validate_sqlite_sidecars`, which acquires a second throwaway guard over the same sidecars and closes it (`store.py:714-715`, `paths.py:452-467`). WAL read/write/checkpoint locks are byte-range locks on `-shm`. This is the condition SQLITE_PROTOCOL is named for. | MEDIUM (latent) | `paths.py:113`, `paths.py:186`, `paths.py:325`, `paths.py:424` | verified by reading |
+| L34 | `SQLiteSidecarGuard.acquire(claim_missing=True)` **creates** zero-byte `-wal`, `-shm` and `-journal` files (`paths.py:294`), and `close(clean_unused_claims=True)` **unlinks** those still at zero bytes (`paths.py:404-421`). Creating a zero-length `-shm` ahead of SQLite forces `walIndexRecover()`; unlinking one that a live connection has mmap'd desynchronizes WAL locking across processes. The stale zero-byte `-journal` beside every namespace, all dated 2026-08-26, is the fingerprint of a process dying between the claim and the cleanup. | MEDIUM (latent) | `paths.py:294`, `paths.py:404-421` | verified by reading |
+
+Noted while measuring, not filed as defects: no `isolation_level` is set
+anywhere, so Python's legacy implicit-`BEGIN` is what opens these
+transactions; and neither `cache_size` nor `wal_autocheckpoint` is configured,
+so a large batch spills the default 2000-page cache mid-transaction and trips
+the default 1000-page autocheckpoint at commit. Both amplified L32's exposure
+rather than causing it.
 
 ### Recovery of the hijacked capture, and the stale audit (2026-09-02)
 
