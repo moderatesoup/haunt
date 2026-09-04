@@ -42,6 +42,13 @@ PINNED: frozenset[str] = frozenset({
     # Every one is called from the embedding write paths only.
     "_drop_memory_spans",
     "plan_memory_spans",
+    # The tail-span cluster is split in two on purpose (L32):
+    # prepare_* embeds and takes no connection, persist_* writes and
+    # takes no model. store_memory_spans joins them for callers that
+    # hold no transaction.
+    "PreparedSpans",
+    "prepare_memory_spans",
+    "persist_memory_spans",
     "store_memory_spans",
     "AliasRetirementError",
     "NamespaceCollisionError",
