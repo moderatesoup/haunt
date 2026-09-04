@@ -1415,6 +1415,52 @@ the leg's width without moving the headline numbers. Those numbers were taken
 against spans built before L27 landed, which does not affect them -- the tail
 probe samples at `max_len + 80`, nowhere near the final span L27 repairs.
 
+### `haunt maintenance` cannot commit on one real namespace (2026-09-03)
+
+Found while draining the v14 span backfill across the live store. Four
+namespaces drained clean -- 18,250 spans, zero span failures. The largest one
+cannot be drained at all.
+
+| ID | Item | Severity | Evidence | Checked |
+|---|---|---|---|---|
+| L32 | `process_embedding_jobs` raises `sqlite3.OperationalError: locking protocol` (SQLITE_PROTOCOL) from `self.conn.commit()` on `github.com-memory-protocol-memory-protocol`. The embedding work itself completes; only the commit fails, so the batch is lost and the backlog never moves -- 0 of 400 attempted batches succeeded across two runs, ~90 minutes apart. **A plain `sqlite3` connection to the same file commits a write transaction without complaint**, and `PRAGMA quick_check` returns `ok`, so the database is healthy and this is haunt's connection configuration rather than file corruption. Not contention: `lsof` shows no other process holding the file at the time of failure. The namespace is the largest in the store (1.08 GB, 12,681 events) and is the only one that fails; the other four drained without a single retry. | HIGH (a namespace cannot build span coverage at all) | traceback below; `PRAGMA journal_mode=wal`, `locking_mode=normal` | verified |
+
+Reproduction:
+
+```
+python -c "
+from haunt.store import open_existing
+with open_existing('github.com-memory-protocol-memory-protocol') as st:
+    st.process_embedding_jobs(limit=5)"
+...
+  File "src/haunt/store.py", in process_embedding_jobs
+    self.conn.commit()
+sqlite3.OperationalError: locking protocol
+```
+
+Control, same file, same moment:
+
+```
+sqlite3 <db> "BEGIN IMMEDIATE; CREATE TABLE _p(x); DROP TABLE _p; COMMIT;"   # ok
+```
+
+Things ruled out: file corruption (`quick_check` ok), another process holding
+the file (`lsof` empty), plain lock contention (a plain writer succeeds
+immediately), and journal mode (`wal`, as everywhere else). A stale zero-byte
+`-journal` sidecar dated 2026-08-26 sits beside it, but several namespaces
+that drain fine have one too, so it is a suspect rather than a cause.
+
+**Not investigated further here.** Diagnosing it means going into
+`haunt.paths`'s SQLite open path -- `SQLITE_OPEN_LOCK`, `SQLitePrimaryGuard`,
+`SQLiteSidecarGuard` -- which is a change to the storage safety machinery and
+should not be started as a side effect of running a backfill. Filed with the
+reproduction so it can be picked up deliberately.
+
+**Consequence today.** That namespace holds 12,681 events and roughly 4,650
+memories that need tail spans; none can be built until this is fixed. Its
+vector search is still correct, just head-only for long rows -- the pre-v14
+behaviour. Every other namespace is fully covered.
+
 ### Recovery of the hijacked capture, and the stale audit (2026-09-02)
 
 **Recovered capture merged, two of three namespaces.** The scratch tree from
