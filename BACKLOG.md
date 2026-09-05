@@ -1200,9 +1200,9 @@ IDs continue the L-series. None is a merge blocker.
 
 | ID | Item | Severity | Evidence | Checked |
 |---|---|---|---|---|
-| L11 | The `test-hybrid` job was authored and exercised on macOS only and has never run on Linux. Its first CI run is a cold `actions/cache` miss that downloads bge-small (~64 MB) before the key populates. The key is a bare literal with no `restore-keys`, so if the embedding model pin ever changes that key must be bumped or the job silently reuses the wrong cached model. | LOW (operational) | `.github/workflows/ci.yml:61-86`, key at `:78` | verified |
-| L13 | `drain_embedding_queue(batch_size=N)` silently clamps N to 100, via `clamp_limit`'s `LIMIT_MAX`. Undocumented kwarg and no production caller sets it — `bootstrap` calls with no arguments. `README.md` is **not** wrong: it documents `HAUNT_EMBED_DRAIN_LIMIT`, which controls `max_rows` and genuinely reaches 100,000. A one-line docstring note is the whole fix. | LOW | `src/haunt/store.py:5714-5715`, clamp at `:5510`; `LIMIT_MAX` at `src/haunt/util.py:154`; `README.md:312` | verified |
-| L14 | `_load_fastembed` remains unpinned: fastembed exposes no revision knob, so `TextEmbedding(model_name=...)` takes whatever the hub serves. A separate download path from the one the R2 BGE-M3 revision pin closed. | LOW (supply chain) | `src/haunt/embed.py:367-374` | verified |
+| L11 | **FIXED.** The `test-hybrid` job was authored and exercised on macOS only and has never run on Linux. Its first CI run is a cold `actions/cache` miss that downloads bge-small (~64 MB) before the key populates. The key is a bare literal with no `restore-keys`, so if the embedding model pin ever changes that key must be bumped or the job silently reuses the wrong cached model. | LOW (operational) | `.github/workflows/ci.yml:61-86`, key at `:78` | verified |
+| L13 | **FIXED (documented).** `drain_embedding_queue(batch_size=N)` silently clamps N to 100, via `clamp_limit`'s `LIMIT_MAX`. Undocumented kwarg and no production caller sets it — `bootstrap` calls with no arguments. `README.md` is **not** wrong: it documents `HAUNT_EMBED_DRAIN_LIMIT`, which controls `max_rows` and genuinely reaches 100,000. A one-line docstring note is the whole fix. | LOW | `src/haunt/store.py:5714-5715`, clamp at `:5510`; `LIMIT_MAX` at `src/haunt/util.py:154`; `README.md:312` | verified |
+| L14 | **DOCUMENTED, not closed.** `_load_fastembed` remains unpinned: fastembed exposes no revision knob, so `TextEmbedding(model_name=...)` takes whatever the hub serves. A separate download path from the one the R2 BGE-M3 revision pin closed. | LOW (supply chain) | `src/haunt/embed.py:367-374` | verified |
 | L15 | `tests/test_correction_lineage.py::test_concurrent_corrections_do_not_fork` failed once at machine load ~97 with `NamespacePathError: SQLite zero-write read observed storage drift`. Passed 5/5 in isolation at the same load, and in the clean-load full suite. Cause not established. Not a merge blocker; re-check if it recurs. | LOW | `tests/test_correction_lineage.py:359`; one observed failure, not reproduced | operator |
 | L16 | Hooks fail **open** on exception, but there is no timeout at all, so a hang is not covered: a contended SQLite lock or a slow disk holds the turn until the host's own hook timeout fires. `SECURITY.md`/`README.md` wording was corrected to "a hook *error* never blocks", which is honest, but the underlying gap remains. Found during the cleanup pass and deliberately not fixed there — behaviour change, out of scope. | LOW-MEDIUM | `SECURITY.md:117-119`; `README.md:158`; no `timeout`/`signal` in `src/haunt/claude_hook.py` or `src/haunt/cursor_hook.py` | verified |
 
@@ -1394,6 +1394,55 @@ confirm zero equals zero, and they were stopped deliberately rather than
 quietly dropped.
 
 
+### Register cleanup (2026-09-05)
+
+**L33 fixed.** Two calls ran with a live WAL connection and opened a descriptor
+per sidecar: `validate_sqlite_sidecars` immediately after
+`PRAGMA journal_mode=WAL`, and `tighten_db_files` right behind it, which opens
+every sidecar to chmod it. Closing a descriptor on an inode releases every
+`fcntl` lock the process holds on it, and SQLite's WAL locks are byte-range
+locks on `-shm`, so both were silently dropping the connection's own locks.
+
+Added `validate_sqlite_sidecars_no_descriptors`, which validates by `lstat`
+alone, and `tighten_db_files(live_connection=True)`, which additionally skips
+`-wal`/`-shm`. Both narrowings, not new defaults: off the connect path the
+stricter fstat-versus-lstat check still runs on every sidecar, and a test
+asserts that. Nothing is lost by the narrowing -- the descriptor exists to
+prove the file you `lstat` is the file you `open`, which only matters when
+something is about to open it; once SQLite holds its own handles a swap cannot
+redirect them, and `lstat` still catches a planted symlink or a hardlink.
+`tests/test_l33_sidecar_locks.py`, six tests, all six fail on the pre-fix tree.
+
+**L34 attempted and backed out.** Not claiming `-wal`/`-shm` is a two-line
+change, and it does not work: `SQLiteSidecarGuard.verify()` requires a sidecar
+that was absent at acquire time to still be absent, so the moment SQLite
+legitimately creates `-wal` the guard raises "sidecar appeared during safe
+open". Closing L34 means changing that invariant to "may appear; must be a
+regular, single-link, non-symlink file if it does", plus reworking the
+fresh-claim teardown that currently relies on the guard owning those files to
+clean them up. That is a deliberate change to the storage-safety contract and
+its tests, which is what the original filing said. Reverted rather than
+half-landed; the entry stands.
+
+**L13 documented.** The clamp is real; the docstring now says `batch_size` is
+capped at 100 by `clamp_limit`, distinguishes it from `max_rows` (which
+`HAUNT_EMBED_DRAIN_LIMIT` drives and which genuinely reaches 100,000), and
+notes no shipped caller sets it.
+
+**L11 fixed.** The model cache key is now derived from the model it pins
+(`haunt-models-v1-BAAI-bge-small-en-v1.5`) with a `restore-keys` prefix, so
+changing `HAUNT_EMBED_MODEL` without bumping the key no longer silently reuses
+the wrong weights, and a bumped key warm-starts instead of paying a cold
+download.
+
+**L14 documented, deliberately not closed.** `_load_fastembed` now carries the
+gap in its docstring: fastembed exposes no revision argument, so it takes
+whatever the hub serves, and that is a second unpinned download path beside the
+BGE-M3 one -- which *is* revision-pinned and hash-verified. Closing it needs
+either a fastembed API that accepts a revision or haunt fetching those weights
+itself. The point of the note is that the pinned BGE-M3 path must not be read
+as covering this one.
+
 ### Adversarial review of the span change (2026-09-02)
 
 Six findings against the L21 implementation, all reproduced before being
@@ -1500,7 +1549,7 @@ changes to the storage safety machinery that deserve their own review.
 
 | ID | Item | Severity | Evidence | Checked |
 |---|---|---|---|---|
-| L33 | POSIX advisory locks are per (process, inode): closing *any* descriptor for an inode drops every `fcntl` lock the process holds on it. SQLite defends against this for descriptors it opened but cannot see one Python opened. `SQLiteSidecarGuard` opens and closes raw fds on `-wal`, `-shm` and `-journal` (`paths.py:325`, `paths.py:424`), and `_connect` runs `PRAGMA journal_mode=WAL` immediately followed by `validate_sqlite_sidecars`, which acquires a second throwaway guard over the same sidecars and closes it (`store.py:714-715`, `paths.py:452-467`). WAL read/write/checkpoint locks are byte-range locks on `-shm`. This is the condition SQLITE_PROTOCOL is named for. | MEDIUM (latent) | `paths.py:113`, `paths.py:186`, `paths.py:325`, `paths.py:424` | verified by reading |
+| L33 | **FIXED.** POSIX advisory locks are per (process, inode): closing *any* descriptor for an inode drops every `fcntl` lock the process holds on it. SQLite defends against this for descriptors it opened but cannot see one Python opened. `SQLiteSidecarGuard` opens and closes raw fds on `-wal`, `-shm` and `-journal` (`paths.py:325`, `paths.py:424`), and `_connect` runs `PRAGMA journal_mode=WAL` immediately followed by `validate_sqlite_sidecars`, which acquires a second throwaway guard over the same sidecars and closes it (`store.py:714-715`, `paths.py:452-467`). WAL read/write/checkpoint locks are byte-range locks on `-shm`. This is the condition SQLITE_PROTOCOL is named for. | MEDIUM (latent) | `paths.py:113`, `paths.py:186`, `paths.py:325`, `paths.py:424` | verified by reading |
 | L34 | `SQLiteSidecarGuard.acquire(claim_missing=True)` **creates** zero-byte `-wal`, `-shm` and `-journal` files (`paths.py:294`), and `close(clean_unused_claims=True)` **unlinks** those still at zero bytes (`paths.py:404-421`). Creating a zero-length `-shm` ahead of SQLite forces `walIndexRecover()`; unlinking one that a live connection has mmap'd desynchronizes WAL locking across processes. The stale zero-byte `-journal` beside every namespace, all dated 2026-08-26, is the fingerprint of a process dying between the claim and the cleanup. | MEDIUM (latent) | `paths.py:294`, `paths.py:404-421` | verified by reading |
 
 Noted while measuring, not filed as defects: no `isolation_level` is set
