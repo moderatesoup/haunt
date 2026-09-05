@@ -84,7 +84,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.haunt/models
-          key: haunt-models-bge-small-en-v1.5
+          # L11: the key names the model this job pins, so changing
+          # HAUNT_EMBED_MODEL below without changing the key here would
+          # silently reuse the wrong cached weights. restore-keys lets a
+          # renamed key still warm-start from the previous cache instead of
+          # paying a cold ~64 MB download on the first run after a bump.
+          key: haunt-models-v1-BAAI-bge-small-en-v1.5
+          restore-keys: |
+            haunt-models-v1-
 
       - name: Pytest (sqlite-vec + embeddings)
         env:

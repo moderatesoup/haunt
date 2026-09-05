@@ -425,6 +425,18 @@ def _load_onnx_bge_m3() -> tuple[OnnxEmbedder, int]:
 
 
 def _load_fastembed(model_id: str) -> Any:
+    """Load a model through fastembed.
+
+    L14, unresolved by design rather than by oversight: fastembed exposes no
+    revision argument, so this takes whatever the hub currently serves for
+    `model_id`. That is a second, unpinned download path beside the BGE-M3 one,
+    which *is* pinned by revision and verified against a committed hash
+    manifest (`BGE_M3_REVISION`, `_verify_bge_m3_cache`). Anything relying on
+    fastembed -- the bge-small fallback, and CI's hybrid job -- inherits that
+    weaker guarantee. Closing it needs either a fastembed API that accepts a
+    revision or haunt fetching those weights itself; do not read the pinned
+    BGE-M3 path as covering this one.
+    """
     if offline():
         raise RuntimeError("offline mode forbids embedding backend initialization")
     from fastembed import TextEmbedding

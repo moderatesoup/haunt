@@ -56,6 +56,7 @@ from haunt.paths import (
     validate_namespace_root,
     validate_registry_db_sources,
     validate_sqlite_sidecars,
+    validate_sqlite_sidecars_no_descriptors,
 )
 from haunt.provenance import (
     encode_json_safe_sqlite_key,
@@ -712,12 +713,17 @@ def _configure_connection(
         # before SQLite receives its first write-mode pragma.
         sidecars.verify()
     conn.execute("PRAGMA journal_mode=WAL")
-    validate_sqlite_sidecars(path)
+    # Descriptor-free: `conn` is live and, now that WAL is on, holds byte-range
+    # locks on `<db>-shm`. Opening and closing our own fd on that inode would
+    # drop them, because POSIX advisory locks are per (process, inode) and
+    # SQLite cannot see a descriptor Python opened (L33).
+    validate_sqlite_sidecars_no_descriptors(path)
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
     if tighten:
-        tighten_db_files(path)
+        # conn is live and WAL is on: skip the sidecars SQLite locks (L33).
+        tighten_db_files(path, live_connection=True)
     from haunt.embed import fts_only
 
     if not fts_only():
@@ -8049,6 +8055,12 @@ class Store:
         """Bounded, synchronous drain of this namespace's embedding_jobs
         backlog: calls process_embedding_jobs in a loop until the queue is
         actually empty, a row bound is hit, or a call makes no progress.
+
+        L13: `batch_size` is silently clamped to `haunt.util.LIMIT_MAX` (100)
+        by `clamp_limit`, so passing more than that quietly gets 100. This is
+        the rows-per-model-call knob, not the total: `max_rows` bounds the
+        whole drain and is what `HAUNT_EMBED_DRAIN_LIMIT` reaches, which does
+        genuinely go to 100,000. No shipped caller sets `batch_size`.
 
         C4 defect this closes: hook writes always pass defer_embedding=True
         (see observe()), so a hook-driven write never reaches the

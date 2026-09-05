@@ -445,10 +445,63 @@ class SQLiteSidecarGuard:
                     pass
 
 
+def validate_sqlite_sidecars_no_descriptors(
+    db_path: Path, *, require_absent: bool = False
+) -> dict[str, tuple[int, int]]:
+    """Validate sidecars by lstat alone, opening no descriptors at all.
+
+    L33: POSIX advisory locks are per (process, inode). Closing *any*
+    descriptor for an inode releases every `fcntl` lock the process holds on
+    it, and SQLite cannot defend against a descriptor it did not open. Its WAL
+    read/write/checkpoint locks are byte-range locks on `<db>-shm`, so opening
+    and closing our own fd on that file while a connection is live silently
+    drops the connection's locks.
+
+    The descriptor-based check exists to close the gap between `lstat` and
+    `open`: it proves the file you stat is the file you opened. That gap only
+    matters when something is about to open the path. Once SQLite already holds
+    its own handles, a swap cannot redirect them, so the remaining question is
+    purely "is what sits at this path still a regular, single-link, non-symlink
+    file" -- which `lstat` answers on its own.
+
+    Use this after a connection exists. Use `validate_sqlite_sidecars` before
+    one does.
+    """
+    existing: dict[str, tuple[int, int]] = {}
+    for suffix in SQLITE_SIDECAR_SUFFIXES:
+        sidecar = Path(str(db_path) + suffix)
+        try:
+            info = sidecar.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise NamespacePathError(
+                f"cannot inspect SQLite sidecar: {sidecar}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise NamespacePathError(
+                f"SQLite sidecar must be a regular non-symlink file: {sidecar}"
+            )
+        if int(info.st_nlink) > 1:
+            raise NamespacePathError(
+                f"SQLite sidecar must have exactly one filesystem link: {sidecar}"
+            )
+        existing[str(sidecar)] = (int(info.st_dev), int(info.st_ino))
+    if require_absent and existing:
+        joined = ", ".join(sorted(existing))
+        raise NamespacePathError(f"unmapped SQLite sidecar already exists: {joined}")
+    return existing
+
+
 def validate_sqlite_sidecars(
     db_path: Path, *, require_absent: bool = False
 ) -> dict[str, tuple[int, int]]:
-    """Validate existing sidecars without creating, deleting, or chmodding them."""
+    """Validate existing sidecars without creating, deleting, or chmodding them.
+
+    Opens a descriptor per sidecar, so it MUST NOT run while a SQLite
+    connection to this database is live -- see
+    `validate_sqlite_sidecars_no_descriptors` (L33).
+    """
     with SQLITE_OPEN_LOCK:
         guard = SQLiteSidecarGuard.acquire(Path(db_path), claim_missing=False)
         try:
@@ -1806,14 +1859,34 @@ def mkdir_private(path: Path) -> Path:
     return path
 
 
-def tighten_db_files(path: Path) -> None:
-    """Tighten only verified SQLite files, never following a sidecar symlink."""
-    validate_sqlite_sidecars(path)
+def tighten_db_files(path: Path, *, live_connection: bool = False) -> None:
+    """Tighten only verified SQLite files, never following a sidecar symlink.
+
+    `live_connection` says a SQLite connection to this database is already
+    open. It then skips `-wal` and `-shm` entirely and validates without
+    descriptors, because both steps here -- the validation and the chmod --
+    open and close a descriptor per file, and doing that to an inode SQLite
+    holds byte-range locks on drops those locks (L33: POSIX advisory locks are
+    per (process, inode)).
+
+    Skipping them costs nothing real: SQLite creates `-wal`/`-shm` with the
+    main database's own mode, and deletes them on last close, so they are
+    already as tight as the file they derive from. `-journal` is untouched by
+    WAL-mode SQLite and stays in scope.
+    """
+    if live_connection:
+        validate_sqlite_sidecars_no_descriptors(path)
+        suffixes: tuple[str, ...] = tuple(
+            x for x in SQLITE_SIDECAR_SUFFIXES if x not in ("-wal", "-shm")
+        )
+    else:
+        validate_sqlite_sidecars(path)
+        suffixes = SQLITE_SIDECAR_SUFFIXES
     nofollow = required_o_nofollow()
     cloexec = getattr(os, "O_CLOEXEC", 0)
     for extra in (
         path,
-        *(Path(str(path) + suffix) for suffix in SQLITE_SIDECAR_SUFFIXES),
+        *(Path(str(path) + suffix) for suffix in suffixes),
     ):
         try:
             before = extra.lstat()
